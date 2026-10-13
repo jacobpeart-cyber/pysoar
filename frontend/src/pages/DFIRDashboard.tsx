@@ -20,7 +20,11 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 import { dfirApi } from '../api/endpoints';
-import { api } from '../lib/api';
+import { api } from '../api/client';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
+
+const NA = 'not available';
 
 const getSeverityColor = (severity: string) => {
   switch (severity) {
@@ -134,12 +138,13 @@ export default function DFIRDashboard() {
     queryFn: () => dfirApi.getCases(),
   });
 
-  const { data: dashboardData, isLoading: dashboardLoading } = useQuery({
+  // Shared axios client: carries the bearer token (the old raw fetch sent
+  // none, always 401'd and silently fell back to first-page counts).
+  const { data: dashboardData, isLoading: dashboardLoading, error: dashboardError } = useQuery({
     queryKey: ['dfir-dashboard'],
     queryFn: async () => {
-      const response = await fetch('/api/v1/dfir/dashboard/metrics');
-      if (!response.ok) return null;
-      return response.json();
+      const response = await api.get('/dfir/dashboard/metrics');
+      return response.data;
     },
   });
 
@@ -148,23 +153,21 @@ export default function DFIRDashboard() {
 
   const { data: evidenceData, isLoading: evidenceLoading, error: evidenceError } = useQuery({
     queryKey: ['dfir-evidence', activeCaseId],
-    queryFn: () => activeCaseId ? dfirApi.getEvidence(activeCaseId) : Promise.resolve({ items: [] }),
+    queryFn: () => dfirApi.getEvidence(activeCaseId as string),
     enabled: !!activeCaseId,
   });
 
   const { data: timelineData, isLoading: timelineLoading, error: timelineError } = useQuery({
     queryKey: ['dfir-timeline', activeCaseId],
-    queryFn: () => activeCaseId ? dfirApi.getTimeline(activeCaseId) : Promise.resolve({ items: [] }),
+    queryFn: () => dfirApi.getTimeline(activeCaseId as string),
     enabled: !!activeCaseId,
   });
 
   const { data: legalHoldsData, isLoading: holdsLoading, error: holdsError } = useQuery({
     queryKey: ['dfir-legal-holds', activeCaseId],
     queryFn: async () => {
-      if (!activeCaseId) return { items: [] };
-      const response = await fetch(`/api/v1/dfir/cases/${activeCaseId}/legal-holds`);
-      if (!response.ok) return { items: [] };
-      return response.json();
+      const response = await api.get(`/dfir/cases/${activeCaseId}/legal-holds`);
+      return response.data;
     },
     enabled: !!activeCaseId,
   });
@@ -186,7 +189,7 @@ export default function DFIRDashboard() {
       resetNewCaseForm();
     },
     onError: (err: any) => {
-      setNewCaseError(err?.response?.data?.detail || err?.message || 'Failed to create case');
+      setNewCaseError(`Failed to create case: ${describeLoadError(err)}`);
     },
   });
 
@@ -202,7 +205,7 @@ export default function DFIRDashboard() {
       setEditCaseError('');
     },
     onError: (err: any) => {
-      setEditCaseError(err?.response?.data?.detail || err?.message || 'Failed to update case');
+      setEditCaseError(`Failed to update case: ${describeLoadError(err)}`);
     },
   });
 
@@ -218,7 +221,7 @@ export default function DFIRDashboard() {
       setEditHoldError('');
     },
     onError: (err: any) => {
-      setEditHoldError(err?.response?.data?.detail || err?.message || 'Failed to update legal hold');
+      setEditHoldError(`Failed to update legal hold: ${describeLoadError(err)}`);
     },
   });
 
@@ -253,26 +256,18 @@ export default function DFIRDashboard() {
   const loading = casesLoading || dashboardLoading;
   const error = casesError;
 
-  // Compute stats from dashboard API or fallback to local data
-  const activeCases = dashboardData?.active_cases ?? cases.filter((c: any) => c?.status === 'open' || c?.status === 'in_progress').length;
-  const totalCases = dashboardData?.total_cases ?? cases.length;
-  const evidenceCount = dashboardData?.total_evidence_items ?? evidence.length;
-  const activeHoldsCount = dashboardData?.legal_holds_active ?? legalHolds.filter((h: any) => h?.status === 'active').length;
-
-  // Compute average resolution time from closed cases
-  const computeAvgResolution = (): string => {
-    if (dashboardData?.avg_resolution_days != null) {
-      return `${Number(dashboardData.avg_resolution_days).toFixed(1)} days`;
-    }
-    const closedCases = cases.filter((c: any) => c?.status === 'closed' && c?.created_at && c?.updated_at);
-    if (closedCases.length === 0) return 'N/A';
-    const totalMs = closedCases.reduce((sum: number, c: any) => {
-      return sum + (new Date(c.updated_at || "").getTime() - new Date(c.created_at || "").getTime());
-    }, 0);
-    const avgDays = totalMs / (closedCases.length || 1) / (1000 * 60 * 60 * 24);
-    return `${avgDays.toFixed(1)} days`;
-  };
-  const avgResolutionTime = computeAvgResolution();
+  // Org-wide counts come only from GET /dfir/dashboard/metrics. No
+  // fallback to the first page of cases or the selected case's evidence,
+  // which used to be presented as global totals.
+  const activeCases = dashboardData?.active_cases ?? NA;
+  const totalCases = dashboardData?.total_cases ?? NA;
+  const evidenceCount = dashboardData?.total_evidence_items ?? NA;
+  const activeHoldsCount = dashboardData?.legal_holds_active ?? NA;
+  // DFIRDashboardResponse has no resolution-time metric; the old
+  // updated_at - created_at proxy is not time-to-close.
+  const avgResolutionTime = dashboardData?.avg_resolution_days != null
+    ? `${Number(dashboardData.avg_resolution_days).toFixed(1)} days`
+    : NA;
 
   const filteredCases = cases.filter((c: any) => {
     const matchesSearch =
@@ -339,6 +334,7 @@ export default function DFIRDashboard() {
       URL.revokeObjectURL(url);
     } catch (err) {
       console.error('Evidence download failed:', err);
+      alert(`Evidence download failed: ${describeLoadError(err)}`);
     }
   }, []);
 
@@ -383,6 +379,9 @@ export default function DFIRDashboard() {
         </div>
 
         {/* Summary Cards */}
+        <div className="mb-4">
+          <LoadErrorBanner what="DFIR dashboard metrics" error={dashboardError} />
+        </div>
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
           <div className="bg-gradient-to-br from-red-50 to-red-100 dark:from-red-900 dark:to-red-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-red-600 dark:text-red-300">Active Cases</p>
@@ -439,10 +438,7 @@ export default function DFIRDashboard() {
             <p className="ml-3 text-gray-500 dark:text-gray-400">Loading DFIR data...</p>
           </div>
         ) : error ? (
-          <div className="flex items-center justify-center h-64">
-            <AlertCircle className="w-8 h-8 text-red-500" />
-            <p className="ml-3 text-red-500">Failed to load data. Please try again.</p>
-          </div>
+          <LoadErrorBanner what="forensic cases" error={error} />
         ) : (
           <>
             {/* Cases Tab */}
@@ -537,7 +533,8 @@ export default function DFIRDashboard() {
                               </span>
                             </td>
                             <td className="px-6 py-4 text-sm">{caseItem.lead_investigator_id || 'Unassigned'}</td>
-                            <td className="px-6 py-4 text-sm">{caseItem.evidence_count || 0}</td>
+                            {/* ForensicCaseResponse carries no evidence_count */}
+                            <td className="px-6 py-4 text-sm">{caseItem.evidence_count ?? NA}</td>
                             <td className="px-6 py-4">
                               {caseItem.legal_hold_active ? (
                                 <CheckCircle className="w-5 h-5 text-green-600" />
@@ -602,7 +599,8 @@ export default function DFIRDashboard() {
                   </div>
                 </div>
 
-                {evidenceLoading ? (
+                <LoadErrorBanner what="evidence" error={evidenceError} />
+                {evidenceError ? null : evidenceLoading ? (
                   <div className="flex items-center justify-center h-32">
                     <Loader2 className="w-6 h-6 animate-spin text-gray-400" />
                     <p className="ml-2 text-gray-500">Loading evidence...</p>
@@ -684,7 +682,8 @@ export default function DFIRDashboard() {
                     Select a case from the Cases tab to view its timeline.
                   </div>
                 )}
-                {timelineLoading ? (
+                <LoadErrorBanner what="the timeline" error={timelineError} />
+                {timelineError ? null : timelineLoading ? (
                   <div className="flex items-center justify-center h-32">
                     <Loader2 className="w-6 h-6 animate-spin text-gray-400" />
                     <p className="ml-2 text-gray-500">Loading timeline...</p>
@@ -775,7 +774,8 @@ export default function DFIRDashboard() {
                     </button>
                   </div>
                 )}
-                {holdsLoading ? (
+                <LoadErrorBanner what="legal holds" error={holdsError} />
+                {holdsError ? null : holdsLoading ? (
                   <div className="flex items-center justify-center h-32">
                     <Loader2 className="w-6 h-6 animate-spin text-gray-400" />
                     <p className="ml-2 text-gray-500">Loading legal holds...</p>
@@ -1150,7 +1150,7 @@ export default function DFIRDashboard() {
                 setShowNewEvidenceModal(false);
                 queryClient.invalidateQueries({ queryKey: ['dfir-evidence'] });
               } catch (err: any) {
-                setNewEvidenceError(err?.response?.data?.detail || err?.message || 'Failed to create evidence');
+                setNewEvidenceError(`Failed to register evidence: ${describeLoadError(err)}`);
               }
             }}>
               <div>
@@ -1222,18 +1222,23 @@ export default function DFIRDashboard() {
                 .map((c) => c.trim())
                 .filter((c) => c.length > 0);
               try {
+                // LegalHoldCreate (src/schemas/dfir.py) requires
+                // `data_sources`; scope/reason/status are not fields and
+                // were silently dropped (and the request 422'd).
+                const dataSources = ((fd.get('data_sources') as string) || '')
+                  .split(',')
+                  .map((d) => d.trim())
+                  .filter((d) => d.length > 0);
                 await api.post(`/dfir/cases/${activeCaseId}/legal-holds`, {
                   case_id: activeCaseId,
                   hold_type: fd.get('hold_type') || 'preservation',
-                  scope: fd.get('scope') || '',
                   custodians,
-                  status: 'active',
-                  reason: fd.get('reason') || '',
+                  data_sources: dataSources,
                 });
                 setShowNewHoldModal(false);
                 queryClient.invalidateQueries({ queryKey: ['dfir-legal-holds'] });
               } catch (err: any) {
-                setNewHoldError(err?.response?.data?.detail || err?.message || 'Failed to create legal hold');
+                setNewHoldError(`Failed to create legal hold: ${describeLoadError(err)}`);
               }
             }}>
               <div>
@@ -1250,12 +1255,8 @@ export default function DFIRDashboard() {
                 <input name="custodians" required type="text" placeholder="alice@acme.com, bob@acme.com" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
               </div>
               <div>
-                <label className="block text-sm font-medium mb-1">Scope</label>
-                <textarea name="scope" rows={2} placeholder="Email, documents, chat history from Q1 2026" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">Reason</label>
-                <textarea name="reason" rows={2} placeholder="Reason for the hold" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
+                <label className="block text-sm font-medium mb-1">Data Sources (comma separated)</label>
+                <input name="data_sources" required type="text" placeholder="mailbox, sharepoint, laptop-042" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
               </div>
               {newHoldError && <p className="text-sm text-red-600 dark:text-red-400">{newHoldError}</p>}
               <div className="flex gap-2 mt-5">
@@ -1278,10 +1279,9 @@ export default function DFIRDashboard() {
 // or not any artifacts existed — a cosmetic lie.
 function ArtifactsTab({ caseId }: { caseId: string | null }) {
   const queryClient = useQueryClient();
-  const { data, isLoading, isError } = useQuery<any>({
+  const { data, isLoading, isError, error: artifactsError } = useQuery<any>({
     queryKey: ['dfir-artifacts', caseId],
     queryFn: async () => {
-      if (!caseId) return { items: [] };
       const res = await api.get(`/dfir/cases/${caseId}/artifacts`, { params: { size: 100 } });
       return res.data;
     },
@@ -1296,10 +1296,15 @@ function ArtifactsTab({ caseId }: { caseId: string | null }) {
     },
     onSuccess: (res) => {
       queryClient.invalidateQueries({ queryKey: ['dfir-artifacts', caseId] });
-      alert(`IOC extraction complete — ${res?.iocs_extracted ?? 0} IOCs found across ${res?.artifacts_scanned ?? 0} artifacts.`);
+      // IOCExtractionResponse: {status, iocs, total_extracted}
+      alert(
+        res?.total_extracted != null
+          ? `IOC extraction complete: ${res.total_extracted} IOCs found.`
+          : 'IOC extraction finished, but the response did not report a count.',
+      );
     },
-    onError: (err: any) => {
-      alert(`IOC extraction failed: ${err?.response?.data?.detail || err?.message}`);
+    onError: (err: unknown) => {
+      alert(`IOC extraction failed: ${describeLoadError(err)}`);
     },
   });
 
@@ -1331,14 +1336,10 @@ function ArtifactsTab({ caseId }: { caseId: string | null }) {
           <Loader2 className="w-4 h-4 animate-spin" /> Loading artifacts…
         </div>
       )}
-      {isError && (
-        <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-3 text-sm text-red-700 dark:text-red-300">
-          Failed to load artifacts.
-        </div>
-      )}
+      <LoadErrorBanner what="artifacts" error={artifactsError} />
       {!isLoading && !isError && items.length === 0 && (
         <div className="bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-6 text-center text-gray-600 dark:text-gray-400">
-          No artifacts registered on this case yet. Evidence registered via the Evidence tab produces artifacts as it is processed.
+          No artifacts registered on this case yet.
         </div>
       )}
       {!isLoading && items.length > 0 && (
@@ -1348,22 +1349,27 @@ function ArtifactsTab({ caseId }: { caseId: string | null }) {
               <tr>
                 <th className="px-4 py-2 text-left">Artifact</th>
                 <th className="px-4 py-2 text-left">Type</th>
-                <th className="px-4 py-2 text-left">Source</th>
+                <th className="px-4 py-2 text-left">Risk Score</th>
                 <th className="px-4 py-2 text-left">Extracted IOCs</th>
-                <th className="px-4 py-2 text-left">Collected</th>
+                <th className="px-4 py-2 text-left">Created</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100 dark:divide-gray-700">
               {items.map((a: any) => (
                 <tr key={a.id} className="text-sm">
-                  <td className="px-4 py-2">{a.name || a.filename || a.id}</td>
-                  <td className="px-4 py-2">{a.artifact_type || a.type || '—'}</td>
-                  <td className="px-4 py-2">{a.source || a.source_system || '—'}</td>
+                  <td className="px-4 py-2 font-mono text-xs">{a.id}</td>
+                  <td className="px-4 py-2">{a.artifact_type ?? NA}</td>
+                  <td className="px-4 py-2">{typeof a.risk_score === 'number' ? a.risk_score.toFixed(1) : NA}</td>
                   <td className="px-4 py-2">
-                    {Array.isArray(a.extracted_iocs) ? a.extracted_iocs.length : (a.ioc_count ?? 0)}
+                    {a.ioc_extracted && typeof a.ioc_extracted === 'object'
+                      ? Object.values(a.ioc_extracted).reduce(
+                          (n: number, v: unknown) => n + (Array.isArray(v) ? v.length : 0),
+                          0,
+                        )
+                      : NA}
                   </td>
                   <td className="px-4 py-2 text-gray-500 dark:text-gray-400">
-                    {a.collected_at ? new Date(a.collected_at).toLocaleString() : '—'}
+                    {a.created_at ? new Date(a.created_at).toLocaleString() : NA}
                   </td>
                 </tr>
               ))}

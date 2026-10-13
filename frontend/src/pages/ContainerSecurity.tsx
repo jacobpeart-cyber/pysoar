@@ -19,6 +19,8 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 import { api } from '../lib/api';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 
 const severityColor = (severity: string) => {
   switch (severity?.toLowerCase()) {
@@ -69,9 +71,11 @@ export default function ContainerSecurity() {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedImage, setSelectedImage] = useState<any>(null);
   const [selectedCluster, setSelectedCluster] = useState<any>(null);
+  // Outcome of the last rescan / audit / remediate action, shown once.
+  const [actionMessage, setActionMessage] = useState<{ kind: 'error' | 'info'; text: string } | null>(null);
 
   // ─── Queries ──────────────────────────────────────────────────────
-  const { data: dashboardData, isLoading: dashLoading } = useQuery({
+  const { data: dashboardData, isLoading: dashLoading, error: dashError } = useQuery({
     queryKey: ['container-security', 'dashboard'],
     queryFn: async () => {
       const res = await api.get('/container-security/dashboard/overview');
@@ -79,7 +83,7 @@ export default function ContainerSecurity() {
     },
   });
 
-  const { data: imagesRaw, isLoading: imagesLoading } = useQuery({
+  const { data: imagesRaw, isLoading: imagesLoading, error: imagesError } = useQuery({
     queryKey: ['container-security', 'images'],
     queryFn: async () => {
       const res = await api.get('/container-security/images');
@@ -88,7 +92,7 @@ export default function ContainerSecurity() {
     enabled: activeTab === 'images' || activeTab === 'overview',
   });
 
-  const { data: clustersRaw, isLoading: clustersLoading } = useQuery({
+  const { data: clustersRaw, isLoading: clustersLoading, error: clustersError } = useQuery({
     queryKey: ['container-security', 'clusters'],
     queryFn: async () => {
       const res = await api.get('/container-security/clusters');
@@ -97,7 +101,7 @@ export default function ContainerSecurity() {
     enabled: activeTab === 'clusters' || activeTab === 'overview',
   });
 
-  const { data: findingsRaw, isLoading: findingsLoading } = useQuery({
+  const { data: findingsRaw, isLoading: findingsLoading, error: findingsError } = useQuery({
     queryKey: ['container-security', 'findings'],
     queryFn: async () => {
       const res = await api.get('/container-security/findings');
@@ -106,7 +110,7 @@ export default function ContainerSecurity() {
     enabled: activeTab === 'findings' || activeTab === 'overview',
   });
 
-  const { data: alertsRaw, isLoading: alertsLoading } = useQuery({
+  const { data: alertsRaw, isLoading: alertsLoading, error: alertsError } = useQuery({
     queryKey: ['container-security', 'runtime-alerts'],
     queryFn: async () => {
       const res = await api.get('/container-security/runtime-alerts');
@@ -127,9 +131,17 @@ export default function ContainerSecurity() {
       const res = await api.post(`/container-security/images/${imageId}/scan`);
       return res.data;
     },
-    onSuccess: () => {
+    onSuccess: (data: any) => {
+      // The backend reports status "no_scanner_backend" when no Trivy/Grype
+      // is configured: counts were only recomputed from recorded rows.
+      setActionMessage(
+        data?.status === 'no_scanner_backend'
+          ? { kind: 'info', text: 'No image scanner is configured; vulnerability counts were recomputed from already-recorded findings only.' }
+          : null,
+      );
       queryClient.invalidateQueries({ queryKey: ['container-security'] });
     },
+    onError: (err) => setActionMessage({ kind: 'error', text: `Rescan failed. ${describeLoadError(err)}` }),
   });
 
   const auditClusterMutation = useMutation({
@@ -142,8 +154,10 @@ export default function ContainerSecurity() {
       return res.data;
     },
     onSuccess: () => {
+      setActionMessage(null);
       queryClient.invalidateQueries({ queryKey: ['container-security'] });
     },
+    onError: (err) => setActionMessage({ kind: 'error', text: `Cluster audit failed. ${describeLoadError(err)}` }),
   });
 
   const remediateFindingMutation = useMutation({
@@ -153,18 +167,22 @@ export default function ContainerSecurity() {
       return res.data;
     },
     onSuccess: () => {
+      setActionMessage(null);
       queryClient.invalidateQueries({ queryKey: ['container-security', 'findings'] });
     },
+    onError: (err) => setActionMessage({ kind: 'error', text: `Remediation failed. ${describeLoadError(err)}` }),
   });
 
   // ─── Dashboard stats ──────────────────────────────────────────────
-  const dash = dashboardData || {};
-  const totalImages = dash.total_images ?? images.length;
-  const totalClusters = dash.total_clusters ?? clusters.length;
-  const totalFindings = dash.open_findings ?? findings.filter((f: any) => f.status === 'open').length;
-  const totalAlerts = dash.active_alerts ?? alerts.filter((a: any) => a.status !== 'resolved').length;
-  const criticalVulns = dash.critical_vulnerabilities ?? images.reduce((s: number, i: any) => s + (i.critical_count || 0), 0);
-  const highVulns = dash.high_vulnerabilities ?? images.reduce((s: number, i: any) => s + (i.high_count || 0), 0);
+  // Counts come only from the org-scoped dashboard aggregate. When it
+  // fails they read "not available" rather than a count of page 1.
+  const dash = dashboardData ?? null;
+  const totalImages: number | null = dash?.total_images ?? null;
+  const totalClusters: number | null = dash?.total_clusters ?? null;
+  const totalFindings: number | null = dash?.open_findings ?? null;
+  const totalAlerts: number | null = dash?.active_alerts ?? null;
+  const criticalVulns: number | null = dash?.critical_vulnerabilities ?? null;
+  const highVulns: number | null = dash?.high_vulnerabilities ?? null;
 
   // Filtered data
   const q = searchQuery.toLowerCase();
@@ -190,10 +208,10 @@ export default function ContainerSecurity() {
 
   const tabs: { id: TabType; label: string; icon: any; count?: number }[] = [
     { id: 'overview', label: 'Overview', icon: Activity },
-    { id: 'images', label: 'Images', icon: Box, count: totalImages },
-    { id: 'clusters', label: 'K8s Clusters', icon: Server, count: totalClusters },
-    { id: 'findings', label: 'Findings', icon: FileWarning, count: totalFindings },
-    { id: 'runtime', label: 'Runtime Alerts', icon: ShieldAlert, count: totalAlerts },
+    { id: 'images', label: 'Images', icon: Box, count: totalImages ?? undefined },
+    { id: 'clusters', label: 'K8s Clusters', icon: Server, count: totalClusters ?? undefined },
+    { id: 'findings', label: 'Findings', icon: FileWarning, count: totalFindings ?? undefined },
+    { id: 'runtime', label: 'Runtime Alerts', icon: ShieldAlert, count: totalAlerts ?? undefined },
   ];
 
   return (
@@ -223,11 +241,28 @@ export default function ContainerSecurity() {
             { label: 'High Vulns', value: highVulns, color: 'text-orange-700', bg: 'bg-orange-50' },
           ].map((c) => (
             <div key={c.label} className={clsx('rounded-lg p-4 text-center', c.bg)}>
-              <p className={clsx('text-2xl font-bold', c.color)}>{c.value}</p>
+              <p className={clsx(c.value === null ? 'text-sm text-gray-400 py-1.5' : ['text-2xl font-bold', c.color])}>
+                {c.value ?? 'not available'}
+              </p>
               <p className="text-xs text-gray-500 mt-1">{c.label}</p>
             </div>
           ))}
         </div>
+
+        <LoadErrorBanner what="container security summary" error={dashError} />
+        {actionMessage && (
+          <div
+            role={actionMessage.kind === 'error' ? 'alert' : 'status'}
+            className={clsx(
+              'text-sm rounded p-3 border',
+              actionMessage.kind === 'error'
+                ? 'text-red-700 bg-red-50 border-red-200'
+                : 'text-gray-700 bg-gray-50 border-gray-200',
+            )}
+          >
+            {actionMessage.text}
+          </div>
+        )}
 
         {/* Tabs */}
         <div className="bg-white rounded-lg border border-gray-200">
@@ -279,6 +314,9 @@ export default function ContainerSecurity() {
               <div className="flex items-center justify-center h-40"><RefreshCw className="w-6 h-6 text-cyan-600 animate-spin" /></div>
             ) : (
               <>
+                <LoadErrorBanner what="images" error={imagesError} />
+                <LoadErrorBanner what="security findings" error={findingsError} />
+                <LoadErrorBanner what="runtime alerts" error={alertsError} />
                 {/* Recent Vulnerable Images */}
                 <div className="bg-white rounded-lg border border-gray-200 p-6">
                   <h3 className="text-sm font-semibold text-gray-700 mb-4">High-Risk Images</h3>
@@ -298,7 +336,7 @@ export default function ContainerSecurity() {
                             </div>
                             <div className="flex items-center gap-3">
                               <span className="text-xs text-red-600 font-semibold">Risk: {img.risk_score}</span>
-                              <span className="text-xs">{img.critical_count || 0}C / {img.high_count || 0}H</span>
+                              <span className="text-xs">{img.vulnerability_count_critical}C / {img.vulnerability_count_high}H</span>
                               <button
                                 onClick={() => setSelectedImage(img)}
                                 className="text-blue-600 hover:text-blue-800"
@@ -362,6 +400,8 @@ export default function ContainerSecurity() {
           <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
             {imagesLoading ? (
               <div className="flex items-center justify-center h-40"><RefreshCw className="w-6 h-6 text-cyan-600 animate-spin" /></div>
+            ) : imagesError ? (
+              <div className="p-4"><LoadErrorBanner what="images" error={imagesError} /></div>
             ) : filteredImages.length === 0 ? (
               <div className="flex flex-col items-center justify-center h-48 text-gray-400">
                 <Box className="w-10 h-10 mb-3" />
@@ -385,7 +425,7 @@ export default function ContainerSecurity() {
                   </thead>
                   <tbody className="divide-y divide-gray-100">
                     {filteredImages.map((img: any) => {
-                      const totalVulns = (img.critical_count || 0) + (img.high_count || 0) + (img.medium_count || 0) + (img.low_count || 0);
+                      const totalVulns = img.vulnerability_count_critical + img.vulnerability_count_high + img.vulnerability_count_medium + img.vulnerability_count_low;
                       return (
                         <tr key={img.id} className="hover:bg-gray-50">
                           <td className="px-4 py-3 font-mono font-medium text-gray-900">{img.repository || 'unknown'}</td>
@@ -396,14 +436,14 @@ export default function ContainerSecurity() {
                               <div className="flex items-center gap-1">
                                 <AlertTriangle className="w-3.5 h-3.5 text-red-500" />
                                 <span className="text-xs">
-                                  <span className="text-red-600 font-semibold">{img.critical_count || 0}</span>C{' '}
-                                  <span className="text-orange-600 font-semibold">{img.high_count || 0}</span>H{' '}
-                                  <span className="text-yellow-600">{img.medium_count || 0}</span>M{' '}
-                                  <span className="text-gray-500">{img.low_count || 0}</span>L
+                                  <span className="text-red-600 font-semibold">{img.vulnerability_count_critical}</span>C{' '}
+                                  <span className="text-orange-600 font-semibold">{img.vulnerability_count_high}</span>H{' '}
+                                  <span className="text-yellow-600">{img.vulnerability_count_medium}</span>M{' '}
+                                  <span className="text-gray-500">{img.vulnerability_count_low}</span>L
                                 </span>
                               </div>
                             ) : (
-                              <span className="flex items-center gap-1 text-green-600 text-xs"><CheckCircle className="w-3.5 h-3.5" /> Clean</span>
+                              <span className="text-xs text-gray-400">None recorded</span>
                             )}
                           </td>
                           <td className="px-4 py-3">
@@ -461,6 +501,8 @@ export default function ContainerSecurity() {
           <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
             {clustersLoading ? (
               <div className="flex items-center justify-center h-40"><RefreshCw className="w-6 h-6 text-cyan-600 animate-spin" /></div>
+            ) : clustersError ? (
+              <div className="p-4"><LoadErrorBanner what="clusters" error={clustersError} /></div>
             ) : filteredClusters.length === 0 ? (
               <div className="flex flex-col items-center justify-center h-48 text-gray-400">
                 <Server className="w-10 h-10 mb-3" />
@@ -549,6 +591,8 @@ export default function ContainerSecurity() {
           <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
             {findingsLoading ? (
               <div className="flex items-center justify-center h-40"><RefreshCw className="w-6 h-6 text-cyan-600 animate-spin" /></div>
+            ) : findingsError ? (
+              <div className="p-4"><LoadErrorBanner what="security findings" error={findingsError} /></div>
             ) : filteredFindings.length === 0 ? (
               <div className="flex flex-col items-center justify-center h-48 text-gray-400">
                 <FileWarning className="w-10 h-10 mb-3" />
@@ -607,6 +651,8 @@ export default function ContainerSecurity() {
           <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
             {alertsLoading ? (
               <div className="flex items-center justify-center h-40"><RefreshCw className="w-6 h-6 text-cyan-600 animate-spin" /></div>
+            ) : alertsError ? (
+              <div className="p-4"><LoadErrorBanner what="runtime alerts" error={alertsError} /></div>
             ) : filteredAlerts.length === 0 ? (
               <div className="flex flex-col items-center justify-center h-48 text-gray-400">
                 <ShieldAlert className="w-10 h-10 mb-3" />
@@ -670,10 +716,10 @@ export default function ContainerSecurity() {
               <div className="border-t pt-3 mt-3">
                 <h4 className="font-semibold text-gray-700 mb-2">Vulnerabilities</h4>
                 <div className="grid grid-cols-4 gap-2 text-center">
-                  <div className="bg-red-50 rounded p-2"><p className="text-lg font-bold text-red-600">{selectedImage.critical_count || 0}</p><p className="text-xs text-gray-500">Critical</p></div>
-                  <div className="bg-orange-50 rounded p-2"><p className="text-lg font-bold text-orange-600">{selectedImage.high_count || 0}</p><p className="text-xs text-gray-500">High</p></div>
-                  <div className="bg-yellow-50 rounded p-2"><p className="text-lg font-bold text-yellow-600">{selectedImage.medium_count || 0}</p><p className="text-xs text-gray-500">Medium</p></div>
-                  <div className="bg-green-50 rounded p-2"><p className="text-lg font-bold text-green-600">{selectedImage.low_count || 0}</p><p className="text-xs text-gray-500">Low</p></div>
+                  <div className="bg-red-50 rounded p-2"><p className="text-lg font-bold text-red-600">{selectedImage.vulnerability_count_critical}</p><p className="text-xs text-gray-500">Critical</p></div>
+                  <div className="bg-orange-50 rounded p-2"><p className="text-lg font-bold text-orange-600">{selectedImage.vulnerability_count_high}</p><p className="text-xs text-gray-500">High</p></div>
+                  <div className="bg-yellow-50 rounded p-2"><p className="text-lg font-bold text-yellow-600">{selectedImage.vulnerability_count_medium}</p><p className="text-xs text-gray-500">Medium</p></div>
+                  <div className="bg-green-50 rounded p-2"><p className="text-lg font-bold text-green-600">{selectedImage.vulnerability_count_low}</p><p className="text-xs text-gray-500">Low</p></div>
                 </div>
               </div>
               {selectedImage.digest_sha256 && (

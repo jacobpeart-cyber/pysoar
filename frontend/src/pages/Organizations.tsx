@@ -16,6 +16,8 @@ import {
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 
 interface Organization {
   id: string;
@@ -139,13 +141,11 @@ function OrganizationsList({
 }) {
   const queryClient = useQueryClient();
 
-  const { data: organizations, isLoading } = useQuery<Organization[]>({
+  const { data: organizations, isLoading, error } = useQuery<Organization[]>({
     queryKey: ['organizations'],
     queryFn: async () => {
-      try {
       const response = await api.get('/organizations');
       return response.data;
-      } catch { return null; }
     },
   });
 
@@ -164,6 +164,10 @@ function OrganizationsList({
         <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
       </div>
     );
+  }
+
+  if (error) {
+    return <LoadErrorBanner what="organizations" error={error} />;
   }
 
   const planColors: Record<string, string> = {
@@ -289,13 +293,11 @@ function TeamsList() {
     },
   });
 
-  const { data: teams, isLoading } = useQuery<Team[]>({
+  const { data: teams, isLoading, error } = useQuery<Team[]>({
     queryKey: ['teams'],
     queryFn: async () => {
-      try {
       const response = await api.get('/teams');
       return response.data;
-      } catch { return null; }
     },
   });
 
@@ -314,6 +316,10 @@ function TeamsList() {
         <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
       </div>
     );
+  }
+
+  if (error) {
+    return <LoadErrorBanner what="teams" error={error} />;
   }
 
   return (
@@ -603,6 +609,7 @@ function OrganizationDetailModal({
   const [showAddMemberModal, setShowAddMemberModal] = useState(false);
   const [newMemberEmail, setNewMemberEmail] = useState('');
   const [newMemberRole, setNewMemberRole] = useState('member');
+  const [settingsError, setSettingsError] = useState<string | null>(null);
   const queryClient = useQueryClient();
 
   const addMemberMutation = useMutation({
@@ -617,13 +624,11 @@ function OrganizationDetailModal({
     },
   });
 
-  const { data: members, isLoading } = useQuery<OrganizationMember[]>({
+  const { data: members, isLoading, error } = useQuery<OrganizationMember[]>({
     queryKey: ['organization-members', organization.id],
     queryFn: async () => {
-      try {
       const response = await api.get(`/organizations/${organization.id}/members`);
       return response.data;
-      } catch { return null; }
     },
   });
 
@@ -687,6 +692,8 @@ function OrganizationDetailModal({
                 <div className="flex justify-center py-8">
                   <Loader2 className="w-6 h-6 animate-spin text-blue-500" />
                 </div>
+              ) : error ? (
+                <LoadErrorBanner what="members" error={error} />
               ) : (
                 <div className="space-y-2">
                   {members?.map((member) => (
@@ -737,6 +744,7 @@ function OrganizationDetailModal({
             <form id="org-settings-form" onSubmit={async (e) => {
               e.preventDefault();
               const fd = new FormData(e.currentTarget);
+              setSettingsError(null);
               try {
                 await api.patch(`/organizations/${organization.id}`, {
                   name: fd.get('name'),
@@ -744,10 +752,15 @@ function OrganizationDetailModal({
                 });
                 queryClient.invalidateQueries({ queryKey: ['organizations'] });
               } catch (err) {
-                console.error('Failed to save organization settings:', err);
+                setSettingsError(`Could not save organization settings. ${describeLoadError(err)}`);
               }
             }}>
             <div className="space-y-6">
+              {settingsError && (
+                <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
+                  {settingsError}
+                </div>
+              )}
               <div>
                 <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
                   Organization Name

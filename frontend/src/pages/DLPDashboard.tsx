@@ -20,6 +20,8 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 import { dlpApi } from '../api/endpoints';
+import { api } from '../api/client';
+import { describeLoadError } from '../lib/loadError';
 
 const getSeverityColor = (severity: string) => {
   switch (severity) {
@@ -98,7 +100,7 @@ export default function DLPDashboard() {
       await refreshPolicies();
       setActionMessage('Policy enabled');
     } catch (err: any) {
-      setError(err?.response?.data?.detail || 'Failed to enable policy');
+      setError(`Failed to enable policy: ${describeLoadError(err)}`);
     } finally {
       setActionBusy(null);
     }
@@ -111,7 +113,7 @@ export default function DLPDashboard() {
       await refreshPolicies();
       setActionMessage('Policy disabled');
     } catch (err: any) {
-      setError(err?.response?.data?.detail || 'Failed to disable policy');
+      setError(`Failed to disable policy: ${describeLoadError(err)}`);
     } finally {
       setActionBusy(null);
     }
@@ -126,13 +128,22 @@ export default function DLPDashboard() {
 
   const runTestPolicy = async () => {
     if (!testingPolicy) return;
+    // DLPPolicyTestRequest requires a non-empty `sample_content`
+    // (src/schemas/dlp.py). dlpApi.testPolicy sends `sample_text`, which
+    // the backend rejects with 422, so the page posts the real field.
+    if (!testSampleText.trim()) {
+      setTestError('Enter sample content to test against this policy.');
+      return;
+    }
     setActionBusy(`test-${testingPolicy.id}`);
     setTestError(null);
     try {
-      const result = await dlpApi.testPolicy(testingPolicy.id, testSampleText || undefined);
-      setTestResult(result);
-    } catch (err: any) {
-      setTestError(err?.response?.data?.detail || err?.message || 'Test failed');
+      const response = await api.post(`/dlp/policies/${testingPolicy.id}/test`, {
+        sample_content: testSampleText,
+      });
+      setTestResult(response.data);
+    } catch (err: unknown) {
+      setTestError(`Test failed: ${describeLoadError(err)}`);
     } finally {
       setActionBusy(null);
     }
@@ -163,7 +174,7 @@ export default function DLPDashboard() {
       setEditingPolicy(null);
       setActionMessage('Policy updated');
     } catch (err: any) {
-      setError(err?.response?.data?.detail || 'Failed to update policy');
+      setError(`Failed to update policy: ${describeLoadError(err)}`);
     } finally {
       setActionBusy(null);
     }
@@ -187,7 +198,7 @@ export default function DLPDashboard() {
       setIncidentNotes('');
       setActionMessage('Incident updated');
     } catch (err: any) {
-      setError(err?.response?.data?.detail || 'Failed to update incident');
+      setError(`Failed to update incident: ${describeLoadError(err)}`);
     } finally {
       setActionBusy(null);
     }
@@ -203,12 +214,17 @@ export default function DLPDashboard() {
           dlpApi.getIncidents(),
           dlpApi.getClassifications(),
         ]);
-        setPolicies(Array.isArray(policiesData) ? policiesData : (policiesData?.items || []));
-        setIncidents(Array.isArray(incidentsData) ? incidentsData : (incidentsData?.items || incidentsData?.data || []));
-        setClassifications(Array.isArray(classificationsData) ? classificationsData : (classificationsData?.items || []));
+        // dlpApi unwraps the paginated `{items}` envelope; anything else is
+        // a contract break and is reported rather than shown as empty.
+        if (!Array.isArray(policiesData) || !Array.isArray(incidentsData) || !Array.isArray(classificationsData)) {
+          throw new Error('Unexpected DLP response shape');
+        }
+        setPolicies(policiesData);
+        setIncidents(incidentsData);
+        setClassifications(classificationsData);
       } catch (err) {
         console.error('Error loading DLP data:', err);
-        setError('Failed to load DLP data. Please try again.');
+        setError(`Could not load DLP data. ${describeLoadError(err)}`);
       } finally {
         setLoading(false);
       }
@@ -425,8 +441,8 @@ export default function DLPDashboard() {
                                 {(policy.severity || 'medium').toUpperCase()}
                               </span>
                             </td>
-                            <td className="px-6 py-4 text-sm">{policy.rules?.length || policy.rule_count || 0}</td>
-                            <td className="px-6 py-4 text-sm font-semibold">{policy.trigger_count || policy.match_count || 0}</td>
+                            <td className="px-6 py-4 text-sm">{policy.data_patterns?.length ?? 'not available'}</td>
+                            <td className="px-6 py-4 text-sm font-semibold">{policy.trigger_count ?? 'not available'}</td>
                             <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
                               {policy.last_triggered
                                 ? new Date(policy.last_triggered || "").toLocaleDateString()
@@ -627,12 +643,11 @@ export default function DLPDashboard() {
                       const name = typeof c === 'string' ? c : (c?.name ?? c?.id ?? 'Unknown');
                       const sensitivity = typeof c === 'object' ? c?.sensitivity ?? c?.level : null;
                       const key = typeof c === 'object' ? c?.id ?? name : name;
-                      const policiesUsing = policies.filter(
-                        (p: any) => p.classification === name || p.dataType === name,
-                      ).length;
-                      const relatedIncidents = incidents.filter(
-                        (i: any) => i.classification === name || i.dataType === name,
-                      ).length;
+                      // DLPPolicyResponse / DLPIncidentResponse carry no
+                      // classification link, so these counts are unknown,
+                      // not 0.
+                      const policiesUsing = 'not available';
+                      const relatedIncidents = 'not available';
                       return (
                         <div key={String(key) + index} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition">
                           <div className="flex items-center gap-3 mb-3">
@@ -800,8 +815,8 @@ export default function DLPDashboard() {
               <div><span className="font-medium text-gray-600 dark:text-gray-400">Description:</span> <span className="ml-2">{selectedPolicy.description || 'N/A'}</span></div>
               <div><span className="font-medium text-gray-600 dark:text-gray-400">Status:</span> <span className="ml-2">{selectedPolicy.enabled !== false ? 'Enabled' : 'Disabled'}</span></div>
               <div><span className="font-medium text-gray-600 dark:text-gray-400">Severity:</span> <span className="ml-2">{(selectedPolicy.severity || 'medium').toUpperCase()}</span></div>
-              <div><span className="font-medium text-gray-600 dark:text-gray-400">Rules:</span> <span className="ml-2">{selectedPolicy.rules?.length || selectedPolicy.rule_count || 0}</span></div>
-              <div><span className="font-medium text-gray-600 dark:text-gray-400">Matches:</span> <span className="ml-2">{selectedPolicy.trigger_count || selectedPolicy.match_count || 0}</span></div>
+              <div><span className="font-medium text-gray-600 dark:text-gray-400">Rules:</span> <span className="ml-2">{selectedPolicy.data_patterns?.length ?? 'not available'}</span></div>
+              <div><span className="font-medium text-gray-600 dark:text-gray-400">Matches:</span> <span className="ml-2">{selectedPolicy.trigger_count ?? 'not available'}</span></div>
             </div>
             <pre className="text-xs bg-gray-100 dark:bg-gray-900 rounded p-4 overflow-auto max-h-48 mt-4">
               {JSON.stringify(selectedPolicy, null, 2)}
@@ -951,12 +966,12 @@ export default function DLPDashboard() {
             <h2 className="text-xl font-bold mb-4">Test Policy: {testingPolicy.name}</h2>
             <div className="space-y-3">
               <div>
-                <label className="block text-sm font-medium mb-1">Sample Text (optional)</label>
+                <label className="block text-sm font-medium mb-1">Sample Content</label>
                 <textarea
                   value={testSampleText}
                   onChange={(e) => setTestSampleText(e.target.value)}
                   rows={5}
-                  placeholder="Paste content to evaluate against this policy. Leave blank to run with backend defaults."
+                  placeholder="Paste content to evaluate against this policy."
                   className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 font-mono text-sm"
                 />
               </div>
@@ -983,7 +998,7 @@ export default function DLPDashboard() {
               </button>
               <button
                 onClick={runTestPolicy}
-                disabled={actionBusy === `test-${testingPolicy.id}`}
+                disabled={actionBusy === `test-${testingPolicy.id}` || !testSampleText.trim()}
                 className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition disabled:opacity-50"
               >
                 Run Test
@@ -1010,8 +1025,8 @@ export default function DLPDashboard() {
           <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[32rem] max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
             <h2 className="text-xl font-bold mb-4">Classification: {selectedClassification}</h2>
             <div className="space-y-3 text-sm">
-              <div><span className="font-medium text-gray-600 dark:text-gray-400">Policies using this classification:</span> <span className="ml-2 font-semibold">{policies.filter(p => p.classification === selectedClassification || p.dataType === selectedClassification).length}</span></div>
-              <div><span className="font-medium text-gray-600 dark:text-gray-400">Related incidents:</span> <span className="ml-2 font-semibold">{incidents.filter(i => i.classification === selectedClassification || i.dataType === selectedClassification).length}</span></div>
+              <div><span className="font-medium text-gray-600 dark:text-gray-400">Policies using this classification:</span> <span className="ml-2 font-semibold">not available</span></div>
+              <div><span className="font-medium text-gray-600 dark:text-gray-400">Related incidents:</span> <span className="ml-2 font-semibold">not available</span></div>
             </div>
             <div className="mt-4 flex justify-end">
               <button onClick={() => setSelectedClassification(null)} className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Close</button>
@@ -1048,7 +1063,7 @@ export default function DLPDashboard() {
                   setShowNewPolicyModal(false);
                 } catch (err) {
                   console.error('Error creating DLP policy:', err);
-                  setError('Failed to create policy. Please try again.');
+                  setError(`Failed to create policy: ${describeLoadError(err)}`);
                 }
               }}
               className="space-y-4"

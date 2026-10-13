@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
+import LoadErrorBanner from '../components/LoadErrorBanner';
 
 const severityColors: Record<string, string> = {
   critical: 'bg-red-100 text-red-700 border-red-200',
@@ -114,90 +115,78 @@ export default function ThreatHunting() {
   };
 
   // Fetch hunting stats
-  const { data: stats, isLoading: statsLoading } = useQuery({
+  const { data: stats, isLoading: statsLoading, error: statsError } = useQuery({
     queryKey: ['hunting-stats'],
     queryFn: async () => {
-      try {
-        const response = await api.get('/hunting/stats');
-        return response.data;
-      } catch { return null; }
+      const response = await api.get('/hunting/stats');
+      return response.data;
     },
     retry: 1,
   });
 
   // Fetch hunt sessions
-  const { data: huntsData, isLoading: huntsLoading } = useQuery({
+  const { data: huntsData, isLoading: huntsLoading, error: huntsError } = useQuery({
     queryKey: ['hunting-sessions', huntFilter],
     queryFn: async () => {
-      try {
-        const response = await api.get('/hunting/sessions', {
-          params: huntFilter ? { status: huntFilter } : {},
-        });
-        return response.data;
-      } catch { return { items: [] }; }
+      const response = await api.get('/hunting/sessions', {
+        params: huntFilter ? { status: huntFilter } : {},
+      });
+      return response.data;
     },
     enabled: activeTab === 'hunts',
     retry: 1,
   });
 
   // Fetch hypotheses
-  const { data: hypothesesData, isLoading: hypothesesLoading } = useQuery({
+  const { data: hypothesesData, isLoading: hypothesesLoading, error: hypothesesError } = useQuery({
     queryKey: ['hunting-hypotheses', mitreFilterTab, priorityFilterTab, hypothesisStatusFilter],
     queryFn: async () => {
-      try {
-        const response = await api.get('/hunting/hypotheses', {
-          params: {
-            ...(mitreFilterTab && { search: mitreFilterTab }),
-            ...(priorityFilterTab && { priority: priorityFilterTab }),
-            ...(hypothesisStatusFilter && { status: hypothesisStatusFilter }),
-          },
-        });
-        return response.data;
-      } catch { return { items: [] }; }
+      const response = await api.get('/hunting/hypotheses', {
+        params: {
+          ...(mitreFilterTab && { search: mitreFilterTab }),
+          ...(priorityFilterTab && { priority: priorityFilterTab }),
+          ...(hypothesisStatusFilter && { status: hypothesisStatusFilter }),
+        },
+      });
+      return response.data;
     },
     enabled: activeTab === 'hypotheses' || showNewHuntModal,
     retry: 1,
   });
 
   // Fetch findings
-  const { data: findingsData, isLoading: findingsLoading } = useQuery({
+  const { data: findingsData, isLoading: findingsLoading, error: findingsError } = useQuery({
     queryKey: ['hunting-findings', findingSeverityFilter, findingStatusFilter],
     queryFn: async () => {
-      try {
-        const response = await api.get('/hunting/findings', {
-          params: {
-            ...(findingSeverityFilter && { severity: findingSeverityFilter }),
-            ...(findingStatusFilter && { classification: findingStatusFilter }),
-          },
-        });
-        return response.data;
-      } catch { return { items: [] }; }
+      const response = await api.get('/hunting/findings', {
+        params: {
+          ...(findingSeverityFilter && { severity: findingSeverityFilter }),
+          ...(findingStatusFilter && { classification: findingStatusFilter }),
+        },
+      });
+      return response.data;
     },
     enabled: activeTab === 'findings',
     retry: 1,
   });
 
   // Fetch notebooks
-  const { data: notebooksData, isLoading: notebooksLoading } = useQuery({
+  const { data: notebooksData, isLoading: notebooksLoading, error: notebooksError } = useQuery({
     queryKey: ['hunting-notebooks'],
     queryFn: async () => {
-      try {
-        const response = await api.get('/hunting/notebooks');
-        return response.data;
-      } catch { return []; }
+      const response = await api.get('/hunting/notebooks');
+      return response.data;
     },
     enabled: activeTab === 'notebooks',
     retry: 1,
   });
 
   // Fetch templates
-  const { data: templatesData, isLoading: templatesLoading } = useQuery({
+  const { data: templatesData, isLoading: templatesLoading, error: templatesError } = useQuery({
     queryKey: ['hunting-templates'],
     queryFn: async () => {
-      try {
-        const response = await api.get('/hunting/templates');
-        return response.data;
-      } catch { return []; }
+      const response = await api.get('/hunting/templates');
+      return response.data;
     },
     enabled: activeTab === 'templates',
     retry: 1,
@@ -205,8 +194,10 @@ export default function ThreatHunting() {
 
   // Pause/Resume hunt mutation
   const toggleHuntMutation = useMutation({
-    mutationFn: async ({ huntId, action }: { huntId: string; action: string }) => {
-      const response = await api.post(`/hunting/sessions/${huntId}/${action}`);
+    mutationFn: async ({ huntId, action }: { huntId: string; action: 'pause' | 'resume' }) => {
+      const response = action === 'pause'
+        ? await api.post(`/hunting/sessions/${huntId}/pause`)
+        : await api.post(`/hunting/sessions/${huntId}/resume`);
       return response.data;
     },
     onSuccess: () => {
@@ -513,28 +504,29 @@ export default function ThreatHunting() {
       {activeTab === 'hunts' && (
         <div className="space-y-6">
           {/* Stats */}
+          <LoadErrorBanner what="hunting stats" error={statsError} />
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
             <StatsCard
               title="Active Hunts"
-              value={statsLoading ? '-' : stats?.active_hunts || 0}
+              value={statsLoading ? '-' : stats?.active_hunts ?? 'not available'}
               icon={Zap}
               color="blue"
             />
             <StatsCard
               title="Hypotheses"
-              value={statsLoading ? '-' : stats?.total_hypotheses || 0}
+              value={statsLoading ? '-' : stats?.total_hypotheses ?? 'not available'}
               icon={Lightbulb}
               color="yellow"
             />
             <StatsCard
               title="Findings"
-              value={statsLoading ? '-' : stats?.total_findings || 0}
+              value={statsLoading ? '-' : stats?.total_findings ?? 'not available'}
               icon={CheckCircle}
               color="green"
             />
             <StatsCard
               title="Completed Hunts"
-              value={statsLoading ? '-' : stats?.completed_hunts || 0}
+              value={statsLoading ? '-' : stats?.completed_hunts ?? 'not available'}
               icon={AlertCircle}
               color="red"
             />
@@ -592,6 +584,7 @@ export default function ThreatHunting() {
           </div>
 
           {/* Hunts Table */}
+          <LoadErrorBanner what="hunt sessions" error={huntsError} />
           <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
             {huntsLoading ? (
               <div className="flex items-center justify-center h-64">
@@ -745,7 +738,7 @@ export default function ThreatHunting() {
                     </div>
                     <div>
                       <label className="block text-sm font-medium text-gray-500 mb-1">Queries Executed</label>
-                      <p className="text-gray-900 font-medium">{selectedHunt.queries_executed || selectedHunt.query_count || 0}</p>
+                      <p className="text-gray-900 font-medium">{selectedHunt.query_count ?? '—'}</p>
                     </div>
                   </div>
                   <div className="grid grid-cols-2 gap-4">
@@ -811,7 +804,9 @@ export default function ThreatHunting() {
                         </option>
                       ))}
                     </select>
-                    {hypotheses.length === 0 && (
+                    {hypothesesError ? (
+                      <div className="mt-1"><LoadErrorBanner what="hypotheses" error={hypothesesError} /></div>
+                    ) : hypotheses.length === 0 && (
                       <p className="text-xs text-gray-500 mt-1">No hypotheses available. Create one first.</p>
                     )}
                   </div>
@@ -912,6 +907,7 @@ export default function ThreatHunting() {
           </div>
 
           {/* Hypotheses Grid */}
+          <LoadErrorBanner what="hypotheses" error={hypothesesError} />
           {hypothesesLoading ? (
             <div className="flex items-center justify-center h-64">
               <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
@@ -1224,7 +1220,7 @@ export default function ThreatHunting() {
             <div className="h-6 border-r border-gray-300" />
 
             <span className="text-xs text-gray-500 font-medium">Classification:</span>
-            {['true_positive', 'false_positive', 'testing'].map((classification) => (
+            {['true_positive', 'false_positive', 'inconclusive', 'benign', 'needs_review'].map((classification) => (
               <button
                 key={classification}
                 onClick={() => setFindingStatusFilter(findingStatusFilter === classification ? '' : classification)}
@@ -1241,6 +1237,7 @@ export default function ThreatHunting() {
           </div>
 
           {/* Findings Table */}
+          <LoadErrorBanner what="hunt findings" error={findingsError} />
           <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
             {findingsLoading ? (
               <div className="flex items-center justify-center h-64">
@@ -1493,6 +1490,7 @@ export default function ThreatHunting() {
             Create Notebook
           </button>
 
+          <LoadErrorBanner what="hunt notebooks" error={notebooksError} />
           {notebooksLoading ? (
             <div className="flex items-center justify-center h-64">
               <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
@@ -1783,6 +1781,7 @@ export default function ThreatHunting() {
       {/* Templates Tab */}
       {activeTab === 'templates' && (
         <div className="space-y-6">
+          <LoadErrorBanner what="hunt templates" error={templatesError} />
           {templatesLoading ? (
             <div className="flex items-center justify-center h-64">
               <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>

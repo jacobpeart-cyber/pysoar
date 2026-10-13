@@ -16,6 +16,8 @@ import {
 import clsx from 'clsx';
 import { api } from '../lib/api';
 import { vulnmgmtApi } from '../api/endpoints';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 
 const getSeverityColor = (severity: string) => {
   switch (severity) {
@@ -56,40 +58,59 @@ const getStatusColor = (status: string) => {
 // Patch Operations, Exceptions) rendered undefined/N/A/Invalid Date
 // because the frontend read `cveId`, `cvss`, `lastRun`, `vulnCount`,
 // etc. which the backend does not emit.
+// Field names follow src/schemas/vulnmgmt.py. The vulnerability catalog
+// row carries no per-asset count or age, so those stay null and render
+// "not available".
+const NA = 'not available';
+
 const normalizeVuln = (v: any) => ({
   ...v,
-  cveId: v.cve_id ?? v.cveId ?? null,
-  cvss: v.cvss_v3_score ?? v.cvss ?? null,
-  epss: v.epss_score ?? v.epss ?? null,
-  patchAvailable: v.patch_available ?? v.patchAvailable ?? false,
-  kev: v.is_kev ?? v.kev ?? false,
-  daysOpen: v.days_open ?? v.daysOpen ?? null,
-  affectedAssets: v.affected_instance_count ?? v.affected_assets ?? v.affectedAssets ?? 0,
+  cveId: v.cve_id ?? null,
+  cvss: v.cvss_v3_score ?? null,
+  epss: v.epss_score ?? null,
+  patchAvailable: Boolean(v.patch_available),
+  kev: Boolean(v.kev_listed),
+  daysOpen: null as number | null,
+  affectedAssets: null as number | null,
 });
 
 const normalizeProfile = (p: any) => ({
   ...p,
-  lastRun: p.last_run ?? p.lastRun ?? null,
-  nextRun: p.next_run ?? p.nextRun ?? null,
-  duration: p.avg_duration_seconds ?? p.duration ?? null,
+  schedule: p.schedule_cron ?? null,
+  status: p.enabled ? 'active' : 'inactive',
+  lastRun: p.last_scan_date ?? null,
+  nextRun: p.next_scan_date ?? null,
 });
 
+// PatchOperationResponse: one row per vulnerability instance.
 const normalizePatchOp = (op: any) => ({
   ...op,
-  vulnCount: op.vulnerability_count ?? op.vuln_count ?? op.vulnCount ?? 0,
-  systemsAffected: op.total_instances ?? op.systems_affected ?? op.systemsAffected ?? 0,
-  progress: op.progress_percentage ?? op.progress ?? 0,
-  startDate: op.started_at ?? op.start_date ?? op.startDate ?? null,
-  targetDate: op.scheduled_date ?? op.target_date ?? op.targetDate ?? null,
-  status: op.deployment_status ?? op.status ?? 'scheduled',
+  name: op.patch_name || op.patch_id || op.patch_type || 'Patch operation',
+  startDate: op.deployment_date ?? null,
+  verifiedDate: op.verification_date ?? null,
+  status: op.deployment_status ?? null,
 });
 
+// VulnerabilityExceptionResponse has no status column; an exception past
+// its expiry_date is reported as expired.
 const normalizeException = (e: any) => ({
   ...e,
-  cveId: e.vulnerability_id ?? e.cveId ?? null,
-  expiryDate: e.expiry_date ?? e.expiryDate ?? null,
-  approver: e.approved_by ?? e.approver ?? null,
+  instanceId: e.vulnerability_instance_id ?? null,
+  reason: e.justification ?? null,
+  expiryDate: e.expiry_date ?? null,
+  approver: e.approved_by ?? null,
+  status: e.expiry_date && new Date(e.expiry_date).getTime() < Date.now() ? 'expired' : 'active',
 });
+
+const fmtDate = (v: string | null | undefined, empty: string) =>
+  v ? new Date(v).toLocaleString() : empty;
+
+// Instance ids for one catalog vulnerability (patch plans, bulk actions and
+// exceptions all operate on vulnerability_instances, not catalog rows).
+const instanceIdsFor = async (vulnerabilityId: string): Promise<string[]> => {
+  const res = await api.get('/vulnmgmt/instances', { params: { vulnerability_id: vulnerabilityId, size: 100 } });
+  return (res.data?.items ?? []).map((i: any) => i.id);
+};
 
 export default function VulnManagement() {
   const [activeTab, setActiveTab] = useState('vulnerabilities');
@@ -99,6 +120,11 @@ export default function VulnManagement() {
   const [exceptions, setExceptions] = useState<any[]>([]);
   const [dashboardMetrics, setDashboardMetrics] = useState<any | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadErrors, setLoadErrors] = useState<Record<'vulns' | 'patches' | 'profiles' | 'exceptions' | 'dashboard', unknown>>({
+    vulns: null, patches: null, profiles: null, exceptions: null, dashboard: null,
+  });
+  const scanFileInput = React.useRef<HTMLInputElement>(null);
+  const [importProfile, setImportProfile] = useState<any | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [showNewVulnModal, setShowNewVulnModal] = useState(false);
   const [selectedVulnerability, setSelectedVulnerability] = useState<any | null>(null);
@@ -114,24 +140,30 @@ export default function VulnManagement() {
   const loadData = async () => {
     setLoading(true);
     try {
-      const [vulnsData, patchData, profilesData, exceptionsData, dashRes] = await Promise.all([
+      const [vulnsRes, patchRes, profilesRes, exceptionsRes, dashRes] = await Promise.allSettled([
         vulnmgmtApi.getVulnerabilities(),
         vulnmgmtApi.getPatchOperations(),
-        vulnmgmtApi.getScanProfiles().catch(() => []),
-        vulnmgmtApi.getExceptions().catch(() => []),
-        api.get('/vulnmgmt/dashboard').then(r => r.data).catch(() => null),
+        vulnmgmtApi.getScanProfiles(),
+        vulnmgmtApi.getExceptions(),
+        api.get('/vulnmgmt/dashboard').then(r => r.data),
       ]);
-      const rawVulns = Array.isArray(vulnsData) ? vulnsData : (vulnsData?.items || []);
-      const rawProfiles = Array.isArray(profilesData) ? profilesData : [];
-      const rawPatches = Array.isArray(patchData) ? patchData : (patchData?.items || []);
-      const rawExceptions = Array.isArray(exceptionsData) ? exceptionsData : [];
-      setVulnerabilities(rawVulns.map(normalizeVuln));
-      setScanProfiles(rawProfiles.map(normalizeProfile));
-      setPatchOps(rawPatches.map(normalizePatchOp));
-      setExceptions(rawExceptions.map(normalizeException));
-      setDashboardMetrics(dashRes);
-    } catch (error) {
-      console.error('Error loading vulnerability data:', error);
+      const asList = (r: PromiseSettledResult<any>): any[] => {
+        if (r.status !== 'fulfilled') return [];
+        return Array.isArray(r.value) ? r.value : (r.value?.items ?? []);
+      };
+      const reason = (r: PromiseSettledResult<any>) => (r.status === 'rejected' ? (r.reason ?? new Error('request failed')) : null);
+      setVulnerabilities(asList(vulnsRes).map(normalizeVuln));
+      setScanProfiles(asList(profilesRes).map(normalizeProfile));
+      setPatchOps(asList(patchRes).map(normalizePatchOp));
+      setExceptions(asList(exceptionsRes).map(normalizeException));
+      setDashboardMetrics(dashRes.status === 'fulfilled' ? dashRes.value : null);
+      setLoadErrors({
+        vulns: reason(vulnsRes),
+        patches: reason(patchRes),
+        profiles: reason(profilesRes),
+        exceptions: reason(exceptionsRes),
+        dashboard: reason(dashRes),
+      });
     } finally {
       setLoading(false);
     }
@@ -141,18 +173,32 @@ export default function VulnManagement() {
     loadData();
   }, []);
 
-  // Prefer the backend dashboard aggregate — previously these two
-  // KPIs were hardcoded marketing numbers (8.3 days, 82% SLA) that
-  // customers saw regardless of actual posture.
-  const criticalVulns = dashboardMetrics?.by_severity?.critical
-    ?? vulnerabilities.filter(v => v.severity === 'critical').length;
-  const openFindings = dashboardMetrics?.total_vulnerabilities ?? vulnerabilities.length;
-  const mttrDays = dashboardMetrics?.mean_time_to_remediate_days
-    ?? dashboardMetrics?.mttr_days
-    ?? null;
-  const slaCompliance = dashboardMetrics?.sla_compliance?.compliance_percentage
-    ?? dashboardMetrics?.sla_compliance
-    ?? null;
+  // Summary cards read only the org-scoped /vulnmgmt/dashboard aggregate
+  // (DashboardMetrics). No client-side count of the first page stands in.
+  const criticalVulns: number | null = dashboardMetrics?.critical_vulnerabilities ?? null;
+  const trackedVulns: number | null = dashboardMetrics?.total_vulnerabilities ?? null;
+  const mttrDays: number | null = dashboardMetrics?.mttr_days ?? null;
+  // With no tracked instances there is nothing to be compliant with.
+  const slaCompliance: number | null = dashboardMetrics?.sla_compliance?.total
+    ? dashboardMetrics.sla_compliance.compliance_percentage
+    : null;
+
+  const runScanImport = async (profile: any, file: File) => {
+    try {
+      const scanData = await file.text();
+      // ScanImportRequest requires scan_format; the profile's scanner_type
+      // names the parser (nessus / qualys / openvas, anything else is JSON).
+      const res = await api.post('/vulnmgmt/vulnerabilities/import-scan', {
+        scan_profile_id: profile.id,
+        scan_format: profile.scanner_type || 'json',
+        scan_data: scanData,
+      });
+      alert(`Scan import complete: ${res.data?.imported ?? 0} finding(s) read, ${res.data?.new ?? 0} new, ${res.data?.existing ?? 0} already known.`);
+      loadData();
+    } catch (error) {
+      alert(`Scan import failed: ${describeLoadError(error)}`);
+    }
+  };
 
   const tabs = [
     { id: 'vulnerabilities', label: 'Vulnerabilities', icon: Bug },
@@ -187,29 +233,33 @@ export default function VulnManagement() {
           </button>
         </div>
 
+        <div className="mb-4">
+          <LoadErrorBanner what="vulnerability dashboard metrics" error={loadErrors.dashboard} />
+        </div>
+
         {/* Summary Cards */}
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
           <div className="bg-gradient-to-br from-red-50 to-red-100 dark:from-red-900 dark:to-red-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-red-600 dark:text-red-300">Critical Vulns</p>
-            <p className="text-3xl font-bold text-red-900 dark:text-red-100 mt-2">{criticalVulns}</p>
+            <p className="text-3xl font-bold text-red-900 dark:text-red-100 mt-2">{criticalVulns ?? NA}</p>
             <p className="text-xs text-red-600 dark:text-red-300 mt-1">requiring immediate action</p>
           </div>
           <div className="bg-gradient-to-br from-orange-50 to-orange-100 dark:from-orange-900 dark:to-orange-800 p-4 rounded-lg">
-            <p className="text-sm font-medium text-orange-600 dark:text-orange-300">Open Findings</p>
-            <p className="text-3xl font-bold text-orange-900 dark:text-orange-100 mt-2">{openFindings}</p>
-            <p className="text-xs text-orange-600 dark:text-orange-300 mt-1">identified</p>
+            <p className="text-sm font-medium text-orange-600 dark:text-orange-300">Tracked Vulnerabilities</p>
+            <p className="text-3xl font-bold text-orange-900 dark:text-orange-100 mt-2">{trackedVulns ?? NA}</p>
+            <p className="text-xs text-orange-600 dark:text-orange-300 mt-1">in the catalog</p>
           </div>
           <div className="bg-gradient-to-br from-purple-50 to-purple-100 dark:from-purple-900 dark:to-purple-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-purple-600 dark:text-purple-300">MTTR</p>
             <p className="text-3xl font-bold text-purple-900 dark:text-purple-100 mt-2">
-              {mttrDays === null || mttrDays === undefined ? '—' : mttrDays}
+              {mttrDays === null ? NA : mttrDays.toFixed(1)}
             </p>
             <p className="text-xs text-purple-600 dark:text-purple-300 mt-1">days mean time to remediate</p>
           </div>
           <div className="bg-gradient-to-br from-green-50 to-green-100 dark:from-green-900 dark:to-green-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-green-600 dark:text-green-300">SLA Compliance</p>
             <p className="text-3xl font-bold text-green-900 dark:text-green-100 mt-2">
-              {slaCompliance === null || slaCompliance === undefined ? '—' : `${slaCompliance}%`}
+              {slaCompliance === null ? NA : `${slaCompliance.toFixed(1)}%`}
             </p>
             <p className="text-xs text-green-600 dark:text-green-300 mt-1">target achievement</p>
           </div>
@@ -251,6 +301,7 @@ export default function VulnManagement() {
             {/* Vulnerabilities Tab */}
             {activeTab === 'vulnerabilities' && (
               <div className="space-y-6">
+                <LoadErrorBanner what="vulnerabilities" error={loadErrors.vulns} />
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
                   <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
                     <h3 className="font-semibold mb-3">CVSS Score Distribution</h3>
@@ -258,7 +309,8 @@ export default function VulnManagement() {
                       <div className="flex justify-between"><span>9.0 - 10.0</span><span className="font-semibold text-red-600">{vulnerabilities.filter(v => (v.cvss ?? 0) >= 9).length}</span></div>
                       <div className="flex justify-between"><span>7.0 - 8.9</span><span className="font-semibold text-orange-600">{vulnerabilities.filter(v => (v.cvss ?? 0) >= 7 && (v.cvss ?? 0) < 9).length}</span></div>
                       <div className="flex justify-between"><span>4.0 - 6.9</span><span className="font-semibold text-yellow-600">{vulnerabilities.filter(v => (v.cvss ?? 0) >= 4 && (v.cvss ?? 0) < 7).length}</span></div>
-                      <div className="flex justify-between"><span>0.0 - 3.9</span><span className="font-semibold text-green-600">{vulnerabilities.filter(v => (v.cvss ?? 0) < 4).length}</span></div>
+                      <div className="flex justify-between"><span>0.0 - 3.9</span><span className="font-semibold text-green-600">{vulnerabilities.filter(v => v.cvss !== null && v.cvss < 4).length}</span></div>
+                      <div className="flex justify-between"><span>Unscored</span><span className="font-semibold text-gray-500">{vulnerabilities.filter(v => v.cvss === null).length}</span></div>
                     </div>
                   </div>
                   <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
@@ -273,8 +325,8 @@ export default function VulnManagement() {
                   <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
                     <h3 className="font-semibold mb-3">Patch Status</h3>
                     <div className="space-y-2 text-sm">
-                      <div className="flex justify-between"><span>Patch Available</span><span className="font-semibold text-green-600">{vulnerabilities.filter(v => v.patchAvailable || v.patch_available).length}</span></div>
-                      <div className="flex justify-between"><span>No Patch</span><span className="font-semibold text-red-600">{vulnerabilities.filter(v => !v.patchAvailable && !v.patch_available).length}</span></div>
+                      <div className="flex justify-between"><span>Patch Available</span><span className="font-semibold text-green-600">{vulnerabilities.filter(v => v.patchAvailable).length}</span></div>
+                      <div className="flex justify-between"><span>No Patch</span><span className="font-semibold text-red-600">{vulnerabilities.filter(v => !v.patchAvailable).length}</span></div>
                       <div className="flex justify-between"><span>KEV Listed</span><span className="font-semibold text-red-600">{vulnerabilities.filter(v => v.kev).length}</span></div>
                     </div>
                   </div>
@@ -310,7 +362,6 @@ export default function VulnManagement() {
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">CVSS</th>
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">EPSS</th>
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">KEV</th>
-                        <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Assets</th>
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Patch</th>
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Actions</th>
                       </tr>
@@ -326,7 +377,7 @@ export default function VulnManagement() {
                             </span>
                           </td>
                           <td className="px-6 py-4 text-sm font-semibold">{vuln.cvss?.toFixed(1) ?? 'N/A'}</td>
-                          <td className="px-6 py-4 text-sm">{((vuln.epss ?? 0) * 100).toFixed(0)}%</td>
+                          <td className="px-6 py-4 text-sm">{vuln.epss === null ? NA : `${(vuln.epss * 100).toFixed(0)}%`}</td>
                           <td className="px-6 py-4">
                             {vuln.kev ? (
                               <AlertTriangle className="w-5 h-5 text-red-600" />
@@ -334,7 +385,6 @@ export default function VulnManagement() {
                               <span className="text-gray-400">—</span>
                             )}
                           </td>
-                          <td className="px-6 py-4 text-sm">{vuln.affectedAssets}</td>
                           <td className="px-6 py-4 text-sm">
                             {vuln.patchAvailable ? (
                               <CheckCircle className="w-5 h-5 text-green-600" />
@@ -376,7 +426,8 @@ export default function VulnManagement() {
                     New Scan Profile
                   </button>
                 </div>
-                {scanProfiles.length === 0 && (
+                <LoadErrorBanner what="scan profiles" error={loadErrors.profiles} />
+                {!loadErrors.profiles && scanProfiles.length === 0 && (
                   <div className="text-center text-gray-500 dark:text-gray-400 py-6 border border-dashed border-gray-300 dark:border-gray-700 rounded-lg">
                     No scan profiles defined.
                   </div>
@@ -387,39 +438,34 @@ export default function VulnManagement() {
                       <div className="flex justify-between items-start mb-3">
                         <div>
                           <h3 className="font-semibold text-lg">{profile.name}</h3>
-                          <p className="text-sm text-gray-600 dark:text-gray-400">Schedule: {profile.schedule}</p>
+                          <p className="text-sm text-gray-600 dark:text-gray-400">Scanner: {profile.scanner_type || NA} · Schedule: {profile.schedule || 'none'}</p>
                         </div>
                         <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(profile.status)}`}>
                           {profile.status}
                         </span>
                       </div>
-                      <div className="grid grid-cols-3 gap-4 text-sm">
+                      <div className="grid grid-cols-2 gap-4 text-sm">
                         <div>
-                          <p className="text-gray-600 dark:text-gray-400">Last Run</p>
-                          <p className="font-medium">{new Date(profile.lastRun || "").toLocaleString()}</p>
+                          <p className="text-gray-600 dark:text-gray-400">Last Scan</p>
+                          <p className="font-medium">{fmtDate(profile.lastRun, 'Never')}</p>
                         </div>
                         <div>
-                          <p className="text-gray-600 dark:text-gray-400">Duration</p>
-                          <p className="font-medium">{profile.duration}</p>
-                        </div>
-                        <div>
-                          <p className="text-gray-600 dark:text-gray-400">Next Run</p>
-                          <p className="font-medium">{new Date(profile.nextRun || "").toLocaleString()}</p>
+                          <p className="text-gray-600 dark:text-gray-400">Next Scan</p>
+                          <p className="font-medium">{fmtDate(profile.nextRun, 'Not scheduled')}</p>
                         </div>
                       </div>
                       <div className="flex gap-2 mt-4">
                         <button
-                          onClick={async () => {
-                            try {
-                              await vulnmgmtApi.runScanProfile(profile.id);
-                              loadData();
-                            } catch (error) {
-                              console.error('Error running scan:', error);
-                            }
+                          onClick={() => {
+                            // No scanner runs server-side: the backend imports a
+                            // scanner export, so pick the file to import.
+                            setImportProfile(profile);
+                            scanFileInput.current?.click();
                           }}
                           className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                          title="Import a scanner export file for this profile"
                         >
-                          Run Now
+                          Import Results
                         </button>
                         <button
                           onClick={() => setEditingScanProfile(profile)}
@@ -437,6 +483,7 @@ export default function VulnManagement() {
             {/* Patch Operations Tab */}
             {activeTab === 'patch-ops' && (
               <div className="space-y-6">
+                <LoadErrorBanner what="patch operations" error={loadErrors.patches} />
                 <div className="grid grid-cols-1 gap-4">
                   {patchOps.map((op) => (
                     <div key={op.id} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
@@ -444,39 +491,27 @@ export default function VulnManagement() {
                         <div>
                           <h3 className="font-semibold text-lg">{op.name}</h3>
                           <div className="flex gap-4 mt-2 text-sm text-gray-600 dark:text-gray-400">
-                            <span>{op.vulnCount} vulnerabilities</span>
+                            <span className="capitalize">{(op.patch_type || '').replace(/_/g, ' ')}</span>
                             <span>·</span>
-                            <span>{op.systemsAffected} systems</span>
+                            <span className="font-mono">instance {op.vulnerability_instance_id}</span>
                           </div>
                         </div>
-                        <span className={`px-3 py-1 rounded-full text-xs font-medium ${getSeverityColor(op.severity)}`}>
-                          {op.severity}
+                        <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(op.status)}`}>
+                          {op.status ?? NA}
                         </span>
                       </div>
-                      <div className="space-y-3">
-                        <div className="flex justify-between text-sm">
-                          <span className="text-gray-600 dark:text-gray-400">Progress</span>
-                          <span className="font-semibold">{op.progress}%</span>
+                      <div className="grid grid-cols-3 gap-4 text-sm pt-2">
+                        <div>
+                          <p className="text-gray-600 dark:text-gray-400">Deployed</p>
+                          <p className="font-medium">{fmtDate(op.startDate, 'Not deployed')}</p>
                         </div>
-                        <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
-                          <div
-                            className="bg-green-600 h-2 rounded-full transition-all"
-                            style={{ width: `${op.progress}%` }}
-                          />
+                        <div>
+                          <p className="text-gray-600 dark:text-gray-400">Verified</p>
+                          <p className="font-medium">{fmtDate(op.verifiedDate, 'Not verified')}</p>
                         </div>
-                        <div className="grid grid-cols-3 gap-4 text-sm pt-2">
-                          <div>
-                            <p className="text-gray-600 dark:text-gray-400">Start</p>
-                            <p className="font-medium">{op.startDate}</p>
-                          </div>
-                          <div>
-                            <p className="text-gray-600 dark:text-gray-400">Status</p>
-                            <p className="font-medium capitalize">{op.status}</p>
-                          </div>
-                          <div>
-                            <p className="text-gray-600 dark:text-gray-400">Target</p>
-                            <p className="font-medium">{op.targetDate}</p>
-                          </div>
+                        <div>
+                          <p className="text-gray-600 dark:text-gray-400">Change Ticket</p>
+                          <p className="font-medium">{op.change_ticket_id || 'None'}</p>
                         </div>
                       </div>
                     </div>
@@ -488,6 +523,7 @@ export default function VulnManagement() {
             {/* Exceptions Tab */}
             {activeTab === 'exceptions' && (
               <div className="space-y-6">
+                <LoadErrorBanner what="exceptions" error={loadErrors.exceptions} />
                 <div className="flex justify-end">
                   <button
                     onClick={() => setShowNewExceptionModal(true)}
@@ -501,8 +537,8 @@ export default function VulnManagement() {
                   <table className="w-full">
                     <thead>
                       <tr className="border-b border-gray-200 dark:border-gray-700">
-                        <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">CVE ID</th>
-                        <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Reason</th>
+                        <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Instance</th>
+                        <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Justification</th>
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Approver</th>
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Expires</th>
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Status</th>
@@ -512,10 +548,10 @@ export default function VulnManagement() {
                     <tbody>
                       {exceptions.map((exc) => (
                         <tr key={exc.id} className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 transition">
-                          <td className="px-6 py-4 text-sm font-mono font-medium">{exc.cveId}</td>
+                          <td className="px-6 py-4 text-sm font-mono font-medium">{exc.instanceId}</td>
                           <td className="px-6 py-4 text-sm">{exc.reason}</td>
-                          <td className="px-6 py-4 text-sm">{exc.approver}</td>
-                          <td className="px-6 py-4 text-sm">{exc.expiryDate}</td>
+                          <td className="px-6 py-4 text-sm">{exc.approver || 'None'}</td>
+                          <td className="px-6 py-4 text-sm">{exc.expiryDate || 'No expiry'}</td>
                           <td className="px-6 py-4">
                             <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(exc.status)}`}>
                               {exc.status}
@@ -546,6 +582,7 @@ export default function VulnManagement() {
                   </p>
                 </div>
 
+                <LoadErrorBanner what="vulnerabilities" error={loadErrors.vulns} />
                 <div className="grid grid-cols-1 gap-4">
                   {kevVulns.map((vuln) => (
                     <div key={vuln.id} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition">
@@ -562,19 +599,19 @@ export default function VulnManagement() {
                           <div className="grid grid-cols-4 gap-4 text-sm">
                             <div>
                               <p className="text-gray-600 dark:text-gray-400">CVSS Score</p>
-                              <p className="font-semibold">{vuln.cvss.toFixed(1)}</p>
+                              <p className="font-semibold">{vuln.cvss === null ? NA : vuln.cvss.toFixed(1)}</p>
                             </div>
                             <div>
                               <p className="text-gray-600 dark:text-gray-400">EPSS Score</p>
-                              <p className="font-semibold">{(vuln.epss * 100).toFixed(0)}%</p>
+                              <p className="font-semibold">{vuln.epss === null ? NA : `${(vuln.epss * 100).toFixed(0)}%`}</p>
                             </div>
                             <div>
                               <p className="text-gray-600 dark:text-gray-400">Affected Assets</p>
-                              <p className="font-semibold">{vuln.affectedAssets}</p>
+                              <p className="font-semibold">{vuln.affectedAssets ?? NA}</p>
                             </div>
                             <div>
                               <p className="text-gray-600 dark:text-gray-400">Days Open</p>
-                              <p className="font-semibold">{vuln.daysOpen}</p>
+                              <p className="font-semibold">{vuln.daysOpen ?? NA}</p>
                             </div>
                           </div>
                         </div>
@@ -611,12 +648,11 @@ export default function VulnManagement() {
               <div><span className="font-medium">CVE ID:</span> {selectedVulnerability.cveId}</div>
               <div><span className="font-medium">Title:</span> {selectedVulnerability.title}</div>
               <div><span className="font-medium">Severity:</span> {selectedVulnerability.severity}</div>
-              <div><span className="font-medium">CVSS:</span> {selectedVulnerability.cvss?.toFixed(1)}</div>
-              {selectedVulnerability.epss && <div><span className="font-medium">EPSS:</span> {(selectedVulnerability.epss * 100).toFixed(0)}%</div>}
+              <div><span className="font-medium">CVSS:</span> {selectedVulnerability.cvss === null ? NA : selectedVulnerability.cvss.toFixed(1)}</div>
+              <div><span className="font-medium">EPSS:</span> {selectedVulnerability.epss === null ? NA : `${(selectedVulnerability.epss * 100).toFixed(0)}%`}</div>
               <div><span className="font-medium">KEV:</span> {selectedVulnerability.kev ? 'Yes' : 'No'}</div>
-              <div><span className="font-medium">Affected Assets:</span> {selectedVulnerability.affectedAssets}</div>
+              <div><span className="font-medium">Affected Assets:</span> {selectedVulnerability.affectedAssets ?? NA}</div>
               <div><span className="font-medium">Patch Available:</span> {selectedVulnerability.patchAvailable ? 'Yes' : 'No'}</div>
-              {selectedVulnerability.daysOpen && <div><span className="font-medium">Days Open:</span> {selectedVulnerability.daysOpen}</div>}
             </div>
             <button onClick={() => setSelectedVulnerability(null)} className="mt-6 w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Close</button>
           </div>
@@ -638,7 +674,7 @@ export default function VulnManagement() {
                 });
                 setEditingVulnerability(null);
                 loadData();
-              } catch (err) { console.error('Update vulnerability failed:', err); }
+              } catch (err) { alert(`Update vulnerability failed: ${describeLoadError(err)}`); }
             }}>
               <div>
                 <label className="block text-sm font-medium mb-1">Title</label>
@@ -666,22 +702,22 @@ export default function VulnManagement() {
       {editingException && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
           <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto">
-            <h2 className="text-xl font-bold mb-4">Edit Exception: {editingException.cveId}</h2>
+            <h2 className="text-xl font-bold mb-4">Edit Exception: {editingException.instanceId}</h2>
             <form className="space-y-4" onSubmit={async (e) => {
               e.preventDefault();
               const fd = new FormData(e.currentTarget);
               try {
                 await api.put(`/vulnmgmt/exceptions/${editingException.id}`, {
-                  reason: fd.get('reason'),
-                  expiry_date: fd.get('expiry_date'),
+                  justification: fd.get('justification'),
+                  expiry_date: fd.get('expiry_date') || null,
                 });
                 setEditingException(null);
                 loadData();
-              } catch (err) { console.error('Update exception failed:', err); }
+              } catch (err) { alert(`Update exception failed: ${describeLoadError(err)}`); }
             }}>
               <div>
-                <label className="block text-sm font-medium mb-1">Reason</label>
-                <textarea name="reason" defaultValue={editingException.reason} rows={3} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <label className="block text-sm font-medium mb-1">Justification</label>
+                <textarea name="justification" required minLength={10} defaultValue={editingException.reason} rows={3} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Expiry Date</label>
@@ -707,19 +743,19 @@ export default function VulnManagement() {
               try {
                 await api.put(`/vulnmgmt/scan-profiles/${editingScanProfile.id}`, {
                   name: fd.get('name'),
-                  schedule: fd.get('schedule'),
+                  schedule_cron: fd.get('schedule') || null,
                 });
                 setEditingScanProfile(null);
                 loadData();
-              } catch (err) { console.error('Update scan profile failed:', err); }
+              } catch (err) { alert(`Update scan profile failed: ${describeLoadError(err)}`); }
             }}>
               <div>
                 <label className="block text-sm font-medium mb-1">Name</label>
                 <input name="name" type="text" defaultValue={editingScanProfile.name} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
-                <label className="block text-sm font-medium mb-1">Schedule</label>
-                <input name="schedule" type="text" defaultValue={editingScanProfile.schedule} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <label className="block text-sm font-medium mb-1">Schedule (cron)</label>
+                <input name="schedule" type="text" defaultValue={editingScanProfile.schedule ?? ''} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div className="flex gap-2 mt-6">
                 <button type="button" onClick={() => setEditingScanProfile(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
@@ -739,22 +775,36 @@ export default function VulnManagement() {
               <p className="text-sm text-gray-600 dark:text-gray-400">{remediatingVuln.title}</p>
               <button onClick={async () => {
                 try {
-                  // Create a real patch plan for this vulnerability's instance.
-                  // The backend expects vulnerability_instance_ids, not a vuln id.
-                  const instanceIds = Array.isArray(remediatingVuln.instance_ids) && remediatingVuln.instance_ids.length
-                    ? remediatingVuln.instance_ids
-                    : [remediatingVuln.id];
+                  // create-plan takes vulnerability_instance_ids, so resolve
+                  // this catalog vulnerability's instances first.
+                  const instanceIds = await instanceIdsFor(remediatingVuln.id);
+                  if (instanceIds.length === 0) {
+                    alert('No affected instances are recorded for this vulnerability, so there is nothing to patch.');
+                    return;
+                  }
                   await api.post('/vulnmgmt/patch-operations/create-plan', {
                     vulnerability_instance_ids: instanceIds,
                   });
                   setRemediatingVuln(null);
                   loadData();
-                } catch (e: any) {
-                  console.error('Apply patch failed:', e);
-                  alert(e?.response?.data?.detail || 'Failed to create patch plan');
+                } catch (e) {
+                  alert(`Create patch plan failed: ${describeLoadError(e)}`);
                 }
               }} className="w-full px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Apply Patch</button>
-              <button onClick={async () => { try { await api.post('/vulnmgmt/instances/bulk-action', { instance_ids: [remediatingVuln.id], action: 'update_status', value: 'mitigated' }); setRemediatingVuln(null); loadData(); } catch (e) { console.error('Apply compensating control failed:', e); } }} className="w-full px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Apply Compensating Control</button>
+              <button onClick={async () => {
+                try {
+                  const instanceIds = await instanceIdsFor(remediatingVuln.id);
+                  if (instanceIds.length === 0) {
+                    alert('No affected instances are recorded for this vulnerability, so there is nothing to mark mitigated.');
+                    return;
+                  }
+                  await api.post('/vulnmgmt/instances/bulk-action', { instance_ids: instanceIds, action: 'update_status', value: 'mitigated' });
+                  setRemediatingVuln(null);
+                  loadData();
+                } catch (e) {
+                  alert(`Apply compensating control failed: ${describeLoadError(e)}`);
+                }
+              }} className="w-full px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Apply Compensating Control</button>
               <button onClick={() => setRemediatingVuln(null)} className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
             </div>
           </div>
@@ -774,12 +824,12 @@ export default function VulnManagement() {
                   cve_id: fd.get('cve_id'),
                   title: fd.get('title'),
                   severity: fd.get('severity') || 'medium',
-                  cvss_v3_score: parseFloat(fd.get('cvss_score') as string) || 0,
+                  cvss_v3_score: fd.get('cvss_score') ? parseFloat(fd.get('cvss_score') as string) : null,
                   description: fd.get('description') || '',
                 });
                 setShowNewVulnModal(false);
                 loadData();
-              } catch (err) { console.error('Create vuln failed:', err); }
+              } catch (err) { alert(`Create vulnerability failed: ${describeLoadError(err)}`); }
             }}>
               <div>
                 <label className="block text-sm font-medium mb-1">CVE ID</label>
@@ -837,16 +887,14 @@ export default function VulnManagement() {
               try {
                 await vulnmgmtApi.createScanProfile({
                   name: fd.get('name'),
-                  scan_type: fd.get('scan_type') || 'authenticated',
-                  target_filters: {},
-                  schedule: fd.get('schedule') || '',
-                  is_active: true,
+                  scanner_type: fd.get('scanner_type'),
+                  schedule_cron: fd.get('schedule') || null,
+                  enabled: true,
                 });
                 setShowNewScanProfileModal(false);
                 loadData();
-              } catch (err: any) {
-                console.error('Create scan profile failed:', err);
-                alert(err?.response?.data?.detail || 'Failed to create scan profile');
+              } catch (err) {
+                alert(`Create scan profile failed: ${describeLoadError(err)}`);
               }
             }}>
               <div>
@@ -854,12 +902,12 @@ export default function VulnManagement() {
                 <input name="name" required type="text" placeholder="Weekly authenticated scan" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
-                <label className="block text-sm font-medium mb-1">Scan Type</label>
-                <select name="scan_type" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
-                  <option value="authenticated">Authenticated</option>
-                  <option value="unauthenticated">Unauthenticated</option>
-                  <option value="compliance">Compliance</option>
-                  <option value="web_app">Web App</option>
+                <label className="block text-sm font-medium mb-1">Scanner (export format)</label>
+                <select name="scanner_type" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                  <option value="nessus">Nessus (.nessus XML)</option>
+                  <option value="qualys">Qualys (CSV)</option>
+                  <option value="openvas">OpenVAS (XML)</option>
+                  <option value="json">Other (JSON findings)</option>
                 </select>
               </div>
               <div>
@@ -885,7 +933,7 @@ export default function VulnManagement() {
               const fd = new FormData(e.currentTarget);
               try {
                 await vulnmgmtApi.createException({
-                  vulnerability_id: fd.get('vulnerability_id'),
+                  vulnerability_instance_id: fd.get('vulnerability_instance_id'),
                   justification: fd.get('justification'),
                   exception_type: fd.get('exception_type') || 'risk_accepted',
                   approved_by: fd.get('approved_by') || null,
@@ -893,14 +941,13 @@ export default function VulnManagement() {
                 });
                 setShowNewExceptionModal(false);
                 loadData();
-              } catch (err: any) {
-                console.error('Create exception failed:', err);
-                alert(err?.response?.data?.detail || 'Failed to create exception');
+              } catch (err) {
+                alert(`Create exception failed: ${describeLoadError(err)}`);
               }
             }}>
               <div>
-                <label className="block text-sm font-medium mb-1">Vulnerability ID</label>
-                <input name="vulnerability_id" required type="text" placeholder="vuln UUID" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <label className="block text-sm font-medium mb-1">Vulnerability Instance ID</label>
+                <input name="vulnerability_instance_id" required type="text" placeholder="vulnerability instance UUID" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Exception Type</label>
@@ -912,7 +959,7 @@ export default function VulnManagement() {
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Justification</label>
-                <textarea name="justification" required rows={3} placeholder="Business justification" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <textarea name="justification" required minLength={10} rows={3} placeholder="Business justification (at least 10 characters)" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Approved By</label>
@@ -930,6 +977,17 @@ export default function VulnManagement() {
           </div>
         </div>
       )}
+
+      <input
+        ref={scanFileInput}
+        type="file"
+        className="hidden"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          e.target.value = '';
+          if (file && importProfile) runScanImport(importProfile, file);
+        }}
+      />
     </div>
   );
 }

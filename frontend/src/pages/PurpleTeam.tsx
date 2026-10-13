@@ -13,6 +13,7 @@ import {
   RadioTower,
 } from 'lucide-react';
 import clsx from 'clsx';
+import LoadErrorBanner from '../components/LoadErrorBanner';
 
 interface AttackTechnique {
   id: string;
@@ -80,31 +81,23 @@ export default function PurpleTeam() {
   const firedTechniquesRef = useRef<Set<string>>(new Set());
   const wsRef = useRef<WebSocket | null>(null);
 
-  const { data: agents } = useQuery({
+  const { data: agents, error: agentsError } = useQuery({
     queryKey: ['pt-agents'],
     queryFn: async () => {
-      try {
-        const r = await api.get<{ agents: Agent[] }>('/agents');
-        return (r.data.agents ?? []).filter(
-          (a) =>
-            a.status === 'active' &&
-            (a.capabilities?.includes('bas') || a.capabilities?.includes('purple')),
-        );
-      } catch {
-        return [];
-      }
+      const r = await api.get<{ agents: Agent[] }>('/agents');
+      return (r.data.agents ?? []).filter(
+        (a) =>
+          a.status === 'active' &&
+          (a.capabilities?.includes('bas') || a.capabilities?.includes('purple')),
+      );
     },
   });
 
-  const { data: techniques } = useQuery({
+  const { data: techniques, error: techniquesError } = useQuery({
     queryKey: ['pt-techniques'],
     queryFn: async () => {
-      try {
-        const r = await api.get<{ techniques: AttackTechnique[] }>('/simulation/techniques');
-        return (r.data.techniques ?? []).filter((t) => t.is_safe);
-      } catch {
-        return [];
-      }
+      const r = await api.get<{ techniques: AttackTechnique[] }>('/simulation/techniques');
+      return (r.data.techniques ?? []).filter((t) => t.is_safe);
     },
   });
 
@@ -241,6 +234,12 @@ export default function PurpleTeam() {
 
       {/* Controls */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
+        {(!!agentsError || !!techniquesError) && (
+          <div className="mb-4 space-y-2">
+            <LoadErrorBanner what="BAS-capable agents" error={agentsError} />
+            <LoadErrorBanner what="ATT&CK techniques" error={techniquesError} />
+          </div>
+        )}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div>
             <label className="block text-sm font-medium mb-1 text-gray-900 dark:text-white">

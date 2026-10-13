@@ -1,106 +1,96 @@
 import { useQuery } from '@tanstack/react-query';
 import {
-  BarChart3,
   TrendingUp,
   TrendingDown,
   Clock,
   AlertTriangle,
   Shield,
-  Activity,
   Target,
   Loader2,
 } from 'lucide-react';
 import { api } from '../lib/api';
+import LoadErrorBanner from '../components/LoadErrorBanner';
 import clsx from 'clsx';
 
+// Numbers the backend could not supply stay null and render "not available";
+// nothing on this page falls back to 0.
 interface MetricsData {
   overview: {
-    total_alerts: number;
-    alerts_change: number;
-    total_incidents: number;
-    incidents_change: number;
-    avg_mttr_hours: number;
-    mttr_change: number;
-    active_iocs: number;
+    alerts_30d: number | null;
+    alerts_change: number | null;
+    open_incidents: number | null;
+    avg_mttr_hours: number | null;
+    active_iocs: number | null;
   };
+  alerts_total: number | null;
   alert_trends: Array<{ date: string; count: number }>;
   severity_distribution: Record<string, number>;
-  status_distribution: Record<string, number>;
   top_sources: Array<{ source: string; count: number }>;
-  top_attackers: Array<{ ip: string; count: number; country?: string }>;
+  top_attackers: Array<{ ip: string; count: number }>;
   incident_types: Record<string, number>;
 }
 
+const NOT_AVAILABLE = 'not available';
+
 export default function Analytics() {
-  const { data: metrics, isLoading } = useQuery<MetricsData>({
+  const { data: metrics, isLoading, error } = useQuery<MetricsData>({
     queryKey: ['metrics'],
     queryFn: async () => {
-      // Previously this derived everything from two /stats endpoints
-      // and hardcoded `alerts_change`, `incidents_change`, `mttr_change`,
-      // `active_iocs`, and `top_attackers` to 0/[] — trend arrows never
-      // appeared and the Top Attackers panel was permanently empty
-      // despite /metrics/top-attackers returning real data. Now pulls
-      // from the real `/metrics/*` surface and computes trend deltas
-      // by comparing current-period totals to prior-period totals.
-      try {
-        const [
-          overviewRes, topAttackersRes, trendsRes, mttrRes,
-          alertsStatsRes, incidentsStatsRes, overviewPriorRes,
-        ] = await Promise.allSettled([
-          api.get('/metrics/overview', { params: { days: 30 } }),
-          api.get('/metrics/top-attackers', { params: { days: 30, limit: 10 } }),
-          api.get('/metrics/alerts/trend', { params: { days: 30 } }),
-          api.get('/metrics/incidents/mttr', { params: { days: 30 } }),
-          api.get('/alerts/stats'),
-          api.get('/incidents/stats'),
-          api.get('/metrics/overview', { params: { days: 60 } }),
-        ]);
+      // Every request must succeed; a failure surfaces as an error banner
+      // instead of an outage rendering as zeros. Field names follow
+      // src/api/v1/endpoints/metrics.py, alerts.py (/stats) and
+      // incidents.py (/stats), all tenant-scoped.
+      const [
+        overviewRes, overviewPriorRes, topAttackersRes, trendsRes, mttrRes,
+        iocsByTypeRes, alertsStatsRes, incidentsStatsRes,
+      ] = await Promise.all([
+        api.get('/metrics/overview', { params: { days: 30 } }),
+        api.get('/metrics/overview', { params: { days: 60 } }),
+        api.get('/metrics/top-attackers', { params: { days: 30, limit: 10 } }),
+        api.get('/metrics/alerts/trend', { params: { days: 7 } }),
+        api.get('/metrics/incidents/mttr', { params: { days: 30 } }),
+        api.get('/metrics/iocs/by-type'),
+        api.get('/alerts/stats'),
+        api.get('/incidents/stats'),
+      ]);
 
-        const overview = overviewRes.status === 'fulfilled' ? overviewRes.value.data : {};
-        const overviewPrior = overviewPriorRes.status === 'fulfilled' ? overviewPriorRes.value.data : {};
-        const alertStats = alertsStatsRes.status === 'fulfilled' ? alertsStatsRes.value.data : {};
-        const incidentStats = incidentsStatsRes.status === 'fulfilled' ? incidentsStatsRes.value.data : {};
-        const topAttackersData = topAttackersRes.status === 'fulfilled' ? topAttackersRes.value.data : {};
-        const trendsData = trendsRes.status === 'fulfilled' ? trendsRes.value.data : {};
-        const mttrData = mttrRes.status === 'fulfilled' ? mttrRes.value.data : {};
+      const overview = overviewRes.data;
+      const overviewPrior = overviewPriorRes.data;
+      const alertStats = alertsStatsRes.data;
+      const incidentStats = incidentsStatsRes.data;
+      const mttr = mttrRes.data;
 
-        // Prior-30-day counts = (last 60 days) − (last 30 days).
-        const priorAlerts = Math.max(0, (overviewPrior.total_alerts ?? 0) - (overview.total_alerts ?? 0));
-        const priorIncidents = Math.max(0, (overviewPrior.total_incidents ?? 0) - (overview.total_incidents ?? 0));
-        const pct = (current: number, prior: number) =>
-          prior > 0 ? Math.round(((current - prior) / prior) * 100) : 0;
+      const alerts30: number | null = overview?.period?.alerts_created ?? null;
+      const alerts60: number | null = overviewPrior?.period?.alerts_created ?? null;
+      // Prior 30 days = (last 60 days) - (last 30 days). No prior volume
+      // means no meaningful percentage, so the arrow is hidden.
+      const priorAlerts = alerts30 !== null && alerts60 !== null ? alerts60 - alerts30 : null;
+      const alertsChange = alerts30 !== null && priorAlerts !== null && priorAlerts > 0
+        ? Math.round(((alerts30 - priorAlerts) / priorAlerts) * 100)
+        : null;
 
-        const mttrHours = mttrData.avg_mttr_hours ?? mttrData.mean_time_to_resolve_hours ?? incidentStats.avg_resolution_hours ?? 0;
-        const mttrPrior = mttrData.prior_avg_mttr_hours ?? mttrData.prior_mttr_hours ?? 0;
+      const iocTypes: Array<{ type: string; count: number }> | undefined = iocsByTypeRes.data?.by_type;
+      const bySource: Record<string, number> = alertStats?.by_source ?? {};
 
-        const topAttackersItems = Array.isArray(topAttackersData) ? topAttackersData : (topAttackersData.items ?? topAttackersData.attackers ?? []);
-
-        return {
-          overview: {
-            total_alerts: overview.total_alerts ?? alertStats.total ?? 0,
-            alerts_change: pct(overview.total_alerts ?? 0, priorAlerts),
-            total_incidents: overview.total_incidents ?? incidentStats.total ?? 0,
-            incidents_change: pct(overview.total_incidents ?? 0, priorIncidents),
-            avg_mttr_hours: mttrHours,
-            mttr_change: mttrPrior > 0
-              ? Math.round(((mttrHours - mttrPrior) / mttrPrior) * 100)
-              : 0,
-            active_iocs: overview.active_iocs ?? 0,
-          },
-          alert_trends: trendsData.series ?? trendsData.trend ?? alertStats.trends ?? [],
-          severity_distribution: alertStats.by_severity ?? {},
-          status_distribution: alertStats.by_status ?? {},
-          top_sources: Array.isArray(alertStats.by_source)
-            ? alertStats.by_source.map((s: any) => ({ source: s.source ?? s.name ?? '', count: s.count ?? 0 }))
-            : [],
-          top_attackers: topAttackersItems.map((a: any) => ({
-            ip: a.ip ?? a.source_ip ?? a.address ?? '',
-            count: a.count ?? a.hits ?? 0,
-            country: a.country ?? a.country_code,
-          })),
-          incident_types: incidentStats.by_type ?? {},
-        };
-      } catch { return null; }
+      return {
+        overview: {
+          alerts_30d: alerts30,
+          alerts_change: alertsChange,
+          open_incidents: incidentStats?.open_count ?? null,
+          avg_mttr_hours: mttr?.mttr_hours ?? null,
+          active_iocs: Array.isArray(iocTypes) ? iocTypes.reduce((sum, t) => sum + t.count, 0) : null,
+        },
+        alerts_total: alertStats?.total ?? null,
+        alert_trends: trendsRes.data?.trend ?? [],
+        severity_distribution: alertStats?.by_severity ?? {},
+        top_sources: Object.entries(bySource)
+          .map(([source, count]) => ({ source, count }))
+          .sort((a, b) => b.count - a.count),
+        top_attackers: (topAttackersRes.data?.top_attackers ?? []).map(
+          (a: { ip: string; alert_count: number }) => ({ ip: a.ip, count: a.alert_count }),
+        ),
+        incident_types: incidentStats?.by_type ?? {},
+      };
     },
   });
 
@@ -112,6 +102,8 @@ export default function Analytics() {
     );
   }
 
+  const mttrHours = metrics?.overview.avg_mttr_hours ?? null;
+
   return (
     <div className="space-y-6">
       <div>
@@ -121,33 +113,32 @@ export default function Analytics() {
         </p>
       </div>
 
+      <LoadErrorBanner what="analytics metrics" error={error} />
+
       {/* KPI Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <KPICard
-          title="Total Alerts"
-          value={metrics?.overview?.total_alerts || 0}
-          change={metrics?.overview?.alerts_change || 0}
+          title="Alerts (30 days)"
+          value={metrics?.overview.alerts_30d ?? null}
+          change={metrics?.overview.alerts_change ?? null}
           icon={AlertTriangle}
           color="orange"
         />
         <KPICard
           title="Active Incidents"
-          value={metrics?.overview?.total_incidents || 0}
-          change={metrics?.overview?.incidents_change || 0}
+          value={metrics?.overview.open_incidents ?? null}
           icon={Shield}
           color="red"
         />
         <KPICard
-          title="Avg. MTTR"
-          value={`${(metrics?.overview?.avg_mttr_hours || 0).toFixed(1)}h`}
-          change={metrics?.overview?.mttr_change || 0}
+          title="Avg. MTTR (30 days)"
+          value={mttrHours !== null ? `${mttrHours.toFixed(1)}h` : null}
           icon={Clock}
           color="blue"
-          invertChange
         />
         <KPICard
           title="Active IOCs"
-          value={metrics?.overview?.active_iocs || 0}
+          value={metrics?.overview.active_iocs ?? null}
           icon={Target}
           color="purple"
         />
@@ -171,7 +162,7 @@ export default function Analytics() {
           </h2>
           <div className="space-y-4">
             {Object.entries(metrics?.severity_distribution || {}).map(([severity, count]) => (
-              <SeverityBar key={severity} severity={severity} count={count as number} total={metrics?.overview?.total_alerts || 1} />
+              <SeverityBar key={severity} severity={severity} count={count as number} total={metrics?.alerts_total ?? 0} />
             ))}
           </div>
         </div>
@@ -225,11 +216,6 @@ export default function Analytics() {
                     <span className="text-gray-900 dark:text-white font-mono text-sm">
                       {attacker.ip}
                     </span>
-                    {attacker.country && (
-                      <span className="ml-2 text-xs text-gray-500 dark:text-gray-400">
-                        {attacker.country}
-                      </span>
-                    )}
                   </div>
                 </div>
                 <span className="text-gray-500 dark:text-gray-400 font-medium">
@@ -282,14 +268,12 @@ function KPICard({
   change,
   icon: Icon,
   color,
-  invertChange = false,
 }: {
   title: string;
-  value: number | string;
-  change?: number;
+  value: number | string | null;
+  change?: number | null;
   icon: React.ComponentType<{ className?: string }>;
   color: 'orange' | 'red' | 'blue' | 'purple' | 'green';
-  invertChange?: boolean;
 }) {
   const colorClasses = {
     orange: 'bg-orange-100 text-orange-600 dark:bg-orange-900/30 dark:text-orange-400',
@@ -299,8 +283,8 @@ function KPICard({
     green: 'bg-green-100 text-green-600 dark:bg-green-900/30 dark:text-green-400',
   };
 
-  const isPositive = invertChange ? (change || 0) < 0 : (change || 0) > 0;
-  const isNegative = invertChange ? (change || 0) > 0 : (change || 0) < 0;
+  const isPositive = change != null && change > 0;
+  const isNegative = change != null && change < 0;
 
   return (
     <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
@@ -308,7 +292,7 @@ function KPICard({
         <div className={clsx('p-3 rounded-lg', colorClasses[color])}>
           <Icon className="w-6 h-6" />
         </div>
-        {change !== undefined && change !== 0 && (
+        {change != null && change !== 0 && (
           <div
             className={clsx(
               'flex items-center gap-1 text-sm',
@@ -326,7 +310,11 @@ function KPICard({
         )}
       </div>
       <div className="mt-4">
-        <div className="text-2xl font-bold text-gray-900 dark:text-white">{value}</div>
+        {value !== null ? (
+          <div className="text-2xl font-bold text-gray-900 dark:text-white">{value}</div>
+        ) : (
+          <div className="text-lg text-gray-400 dark:text-gray-500">{NOT_AVAILABLE}</div>
+        )}
         <div className="text-sm text-gray-500 dark:text-gray-400">{title}</div>
       </div>
     </div>

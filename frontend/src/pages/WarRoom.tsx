@@ -13,6 +13,8 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 import { collaborationApi } from '../api/endpoints';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 
 // ---------------------------------------------------------------------------
 // Types matching backend response schemas
@@ -117,7 +119,7 @@ export default function WarRoom() {
   // Queries
   // ---------------------------------------------------------------------------
 
-  const { data: warRooms = [] } = useQuery<WarRoomType[]>({
+  const { data: warRooms = [], error: warRoomsError } = useQuery<WarRoomType[]>({
     queryKey: ['warRooms'],
     queryFn: async () => {
       const data = await collaborationApi.getWarRooms();
@@ -125,7 +127,7 @@ export default function WarRoom() {
     },
   });
 
-  const { data: allActionItems = [] } = useQuery<ActionItemType[]>({
+  const { data: allActionItems = [], error: actionItemsError } = useQuery<ActionItemType[]>({
     queryKey: ['allActionItems'],
     queryFn: async () => {
       const data = await collaborationApi.getAllActionItems();
@@ -133,7 +135,7 @@ export default function WarRoom() {
     },
   });
 
-  const { data: archivedRooms = [] } = useQuery<WarRoomType[]>({
+  const { data: archivedRooms = [], error: archivedError } = useQuery<WarRoomType[]>({
     queryKey: ['archivedRooms'],
     queryFn: async () => {
       const data = await collaborationApi.getArchivedRooms();
@@ -142,7 +144,7 @@ export default function WarRoom() {
     enabled: activeTab === 'archived',
   });
 
-  const { data: roomMessages = [] } = useQuery<MessageType[]>({
+  const { data: roomMessages = [], error: messagesError } = useQuery<MessageType[]>({
     queryKey: ['roomMessages', selectedRoom?.id],
     queryFn: async () => {
       if (!selectedRoom) return [];
@@ -152,7 +154,7 @@ export default function WarRoom() {
     enabled: !!selectedRoom,
   });
 
-  const { data: dashboard } = useQuery({
+  const { data: dashboard, error: dashboardError } = useQuery({
     queryKey: ['collaborationDashboard'],
     queryFn: collaborationApi.getDashboard,
   });
@@ -221,23 +223,34 @@ export default function WarRoom() {
   // Derived Stats
   // ---------------------------------------------------------------------------
 
-  const stats = useMemo(() => {
+  // A count that could not be loaded is null and renders "not available",
+  // never 0. Without the dashboard, fall back to counting the lists we did
+  // load; a list that failed to load contributes nothing.
+  const stats = useMemo((): {
+    activeRooms: number | null;
+    totalActions: number | null;
+    overdueActions: number | null;
+    totalParticipants: number | null;
+  } => {
     if (dashboard) {
       return {
-        activeRooms: dashboard.active_rooms ?? 0,
-        totalActions: dashboard.pending_actions ?? 0,
-        overdueActions: dashboard.overdue_actions ?? 0,
-        totalParticipants: dashboard.total_participants ?? 0,
+        activeRooms: dashboard.active_rooms ?? null,
+        totalActions: dashboard.pending_actions ?? null,
+        overdueActions: dashboard.overdue_actions ?? null,
+        totalParticipants: dashboard.total_participants ?? null,
       };
     }
-    const activeRooms = warRooms.filter((r) => r.status === 'active').length;
-    const totalActions = allActionItems.length;
-    const overdueActions = allActionItems.filter((a) => {
-      if (!a.due_date || a.status === 'completed' || a.status === 'cancelled') return false;
-      return new Date(a.due_date) < new Date();
-    }).length;
-    return { activeRooms, totalActions, overdueActions, totalParticipants: 0 };
-  }, [warRooms, allActionItems, dashboard]);
+    const activeRooms = warRoomsError ? null : warRooms.filter((r) => r.status === 'active').length;
+    const totalActions = actionItemsError ? null : allActionItems.length;
+    const overdueActions = actionItemsError
+      ? null
+      : allActionItems.filter((a) => {
+          if (!a.due_date || a.status === 'completed' || a.status === 'cancelled') return false;
+          return new Date(a.due_date) < new Date();
+        }).length;
+    return { activeRooms, totalActions, overdueActions, totalParticipants: null };
+  }, [warRooms, allActionItems, dashboard, warRoomsError, actionItemsError]);
+  const showCount = (n: number | null) => (n == null ? 'not available' : n);
 
   const handleSendMessage = () => {
     if (newMessage.trim() && selectedRoom) {
@@ -264,13 +277,19 @@ export default function WarRoom() {
           <p className="text-gray-400">Incident Response Coordination & Collaboration</p>
         </div>
 
+        {!!dashboardError && (
+          <div className="mb-4">
+            <LoadErrorBanner what="collaboration statistics" error={dashboardError} />
+          </div>
+        )}
+
         {/* Summary Cards */}
         <div className="grid grid-cols-4 gap-4 mb-8">
-          <div className={clsx('border rounded-lg p-6', stats.activeRooms > 0 ? 'bg-red-900/20 border-red-700' : 'bg-gray-800 border-gray-700')}>
+          <div className={clsx('border rounded-lg p-6', (stats.activeRooms ?? 0) > 0 ? 'bg-red-900/20 border-red-700' : 'bg-gray-800 border-gray-700')}>
             <div className="flex items-start justify-between">
               <div>
                 <p className="text-gray-400 text-sm mb-2">Active War Rooms</p>
-                <p className="text-3xl font-bold">{stats.activeRooms}</p>
+                <p className="text-3xl font-bold">{showCount(stats.activeRooms)}</p>
               </div>
               <Shield className="w-8 h-8 text-orange-400" />
             </div>
@@ -280,17 +299,17 @@ export default function WarRoom() {
             <div className="flex items-start justify-between">
               <div>
                 <p className="text-gray-400 text-sm mb-2">Action Items</p>
-                <p className="text-3xl font-bold">{stats.totalActions}</p>
+                <p className="text-3xl font-bold">{showCount(stats.totalActions)}</p>
               </div>
               <FileText className="w-8 h-8 text-blue-400" />
             </div>
           </div>
 
-          <div className={clsx('border rounded-lg p-6', stats.overdueActions > 0 ? 'bg-red-900/20 border-red-700' : 'bg-gray-800 border-gray-700')}>
+          <div className={clsx('border rounded-lg p-6', (stats.overdueActions ?? 0) > 0 ? 'bg-red-900/20 border-red-700' : 'bg-gray-800 border-gray-700')}>
             <div className="flex items-start justify-between">
               <div>
                 <p className="text-gray-400 text-sm mb-2">Overdue Actions</p>
-                <p className="text-3xl font-bold">{stats.overdueActions}</p>
+                <p className="text-3xl font-bold">{showCount(stats.overdueActions)}</p>
               </div>
               <AlertTriangle className="w-8 h-8 text-red-400" />
             </div>
@@ -300,7 +319,7 @@ export default function WarRoom() {
             <div className="flex items-start justify-between">
               <div>
                 <p className="text-gray-400 text-sm mb-2">Participants</p>
-                <p className="text-3xl font-bold">{stats.totalParticipants}</p>
+                <p className="text-3xl font-bold">{showCount(stats.totalParticipants)}</p>
               </div>
               <Users className="w-8 h-8 text-green-400" />
             </div>
@@ -350,7 +369,9 @@ export default function WarRoom() {
               </button>
             </div>
 
-            {activeRooms.length === 0 ? (
+            {warRoomsError ? (
+              <LoadErrorBanner what="war rooms" error={warRoomsError} />
+            ) : activeRooms.length === 0 ? (
               <div className="text-center py-16 text-gray-500">
                 <Shield className="w-12 h-12 mx-auto mb-4 opacity-50" />
                 <p>No active war rooms. Create one to start coordinating.</p>
@@ -408,13 +429,18 @@ export default function WarRoom() {
                           // metrics. Silently tolerate a 409 "already
                           // a participant" or missing endpoint so old
                           // backends still work.
+                          // 409 means already a participant; any other
+                          // failure is shown in the room's error strip.
+                          setChatError(null);
                           try {
                             const apiAny = collaborationApi as any;
                             if (typeof apiAny.joinRoom === 'function') {
                               await apiAny.joinRoom(room.id);
                             }
-                          } catch {
-                            /* non-fatal */
+                          } catch (err: any) {
+                            if (err?.response?.status !== 409) {
+                              setChatError(`Could not join the room. ${describeLoadError(err)}`);
+                            }
                           }
                           setSelectedRoom(room);
                         }}
@@ -447,7 +473,9 @@ export default function WarRoom() {
               </button>
             </div>
 
-            {allActionItems.length === 0 ? (
+            {actionItemsError ? (
+              <LoadErrorBanner what="action items" error={actionItemsError} />
+            ) : allActionItems.length === 0 ? (
               <div className="text-center py-16 text-gray-500">
                 <FileText className="w-12 h-12 mx-auto mb-4 opacity-50" />
                 <p>No action items yet.</p>
@@ -503,7 +531,9 @@ export default function WarRoom() {
         {/* ================================================================ */}
         {activeTab === 'archived' && (
           <div>
-            {archivedRooms.length === 0 ? (
+            {archivedError ? (
+              <LoadErrorBanner what="archived war rooms" error={archivedError} />
+            ) : archivedRooms.length === 0 ? (
               <div className="text-center py-16 text-gray-500">
                 <Archive className="w-12 h-12 mx-auto mb-4 opacity-50" />
                 <p>No archived war rooms.</p>
@@ -556,7 +586,9 @@ export default function WarRoom() {
               </div>
 
               <div className="flex-1 overflow-y-auto p-6 space-y-4 min-h-[200px]">
-                {roomMessages.length === 0 ? (
+                {messagesError ? (
+                  <LoadErrorBanner what="messages" error={messagesError} />
+                ) : roomMessages.length === 0 ? (
                   <p className="text-gray-500 text-center py-8">No messages yet. Start the conversation.</p>
                 ) : (
                   roomMessages.map((msg) => (

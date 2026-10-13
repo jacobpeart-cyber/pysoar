@@ -18,6 +18,7 @@ import {
 } from 'lucide-react';
 // recharts imports removed - timeline chart not available in dashboard response
 import clsx from 'clsx';
+import LoadErrorBanner from '../components/LoadErrorBanner';
 
 interface DeceptionDashboardStats {
   total_decoys: number;
@@ -167,64 +168,54 @@ export default function DeceptionTech() {
   const queryClient = useQueryClient();
 
   // Fetch deception dashboard
-  const { data: dashboard, isLoading: dashboardLoading } = useQuery({
+  const { data: dashboard, isLoading: dashboardLoading, error: dashboardError } = useQuery({
     queryKey: ['deceptionDashboard'],
     queryFn: async () => {
-      try {
       const response = await api.get<DeceptionDashboard>('/deception/dashboard');
       return response.data;
-      } catch { return null; }
     },
   });
 
   // Fetch decoys
-  const { data: decoys, isLoading: decoysLoading } = useQuery({
+  const { data: decoys, isLoading: decoysLoading, error: decoysError } = useQuery({
     queryKey: ['decoys', decoyTypeFilter, decoyStatusFilter],
     queryFn: async () => {
       const params: Record<string, any> = {};
       if (decoyTypeFilter !== 'all') params.decoy_type = decoyTypeFilter;
       if (decoyStatusFilter !== 'all') params.status = decoyStatusFilter;
 
-      try {
       const response = await api.get<Decoy[]>('/deception/decoys', { params });
       return response.data;
-      } catch { return null; }
     },
   });
 
   // Fetch honey tokens
-  const { data: tokens, isLoading: tokensLoading } = useQuery({
+  const { data: tokens, isLoading: tokensLoading, error: tokensError } = useQuery({
     queryKey: ['honeyTokens'],
     queryFn: async () => {
-      try {
       const response = await api.get<HoneyToken[]>('/deception/tokens');
       return response.data;
-      } catch { return null; }
     },
   });
 
   // Fetch interactions
-  const { data: interactions, isLoading: interactionsLoading } = useQuery({
+  const { data: interactions, isLoading: interactionsLoading, error: interactionsError } = useQuery({
     queryKey: ['interactions', threatLevelFilter],
     queryFn: async () => {
       const params: Record<string, any> = {};
       if (threatLevelFilter !== 'all') params.threat_level = threatLevelFilter;
 
-      try {
       const response = await api.get<Interaction[]>('/deception/interactions', { params });
       return response.data;
-      } catch { return null; }
     },
   });
 
   // Fetch campaigns
-  const { data: campaigns, isLoading: campaignsLoading } = useQuery({
+  const { data: campaigns, isLoading: campaignsLoading, error: campaignsError } = useQuery({
     queryKey: ['campaigns'],
     queryFn: async () => {
-      try {
       const response = await api.get<Campaign[]>('/deception/campaigns');
       return response.data;
-      } catch { return null; }
     },
   });
 
@@ -277,27 +268,29 @@ export default function DeceptionTech() {
           {/* Stats */}
           {dashboardLoading ? (
             <div className="text-center py-8 text-gray-500 dark:text-gray-400">Loading dashboard...</div>
+          ) : dashboardError ? (
+            <LoadErrorBanner what="the deception dashboard" error={dashboardError} />
           ) : (
           <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
               <p className="text-gray-600 dark:text-gray-400 text-sm">Active Decoys</p>
-              <p className="text-3xl font-bold text-green-600 dark:text-green-400 mt-2">{dashboard?.stats?.active_decoys ?? 0}</p>
+              <p className="text-3xl font-bold text-green-600 dark:text-green-400 mt-2">{dashboard?.stats?.active_decoys ?? 'not available'}</p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
               <p className="text-gray-600 dark:text-gray-400 text-sm">Tokens Deployed</p>
-              <p className="text-3xl font-bold text-purple-600 dark:text-purple-400 mt-2">{dashboard?.stats?.total_honeytokens ?? 0}</p>
+              <p className="text-3xl font-bold text-purple-600 dark:text-purple-400 mt-2">{dashboard?.stats?.total_honeytokens ?? 'not available'}</p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
               <p className="text-gray-600 dark:text-gray-400 text-sm">Interactions Today</p>
-              <p className="text-3xl font-bold text-orange-600 dark:text-orange-400 mt-2">{dashboard?.stats?.interactions_today ?? 0}</p>
+              <p className="text-3xl font-bold text-orange-600 dark:text-orange-400 mt-2">{dashboard?.stats?.interactions_today ?? 'not available'}</p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
               <p className="text-gray-600 dark:text-gray-400 text-sm">Unique Attackers</p>
-              <p className="text-3xl font-bold text-red-600 dark:text-red-400 mt-2">{dashboard?.stats?.unique_attackers_today ?? 0}</p>
+              <p className="text-3xl font-bold text-red-600 dark:text-red-400 mt-2">{dashboard?.stats?.unique_attackers_today ?? 'not available'}</p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
               <p className="text-gray-600 dark:text-gray-400 text-sm">Active Campaigns</p>
-              <p className="text-3xl font-bold text-blue-600 dark:text-blue-400 mt-2">{dashboard?.stats?.active_campaigns ?? 0}</p>
+              <p className="text-3xl font-bold text-blue-600 dark:text-blue-400 mt-2">{dashboard?.stats?.active_campaigns ?? 'not available'}</p>
             </div>
           </div>
           )}
@@ -320,7 +313,9 @@ export default function DeceptionTech() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-                {(dashboard?.recent_interactions || []).length === 0 ? (
+                {dashboardError ? (
+                  <tr><td colSpan={5} className="px-6 py-8 text-center text-gray-500 dark:text-gray-400">Recent interactions not available.</td></tr>
+                ) : (dashboard?.recent_interactions || []).length === 0 ? (
                   <tr><td colSpan={5} className="px-6 py-8 text-center text-gray-500 dark:text-gray-400">No recent interactions</td></tr>
                 ) : (dashboard?.recent_interactions || []).slice(0, 10).map((interaction) => (
                   <tr key={interaction.id} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
@@ -380,6 +375,8 @@ export default function DeceptionTech() {
           {/* Decoys Grid */}
           {decoysLoading ? (
             <div className="text-center py-8 text-gray-500 dark:text-gray-400">Loading decoys...</div>
+          ) : decoysError ? (
+            <LoadErrorBanner what="decoys" error={decoysError} />
           ) : (decoys || []).length === 0 ? (
             <div className="text-center py-8 text-gray-500 dark:text-gray-400">No decoys found. Deploy one to get started.</div>
           ) : (
@@ -478,6 +475,8 @@ export default function DeceptionTech() {
               <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
                 {tokensLoading ? (
                   <tr><td colSpan={7} className="px-6 py-8 text-center text-gray-500 dark:text-gray-400">Loading tokens...</td></tr>
+                ) : tokensError ? (
+                  <tr><td colSpan={7} className="px-6 py-4"><LoadErrorBanner what="honey tokens" error={tokensError} /></td></tr>
                 ) : (tokens || []).length === 0 ? (
                   <tr><td colSpan={7} className="px-6 py-8 text-center text-gray-500 dark:text-gray-400">No honey tokens found. Generate one to get started.</td></tr>
                 ) : (tokens || []).slice(0, 15).map((token) => (
@@ -554,6 +553,8 @@ export default function DeceptionTech() {
               <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
                 {interactionsLoading ? (
                   <tr><td colSpan={7} className="px-6 py-8 text-center text-gray-500 dark:text-gray-400">Loading interactions...</td></tr>
+                ) : interactionsError ? (
+                  <tr><td colSpan={7} className="px-6 py-4"><LoadErrorBanner what="interactions" error={interactionsError} /></td></tr>
                 ) : (interactions || []).length === 0 ? (
                   <tr><td colSpan={7} className="px-6 py-8 text-center text-gray-500 dark:text-gray-400">No interactions found.</td></tr>
                 ) : (interactions || []).slice(0, 20).map((interaction) => (
@@ -597,6 +598,8 @@ export default function DeceptionTech() {
           {/* Campaigns Grid */}
           {campaignsLoading ? (
             <div className="text-center py-8 text-gray-500 dark:text-gray-400">Loading campaigns...</div>
+          ) : campaignsError ? (
+            <LoadErrorBanner what="campaigns" error={campaignsError} />
           ) : (campaigns || []).length === 0 ? (
             <div className="text-center py-8 text-gray-500 dark:text-gray-400">No campaigns found. Create one to get started.</div>
           ) : (

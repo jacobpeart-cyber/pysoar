@@ -14,6 +14,7 @@ import {
   ChevronRight,
 } from 'lucide-react';
 import clsx from 'clsx';
+import LoadErrorBanner from '../components/LoadErrorBanner';
 
 interface Agent {
   id: string;
@@ -111,28 +112,20 @@ export default function AgentManagement() {
   });
   const [copied, setCopied] = useState(false);
 
-  const { data: dashboard } = useQuery({
+  const { data: dashboard, error: dashboardError } = useQuery({
     queryKey: ['agents-dashboard'],
     queryFn: async () => {
-      try {
-        const r = await api.get<Dashboard>('/agents/dashboard');
-        return r.data;
-      } catch {
-        return null;
-      }
+      const r = await api.get<Dashboard>('/agents/dashboard');
+      return r.data;
     },
     refetchInterval: 5000,
   });
 
-  const { data: agents } = useQuery({
+  const { data: agents, error: agentsError } = useQuery({
     queryKey: ['agents-list'],
     queryFn: async () => {
-      try {
-        const r = await api.get<{ total: number; agents: Agent[] }>('/agents');
-        return r.data.agents ?? [];
-      } catch {
-        return [];
-      }
+      const r = await api.get<{ total: number; agents: Agent[] }>('/agents');
+      return r.data.agents ?? [];
     },
     refetchInterval: 5000,
   });
@@ -215,30 +208,32 @@ export default function AgentManagement() {
         </div>
       </div>
 
+      <LoadErrorBanner what="the agent dashboard" error={dashboardError} />
+
       {/* Stat tiles */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <StatTile
           label="Active Agents"
-          value={dashboard?.active_agents ?? 0}
-          total={dashboard?.total_agents ?? 0}
+          value={dashboard?.active_agents ?? null}
+          total={dashboard?.total_agents ?? null}
           icon={<CheckCircle className="w-5 h-5" />}
           color="text-green-600"
         />
         <StatTile
           label="Offline"
-          value={dashboard?.offline_agents ?? 0}
+          value={dashboard?.offline_agents ?? null}
           icon={<XCircle className="w-5 h-5" />}
           color="text-gray-500"
         />
         <StatTile
           label="Commands in Flight"
-          value={dashboard?.commands_in_flight ?? 0}
+          value={dashboard?.commands_in_flight ?? null}
           icon={<Clock className="w-5 h-5" />}
           color="text-blue-600"
         />
         <StatTile
           label="Awaiting Approval"
-          value={dashboard?.commands_awaiting_approval ?? 0}
+          value={dashboard?.commands_awaiting_approval ?? null}
           icon={<ShieldAlert className="w-5 h-5" />}
           color="text-yellow-600"
         />
@@ -256,7 +251,7 @@ export default function AgentManagement() {
               className={clsx('px-3 py-1 rounded-full text-xs font-medium', capabilityColors[cap])}
             >
               {cap.toUpperCase()}:{' '}
-              {dashboard?.capability_counts?.[cap as 'bas' | 'ir' | 'purple'] ?? 0}
+              {dashboard?.capability_counts?.[cap as 'bas' | 'ir' | 'purple'] ?? 'not available'}
             </span>
           ))}
         </div>
@@ -288,7 +283,14 @@ export default function AgentManagement() {
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-            {(!agents || agents.length === 0) && (
+            {!!agentsError && (
+              <tr>
+                <td colSpan={5} className="px-6 py-4">
+                  <LoadErrorBanner what="enrolled agents" error={agentsError} />
+                </td>
+              </tr>
+            )}
+            {!agentsError && (!agents || agents.length === 0) && (
               <tr>
                 <td
                   colSpan={5}
@@ -551,8 +553,8 @@ function StatTile({
   color,
 }: {
   label: string;
-  value: number;
-  total?: number;
+  value: number | null;
+  total?: number | null;
   icon: React.ReactNode;
   color: string;
 }) {
@@ -563,8 +565,8 @@ function StatTile({
         <span className={color}>{icon}</span>
       </div>
       <p className="text-3xl font-bold text-gray-900 dark:text-white mt-2">
-        {value}
-        {total !== undefined && (
+        {value ?? 'not available'}
+        {value != null && total != null && (
           <span className="text-lg text-gray-400 dark:text-gray-500 font-normal"> / {total}</span>
         )}
       </p>

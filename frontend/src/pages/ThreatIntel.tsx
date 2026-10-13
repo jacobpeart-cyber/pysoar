@@ -21,6 +21,8 @@ import {
   Download,
 } from 'lucide-react';
 import { api } from '../lib/api';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 import clsx from 'clsx';
 
 interface ThreatFeed {
@@ -34,11 +36,16 @@ interface ThreatFeed {
   status: 'active' | 'error' | 'disabled';
 }
 
+// Local sources (intel.py lookup) carry name/verdict/last_seen; external
+// enrichment sources (VirusTotal / AbuseIPDB) carry confidence plus either
+// `raw` (the provider's response excerpt) or `error`.
 interface LookupSource {
   name: string;
   verdict: string;
-  last_seen: string;
-  details: Record<string, unknown>;
+  last_seen?: string;
+  confidence?: number;
+  raw?: Record<string, unknown>;
+  error?: string;
 }
 
 interface IOCLookupResult {
@@ -52,7 +59,7 @@ interface IOCLookupResult {
   // they were previously declared but never rendered, so free VT data
   // was silently dropped.
   external_sources?: LookupSource[];
-  external_errors?: Array<{ source: string; error: string }>;
+  external_errors?: string[];
   tags: string[];
   first_seen: string | null;
   last_seen: string | null;
@@ -103,15 +110,13 @@ function IndicatorDetailContent({ indicatorId }: { indicatorId: string }) {
   }>({
     queryKey: ['threat-intel', 'indicator-detail', indicatorId],
     queryFn: async () => {
-      try {
       const response = await api.get(`/threat-intel/indicators/${indicatorId}`);
       return response.data;
-      } catch { return null; }
     },
   });
 
   if (isLoading) return <div className="flex justify-center py-8"><Loader2 className="w-6 h-6 animate-spin text-gray-400" /></div>;
-  if (error || !data) return <p className="text-sm text-red-500">Failed to load indicator details.</p>;
+  if (error || !data) return <p className="text-sm text-red-500">Failed to load indicator details. {describeLoadError(error)}</p>;
 
   return (
     <div className="space-y-3 text-sm">
@@ -178,16 +183,14 @@ export default function ThreatIntel() {
   const [iocPage, setIocPage] = useState(1);
   const [selectedIndicatorId, setSelectedIndicatorId] = useState<string | null>(null);
 
-  const { data: stats } = useQuery<ThreatStats>({
+  const { data: stats, error: statsError } = useQuery<ThreatStats>({
     queryKey: ['threat-intel', 'stats'],
     // Auto-refresh stats every 60s so operators see feed ingestion results
     // without manually reloading the page.
     refetchInterval: 60_000,
     queryFn: async () => {
-      try {
       const response = await api.get('/threat-intel/stats');
       return response.data;
-      } catch { return null; }
     },
   });
 
@@ -202,26 +205,24 @@ export default function ThreatIntel() {
     return defaultIndicatorTypes;
   }, []);
 
-  const { data: feeds, refetch: refetchFeeds } = useQuery<ThreatFeed[]>({
+  const { data: feeds, refetch: refetchFeeds, error: feedsError } = useQuery<ThreatFeed[]>({
     queryKey: ['threat-intel', 'feeds'],
     // Auto-refresh feeds every 60s so sync progress shows up naturally.
     refetchInterval: 60_000,
     queryFn: async () => {
-      try {
-        const response = await api.get('/threat-intel/feeds');
-        const d = response.data;
-        const items = Array.isArray(d) ? d : (d?.items ?? []);
-        // Backend doesn't populate a "status" field — derive it from
-        // is_enabled + last_error + last_poll_at.
-        return items.map((f: any) => ({
-          ...f,
-          status: !f.is_enabled
-            ? 'disabled'
-            : f.last_error
-              ? 'error'
-              : 'active',
-        }));
-      } catch { return []; }
+      const response = await api.get('/threat-intel/feeds');
+      const d = response.data;
+      const items = Array.isArray(d) ? d : (d?.items ?? []);
+      // Backend doesn't populate a "status" field — derive it from
+      // is_enabled + last_error + last_poll_at.
+      return items.map((f: any) => ({
+        ...f,
+        status: !f.is_enabled
+          ? 'disabled'
+          : f.last_error
+            ? 'error'
+            : 'active',
+      }));
     },
   });
 
@@ -250,7 +251,7 @@ export default function ThreatIntel() {
     return params;
   }, [iocPage, iocTypeFilter, iocReputationFilter]);
 
-  const { data: iocData, isLoading: iocLoading } = useQuery<{
+  const { data: iocData, isLoading: iocLoading, error: iocError } = useQuery<{
     items: Array<{
       id: string;
       indicator_type: string;
@@ -268,29 +269,23 @@ export default function ThreatIntel() {
   }>({
     queryKey: ['threat-intel', 'ioc-database', iocQueryParams],
     queryFn: async () => {
-      try {
       const response = await api.get('/threat-intel/indicators', { params: iocQueryParams });
       return response.data;
-      } catch { return null; }
     },
     enabled: activeTab === 'iocs',
   });
 
   const lookupMutation = useMutation<IOCLookupResult, Error, { indicator: string; type: string }>({
     mutationFn: async ({ indicator, type }) => {
-      try {
       const response = await api.post('/threat-intel/lookup', { indicator, type });
       return response.data;
-      } catch { return null; }
     },
   });
 
   const syncFeedMutation = useMutation({
     mutationFn: async (feedId: string) => {
-      try {
       const response = await api.post(`/threat-intel/feeds/${feedId}/sync`);
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
       refetchFeeds();
@@ -328,6 +323,8 @@ export default function ThreatIntel() {
         </div>
       </div>
 
+      <LoadErrorBanner what="threat intel statistics" error={statsError} />
+
       {/* Stats Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
         <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
@@ -338,7 +335,7 @@ export default function ThreatIntel() {
             <div>
               <p className="text-sm text-gray-500 dark:text-gray-400">Total Indicators</p>
               <p className="text-xl font-semibold text-gray-900 dark:text-white">
-                {stats?.total_indicators?.toLocaleString() || 0}
+                {stats?.total_indicators?.toLocaleString() ?? 'not available'}
               </p>
             </div>
           </div>
@@ -352,7 +349,7 @@ export default function ThreatIntel() {
             <div>
               <p className="text-sm text-gray-500 dark:text-gray-400">Malicious IPs</p>
               <p className="text-xl font-semibold text-gray-900 dark:text-white">
-                {stats?.malicious_ips?.toLocaleString() || 0}
+                {stats?.malicious_ips?.toLocaleString() ?? 'not available'}
               </p>
             </div>
           </div>
@@ -366,7 +363,7 @@ export default function ThreatIntel() {
             <div>
               <p className="text-sm text-gray-500 dark:text-gray-400">Malicious Domains</p>
               <p className="text-xl font-semibold text-gray-900 dark:text-white">
-                {stats?.malicious_domains?.toLocaleString() || 0}
+                {stats?.malicious_domains?.toLocaleString() ?? 'not available'}
               </p>
             </div>
           </div>
@@ -380,7 +377,7 @@ export default function ThreatIntel() {
             <div>
               <p className="text-sm text-gray-500 dark:text-gray-400">Malicious Hashes</p>
               <p className="text-xl font-semibold text-gray-900 dark:text-white">
-                {stats?.malicious_hashes?.toLocaleString() || 0}
+                {stats?.malicious_hashes?.toLocaleString() ?? 'not available'}
               </p>
             </div>
           </div>
@@ -394,7 +391,7 @@ export default function ThreatIntel() {
             <div>
               <p className="text-sm text-gray-500 dark:text-gray-400">Active Feeds</p>
               <p className="text-xl font-semibold text-gray-900 dark:text-white">
-                {stats?.feeds_active || 0}
+                {stats?.feeds_active ?? 'not available'}
               </p>
             </div>
           </div>
@@ -630,19 +627,22 @@ export default function ThreatIntel() {
                             {source.verdict}
                           </span>
                         </div>
-                        {source.details && Object.keys(source.details).length > 0 && (
+                        {source.raw && Object.keys(source.raw).length > 0 && (
                           <pre className="mt-2 text-xs text-gray-600 dark:text-gray-400 whitespace-pre-wrap break-all">
-                            {JSON.stringify(source.details, null, 2)}
+                            {JSON.stringify(source.raw, null, 2)}
                           </pre>
+                        )}
+                        {source.error && (
+                          <p className="mt-2 text-xs text-red-600 dark:text-red-400 break-all">{source.error}</p>
                         )}
                       </div>
                     ))}
-                    {lookupMutation.data?.external_errors?.map((err, idx) => (
+                    {lookupMutation.data?.external_errors?.map((err: string, idx: number) => (
                       <div
                         key={`err-${idx}`}
                         className="p-3 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-100 dark:border-yellow-900 rounded-lg text-xs text-yellow-800 dark:text-yellow-300"
                       >
-                        <strong>{err.source}:</strong> {err.error}
+                        {err}
                       </div>
                     ))}
                   </div>
@@ -657,7 +657,7 @@ export default function ThreatIntel() {
               <div className="flex items-center gap-3">
                 <XCircle className="w-5 h-5 text-red-600 dark:text-red-400" />
                 <p className="text-sm text-red-700 dark:text-red-300">
-                  Failed to lookup indicator. Please try again.
+                  Failed to lookup indicator. {describeLoadError(lookupMutation.error)}
                 </p>
               </div>
             </div>
@@ -668,6 +668,10 @@ export default function ThreatIntel() {
       {/* Feeds Tab */}
       {activeTab === 'feeds' && (
         <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
+          <LoadErrorBanner what="threat feeds" error={feedsError} />
+          {syncFeedMutation.error ? (
+            <p role="alert" className="m-4 text-sm text-red-700 dark:text-red-300">Feed sync failed. {describeLoadError(syncFeedMutation.error)}</p>
+          ) : null}
           <div className="p-4 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between">
             <h3 className="font-medium text-gray-900 dark:text-white">Threat Intelligence Feeds</h3>
             <button
@@ -679,7 +683,7 @@ export default function ThreatIntel() {
             </button>
           </div>
           <div className="divide-y divide-gray-200 dark:divide-gray-700">
-            {feeds?.map((feed) => (
+            {(feeds ?? []).map((feed) => (
               <div key={feed.id} className="p-4 flex items-center justify-between">
                 <div className="flex items-center gap-4">
                   <div
@@ -727,11 +731,11 @@ export default function ThreatIntel() {
                   </button>
                 </div>
               </div>
-            )) || (
+            ))}
+            {feeds && feeds.length === 0 && (
               <div className="p-8 text-center text-gray-500 dark:text-gray-400">
                 <Activity className="w-12 h-12 mx-auto mb-3 opacity-50" />
                 <p>No threat feeds configured</p>
-                <p className="text-sm">Configure feeds in Settings &gt; Integrations</p>
               </div>
             )}
           </div>
@@ -741,6 +745,7 @@ export default function ThreatIntel() {
       {/* IOCs Tab */}
       {activeTab === 'iocs' && (
         <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
+          <LoadErrorBanner what="IOC database" error={iocError} />
           <div className="p-4 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between">
             <h3 className="font-medium text-gray-900 dark:text-white">IOC Database</h3>
             <div className="flex items-center gap-2">

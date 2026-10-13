@@ -15,11 +15,13 @@ import {
 } from 'lucide-react';
 import { XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar } from 'recharts';
 import clsx from 'clsx';
+import LoadErrorBanner from '../components/LoadErrorBanner';
 
+// UEBADashboardStats (src/schemas/ueba.py)
 interface UEBADashboard {
   total_entities: number;
   watched_entities: number;
-  high_risk_entities: Entity[];
+  high_risk_entities: HighRiskEntity[];
   risk_distribution: { level: string; count: number }[];
   alert_distribution: { severity: string; count: number }[];
   alerts_last_7d: number;
@@ -29,9 +31,23 @@ interface UEBADashboard {
   updated_at: string;
 }
 
+// HighRiskEntity (src/schemas/ueba.py): the dashboard's top-10 projection.
+interface HighRiskEntity {
+  id: string;
+  entity_id: string;
+  entity_type: string;
+  risk_score: number;
+  risk_level: 'critical' | 'high' | 'medium' | 'low';
+  latest_alert?: string | null;
+  last_anomaly_at?: string | null;
+}
+
+// EntityProfileResponse: there is no `name`; display_name is optional and
+// entity_id is the stable identifier.
 interface Entity {
   id: string;
-  name: string;
+  entity_id: string;
+  display_name?: string | null;
   entity_type: 'user' | 'host' | 'service_account';
   department?: string;
   risk_score: number;
@@ -71,6 +87,9 @@ interface BehaviorEvent {
 }
 
 
+const entityLabel = (e: { display_name?: string | null; entity_id?: string } | undefined) =>
+  e?.display_name || e?.entity_id;
+
 const riskLevelColors = {
   critical: 'text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20',
   high: 'text-orange-600 dark:text-orange-400 bg-orange-50 dark:bg-orange-900/20',
@@ -109,18 +128,16 @@ export default function UEBADashboard() {
   const [escalateAlert, setEscalateAlert] = useState<RiskAlert | null>(null);
 
   // Fetch UEBA dashboard
-  const { data: dashboard } = useQuery({
+  const { data: dashboard, error: dashboardError } = useQuery({
     queryKey: ['uebaDashboard'],
     queryFn: async () => {
-      try {
       const response = await api.get<UEBADashboard>('/ueba/dashboard');
       return response.data;
-      } catch { return null; }
     },
   });
 
   // Fetch entities
-  const { data: entities } = useQuery({
+  const { data: entities, error: entitiesError } = useQuery({
     queryKey: ['ueba-entities', entityTypeFilter, riskLevelFilter, searchQuery],
     queryFn: async () => {
       const params: Record<string, any> = {};
@@ -128,32 +145,26 @@ export default function UEBADashboard() {
       if (riskLevelFilter !== 'all') params.risk_level = riskLevelFilter;
       if (searchQuery) params.search = searchQuery;
 
-      try {
       const response = await api.get<Entity[]>('/ueba/entities', { params });
       return response.data;
-      } catch { return null; }
     },
   });
 
   // Fetch risk alerts
-  const { data: alerts } = useQuery({
+  const { data: alerts, error: alertsError } = useQuery({
     queryKey: ['ueba-alerts'],
     queryFn: async () => {
-      try {
       const response = await api.get<RiskAlert[]>('/ueba/alerts');
       return response.data;
-      } catch { return null; }
     },
   });
 
   // Fetch peer groups
-  const { data: peerGroups } = useQuery({
+  const { data: peerGroups, error: peerGroupsError } = useQuery({
     queryKey: ['ueba-peer-groups'],
     queryFn: async () => {
-      try {
       const response = await api.get<PeerGroup[]>('/ueba/peer-groups');
       return response.data;
-      } catch { return null; }
     },
   });
 
@@ -203,23 +214,28 @@ export default function UEBADashboard() {
       {/* Risk Overview */}
       {activeTab === 'overview' && (
         <div className="space-y-6">
+          <LoadErrorBanner what="the UEBA dashboard" error={dashboardError} />
           {/* Stats */}
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
               <p className="text-gray-600 dark:text-gray-400 text-sm">Entities Monitored</p>
-              <p className="text-3xl font-bold text-gray-900 dark:text-white mt-2">{dashboard?.total_entities ?? 0}</p>
+              <p className="text-3xl font-bold text-gray-900 dark:text-white mt-2">{dashboard?.total_entities ?? 'not available'}</p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
               <p className="text-gray-600 dark:text-gray-400 text-sm">High-Risk Entities</p>
-              <p className="text-3xl font-bold text-red-600 dark:text-red-400 mt-2">{Array.isArray(dashboard?.high_risk_entities) ? dashboard.high_risk_entities.length : 0}</p>
+              <p className="text-3xl font-bold text-red-600 dark:text-red-400 mt-2">{Array.isArray(dashboard?.risk_distribution)
+                ? dashboard.risk_distribution
+                    .filter((r) => r.level === 'critical' || r.level === 'high')
+                    .reduce((sum, r) => sum + r.count, 0)
+                : 'not available'}</p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
               <p className="text-gray-600 dark:text-gray-400 text-sm">Alerts (7d)</p>
-              <p className="text-3xl font-bold text-orange-600 dark:text-orange-400 mt-2">{dashboard?.alerts_last_7d ?? 0}</p>
+              <p className="text-3xl font-bold text-orange-600 dark:text-orange-400 mt-2">{dashboard?.alerts_last_7d ?? 'not available'}</p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
               <p className="text-gray-600 dark:text-gray-400 text-sm">Anomalies (7d)</p>
-              <p className="text-3xl font-bold text-blue-600 dark:text-blue-400 mt-2">{dashboard?.anomalies_last_7d ?? 0}</p>
+              <p className="text-3xl font-bold text-blue-600 dark:text-blue-400 mt-2">{dashboard?.anomalies_last_7d ?? 'not available'}</p>
             </div>
           </div>
 
@@ -258,14 +274,14 @@ export default function UEBADashboard() {
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Type</th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Risk Score</th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Level</th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Anomalies (30d)</th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Last Activity</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Latest Alert</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Last Anomaly</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
                 {(Array.isArray(dashboard?.high_risk_entities) && dashboard.high_risk_entities.length > 0) ? dashboard.high_risk_entities.slice(0, 10).map((entity) => (
                   <tr key={entity.id} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
-                    <td className="px-6 py-4 font-medium text-gray-900 dark:text-white">{entity.name ?? '—'}</td>
+                    <td className="px-6 py-4 font-medium text-gray-900 dark:text-white">{entity.entity_id || '—'}</td>
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 capitalize">{entity.entity_type ?? '—'}</td>
                     <td className="px-6 py-4">
                       <div className="flex items-center gap-2">
@@ -288,9 +304,9 @@ export default function UEBADashboard() {
                         </span>
                       ) : '—'}
                     </td>
-                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{entity.anomaly_count_30d ?? 0}</td>
+                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{entity.latest_alert || '—'}</td>
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                      {entity.last_activity_at ? new Date(entity.last_activity_at || "").toLocaleString() : '—'}
+                      {entity.last_anomaly_at ? new Date(entity.last_anomaly_at).toLocaleString() : '—'}
                     </td>
                   </tr>
                 )) : (
@@ -309,6 +325,7 @@ export default function UEBADashboard() {
       {/* Entities Tab */}
       {activeTab === 'entities' && (
         <div className="space-y-6">
+          <LoadErrorBanner what="entities" error={entitiesError} />
           {/* Search and Filters */}
           <div className="flex flex-col md:flex-row gap-4">
             <div className="flex-1 relative">
@@ -366,7 +383,7 @@ export default function UEBADashboard() {
                     className="hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors cursor-pointer"
                   >
                     <td className="px-6 py-4">
-                      <p className="font-medium text-gray-900 dark:text-white">{entity.name ?? '—'}</p>
+                      <p className="font-medium text-gray-900 dark:text-white">{entityLabel(entity) ?? '—'}</p>
                     </td>
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 capitalize">{entity.entity_type ?? '—'}</td>
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{entity.department || '—'}</td>
@@ -397,7 +414,7 @@ export default function UEBADashboard() {
                 )) : (
                   <tr>
                     <td colSpan={7} className="px-6 py-8 text-center text-gray-500 dark:text-gray-400">
-                      {entities === undefined ? 'Loading entities...' : 'No entities found.'}
+                      {entitiesError ? 'Entities not available.' : entities === undefined ? 'Loading entities...' : 'No entities found.'}
                     </td>
                   </tr>
                 )}
@@ -408,6 +425,7 @@ export default function UEBADashboard() {
       )}
 
       {/* Risk Alerts Tab */}
+      {activeTab === 'alerts' && <LoadErrorBanner what="risk alerts" error={alertsError} />}
       {activeTab === 'alerts' && (
         <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
           <table className="w-full">
@@ -429,7 +447,7 @@ export default function UEBADashboard() {
                     {alert.created_at ? new Date(alert.created_at || "").toLocaleString() : '—'}
                   </td>
                   <td className="px-6 py-4 font-medium text-gray-900 dark:text-white">
-                    {entities?.find(ent => ent.id === alert.entity_profile_id)?.name ?? alert.entity_profile_id ?? '—'}
+                    {entityLabel(entities?.find(ent => ent.id === alert.entity_profile_id)) ?? alert.entity_profile_id ?? '—'}
                   </td>
                   <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{alert.alert_type ?? '—'}</td>
                   <td className="px-6 py-4">
@@ -472,7 +490,7 @@ export default function UEBADashboard() {
               )) : (
                 <tr>
                   <td colSpan={7} className="px-6 py-8 text-center text-gray-500 dark:text-gray-400">
-                    {alerts === undefined ? 'Loading alerts...' : 'No alerts found.'}
+                    {alertsError ? 'Alerts not available.' : alerts === undefined ? 'Loading alerts...' : 'No alerts found.'}
                   </td>
                 </tr>
               )}
@@ -484,6 +502,7 @@ export default function UEBADashboard() {
       {/* Peer Groups Tab */}
       {activeTab === 'peers' && (
         <div className="space-y-6">
+          <LoadErrorBanner what="peer groups" error={peerGroupsError} />
           <button
             onClick={async () => {
               try {
@@ -522,7 +541,7 @@ export default function UEBADashboard() {
             </div>
           ) : (
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-8 text-center text-gray-500 dark:text-gray-400">
-              {peerGroups === undefined ? 'Loading peer groups...' : 'No peer groups found. Click Auto-Cluster to create groups.'}
+              {peerGroupsError ? 'Peer groups not available.' : peerGroups === undefined ? 'Loading peer groups...' : 'No peer groups found. Click Auto-Cluster to create groups.'}
             </div>
           )}
         </div>
@@ -563,17 +582,12 @@ interface IncidentSummary {
 function TimelineTab({ entities }: { entities: Entity[] }) {
   const [entityId, setEntityId] = useState<string>('');
 
-  const { data: timeline, isLoading } = useQuery<{ events: any[] } | null>({
+  const { data: timeline, isLoading, error: timelineError } = useQuery<{ events: any[] } | null>({
     queryKey: ['ueba-entity-timeline', entityId],
     queryFn: async () => {
       if (!entityId) return null;
-      try {
-        const response = await api.get(`/ueba/entities/${entityId}/timeline`, { params: { days: 7 } });
-        return response.data;
-      } catch (err) {
-        console.error('Failed to load timeline:', err);
-        return null;
-      }
+      const response = await api.get(`/ueba/entities/${entityId}/timeline`, { params: { days: 7 } });
+      return response.data;
     },
     enabled: !!entityId,
   });
@@ -592,7 +606,7 @@ function TimelineTab({ entities }: { entities: Entity[] }) {
     is_anomaly: Boolean(e.is_anomalous ?? e.is_anomaly),
     severity: e.severity,
   }));
-  const selectedName = entities.find((e) => e.id === entityId)?.name;
+  const selectedName = entityLabel(entities.find((e) => e.id === entityId));
 
   return (
     <div className="space-y-6">
@@ -605,7 +619,7 @@ function TimelineTab({ entities }: { entities: Entity[] }) {
         >
           <option value="">Choose an entity...</option>
           {entities.map((entity) => (
-            <option key={entity.id} value={entity.id}>{entity.name ?? entity.id}</option>
+            <option key={entity.id} value={entity.id}>{entityLabel(entity) ?? entity.id}</option>
           ))}
         </select>
         {selectedName && (
@@ -621,6 +635,8 @@ function TimelineTab({ entities }: { entities: Entity[] }) {
         <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-8 text-center text-gray-500 dark:text-gray-400">
           Loading timeline...
         </div>
+      ) : timelineError ? (
+        <LoadErrorBanner what="the behavior timeline" error={timelineError} />
       ) : events.length === 0 ? (
         <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-8 text-center text-gray-500 dark:text-gray-400">
           No behavior events recorded in the last 7 days.
@@ -680,17 +696,13 @@ function EscalateAlertModal({
   const [error, setError] = useState<string | null>(null);
 
   // Fetch open incidents (size=50, status=open) so the user can pick from a dropdown.
-  const { data: incidentsResp, isLoading: incidentsLoading } = useQuery({
+  const { data: incidentsResp, isLoading: incidentsLoading, error: incidentsError } = useQuery({
     queryKey: ['incidents', 'open-for-escalate'],
     queryFn: async () => {
-      try {
-        const response = await api.get('/incidents', {
-          params: { status: 'open', size: 50, sort_by: 'created_at', sort_order: 'desc' },
-        });
-        return response.data;
-      } catch {
-        return null;
-      }
+      const response = await api.get('/incidents', {
+        params: { status: 'open', size: 50, sort_by: 'created_at', sort_order: 'desc' },
+      });
+      return response.data;
     },
   });
   const incidents: IncidentSummary[] = Array.isArray(incidentsResp?.items)
@@ -813,7 +825,9 @@ function EscalateAlertModal({
                   </option>
                 ))}
               </select>
-              {!incidentsLoading && incidents.length === 0 && (
+              {incidentsError ? (
+                <div className="mt-1"><LoadErrorBanner what="open incidents" error={incidentsError} /></div>
+              ) : !incidentsLoading && incidents.length === 0 && (
                 <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
                   No open incidents found. Switch to "Create new incident".
                 </p>

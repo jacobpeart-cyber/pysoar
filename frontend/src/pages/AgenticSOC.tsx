@@ -27,6 +27,8 @@ import type { PendingApprovalRow } from '../api/endpoints';
 import { useAuth } from '../contexts/AuthContext';
 import ChatWorkbench from '../components/ChatWorkbench';
 import PendingApprovals from '../components/agentic/PendingApprovals';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 
 type TabId = 'chat' | 'investigations' | 'approvals' | 'triage' | 'anomalies' | 'predictions' | 'models' | 'agents';
 
@@ -67,12 +69,27 @@ const AgenticSOC: React.FC = () => {
   const [pendingApprovals, setPendingApprovals] = useState<PendingApprovalRow[]>([]);
   const [reasoningChain, setReasoningChain] = useState<any[]>([]);
   const [timelineData, setTimelineData] = useState<any[]>([]);
-  const [agentMetrics, setAgentMetrics] = useState({
-    activeAgents: 0,
-    openInvestigations: 0,
-    avgConfidenceScore: 0,
-    actionsPendingApproval: 0,
+  // Summary cards read the org-wide aggregates the backend computes
+  // (GET /agentic/dashboard/metrics, /agentic/dashboard/investigation-metrics
+  // and the `total` of /agentic/actions/pending-approval). `null` means the
+  // number is not available (request failed or field absent); the card
+  // says so instead of substituting a count of something else.
+  const [agentMetrics, setAgentMetrics] = useState<{
+    activeAgents: number | null;
+    openInvestigations: number | null;
+    avgConfidenceScore: number | null;
+    actionsPendingApproval: number | null;
+  }>({
+    activeAgents: null,
+    openInvestigations: null,
+    avgConfidenceScore: null,
+    actionsPendingApproval: null,
   });
+  // Per-section load failures, rendered with LoadErrorBanner next to the
+  // section they affect instead of being swallowed into empty lists.
+  const [loadErrors, setLoadErrors] = useState<Record<string, unknown>>({});
+  const setLoadError = (key: string, err: unknown) =>
+    setLoadErrors((prev) => (prev[key] === err ? prev : { ...prev, [key]: err }));
 
   // AI Engine absorbed state
   const [aiDashboard, setAiDashboard] = useState<any>(null);
@@ -91,15 +108,53 @@ const AgenticSOC: React.FC = () => {
     setTimeout(() => setStatusToast(null), 4000);
   };
 
+  // Investigation statuses that end an investigation; everything else in
+  // the backend's by_status breakdown counts as open.
+  const CLOSED_INVESTIGATION_STATUSES = ['completed', 'escalated', 'abandoned'];
+
+  const numOrNull = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+
+  // Resolve a request to its response, recording (or clearing) the
+  // section's load error instead of swallowing it.
+  const tracked = <T,>(key: string, p: Promise<T>): Promise<T | null> =>
+    p.then(
+      (r) => { setLoadError(key, null); return r; },
+      (e) => { setLoadError(key, e); return null; },
+    );
+
+  const loadSummary = async () => {
+    const [metricsRes, invMetricsRes] = await Promise.all([
+      tracked('summary', api.get('/agentic/dashboard/metrics')),
+      tracked('investigationMetrics', api.get('/agentic/dashboard/investigation-metrics')),
+    ]);
+    const byStatus = invMetricsRes?.data?.by_status;
+    const openInvestigations = byStatus && typeof byStatus === 'object'
+      ? Object.entries(byStatus as Record<string, number>)
+          .filter(([status]) => !CLOSED_INVESTIGATION_STATUSES.includes(status))
+          .reduce((sum, [, n]) => sum + Number(n), 0)
+      : null;
+    // The backend averages only investigations with a recorded confidence,
+    // but collapses "nothing to average" to 0.0; a 0 here is shown as not
+    // available rather than as a 0% score.
+    const avgConf = numOrNull(invMetricsRes?.data?.avg_confidence_score);
+    setAgentMetrics((m) => ({
+      ...m,
+      activeAgents: numOrNull(metricsRes?.data?.agents_active),
+      openInvestigations,
+      avgConfidenceScore: avgConf !== null && avgConf > 0 ? avgConf : null,
+    }));
+  };
+
   useEffect(() => {
     const loadData = async () => {
       setLoading(true);
       setError(null);
       try {
         const [agentsRes, investigationsRes, actionsRes] = await Promise.all([
-          api.get('/agentic/agents').catch(() => ({ data: { items: [] } })),
-          api.get('/agentic/investigations').catch(() => ({ data: { items: [] } })),
-          api.get('/agentic/actions/pending-approval').catch(() => ({ data: { items: [] } })),
+          tracked('agents', api.get('/agentic/agents')),
+          tracked('investigations', api.get('/agentic/investigations')),
+          tracked('actions', api.get('/agentic/actions/pending-approval')),
+          loadSummary(),
         ]);
 
         const agentList = agentsRes?.data?.items || (Array.isArray(agentsRes?.data) ? agentsRes.data : []);
@@ -110,19 +165,11 @@ const AgenticSOC: React.FC = () => {
         setInvestigations(invList);
         setPendingApprovals(actionList);
 
-        // Compute metrics from real data
-        const activeCount = agentList.filter((a: any) => a.status === 'active').length;
-        const openInv = invList.filter((i: any) => i.status !== 'completed' && i.status !== 'closed').length;
-        const avgConf = invList.length > 0
-          ? Math.round(invList.reduce((sum: number, i: any) => sum + (i.confidence_score || 0), 0) / (invList.length || 1) * 10) / 10
-          : 0;
-
-        setAgentMetrics({
-          activeAgents: activeCount || agentList.length,
-          openInvestigations: openInv || invList.length,
-          avgConfidenceScore: avgConf,
-          actionsPendingApproval: actionList.length,
-        });
+        // Pending count is the server's total, not the length of page 1.
+        setAgentMetrics((m) => ({
+          ...m,
+          actionsPendingApproval: actionsRes ? numOrNull(actionsRes.data?.total) : null,
+        }));
 
         // Build timeline from investigation timestamps
         const timelineMap: Record<string, number> = {};
@@ -162,6 +209,8 @@ const AgenticSOC: React.FC = () => {
               }))
             );
           } catch {
+            // reasoningChain is not rendered anywhere on this page yet
+            // (audit: UI-ONLY), so there is no section to report into.
             setReasoningChain([]);
           }
         }
@@ -175,25 +224,21 @@ const AgenticSOC: React.FC = () => {
     // Refresh investigations + agent metrics every 10s so the UI
     // reflects auto-triage kickoffs and live investigation progress
     // without a page reload. Other slow/one-shot data (AI models,
-    // dashboard counters) stays on-mount only.
+    // dashboard counters) stays on-mount only. A failed poll keeps the
+    // last good rows and surfaces the error next to the section.
     const pollId = window.setInterval(() => {
       (async () => {
-        try {
-          const [invRes, actRes] = await Promise.all([
-            api.get('/agentic/investigations').catch(() => ({ data: { items: [] } })),
-            api.get('/agentic/actions/pending-approval').catch(() => ({ data: { items: [] } })),
-          ]);
-          const invList = invRes?.data?.items || (Array.isArray(invRes?.data) ? invRes.data : []);
-          const actList = actRes?.data?.items || (Array.isArray(actRes?.data) ? actRes.data : []);
-          setInvestigations(invList);
-          setPendingApprovals(actList);
-          setAgentMetrics((m) => ({
-            ...m,
-            openInvestigations: invList.filter((i: any) => i.status !== 'completed' && i.status !== 'closed').length,
-            actionsPendingApproval: actList.length,
-          }));
-        } catch {
-          /* ignore transient poll errors */
+        const [invRes, actRes] = await Promise.all([
+          tracked('investigations', api.get('/agentic/investigations')),
+          tracked('actions', api.get('/agentic/actions/pending-approval')),
+          loadSummary(),
+        ]);
+        if (invRes) {
+          setInvestigations(invRes.data?.items || (Array.isArray(invRes.data) ? invRes.data : []));
+        }
+        if (actRes) {
+          setPendingApprovals(actRes.data?.items || (Array.isArray(actRes.data) ? actRes.data : []));
+          setAgentMetrics((m) => ({ ...m, actionsPendingApproval: numOrNull(actRes.data?.total) }));
         }
       })();
     }, 10000);
@@ -203,18 +248,14 @@ const AgenticSOC: React.FC = () => {
   // Load AI Engine data (dashboard, triage, models) once on mount
   useEffect(() => {
     const loadAi = async () => {
-      try {
-        const [dash, triaged, mdls] = await Promise.all([
-          api.get('/ai/dashboard').catch(() => ({ data: null })),
-          api.get('/ai/alerts/triaged').catch(() => ({ data: [] })),
-          api.get('/ai/models').catch(() => ({ data: [] })),
-        ]);
-        setAiDashboard(dash?.data || null);
-        setTriagedAlerts(Array.isArray(triaged?.data) ? triaged.data : []);
-        setModels(Array.isArray(mdls?.data) ? mdls.data : []);
-      } catch {
-        /* graceful: tabs will show empty states */
-      }
+      const [dash, triaged, mdls] = await Promise.all([
+        tracked('aiDashboard', api.get('/ai/dashboard')),
+        tracked('triaged', api.get('/ai/alerts/triaged')),
+        tracked('models', api.get('/ai/models')),
+      ]);
+      setAiDashboard(dash?.data || null);
+      setTriagedAlerts(Array.isArray(triaged?.data) ? triaged.data : []);
+      setModels(Array.isArray(mdls?.data) ? mdls.data : []);
     };
     loadAi();
   }, []);
@@ -227,8 +268,10 @@ const AgenticSOC: React.FC = () => {
           params: anomalyFilter !== 'all' ? { status: anomalyFilter } : {},
         });
         setAnomalies(res.data?.anomalies ?? []);
-      } catch {
+        setLoadError('anomalies', null);
+      } catch (err) {
         setAnomalies([]);
+        setLoadError('anomalies', err);
       }
     };
     loadAnomalies();
@@ -245,8 +288,10 @@ const AgenticSOC: React.FC = () => {
           },
         });
         setPredictions(Array.isArray(res.data) ? res.data : []);
-      } catch {
+        setLoadError('predictions', null);
+      } catch (err) {
         setPredictions([]);
+        setLoadError('predictions', err);
       }
     };
     loadPredictions();
@@ -261,8 +306,8 @@ const AgenticSOC: React.FC = () => {
       const refresh = await api.get('/ai/alerts/triaged');
       setTriagedAlerts(Array.isArray(refresh?.data) ? refresh.data : []);
       showStatus('success', `Triaged ${count} alerts successfully`);
-    } catch {
-      showStatus('error', 'Alert triage failed — check API connection');
+    } catch (err) {
+      showStatus('error', `Alert triage failed: ${describeLoadError(err)}`);
     } finally {
       setTriageLoading(false);
     }
@@ -277,8 +322,8 @@ const AgenticSOC: React.FC = () => {
       });
       setAnomalies(res.data?.anomalies ?? []);
       showStatus('success', `Anomaly ${action === 'confirm' ? 'confirmed' : 'dismissed'}`);
-    } catch {
-      showStatus('error', `Failed to ${action} anomaly`);
+    } catch (err) {
+      showStatus('error', `Failed to ${action} anomaly: ${describeLoadError(err)}`);
     }
   };
 
@@ -293,8 +338,8 @@ const AgenticSOC: React.FC = () => {
       const refresh = await api.get('/ai/models');
       setModels(Array.isArray(refresh?.data) ? refresh.data : []);
       showStatus('success', 'Model training initiated successfully');
-    } catch {
-      showStatus('error', 'Model training failed — check API connection');
+    } catch (err) {
+      showStatus('error', `Model training failed: ${describeLoadError(err)}`);
     } finally {
       setTrainLoading(false);
     }
@@ -306,7 +351,7 @@ const AgenticSOC: React.FC = () => {
     setPendingApprovals((prev) => prev.filter((a) => (a.action_id || a.id) !== id));
     setAgentMetrics((m) => ({
       ...m,
-      actionsPendingApproval: Math.max(0, m.actionsPendingApproval - 1),
+      actionsPendingApproval: m.actionsPendingApproval === null ? null : Math.max(0, m.actionsPendingApproval - 1),
     }));
     showStatus('success', `Action ${outcome}.`);
   };
@@ -345,13 +390,17 @@ const AgenticSOC: React.FC = () => {
         )}
 
         {/* Summary Cards */}
+        <div className="space-y-2 mb-4 empty:hidden">
+          <LoadErrorBanner what="agent summary metrics" error={loadErrors.summary} />
+          <LoadErrorBanner what="investigation metrics" error={loadErrors.investigationMetrics} />
+        </div>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
           <div className="bg-white dark:bg-gray-800 rounded-lg p-6 border border-gray-200 dark:border-gray-700">
             <div className="flex items-center justify-between">
               <div>
                 <p className="text-gray-600 dark:text-gray-400 text-sm font-medium">Active Agents</p>
                 <p className="text-3xl font-bold text-gray-900 dark:text-white mt-2">
-                  {agentMetrics.activeAgents}
+                  {agentMetrics.activeAgents ?? 'not available'}
                 </p>
               </div>
               <Bot className="w-10 h-10 text-blue-500 dark:text-blue-400 opacity-20" />
@@ -365,7 +414,7 @@ const AgenticSOC: React.FC = () => {
                   Open Investigations
                 </p>
                 <p className="text-3xl font-bold text-gray-900 dark:text-white mt-2">
-                  {agentMetrics.openInvestigations}
+                  {agentMetrics.openInvestigations ?? 'not available'}
                 </p>
               </div>
               <Brain className="w-10 h-10 text-purple-500 dark:text-purple-400 opacity-20" />
@@ -379,7 +428,7 @@ const AgenticSOC: React.FC = () => {
                   Avg Confidence Score
                 </p>
                 <p className="text-3xl font-bold text-gray-900 dark:text-white mt-2">
-                  {agentMetrics.avgConfidenceScore}%
+                  {agentMetrics.avgConfidenceScore !== null ? `${agentMetrics.avgConfidenceScore}%` : 'not available'}
                 </p>
               </div>
               <TrendingUp className="w-10 h-10 text-green-500 dark:text-green-400 opacity-20" />
@@ -393,7 +442,7 @@ const AgenticSOC: React.FC = () => {
                   Actions Pending
                 </p>
                 <p className="text-3xl font-bold text-gray-900 dark:text-white mt-2">
-                  {agentMetrics.actionsPendingApproval}
+                  {agentMetrics.actionsPendingApproval ?? 'not available'}
                 </p>
               </div>
               <AlertCircle className="w-10 h-10 text-orange-500 dark:text-orange-400 opacity-20" />
@@ -457,6 +506,7 @@ const AgenticSOC: React.FC = () => {
           {activeTab === 'agents' && (
             <div>
               <h2 className="text-xl font-bold text-gray-900 dark:text-white mb-6">Active Agents</h2>
+              <div className="mb-4 empty:hidden"><LoadErrorBanner what="SOC agents" error={loadErrors.agents} /></div>
               {agents.length === 0 ? (
                 <div className="text-center py-8 text-gray-500 dark:text-gray-400 text-sm">
                   No agents registered. Agents come online when the backend
@@ -549,6 +599,7 @@ const AgenticSOC: React.FC = () => {
               </div>
 
               <div className="space-y-4">
+                <LoadErrorBanner what="investigations" error={loadErrors.investigations} />
                 {investigations.length === 0 ? (
                   <div className="text-center py-8 text-gray-500 dark:text-gray-400 text-sm">
                     No investigations yet. The auto-triage beat will open one
@@ -630,6 +681,8 @@ const AgenticSOC: React.FC = () => {
           {/* Alert Triage Tab */}
           {activeTab === 'triage' && (
             <div className="space-y-6">
+              <LoadErrorBanner what="the AI engine dashboard" error={loadErrors.aiDashboard} />
+              <LoadErrorBanner what="triaged alerts" error={loadErrors.triaged} />
               <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                 <div className="bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 p-5">
                   <p className="text-gray-600 dark:text-gray-400 text-sm">Total Analyses</p>
@@ -700,6 +753,8 @@ const AgenticSOC: React.FC = () => {
           {/* Anomalies Tab */}
           {activeTab === 'anomalies' && (
             <div className="space-y-6">
+              <LoadErrorBanner what="the AI engine dashboard" error={loadErrors.aiDashboard} />
+              <LoadErrorBanner what="anomalies" error={loadErrors.anomalies} />
               <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                 <div className="bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 p-5">
                   <p className="text-gray-600 dark:text-gray-400 text-sm">Anomalies Detected</p>
@@ -791,6 +846,7 @@ const AgenticSOC: React.FC = () => {
           {/* Predictions Tab */}
           {activeTab === 'predictions' && (
             <div className="space-y-6">
+              <LoadErrorBanner what="threat predictions" error={loadErrors.predictions} />
               <div className="flex flex-wrap gap-4">
                 <div>
                   <label className="block text-sm font-medium text-gray-900 dark:text-white mb-2">Entity Type</label>
@@ -889,6 +945,7 @@ const AgenticSOC: React.FC = () => {
           {/* ML Models Tab */}
           {activeTab === 'models' && (
             <div className="space-y-6">
+              <LoadErrorBanner what="ML models" error={loadErrors.models} />
               <button
                 onClick={handleTrainModel}
                 disabled={trainLoading}
@@ -956,12 +1013,15 @@ const AgenticSOC: React.FC = () => {
               integrity hash echo live in the shared ApprovalCard so the
               chat workbench and this page cannot diverge. */}
           {activeTab === 'approvals' && (
-            <PendingApprovals
-              rows={pendingApprovals}
-              role={user?.role}
-              isSuperuser={user?.is_superuser}
-              onResolved={handleApprovalResolved}
-            />
+            <div className="space-y-4">
+              <LoadErrorBanner what="pending approvals" error={loadErrors.actions} />
+              <PendingApprovals
+                rows={pendingApprovals}
+                role={user?.role}
+                isSuperuser={user?.is_superuser}
+                onResolved={handleApprovalResolved}
+              />
+            </div>
           )}
         </div>
 

@@ -20,6 +20,8 @@ import {
 import { alertsApi, incidentsApi, playbooksApi } from '../lib/api';
 import type { Alert, Playbook } from '../lib/types';
 import clsx from 'clsx';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 
 const severityColors: Record<string, string> = {
   critical: 'bg-red-100 text-red-700 border-red-200 dark:bg-red-900/30 dark:text-red-300 dark:border-red-900/50',
@@ -61,13 +63,13 @@ export default function AlertDetail() {
     setTimeout(() => setToast(null), 4000);
   };
 
-  const { data: alert, isLoading } = useQuery<Alert>({
+  const { data: alert, isLoading, error: alertError } = useQuery<Alert>({
     queryKey: ['alert', id],
     queryFn: () => alertsApi.get(id!),
     enabled: !!id,
   });
 
-  const { data: playbooksData } = useQuery({
+  const { data: playbooksData, error: playbooksError } = useQuery({
     queryKey: ['playbooks'],
     queryFn: () => playbooksApi.list({ size: 100 }),
   });
@@ -79,7 +81,7 @@ export default function AlertDetail() {
       queryClient.invalidateQueries({ queryKey: ['alerts'] });
       showToast('success', 'Alert updated');
     },
-    onError: () => showToast('error', 'Update failed'),
+    onError: (err) => showToast('error', `Update failed. ${describeLoadError(err)}`),
   });
 
   const deleteMutation = useMutation({
@@ -88,7 +90,7 @@ export default function AlertDetail() {
       queryClient.invalidateQueries({ queryKey: ['alerts'] });
       navigate('/alerts');
     },
-    onError: () => showToast('error', 'Delete failed'),
+    onError: (err) => showToast('error', `Delete failed. ${describeLoadError(err)}`),
   });
 
   const createIncidentMutation = useMutation({
@@ -102,7 +104,7 @@ export default function AlertDetail() {
     onSuccess: (incident) => {
       navigate(`/incidents/${incident.id}`);
     },
-    onError: () => showToast('error', 'Failed to create incident'),
+    onError: (err) => showToast('error', `Failed to create incident. ${describeLoadError(err)}`),
   });
 
   const executePlaybookMutation = useMutation({
@@ -111,13 +113,25 @@ export default function AlertDetail() {
       setShowPlaybookModal(false);
       showToast('success', 'Playbook execution queued');
     },
-    onError: () => showToast('error', 'Playbook execution failed'),
+    onError: (err) => showToast('error', `Playbook execution failed. ${describeLoadError(err)}`),
   });
 
   if (isLoading) {
     return (
       <div className="flex items-center justify-center h-64">
         <Loader2 className="w-8 h-8 animate-spin text-blue-500 dark:text-blue-400" />
+      </div>
+    );
+  }
+
+  // A failed request is not "not found": show what the server said.
+  if (alertError && !alert) {
+    return (
+      <div className="space-y-4">
+        <LoadErrorBanner what="this alert" error={alertError} />
+        <Link to="/alerts" className="text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 inline-block">
+          Back to Alerts
+        </Link>
       </div>
     );
   }
@@ -352,6 +366,7 @@ export default function AlertDetail() {
           <div className="bg-white dark:bg-gray-800 rounded-lg w-full max-w-md p-6">
             <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Run Playbook</h2>
             <div className="space-y-2 max-h-64 overflow-y-auto">
+              <LoadErrorBanner what="playbooks" error={playbooksError} />
               {(playbooksData?.items || [])
                 .filter((p: Playbook) => p.is_enabled)
                 .map((playbook: Playbook) => (
@@ -368,7 +383,7 @@ export default function AlertDetail() {
                     <ChevronRight className="w-4 h-4 text-gray-400" />
                   </button>
                 ))}
-              {(playbooksData?.items || []).filter((p: Playbook) => p.is_enabled).length === 0 && (
+              {!playbooksError && (playbooksData?.items || []).filter((p: Playbook) => p.is_enabled).length === 0 && (
                 <p className="text-sm text-gray-500 dark:text-gray-400 text-center py-4">No enabled playbooks</p>
               )}
             </div>

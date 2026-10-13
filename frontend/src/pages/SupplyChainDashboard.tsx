@@ -19,6 +19,7 @@ import {
 import clsx from 'clsx';
 import { api } from '../lib/api';
 import { supplychainApi } from '../api/endpoints';
+import LoadErrorBanner from '../components/LoadErrorBanner';
 
 
 const riskScoreToLevel = (score: number | null | undefined): string => {
@@ -107,22 +108,40 @@ export default function SupplyChainDashboard() {
   const [selectedComponent, setSelectedComponent] = useState<any | null>(null);
   const [selectedVendor, setSelectedVendor] = useState<any | null>(null);
   const [showFilter, setShowFilter] = useState(false);
+  // Per-list load failures; each list's tab and card report its own error
+  // instead of rendering an empty list / zero.
+  const [loadErrors, setLoadErrors] = useState<{
+    sboms?: unknown; components?: unknown; vendors?: unknown; risks?: unknown;
+  }>({});
 
   const loadData = async () => {
     setLoading(true);
     try {
-      const [sbomData, vendorData, riskData, compData] = await Promise.all([
+      const [sbomData, vendorData, riskData, compData] = await Promise.allSettled([
         supplychainApi.getSBOMs(),
         supplychainApi.getVendorAssessments(),
         supplychainApi.getSupplyChainRisks(),
-        api.get('/supplychain/components').then(r => Array.isArray(r.data) ? r.data : (r.data?.items || [])).catch(() => []),
+        api.get('/supplychain/components').then(r => Array.isArray(r.data) ? r.data : (r.data?.items || [])),
       ]);
-      setSBOMs(Array.isArray(sbomData) ? sbomData : (sbomData?.items || []));
-      setComponents(compData);
-      setVendors(Array.isArray(vendorData) ? vendorData : (vendorData?.items || []));
-      setRisks(Array.isArray(riskData) ? riskData : (riskData?.items || riskData?.findings || []));
-    } catch (error) {
-      console.error('Error loading supply chain data:', error);
+      setLoadErrors({
+        sboms: sbomData.status === 'rejected' ? sbomData.reason : undefined,
+        vendors: vendorData.status === 'rejected' ? vendorData.reason : undefined,
+        risks: riskData.status === 'rejected' ? riskData.reason : undefined,
+        components: compData.status === 'rejected' ? compData.reason : undefined,
+      });
+      if (sbomData.status === 'fulfilled') {
+        const v = sbomData.value;
+        setSBOMs(Array.isArray(v) ? v : (v?.items || []));
+      }
+      if (compData.status === 'fulfilled') setComponents(compData.value);
+      if (vendorData.status === 'fulfilled') {
+        const v = vendorData.value;
+        setVendors(Array.isArray(v) ? v : (v?.items || []));
+      }
+      if (riskData.status === 'fulfilled') {
+        const v = riskData.value;
+        setRisks(Array.isArray(v) ? v : (v?.items || v?.findings || []));
+      }
     } finally {
       setLoading(false);
     }
@@ -132,16 +151,19 @@ export default function SupplyChainDashboard() {
     loadData();
   }, []);
 
-  const totalComponents = components.length;
-  const criticalRisks = risks.filter(r => r.severity === 'critical').length;
-  const vendorScoreAvg = (
-    vendors.reduce((sum, v) => sum + (Number(v.security_score) || 0), 0) / (vendors.length || 1)
-  ).toFixed(1);
-  const sbomCompliance = sboms.length
+  // A card whose list failed to load, or that has nothing to average,
+  // shows "not available" rather than 0.
+  const totalComponents: number | null = loadErrors.components ? null : components.length;
+  const criticalRisks: number | null = loadErrors.risks ? null : risks.filter(r => r.severity === 'critical').length;
+  const scoredVendors = vendors.filter((v) => v.security_score !== null && v.security_score !== undefined && v.security_score !== '');
+  const vendorScoreAvg: string | null = !loadErrors.vendors && scoredVendors.length > 0
+    ? (scoredVendors.reduce((sum, v) => sum + Number(v.security_score), 0) / scoredVendors.length).toFixed(1)
+    : null;
+  const sbomCompliance: number | null = !loadErrors.sboms && sboms.length
     ? Math.round(
         (sboms.filter((s) => s.compliance_status === 'compliant').length / sboms.length) * 100,
       )
-    : 0;
+    : null;
 
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
   const [uploadBusy, setUploadBusy] = useState(false);
@@ -217,22 +239,22 @@ export default function SupplyChainDashboard() {
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
           <div className="bg-gradient-to-br from-blue-50 to-blue-100 dark:from-blue-900 dark:to-blue-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-blue-600 dark:text-blue-300">Total Components</p>
-            <p className="text-3xl font-bold text-blue-900 dark:text-blue-100 mt-2">{totalComponents}</p>
+            <p className="text-3xl font-bold text-blue-900 dark:text-blue-100 mt-2">{totalComponents ?? 'not available'}</p>
             <p className="text-xs text-blue-600 dark:text-blue-300 mt-1">tracked across SBOMs</p>
           </div>
           <div className="bg-gradient-to-br from-red-50 to-red-100 dark:from-red-900 dark:to-red-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-red-600 dark:text-red-300">Critical Risks</p>
-            <p className="text-3xl font-bold text-red-900 dark:text-red-100 mt-2">{criticalRisks}</p>
+            <p className="text-3xl font-bold text-red-900 dark:text-red-100 mt-2">{criticalRisks ?? 'not available'}</p>
             <p className="text-xs text-red-600 dark:text-red-300 mt-1">requiring action</p>
           </div>
           <div className="bg-gradient-to-br from-green-50 to-green-100 dark:from-green-900 dark:to-green-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-green-600 dark:text-green-300">Vendor Score Avg</p>
-            <p className="text-3xl font-bold text-green-900 dark:text-green-100 mt-2">{vendorScoreAvg}</p>
+            <p className="text-3xl font-bold text-green-900 dark:text-green-100 mt-2">{vendorScoreAvg ?? 'not available'}</p>
             <p className="text-xs text-green-600 dark:text-green-300 mt-1">assessment score</p>
           </div>
           <div className="bg-gradient-to-br from-purple-50 to-purple-100 dark:from-purple-900 dark:to-purple-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-purple-600 dark:text-purple-300">SBOM Compliance</p>
-            <p className="text-3xl font-bold text-purple-900 dark:text-purple-100 mt-2">{sbomCompliance}%</p>
+            <p className="text-3xl font-bold text-purple-900 dark:text-purple-100 mt-2">{sbomCompliance !== null ? `${sbomCompliance}%` : 'not available'}</p>
             <p className="text-xs text-purple-600 dark:text-purple-300 mt-1">coverage</p>
           </div>
         </div>
@@ -273,6 +295,7 @@ export default function SupplyChainDashboard() {
             {/* SBOMs Tab */}
             {activeTab === 'sboms' && (
               <div className="space-y-6">
+                <LoadErrorBanner what="SBOMs" error={loadErrors.sboms} />
                 <div className="flex justify-end gap-2">
                   <input
                     ref={uploadInputRef}
@@ -392,6 +415,7 @@ export default function SupplyChainDashboard() {
             {/* Components Tab */}
             {activeTab === 'components' && (
               <div className="space-y-6">
+                <LoadErrorBanner what="software components" error={loadErrors.components} />
                 <div className="flex gap-4">
                   <div className="flex-1 relative">
                     <Search className="absolute left-3 top-3 w-4 h-4 text-gray-400" />
@@ -474,6 +498,7 @@ export default function SupplyChainDashboard() {
             {/* Supply Chain Risks Tab */}
             {activeTab === 'risks' && (
               <div className="space-y-6">
+                <LoadErrorBanner what="supply chain risks" error={loadErrors.risks} />
                 <div className="flex gap-4">
                   <div className="flex-1 relative">
                     <Search className="absolute left-3 top-3 w-4 h-4 text-gray-400" />
@@ -533,6 +558,7 @@ export default function SupplyChainDashboard() {
             {/* Vendor Assessments Tab */}
             {activeTab === 'vendors' && (
               <div className="space-y-6">
+                <LoadErrorBanner what="vendor assessments" error={loadErrors.vendors} />
                 <div className="flex gap-4">
                   <div className="flex-1 relative">
                     <Search className="absolute left-3 top-3 w-4 h-4 text-gray-400" />

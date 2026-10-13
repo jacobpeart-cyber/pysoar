@@ -16,8 +16,48 @@ import {
 } from 'lucide-react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line } from 'recharts';
 import clsx from 'clsx';
-import { api } from '../lib/api';
+import { api } from '../api/client';
 import { datalakeApi } from '../api/endpoints';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
+
+const NA = 'not available';
+
+// Normalised DataSourceResponse (src/schemas/data_lake.py). Numbers the
+// backend does not report are null and render "not available".
+interface DataSource {
+  id: string;
+  name: string;
+  type: string;
+  health: string;
+  ingestionRate: number | null; // events/sec (ingestion_rate_eps)
+  events: number | null; // total_events_ingested
+  lastSync: string | null; // last_event_received
+  lastError: string | null;
+}
+
+// Pipeline row from GET /data-lake/pipelines (custom rows + Celery beat
+// built-ins). Built-ins carry no run history, so their counters are null.
+interface Pipeline {
+  id: string;
+  name: string;
+  status: string;
+  successRate: number | null;
+  recordsProcessed: number | null;
+  lastRun: string | null;
+  duration: string | null;
+  schedule: string | null;
+  builtin: boolean;
+}
+
+const fmtTs = (v: string | null | undefined): string => {
+  if (!v) return NA;
+  const d = new Date(v);
+  return Number.isFinite(d.getTime()) ? d.toLocaleString() : v;
+};
+
+const fmtEps = (v: number | null): string => (v == null ? NA : `${v.toLocaleString()} events/sec`);
+const fmtCount = (v: number | null): string => (v == null ? NA : v.toLocaleString());
 
 
 export default function DataLakeDashboard() {
@@ -45,17 +85,13 @@ export default function DataLakeDashboard() {
   };
   const normalizeSource = (s: any): DataSource => ({
     id: s.id,
-    name: s.name ?? s.source_name ?? s.display_name ?? 'Unnamed source',
-    type: s.type ?? s.source_type ?? 'unknown',
+    name: s.name ?? 'Unnamed source',
+    type: s.source_type ?? 'unknown',
     health: backendStatusToHealth(s),
-    ingestionRate: typeof s.ingestionRate === 'number'
-      ? s.ingestionRate
-      : (s.ingestion_rate ?? s.ingestion_rate_eps ?? s.events_per_second ?? 0),
-    events: typeof s.events === 'number'
-      ? s.events
-      : (s.total_events ?? s.total_events_ingested ?? s.event_count ?? 0),
-    lastSync: s.lastSync ?? s.last_sync_at ?? s.last_event_received ?? s.last_event_at ?? null,
-    schema: s.schema ?? null,
+    ingestionRate: typeof s.ingestion_rate_eps === 'number' ? s.ingestion_rate_eps : null,
+    events: typeof s.total_events_ingested === 'number' ? s.total_events_ingested : null,
+    lastSync: s.last_event_received ?? null,
+    lastError: s.last_error ?? null,
   });
   const backendStatusToPipelineStatus = (p: any): string => {
     const raw = String(p?.status ?? p?.pipeline_status ?? '').toLowerCase();
@@ -66,21 +102,30 @@ export default function DataLakeDashboard() {
     if (raw === 'building' || raw === 'initializing') return 'Building';
     return raw || 'unknown';
   };
-  const normalizePipeline = (p: any): Pipeline => ({
-    id: p.id,
-    name: p.name,
-    status: backendStatusToPipelineStatus(p),
-    successRate: typeof p.successRate === 'number'
-      ? p.successRate
-      : (p.success_rate ?? (p.error_count > 0 ? 0 : 100)),
-    throughput: p.throughput ?? p.records_processed_total ?? p.events_processed ?? 0,
-    lastRun: p.lastRun ?? p.last_run ?? p.last_run_at ?? null,
-    duration: p.duration ?? (p.avg_processing_time_ms ? `${p.avg_processing_time_ms}ms` : ''),
-  });
+  const normalizePipeline = (p: any): Pipeline => {
+    const records = typeof p.records_processed_total === 'number' ? p.records_processed_total : null;
+    const errors = typeof p.error_count === 'number' ? p.error_count : null;
+    // Success rate only when something was actually processed; never
+    // derived from "no errors recorded".
+    const successRate = records != null && records > 0 && errors != null
+      ? Math.round(((records - Math.min(errors, records)) / records) * 1000) / 10
+      : null;
+    return {
+      id: p.id,
+      name: p.name,
+      status: backendStatusToPipelineStatus(p),
+      successRate,
+      recordsProcessed: records,
+      lastRun: p.last_run ?? null,
+      duration: typeof p.avg_processing_time_ms === 'number' ? `${p.avg_processing_time_ms}ms avg` : null,
+      schedule: p.schedule_cron ?? null,
+      builtin: Boolean(p.builtin),
+    };
+  };
 
-  const { data: sourcesRaw = [] } = useQuery({ queryKey: ['dataSources'], queryFn: datalakeApi.getDataSources });
-  const { data: pipelinesRaw = [] } = useQuery({ queryKey: ['pipelines'], queryFn: datalakeApi.getPipelines });
-  const { data: catalog = [] } = useQuery({ queryKey: ['dataCatalog'], queryFn: datalakeApi.getCatalog });
+  const { data: sourcesRaw = [], error: sourcesError } = useQuery({ queryKey: ['dataSources'], queryFn: () => datalakeApi.getDataSources() });
+  const { data: pipelinesRaw = [], error: pipelinesError } = useQuery({ queryKey: ['pipelines'], queryFn: () => datalakeApi.getPipelines() });
+  const { data: catalog = [], error: catalogError } = useQuery({ queryKey: ['dataCatalog'], queryFn: datalakeApi.getCatalog });
   const sources: DataSource[] = useMemo(
     () => (Array.isArray(sourcesRaw) ? sourcesRaw : ((sourcesRaw as any)?.items ?? [])).map(normalizeSource),
     [sourcesRaw],
@@ -94,16 +139,13 @@ export default function DataLakeDashboard() {
   // fabrication (hot 0.7% / warm 2.5% / cold 12% split of an
   // events×0.0002 estimate) that produced a pie chart of invented
   // numbers even when the lake was empty.
-  const { data: storageBreakdownRaw } = useQuery({
+  // Shared axios client: sends the bearer token (the old raw fetch sent
+  // none and always 401'd) and surfaces failures instead of null.
+  const { data: storageBreakdownRaw, error: storageError } = useQuery({
     queryKey: ['dl-storage-breakdown'],
     queryFn: async () => {
-      try {
-        const res = await fetch('/api/v1/data-lake/dashboard/storage-breakdown', { credentials: 'include' });
-        if (!res.ok) return null;
-        return await res.json();
-      } catch {
-        return null;
-      }
+      const res = await api.get('/data-lake/dashboard/storage-breakdown');
+      return res.data;
     },
   });
 
@@ -127,20 +169,27 @@ export default function DataLakeDashboard() {
   }, [catalog, catalogSearch]);
 
   const stats = useMemo(() => {
-    const activeSources = sources.filter((s: DataSource) => s.health === 'Healthy').length;
-    const totalEvents = sources.reduce((sum: number, s: DataSource) => sum + (s.events || 0), 0);
-    const totalBytes = Number((storageBreakdownRaw as any)?.total_bytes ?? 0);
-    const tb = totalBytes / 1024 ** 4;
-    const totalStorage = tb >= 1
-      ? `${tb.toFixed(2)} TB`
-      : totalBytes >= 1024 ** 3
-        ? `${(totalBytes / 1024 ** 3).toFixed(2)} GB`
-        : totalBytes >= 1024 ** 2
-          ? `${(totalBytes / 1024 ** 2).toFixed(1)} MB`
-          : `${totalBytes} B`;
-    const activePipelines = pipelines.filter((p: Pipeline) => p.status === 'Running').length;
+    const activeSources = sourcesError ? NA : `${sources.filter((s: DataSource) => s.health === 'Healthy').length}/${sources.length}`;
+    const known = sources.filter((s: DataSource) => s.events != null);
+    const totalEvents = sourcesError || known.length === 0
+      ? NA
+      : known.reduce((sum: number, s: DataSource) => sum + (s.events as number), 0).toLocaleString();
+    const rawTotal = (storageBreakdownRaw as any)?.total_bytes;
+    let totalStorage = NA;
+    if (!storageError && typeof rawTotal === 'number') {
+      const totalBytes = rawTotal;
+      const tb = totalBytes / 1024 ** 4;
+      totalStorage = tb >= 1
+        ? `${tb.toFixed(2)} TB`
+        : totalBytes >= 1024 ** 3
+          ? `${(totalBytes / 1024 ** 3).toFixed(2)} GB`
+          : totalBytes >= 1024 ** 2
+            ? `${(totalBytes / 1024 ** 2).toFixed(1)} MB`
+            : `${totalBytes} B`;
+    }
+    const activePipelines = pipelinesError ? NA : String(pipelines.filter((p: Pipeline) => p.status === 'Running').length);
     return { activeSources, totalEvents, totalStorage, activePipelines };
-  }, [sources, pipelines, storageBreakdownRaw]);
+  }, [sources, pipelines, storageBreakdownRaw, sourcesError, pipelinesError, storageError]);
 
   const storageBreakdown = useMemo(() => {
     // Use the backend's real hot/warm/cold/archived split when
@@ -189,15 +238,11 @@ export default function DataLakeDashboard() {
   // Real live partitions for the SIEM log table — one row per day,
   // bucketed hot/warm/cold/archived by age. Replaces the static
   // dashboard with genuine partitioned-data view.
-  const { data: logPartitions } = useQuery({
+  const { data: logPartitions, error: partitionsError } = useQuery({
     queryKey: ['dl-log-partitions'],
     queryFn: async () => {
-      try {
-        const res = await api.get('/data-lake/partitions/daily/log_entries?days=30');
-        return res.data;
-      } catch {
-        return { partitions: [], partition_count: 0, total_rows_scanned: 0 };
-      }
+      const res = await api.get('/data-lake/partitions/daily/log_entries?days=30');
+      return res.data;
     },
   });
 
@@ -208,7 +253,7 @@ export default function DataLakeDashboard() {
   // built-in ingest surfaces and org-scoped on the backend. Replaces
   // the fabricated 5-point line (base rate × [0.9, 0.95, 1.0] jitter).
   // No ingested rows → empty array → the chart's empty state.
-  const { data: ingestTrendRaw } = useQuery({
+  const { data: ingestTrendRaw, error: ingestTrendError } = useQuery({
     queryKey: ['dl-ingestion-trend'],
     queryFn: () => datalakeApi.getIngestionTrend(24),
   });
@@ -222,12 +267,15 @@ export default function DataLakeDashboard() {
     }));
   }, [ingestTrendRaw]);
 
+  // Only pipelines with a measured success rate are charted.
   const pipelineHealthData = useMemo(() => {
-    return pipelines.map((p: Pipeline) => ({
-      pipeline: p.name,
-      success: p.successRate,
-      failure: Math.round((100 - p.successRate) * 10) / 10,
-    }));
+    return pipelines
+      .filter((p: Pipeline) => p.successRate != null)
+      .map((p: Pipeline) => ({
+        pipeline: p.name,
+        success: p.successRate as number,
+        failure: Math.round((100 - (p.successRate as number)) * 10) / 10,
+      }));
   }, [pipelines]);
 
   return (
@@ -248,7 +296,7 @@ export default function DataLakeDashboard() {
             <div className="flex items-start justify-between">
               <div>
                 <p className="text-gray-400 text-sm mb-2">Data Sources Active</p>
-                <p className="text-3xl font-bold">{stats.activeSources}/{sources.length}</p>
+                <p className="text-3xl font-bold">{stats.activeSources}</p>
               </div>
               <Database className="w-8 h-8 text-blue-400" />
             </div>
@@ -258,7 +306,7 @@ export default function DataLakeDashboard() {
             <div className="flex items-start justify-between">
               <div>
                 <p className="text-gray-400 text-sm mb-2">Total Events</p>
-                <p className="text-3xl font-bold">{stats.totalEvents.toLocaleString()}</p>
+                <p className="text-3xl font-bold">{stats.totalEvents}</p>
               </div>
               <TrendingUp className="w-8 h-8 text-green-400" />
             </div>
@@ -319,6 +367,10 @@ export default function DataLakeDashboard() {
         {/* Sources Tab */}
         {activeTab === 'sources' && (
           <div>
+            <div className="space-y-2 mb-4">
+              <LoadErrorBanner what="data sources" error={sourcesError} />
+              <LoadErrorBanner what="the ingestion trend" error={ingestTrendError} />
+            </div>
             <div className="mb-6 flex justify-end">
               <button
                 onClick={() => setShowModal(true)}
@@ -363,8 +415,8 @@ export default function DataLakeDashboard() {
                       className="border-t border-gray-700 hover:bg-gray-700/50 cursor-pointer"
                     >
                       <td className="px-6 py-4 text-sm font-medium text-white">{source.name}</td>
-                      <td className="px-6 py-4 text-sm text-gray-300">{(source.ingestionRate / 1000).toFixed(0)}K/sec</td>
-                      <td className="px-6 py-4 text-sm text-gray-300">{(source.events / 1000000).toFixed(1)}M</td>
+                      <td className="px-6 py-4 text-sm text-gray-300">{fmtEps(source.ingestionRate)}</td>
+                      <td className="px-6 py-4 text-sm text-gray-300">{fmtCount(source.events)}</td>
                       <td className="px-6 py-4 text-sm">
                         <span
                           className={clsx(
@@ -378,7 +430,7 @@ export default function DataLakeDashboard() {
                           {source.health}
                         </span>
                       </td>
-                      <td className="px-6 py-4 text-sm text-gray-400">{source.lastSync}</td>
+                      <td className="px-6 py-4 text-sm text-gray-400">{fmtTs(source.lastSync)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -390,6 +442,9 @@ export default function DataLakeDashboard() {
         {/* Pipelines Tab */}
         {activeTab === 'pipelines' && (
           <div>
+            <div className="mb-4">
+              <LoadErrorBanner what="pipelines" error={pipelinesError} />
+            </div>
             <div className="grid grid-cols-2 gap-8 mb-8">
               <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 dark:bg-gray-800 dark:border-gray-700">
                 <h3 className="text-lg font-semibold mb-4">Pipeline Success Rates</h3>
@@ -425,10 +480,10 @@ export default function DataLakeDashboard() {
                         {pipeline.status}
                       </span>
                     </div>
-                    <p className="text-xs text-gray-400 mb-2">Success Rate: <span className="text-green-400 font-semibold">{pipeline.successRate}%</span></p>
+                    <p className="text-xs text-gray-400 mb-2">Success Rate: <span className="text-green-400 font-semibold">{pipeline.successRate != null ? `${pipeline.successRate}%` : NA}</span></p>
                     <div className="flex justify-between text-xs text-gray-500">
-                      <span>{pipeline.lastRun}</span>
-                      <span>{pipeline.duration}</span>
+                      <span>{pipeline.builtin ? pipeline.schedule ?? NA : `Last run: ${fmtTs(pipeline.lastRun)}`}</span>
+                      <span>{pipeline.duration ?? NA}</span>
                     </div>
                   </div>
                 ))}
@@ -465,15 +520,19 @@ export default function DataLakeDashboard() {
                         </span>
                       </td>
                       <td className="px-6 py-4 text-sm">
-                        <div className="flex items-center gap-2">
-                          <div className="w-20 h-2 bg-gray-700 rounded-full dark:bg-gray-700">
-                            <div className="h-full bg-green-500 rounded-full" style={{ width: `${pipeline.successRate}%` }} />
+                        {pipeline.successRate != null ? (
+                          <div className="flex items-center gap-2">
+                            <div className="w-20 h-2 bg-gray-700 rounded-full dark:bg-gray-700">
+                              <div className="h-full bg-green-500 rounded-full" style={{ width: `${pipeline.successRate}%` }} />
+                            </div>
+                            <span className="text-gray-400 text-xs">{pipeline.successRate}%</span>
                           </div>
-                          <span className="text-gray-400 text-xs">{pipeline.successRate}%</span>
-                        </div>
+                        ) : (
+                          <span className="text-gray-500 text-xs">{NA}</span>
+                        )}
                       </td>
-                      <td className="px-6 py-4 text-sm text-gray-400">{pipeline.lastRun}</td>
-                      <td className="px-6 py-4 text-sm text-gray-400">{pipeline.duration}</td>
+                      <td className="px-6 py-4 text-sm text-gray-400">{fmtTs(pipeline.lastRun)}</td>
+                      <td className="px-6 py-4 text-sm text-gray-400">{pipeline.duration ?? NA}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -553,8 +612,8 @@ export default function DataLakeDashboard() {
                       } else {
                         setQueryResult(JSON.stringify(d, null, 2));
                       }
-                    } catch (err: any) {
-                      setQueryResult('Error: ' + (err?.response?.data?.detail || err.message || 'Query failed'));
+                    } catch (err: unknown) {
+                      setQueryResult('Error: ' + describeLoadError(err));
                     } finally {
                       setQueryRunning(false);
                     }
@@ -579,6 +638,9 @@ export default function DataLakeDashboard() {
         {activeTab === 'catalog' && (
           <div>
             <div className="mb-6">
+              <div className="mb-4">
+                <LoadErrorBanner what="the data catalog" error={catalogError} />
+              </div>
               <input
                 type="text"
                 placeholder="Search data catalog..."
@@ -607,7 +669,7 @@ export default function DataLakeDashboard() {
                 </thead>
                 <tbody>
                   {filteredCatalog.map((item: any) => {
-                    const rowCount = item.row_count ?? item.rows ?? 0;
+                    const rowCount = item.row_count ?? item.rows ?? null;
                     const bytes = item.size_bytes ?? 0;
                     const sizeLabel = bytes >= 1024 ** 3
                       ? `${(bytes / 1024 ** 3).toFixed(2)} GB`
@@ -639,7 +701,7 @@ export default function DataLakeDashboard() {
                           )}
                         </td>
                         <td className="px-6 py-4 text-sm text-gray-300">{item.type ?? item.entity_type ?? '—'}</td>
-                        <td className="px-6 py-4 text-sm text-gray-300">{Number(rowCount).toLocaleString()}</td>
+                        <td className="px-6 py-4 text-sm text-gray-300">{rowCount != null ? Number(rowCount).toLocaleString() : NA}</td>
                         <td className="px-6 py-4 text-sm text-gray-300">{sizeLabel}</td>
                         <td className="px-6 py-4 text-sm text-gray-300">{columnCount || '—'}</td>
                         <td className="px-6 py-4 text-sm text-gray-400">{last}</td>
@@ -655,6 +717,9 @@ export default function DataLakeDashboard() {
         {/* Partitions Tab — real daily partitions of log_entries bucketed by age */}
         {activeTab === 'partitions' && (
           <div>
+            <div className="mb-4">
+              <LoadErrorBanner what="log partitions" error={partitionsError} />
+            </div>
             <div className="mb-6 flex items-center justify-between">
               <div>
                 <h3 className="text-lg font-semibold">SIEM Log Partitions (last 30 days)</h3>
@@ -665,7 +730,7 @@ export default function DataLakeDashboard() {
               {logPartitions && (
                 <div className="text-sm text-gray-400">
                   {(logPartitions as any).partition_count} partitions ·{' '}
-                  {Number((logPartitions as any).total_rows_scanned || 0).toLocaleString()} rows
+                  {(logPartitions as any).total_rows_scanned != null ? Number((logPartitions as any).total_rows_scanned).toLocaleString() : NA} rows
                 </div>
               )}
             </div>
@@ -712,7 +777,7 @@ export default function DataLakeDashboard() {
                         </tr>
                       );
                     })
-                  ) : (
+                  ) : partitionsError ? null : (
                     <tr>
                       <td colSpan={6} className="px-6 py-6 text-center text-sm text-gray-500">
                         No log_entries in the last 30 days for this org.
@@ -726,7 +791,10 @@ export default function DataLakeDashboard() {
         )}
 
         {/* Storage Tab */}
-        {activeTab === 'storage' && (
+        {activeTab === 'storage' && storageError && (
+          <LoadErrorBanner what="the storage breakdown" error={storageError} />
+        )}
+        {activeTab === 'storage' && !storageError && (
           <div className="grid grid-cols-2 gap-8">
             <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 dark:bg-gray-800 dark:border-gray-700">
               <h3 className="text-lg font-semibold mb-4">Storage Tier Breakdown</h3>
@@ -753,8 +821,9 @@ export default function DataLakeDashboard() {
 
             <div className="space-y-4">
               {(() => {
-                const totalValue = storageBreakdown.reduce((sum, t) => sum + t.value, 0) || 1;
-                const totalLabel = totalValue >= 1000 ? `${(totalValue / 1000).toFixed(2)} TB` : `${totalValue} GB`;
+                const totalValue = storageBreakdown.reduce((sum, t) => sum + t.value, 0);
+                // Same real total_bytes figure as the summary card.
+                const totalLabel = stats.totalStorage;
                 return (
                   <>
                     {storageBreakdown.map((tier, idx) => (
@@ -817,7 +886,10 @@ export default function DataLakeDashboard() {
                   });
                   setShowModal(false);
                   window.location.reload();
-                } catch (err) { console.error('Failed to add source:', err); }
+                } catch (err) {
+                  console.error('Failed to add source:', err);
+                  alert(`Failed to add source: ${describeLoadError(err)}`);
+                }
               }}>
                 <div>
                   <label className="block text-sm font-medium text-gray-300 mb-2">Source Name</label>
@@ -883,11 +955,11 @@ export default function DataLakeDashboard() {
               <div className="space-y-3">
                 <div>
                   <p className="text-sm text-gray-400">Ingestion Rate</p>
-                  <p className="text-white font-medium">{(selectedSource.ingestionRate / 1000).toFixed(0)}K events/sec</p>
+                  <p className="text-white font-medium">{fmtEps(selectedSource.ingestionRate)}</p>
                 </div>
                 <div>
                   <p className="text-sm text-gray-400">Total Events</p>
-                  <p className="text-white font-medium">{(selectedSource.events / 1000000).toFixed(1)}M</p>
+                  <p className="text-white font-medium">{fmtCount(selectedSource.events)}</p>
                 </div>
                 <div>
                   <p className="text-sm text-gray-400">Health</p>
@@ -897,8 +969,14 @@ export default function DataLakeDashboard() {
                 </div>
                 <div>
                   <p className="text-sm text-gray-400">Last Sync</p>
-                  <p className="text-white font-medium">{selectedSource.lastSync}</p>
+                  <p className="text-white font-medium">{fmtTs(selectedSource.lastSync)}</p>
                 </div>
+                {selectedSource.lastError && (
+                  <div>
+                    <p className="text-sm text-gray-400">Last Error</p>
+                    <p className="text-red-300 font-medium break-words">{selectedSource.lastError}</p>
+                  </div>
+                )}
               </div>
 
               <button

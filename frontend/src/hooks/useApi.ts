@@ -8,10 +8,6 @@ import {
   huntingApi,
   exposureApi,
   aiApi,
-  uebaApi,
-  simulationApi,
-  deceptionApi,
-  remediationApi,
   complianceApi,
   vulnmgmtApi,
   supplychainApi,
@@ -156,26 +152,6 @@ export const useAttackSurface = (options?: Omit<UseQueryOptions, 'queryKey' | 'q
   });
 };
 
-// UEBA
-export const useUserBehaviors = (
-  params?: { page?: number; size?: number; search?: string },
-  options?: Omit<UseQueryOptions, 'queryKey' | 'queryFn'>
-) => {
-  return useQuery({
-    queryKey: ['ueba', 'behaviors', params],
-    queryFn: () => uebaApi.getUserBehaviors(params),
-    ...options,
-  });
-};
-
-export const useRiskScores = (options?: Omit<UseQueryOptions, 'queryKey' | 'queryFn'>) => {
-  return useQuery({
-    queryKey: ['ueba', 'risk-scores'],
-    queryFn: () => uebaApi.getRiskScores(),
-    ...options,
-  });
-};
-
 // Compliance
 export const useComplianceFrameworks = (options?: Omit<UseQueryOptions, 'queryKey' | 'queryFn'>) => {
   return useQuery({
@@ -305,14 +281,6 @@ export const useRunVulnerabilityS = () => {
   return useMutationWithToast((assetId?: string) => vulnmgmtApi.runScan(assetId));
 };
 
-export const useApproveRemediationAction = () => {
-  return useMutationWithToast((id: string) => remediationApi.approveAction(id));
-};
-
-export const useExecuteRemediationAction = () => {
-  return useMutationWithToast((id: string) => remediationApi.executeAction(id));
-};
-
 export const useCreatePlaybook = () => {
   return useMutationWithToast(
     (data: { name: string; description: string; trigger_type: string }) => playbookApi.createPlaybook(data)
@@ -330,8 +298,4 @@ export const useCreateWarRoom = () => {
   return useMutationWithToast(
     (data: { title: string; description?: string }) => collaborationApi.createWarRoom(data)
   );
-};
-
-export const useEnrichIOC = () => {
-  return useMutationWithToast((value: string) => threatIntelApi.enrichIOC(value));
 };

@@ -22,6 +22,7 @@ import { api } from '../lib/api';
 import clsx from 'clsx';
 import DetailDrawer, { DetailSection } from '../components/DetailDrawer';
 import FormModal from '../components/FormModal';
+import LoadErrorBanner from '../components/LoadErrorBanner';
 
 type TabType = 'overview' | 'access-control' | 'devices' | 'segmentation' | 'policies';
 
@@ -74,49 +75,49 @@ interface DashboardData {
   pillars?: any;
 }
 
+// GET /zerotrust/decisions row (zerotrust.py list_access_decisions):
+// subject/resource are "type:id" strings; there is no reason field.
 interface AccessDecision {
   id: string;
   created_at: string;
+  subject: string;
+  resource: string;
   decision: string;
   risk_score: number;
-  risk_factors: string[];
-  reason: string;
 }
 
+// GET /zerotrust/devices row. The list projection carries no compliance
+// fields; those are only on GET /zerotrust/devices/{device_id}.
 interface Device {
   id: string;
-  hostname: string;
+  device_id: string;
+  hostname: string | null;
   device_type: string;
-  os_type: string;
   trust_score: number;
-  is_compliant: boolean;
-  compliance_checks: Record<string, boolean>;
-  checks?: Record<string, boolean>;
-  last_seen: string;
-  status: string;
+  trust_level: string;
+  last_seen: string | null;
 }
 
+// MicroSegmentResponse
 interface Segment {
   id: string;
   name: string;
   segment_type: string;
-  type?: string;
-  member_count: number;
+  member_assets: string[];
   allowed_protocols: string[];
   violation_count: number;
-  status: string;
+  is_active: boolean;
 }
 
+// ZeroTrustPolicyResponse
 interface Policy {
   id: string;
   name: string;
   policy_type: string;
-  type?: string;
-  status?: string;
   risk_threshold: number;
-  mfa_required: boolean;
-  device_trust_required: boolean;
-  decision_count: number;
+  requires_mfa: boolean;
+  requires_device_trust: boolean;
+  hit_count: number;
   is_enabled: boolean;
 }
 
@@ -135,33 +136,27 @@ export default function ZeroTrustDashboard() {
   const [actionError, setActionError] = useState<string | null>(null);
   const queryClient = useQueryClient();
 
-  const { data: dashboardData, isLoading: dashboardLoading } = useQuery<DashboardData>({
+  const { data: dashboardData, isLoading: dashboardLoading, error: dashboardError } = useQuery<DashboardData>({
     queryKey: ['zerotrust-dashboard'],
     queryFn: async () => {
-      try {
       const response = await api.get('/zerotrust/dashboard');
       return response.data;
-      } catch { return null; }
     },
   });
 
-  const { data: deviceStats, isLoading: statsLoading } = useQuery<DeviceStats>({
+  const { data: deviceStats, isLoading: statsLoading, error: statsError } = useQuery<DeviceStats>({
     queryKey: ['zerotrust-device-stats'],
     queryFn: async () => {
-      try {
       const response = await api.get('/zerotrust/device-stats');
       return response.data;
-      } catch { return null; }
     },
   });
 
-  const { data: devicesRaw, isLoading: devicesLoading } = useQuery<any>({
+  const { data: devicesRaw, isLoading: devicesLoading, error: devicesError } = useQuery<any>({
     queryKey: ['zerotrust-devices'],
     queryFn: async () => {
-      try {
       const response = await api.get('/zerotrust/devices');
       return response.data;
-      } catch { return null; }
     },
   });
   const devices: Device[] = Array.isArray(devicesRaw) ? devicesRaw : (devicesRaw?.devices || devicesRaw?.items || []);
@@ -170,39 +165,34 @@ export default function ZeroTrustDashboard() {
   // received a hardcoded `[]` for recentDecisions so the live decisions
   // table was always empty despite /zerotrust/decisions returning real
   // rows.
-  const { data: accessDecisionsRaw, isLoading: accessDecisionsLoading } = useQuery<any>({
+  const { data: accessDecisionsRaw, isLoading: accessDecisionsLoading, error: accessDecisionsError } = useQuery<any>({
     queryKey: ['zerotrust-decisions', 'access-control'],
     queryFn: async () => {
-      try {
-        const response = await api.get('/zerotrust/decisions', { params: { size: 50 } });
-        return response.data;
-      } catch {
-        return null;
-      }
+      // The handler pages with skip/limit (it ignores `size`).
+      const response = await api.get('/zerotrust/decisions', { params: { limit: 50 } });
+      return response.data;
     },
   });
   const accessDecisions: AccessDecision[] = Array.isArray(accessDecisionsRaw)
     ? accessDecisionsRaw
     : (accessDecisionsRaw?.decisions || accessDecisionsRaw?.items || []);
 
-  const { data: segmentsRaw, isLoading: segmentsLoading } = useQuery<any>({
+  const { data: segmentsRaw, isLoading: segmentsLoading, error: segmentsError } = useQuery<any>({
     queryKey: ['zerotrust-segments'],
     queryFn: async () => {
-      try {
       const response = await api.get('/zerotrust/segments');
       return response.data;
-      } catch { return null; }
     },
   });
   const segments: Segment[] = Array.isArray(segmentsRaw) ? segmentsRaw : (segmentsRaw?.segments || segmentsRaw?.items || []);
 
-  const { data: policiesRaw, isLoading: policiesLoading } = useQuery<any>({
+  const { data: policiesRaw, isLoading: policiesLoading, error: policiesError } = useQuery<any>({
     queryKey: ['zerotrust-policies'],
     queryFn: async () => {
-      try {
-      const response = await api.get('/zerotrust/policies');
+      // enabled_only defaults to true server-side, which hid disabled
+      // policies while `total` still counted them.
+      const response = await api.get('/zerotrust/policies', { params: { enabled_only: false } });
       return response.data;
-      } catch { return null; }
     },
   });
   const policies: Policy[] = Array.isArray(policiesRaw) ? policiesRaw : (policiesRaw?.policies || policiesRaw?.items || []);
@@ -320,26 +310,38 @@ export default function ZeroTrustDashboard() {
 
       {/* Overview Tab */}
       {activeTab === 'overview' && (
-        <OverviewTab
-          data={dashboardData}
-          loading={dashboardLoading}
-        />
+        <>
+          <LoadErrorBanner what="the Zero Trust dashboard" error={dashboardError} />
+          <LoadErrorBanner what="access decisions" error={accessDecisionsError} />
+          <OverviewTab
+            data={dashboardData}
+            recentDecisions={accessDecisions}
+            loading={dashboardLoading}
+          />
+        </>
       )}
 
       {/* Access Control Tab */}
       {activeTab === 'access-control' && (
+        <>
+        <LoadErrorBanner what="the Zero Trust dashboard" error={dashboardError} />
+        <LoadErrorBanner what="access decisions" error={accessDecisionsError} />
         <AccessControlTab
           recentDecisions={accessDecisions}
-          accessDecisions24h={{ allowed: dashboardData?.allowed_decisions || 0, denied: dashboardData?.denied_decisions || 0, challenged: dashboardData?.challenged_decisions || 0 }}
+          accessDecisions24h={dashboardData ? { allowed: dashboardData.allowed_decisions, denied: dashboardData.denied_decisions, challenged: dashboardData.challenged_decisions } : undefined}
           loading={dashboardLoading || accessDecisionsLoading}
           decisionFilter={decisionFilter}
           setDecisionFilter={setDecisionFilter}
           onEvaluateAccess={(data) => evaluateAccessMutation.mutate(data)}
         />
+        </>
       )}
 
       {/* Device Trust Tab */}
       {activeTab === 'devices' && (
+        <>
+        <LoadErrorBanner what="device trust stats" error={statsError} />
+        <LoadErrorBanner what="devices" error={devicesError} />
         <DeviceTrustTab
           devices={devices || []}
           stats={deviceStats}
@@ -348,22 +350,29 @@ export default function ZeroTrustDashboard() {
           setExpandedDevice={setExpandedDevice}
           onAssessDevices={() => assessDevicesMutation.mutate()}
         />
+        </>
       )}
 
       {/* Micro-Segmentation Tab */}
       {activeTab === 'segmentation' && (
-        <SegmentationTab
-          segments={segments || []}
-          loading={segmentsLoading}
-        />
+        <>
+          <LoadErrorBanner what="micro-segments" error={segmentsError} />
+          <SegmentationTab
+            segments={segments || []}
+            loading={segmentsLoading}
+          />
+        </>
       )}
 
       {/* Policies Tab */}
       {activeTab === 'policies' && (
-        <PoliciesTab
-          policies={policies || []}
-          loading={policiesLoading}
-        />
+        <>
+          <LoadErrorBanner what="Zero Trust policies" error={policiesError} />
+          <PoliciesTab
+            policies={policies || []}
+            loading={policiesLoading}
+          />
+        </>
       )}
     </div>
   );
@@ -487,24 +496,24 @@ function OverviewTab({
       {/* Access Decisions Chart */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
         <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-6">
-          Access Decisions (24h)
+          Access Decisions (all time)
         </h2>
         <div className="grid grid-cols-3 gap-4">
           <DecisionChart
             label="Allowed"
-            value={data?.allowed_decisions || 0}
+            value={data?.allowed_decisions ?? 'not available'}
             icon={CheckCircle}
             color="green"
           />
           <DecisionChart
             label="Denied"
-            value={data?.denied_decisions || 0}
+            value={data?.denied_decisions ?? 'not available'}
             icon={AlertTriangle}
             color="red"
           />
           <DecisionChart
             label="Challenged"
-            value={data?.challenged_decisions || 0}
+            value={data?.challenged_decisions ?? 'not available'}
             icon={Clock}
             color="yellow"
           />
@@ -529,7 +538,7 @@ function OverviewTab({
             >
               <div className="flex-1">
                 <div className="text-sm font-medium text-gray-900 dark:text-white">
-                  {(decision as any).subject_id || "user"} → {(decision as any).resource_id || "resource"}
+                  {decision.subject} → {decision.resource}
                 </div>
                 <div className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
                   {new Date(decision.created_at || "").toLocaleTimeString()} • Risk: {decision.risk_score}%
@@ -711,19 +720,19 @@ function AccessControlTab({
       <div className="grid grid-cols-3 gap-4">
         <DecisionChart
           label="Allowed"
-          value={accessDecisions24h?.allowed || 0}
+          value={accessDecisions24h?.allowed ?? 'not available'}
           icon={CheckCircle}
           color="green"
         />
         <DecisionChart
           label="Denied"
-          value={accessDecisions24h?.denied || 0}
+          value={accessDecisions24h?.denied ?? 'not available'}
           icon={AlertTriangle}
           color="red"
         />
         <DecisionChart
           label="Challenged"
-          value={accessDecisions24h?.challenged || 0}
+          value={accessDecisions24h?.challenged ?? 'not available'}
           icon={Clock}
           color="yellow"
         />
@@ -773,9 +782,6 @@ function AccessControlTab({
               <th className="px-6 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300">
                 Risk Score
               </th>
-              <th className="px-6 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300">
-                Reason
-              </th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
@@ -785,10 +791,10 @@ function AccessControlTab({
                   {new Date(decision.created_at || "").toLocaleTimeString()}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-900 dark:text-white font-mono">
-                  {(decision as any).subject_id || "user"}
+                  {decision.subject}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-900 dark:text-white">
-                  {(decision as any).resource_id || "resource"}
+                  {decision.resource}
                 </td>
                 <td className="px-6 py-4 text-sm">
                   <span
@@ -824,9 +830,6 @@ function AccessControlTab({
                     </span>
                   </div>
                 </td>
-                <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {decision.reason}
-                </td>
               </tr>
             ))}
           </tbody>
@@ -853,6 +856,7 @@ function DeviceTrustTab({
 }) {
   const [detailDevice, setDetailDevice] = useState<any | null>(null);
   const [reassessedDevices, setReassessedDevices] = useState<Record<string, number>>({});
+  const [detailError, setDetailError] = useState<unknown>(null);
 
   if (loading) {
     return (
@@ -866,11 +870,11 @@ function DeviceTrustTab({
     <div className="space-y-6">
       {/* Device Stats */}
       <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
-        <StatCard label="Total Devices" value={stats?.total || 0} color="blue" />
-        <StatCard label="Trusted" value={stats?.trusted || 0} color="green" />
-        <StatCard label="Conditional" value={stats?.conditional || 0} color="yellow" />
-        <StatCard label="Untrusted" value={stats?.untrusted || 0} color="orange" />
-        <StatCard label="Blocked" value={stats?.blocked || 0} color="red" />
+        <StatCard label="Total Devices" value={stats?.total ?? 'not available'} color="blue" />
+        <StatCard label="Trusted" value={stats?.trusted ?? 'not available'} color="green" />
+        <StatCard label="Conditional" value={stats?.conditional ?? 'not available'} color="yellow" />
+        <StatCard label="Untrusted" value={stats?.untrusted ?? 'not available'} color="orange" />
+        <StatCard label="Blocked" value={stats?.blocked ?? 'not available'} color="red" />
       </div>
 
       {/* Assess Devices Button */}
@@ -882,17 +886,14 @@ function DeviceTrustTab({
         Assess All Devices
       </button>
 
+      <LoadErrorBanner what="the device" error={detailError} />
+
       {/* Devices Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         {devices.map((device) => (
           <div
             key={device.id}
-            className={clsx(
-              'rounded-lg border p-5 cursor-pointer transition-all',
-              device.is_compliant
-                ? 'bg-white dark:bg-gray-800 border-gray-200 dark:border-gray-700 hover:border-blue-400 dark:hover:border-blue-600'
-                : 'bg-red-50 dark:bg-red-900/20 border-red-200 dark:border-red-800'
-            )}
+            className="rounded-lg border p-5 cursor-pointer transition-all bg-white dark:bg-gray-800 border-gray-200 dark:border-gray-700 hover:border-blue-400 dark:hover:border-blue-600"
             onClick={() => setExpandedDevice(expandedDevice === device.id ? null : device.id)}
           >
             <div className="flex items-start justify-between mb-3">
@@ -901,18 +902,13 @@ function DeviceTrustTab({
                   {device.hostname}
                 </h3>
                 <p className="text-xs text-gray-600 dark:text-gray-400 mt-1">
-                  {(device.device_type || 'unknown').charAt(0).toUpperCase() + (device.device_type || 'unknown').slice(1)} • {device.os_type || 'N/A'}
+                  {(device.device_type || 'unknown').charAt(0).toUpperCase() + (device.device_type || 'unknown').slice(1)}
                 </p>
               </div>
-              <span
-                className={clsx(
-                  'inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium',
-                  device.is_compliant
-                    ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400'
-                    : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400'
-                )}
-              >
-                {device.is_compliant ? 'Compliant' : 'Non-Compliant'}
+              {/* The list projection has no compliance verdict; show the
+                  backend's trust_level instead of inventing one. */}
+              <span className="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-300">
+                {device.trust_level || 'unknown'}
               </span>
             </div>
 
@@ -939,17 +935,12 @@ function DeviceTrustTab({
               </div>
             </div>
 
-            {/* Compliance Checks */}
-            <div className="space-y-1 text-xs">
-              <CheckItem label="Patch" status={device.checks?.patch ?? device.compliance_checks?.patch} />
-              <CheckItem label="Antivirus" status={device.checks?.av ?? device.compliance_checks?.av} />
-              <CheckItem label="Encryption" status={device.checks?.encryption ?? device.compliance_checks?.encryption} />
-              <CheckItem label="Firewall" status={device.checks?.firewall ?? device.compliance_checks?.firewall} />
-            </div>
+            {/* Compliance checks live on the device detail (View Details),
+                not on the list rows, so none are drawn here. */}
 
             {/* Last Seen */}
             <div className="text-xs text-gray-500 dark:text-gray-400 mt-3 pt-3 border-t border-gray-200 dark:border-gray-700">
-              Last seen: {new Date(device.last_seen || "").toLocaleTimeString()}
+              Last seen: {device.last_seen ? new Date(device.last_seen).toLocaleString() : 'never reported'}
             </div>
 
             {/* Expanded Details */}
@@ -958,10 +949,11 @@ function DeviceTrustTab({
                 <button
                   onClick={async () => {
                     try {
-                      const res = await api.get(`/zerotrust/devices/${device.id}`);
+                      const res = await api.get(`/zerotrust/devices/${encodeURIComponent(device.device_id)}`);
+                      setDetailError(null);
                       setDetailDevice(res.data);
                     } catch (err) {
-                      console.error('Device detail fetch failed:', err);
+                      setDetailError(err);
                     }
                   }}
                   className="w-full px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-xs font-medium"
@@ -971,10 +963,11 @@ function DeviceTrustTab({
                 <button
                   onClick={async () => {
                     try {
-                      await api.post('/zerotrust/assess-devices', { device_ids: [device.id] });
+                      await api.post('/zerotrust/assess-devices', { device_ids: [device.device_id] });
+                      setDetailError(null);
                       setReassessedDevices((prev) => ({ ...prev, [device.id]: Date.now() }));
                     } catch (err) {
-                      console.error('Re-assess failed:', err);
+                      setDetailError(err);
                     }
                   }}
                   className="w-full px-3 py-2 bg-gray-100 dark:bg-gray-700 text-gray-900 dark:text-white rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 text-xs font-medium"
@@ -992,7 +985,7 @@ function DeviceTrustTab({
       <DetailDrawer
         open={!!detailDevice}
         onClose={() => setDetailDevice(null)}
-        title={detailDevice?.device_name || detailDevice?.hostname || 'Device Trust Profile'}
+        title={detailDevice?.hostname || detailDevice?.device_id || 'Device Trust Profile'}
         subtitle={detailDevice ? `${detailDevice.device_type || 'device'} · trust score ${detailDevice.trust_score ?? '—'}` : undefined}
         sections={
           detailDevice
@@ -1000,11 +993,11 @@ function DeviceTrustTab({
                 {
                   title: 'Identity',
                   fields: [
-                    { label: 'Device ID', value: detailDevice.id || detailDevice.device_id, mono: true, full: true },
-                    { label: 'Hostname', value: detailDevice.hostname || detailDevice.device_name },
+                    { label: 'Device ID', value: detailDevice.device_id, mono: true, full: true },
+                    { label: 'Hostname', value: detailDevice.hostname },
                     { label: 'Type', value: detailDevice.device_type },
-                    { label: 'Owner', value: detailDevice.user_id || detailDevice.owner },
-                    { label: 'OS', value: detailDevice.os || detailDevice.operating_system },
+                    { label: 'Owner', value: detailDevice.owner_id },
+                    { label: 'OS', value: detailDevice.os_type },
                     { label: 'OS Version', value: detailDevice.os_version },
                   ],
                 },
@@ -1012,20 +1005,35 @@ function DeviceTrustTab({
                   title: 'Trust Posture',
                   fields: [
                     { label: 'Trust Score', value: detailDevice.trust_score },
-                    { label: 'Compliance', value: detailDevice.compliance_status || detailDevice.compliant },
-                    { label: 'MDM Enrolled', value: detailDevice.mdm_enrolled != null ? (detailDevice.mdm_enrolled ? 'Yes' : 'No') : null },
-                    { label: 'Encryption', value: detailDevice.disk_encrypted != null ? (detailDevice.disk_encrypted ? 'Enabled' : 'Disabled') : null },
-                    { label: 'EDR Agent', value: detailDevice.edr_agent || detailDevice.edr_installed },
-                    { label: 'Patch Level', value: detailDevice.patch_level },
+                    { label: 'Trust Level', value: detailDevice.trust_level },
+                    {
+                      label: 'Compliance',
+                      value: detailDevice.compliance_status && Object.keys(detailDevice.compliance_status).length > 0
+                        ? JSON.stringify(detailDevice.compliance_status)
+                        : null,
+                      mono: true,
+                      full: true,
+                    },
+                    { label: 'Encryption', value: detailDevice.encryption_enabled ? 'Enabled' : 'Disabled' },
+                    { label: 'Antivirus', value: detailDevice.antivirus_active ? 'Active' : 'Inactive' },
+                    { label: 'Firewall', value: detailDevice.firewall_enabled ? 'Enabled' : 'Disabled' },
+                    { label: 'Certificate', value: detailDevice.certificate_valid ? 'Valid' : 'Invalid' },
+                    { label: 'Jailbroken', value: detailDevice.jailbroken ? 'Yes' : 'No' },
+                    {
+                      label: 'Risk Factors',
+                      value: Array.isArray(detailDevice.risk_factors) && detailDevice.risk_factors.length > 0
+                        ? detailDevice.risk_factors.join(', ')
+                        : null,
+                      full: true,
+                    },
                   ],
                 },
                 {
-                  title: 'Network',
+                  title: 'Activity',
                   fields: [
-                    { label: 'IP Address', value: detailDevice.ip_address, mono: true },
-                    { label: 'MAC Address', value: detailDevice.mac_address, mono: true },
-                    { label: 'Last Seen', value: detailDevice.last_seen ? new Date(detailDevice.last_seen).toLocaleString() : null },
-                    { label: 'Last Assessed', value: detailDevice.last_assessed ? new Date(detailDevice.last_assessed).toLocaleString() : null },
+                    { label: 'Last Seen', value: detailDevice.last_seen_at ? new Date(detailDevice.last_seen_at).toLocaleString() : null },
+                    { label: 'Last Assessed', value: detailDevice.last_assessment_at ? new Date(detailDevice.last_assessment_at).toLocaleString() : null },
+                    { label: 'Enrolled', value: detailDevice.enrolled_at ? new Date(detailDevice.enrolled_at).toLocaleString() : null },
                   ],
                 },
               ] as DetailSection[])
@@ -1139,18 +1147,18 @@ function SegmentationTab({
                   {segment.name}
                 </h3>
                 <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-                  Type: {segment.type}
+                  Type: {segment.segment_type}
                 </p>
               </div>
               <span
                 className={clsx(
                   'inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium',
-                  segment.status === 'healthy'
+                  segment.is_active
                     ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400'
-                    : 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400'
+                    : 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-400'
                 )}
               >
-                {segment.status}
+                {segment.is_active ? 'active' : 'inactive'}
               </span>
             </div>
 
@@ -1158,7 +1166,7 @@ function SegmentationTab({
               <div className="flex items-center justify-between text-gray-600 dark:text-gray-400">
                 <span>Members</span>
                 <span className="font-medium text-gray-900 dark:text-white">
-                  {segment.member_count}
+                  {(segment.member_assets || []).length}
                 </span>
               </div>
               <div>
@@ -1324,27 +1332,27 @@ function PoliciesTab({
                   {policy.name}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {policy.type}
+                  {policy.policy_type}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
                   {policy.risk_threshold}%
                 </td>
                 <td className="px-6 py-4 text-sm">
-                  {policy.mfa_required ? (
+                  {policy.requires_mfa ? (
                     <CheckCircle className="w-4 h-4 text-green-600 dark:text-green-400" />
                   ) : (
                     <AlertCircle className="w-4 h-4 text-gray-400" />
                   )}
                 </td>
                 <td className="px-6 py-4 text-sm">
-                  {policy.device_trust_required ? (
+                  {policy.requires_device_trust ? (
                     <CheckCircle className="w-4 h-4 text-green-600 dark:text-green-400" />
                   ) : (
                     <AlertCircle className="w-4 h-4 text-gray-400" />
                   )}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {policy.decision_count}
+                  {policy.hit_count}
                 </td>
                 <td className="px-6 py-4 text-sm">
                   <span
@@ -1355,7 +1363,7 @@ function PoliciesTab({
                         : 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-400'
                     )}
                   >
-                    {policy.status}
+                    {policy.is_enabled ? 'enabled' : 'disabled'}
                   </span>
                 </td>
               </tr>
@@ -1374,7 +1382,7 @@ function DecisionChart({
   color,
 }: {
   label: string;
-  value: number;
+  value: number | string;
   icon: React.ComponentType<{ className?: string }>;
   color: 'green' | 'red' | 'yellow';
 }) {
@@ -1401,7 +1409,7 @@ function StatCard({
   color,
 }: {
   label: string;
-  value: number;
+  value: number | string;
   color: 'blue' | 'green' | 'yellow' | 'orange' | 'red';
 }) {
   const colorClasses: Record<string, string> = {
@@ -1419,19 +1427,6 @@ function StatCard({
       </div>
       <div className="text-2xl font-bold text-gray-900 dark:text-white">{value}</div>
       <div className="text-sm text-gray-600 dark:text-gray-400">{label}</div>
-    </div>
-  );
-}
-
-function CheckItem({ label, status }: { label: string; status: boolean }) {
-  return (
-    <div className="flex items-center justify-between text-gray-600 dark:text-gray-400">
-      <span>{label}</span>
-      {status ? (
-        <CheckCircle className="w-4 h-4 text-green-500" />
-      ) : (
-        <AlertCircle className="w-4 h-4 text-red-500" />
-      )}
     </div>
   );
 }

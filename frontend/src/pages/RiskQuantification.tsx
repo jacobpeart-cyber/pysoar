@@ -18,6 +18,8 @@ import {
 import clsx from 'clsx';
 import { riskquantApi } from '../api/endpoints';
 import { api } from '../lib/api';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 
 const getSeverityColor = (severity: string) => {
   switch (severity) {
@@ -81,6 +83,9 @@ export default function RiskQuantification() {
   const [analyzeResultBanner, setAnalyzeResultBanner] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Secondary loads (FAIR analyses, dashboard, loss exceedance) that failed;
+  // shown next to the panels they feed instead of rendering as empty.
+  const [loadErrors, setLoadErrors] = useState<{ fair?: unknown; dashboard?: unknown; loss?: unknown }>({});
   const [searchQuery, setSearchQuery] = useState('');
   const [showNewScenarioModal, setShowNewScenarioModal] = useState(false);
   const [selectedScenario, setSelectedScenario] = useState<any | null>(null);
@@ -119,9 +124,18 @@ export default function RiskQuantification() {
         riskquantApi.getDashboard(),
         riskquantApi.getFairAnalyses(),
       ]);
-      const rawScenarios: any[] = scenariosData.status === 'fulfilled'
-        ? (scenariosData.value || [])
-        : [];
+      if (scenariosData.status === 'rejected') {
+        // The scenario list is the page; without it there is nothing honest
+        // to render, so fail the whole view with the server's reason.
+        setError(`Could not load risk scenarios. ${describeLoadError(scenariosData.reason)}`);
+        return;
+      }
+      setLoadErrors({
+        fair: fairData.status === 'rejected' ? fairData.reason : undefined,
+        dashboard: dashData.status === 'rejected' ? dashData.reason : undefined,
+        loss: lossData.status === 'rejected' ? lossData.reason : undefined,
+      });
+      const rawScenarios: any[] = scenariosData.value || [];
       const fairList: any[] = fairData.status === 'fulfilled'
         ? (fairData.value || [])
         : [];
@@ -167,14 +181,17 @@ export default function RiskQuantification() {
       );
       // Also refresh dashboard + loss exceedance so those panels reflect
       // the new analyses.
-      try {
-        const [d, l] = await Promise.all([
-          riskquantApi.getDashboard().catch(() => null),
-          riskquantApi.getLossExceedance().catch(() => null),
-        ]);
-        if (d) setDashboard(d);
-        if (l) setAnalysisResults(l);
-      } catch { /* ignore */ }
+      const [d, l] = await Promise.allSettled([
+        riskquantApi.getDashboard(),
+        riskquantApi.getLossExceedance(),
+      ]);
+      if (d.status === 'fulfilled') setDashboard(d.value);
+      if (l.status === 'fulfilled') setAnalysisResults(l.value);
+      setLoadErrors((prev) => ({
+        ...prev,
+        dashboard: d.status === 'rejected' ? d.reason : undefined,
+        loss: l.status === 'rejected' ? l.reason : undefined,
+      }));
     } catch (err: any) {
       setAnalyzeResultBanner(`Analysis failed: ${err?.response?.data?.detail || err?.message || 'unknown error'}`);
     } finally {
@@ -196,8 +213,10 @@ export default function RiskQuantification() {
   // is empty (no FAIR analyses yet).
   const totalAleAggregate = dashboard?.total_ale_annual_usd
     ?? scenarios.reduce((sum, s) => sum + (s.ale || 0), 0);
-  const totalControls = (dashboard?.number_of_controls
-    ?? scenarios.reduce((sum, s) => sum + (s.controls?.length || 0), 0));
+  // GET /risk-quantification/dashboard has no control count (it returns
+  // control_effectiveness_avg only) and scenarios carry no controls, so
+  // there is no real number to show here.
+  const totalControls: number | null = null;
 
   const tabs = [
     { id: 'scenarios', label: 'Scenarios', icon: Target },
@@ -262,6 +281,11 @@ export default function RiskQuantification() {
         </div>
 
         {/* Summary Cards */}
+        <div className="space-y-2 mb-4 empty:hidden">
+          <LoadErrorBanner what="FAIR analyses" error={loadErrors.fair} />
+          <LoadErrorBanner what="the risk dashboard" error={loadErrors.dashboard} />
+          <LoadErrorBanner what="loss exceedance data" error={loadErrors.loss} />
+        </div>
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
           <div className="bg-gradient-to-br from-emerald-50 to-emerald-100 dark:from-emerald-900 dark:to-emerald-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-emerald-600 dark:text-emerald-300">Risk Scenarios</p>
@@ -280,7 +304,7 @@ export default function RiskQuantification() {
           </div>
           <div className="bg-gradient-to-br from-purple-50 to-purple-100 dark:from-purple-900 dark:to-purple-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-purple-600 dark:text-purple-300">Total Controls</p>
-            <p className="text-3xl font-bold text-purple-900 dark:text-purple-100 mt-2">{totalControls}</p>
+            <p className="text-3xl font-bold text-purple-900 dark:text-purple-100 mt-2">{totalControls ?? 'not available'}</p>
             <p className="text-xs text-purple-600 dark:text-purple-300 mt-1">mitigating controls</p>
           </div>
         </div>
@@ -485,7 +509,7 @@ export default function RiskQuantification() {
                         const fairs = Object.values(fairByScenario);
                         const sumPct = (key: string) =>
                           fairs.reduce((s: number, a: any) => s + Number(a?.[key] ?? 0), 0);
-                        const p10 = sumPct('ale_p10') || sumPct('ale_p50') / 2;
+                        const p10 = sumPct('ale_p10');
                         const p50 = sumPct('ale_p50');
                         const p90 = sumPct('ale_p90');
                         return (

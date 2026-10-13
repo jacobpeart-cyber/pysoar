@@ -15,6 +15,8 @@ import {
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 
 interface AuditLog {
   id: string;
@@ -67,8 +69,9 @@ export default function AuditLogs() {
   });
   const [showFilters, setShowFilters] = useState(false);
   const [exportFormat, setExportFormat] = useState<'csv' | 'json' | 'xml'>('csv');
+  const [exportError, setExportError] = useState<string | null>(null);
 
-  const { data, isLoading } = useQuery<AuditLogResponse>({
+  const { data, isLoading, error } = useQuery<AuditLogResponse>({
     queryKey: ['audit-logs', page, filters],
     queryFn: async () => {
       const params = new URLSearchParams();
@@ -80,10 +83,8 @@ export default function AuditLogs() {
       if (filters.days) params.append('days', String(filters.days));
       if (filters.search) params.append('search', filters.search);
 
-      try {
       const response = await api.get(`/audit?${params.toString()}`);
       return response.data;
-      } catch { return null; }
     },
   });
 
@@ -92,32 +93,24 @@ export default function AuditLogs() {
   const { data: auditStats } = useQuery<any>({
     queryKey: ['audit-stats', filters.days],
     queryFn: async () => {
-      try {
-        const res = await api.get('/audit/stats', { params: { days: filters.days || 90 } });
-        return res.data;
-      } catch {
-        return null;
-      }
+      const res = await api.get('/audit/stats', { params: { days: filters.days || 90 } });
+      return res.data;
     },
   });
 
-  const { data: actionsData } = useQuery<{ actions: string[] }>({
+  const { data: actionsData, error: actionsError } = useQuery<{ actions: string[] }>({
     queryKey: ['audit-actions'],
     queryFn: async () => {
-      try {
       const response = await api.get('/audit/actions');
       return response.data;
-      } catch { return null; }
     },
   });
 
-  const { data: resourceTypesData } = useQuery<{ resource_types: string[] }>({
+  const { data: resourceTypesData, error: resourceTypesError } = useQuery<{ resource_types: string[] }>({
     queryKey: ['audit-resource-types'],
     queryFn: async () => {
-      try {
       const response = await api.get('/audit/resource-types');
       return response.data;
-      } catch { return null; }
     },
   });
 
@@ -145,6 +138,7 @@ export default function AuditLogs() {
               // Hit the real backend /audit/export which streams a CSV with
               // proper Content-Disposition. Required for FedRAMP AU-6 audit
               // evidence export.
+              setExportError(null);
               const params = new URLSearchParams();
               params.append('format', exportFormat);
               params.append('days', String(filters.days || 90));
@@ -170,7 +164,7 @@ export default function AuditLogs() {
                 document.body.removeChild(a);
                 URL.revokeObjectURL(url);
               } catch (err) {
-                console.error('Audit export failed:', err);
+                setExportError(`Audit export failed. ${describeLoadError(err)}`);
               }
             }}
             className="flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-200 bg-white text-gray-700 hover:bg-gray-50 transition-colors"
@@ -193,9 +187,21 @@ export default function AuditLogs() {
         </div>
       </div>
 
+      {exportError && (
+        <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
+          {exportError}
+        </div>
+      )}
+
       {/* Filters */}
       {showFilters && (
         <div className="bg-white rounded-lg border border-gray-200 p-4">
+          {(!!actionsError || !!resourceTypesError) && (
+            <div className="mb-4 space-y-2">
+              <LoadErrorBanner what="audit action filters" error={actionsError} />
+              <LoadErrorBanner what="resource type filters" error={resourceTypesError} />
+            </div>
+          )}
           <div className="grid grid-cols-3 gap-4">
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Action</label>
@@ -253,6 +259,10 @@ export default function AuditLogs() {
         {isLoading ? (
           <div className="flex items-center justify-center h-64">
             <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
+          </div>
+        ) : error ? (
+          <div className="p-4">
+            <LoadErrorBanner what="audit logs" error={error} />
           </div>
         ) : (
           <table className="w-full">

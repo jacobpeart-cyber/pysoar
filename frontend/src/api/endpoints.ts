@@ -8,60 +8,39 @@ import {
   SIEMDashboard,
   ThreatIndicator,
   ThreatIntelFeed,
-  EnrichmentResult,
   Hunt,
   HuntFinding,
   ExposureAssessment,
   AttackSurface,
   AIPrediction,
-  AnalysisResult,
-  UserBehavior,
-  RiskScore,
-  SimulationCampaign,
-  SimulationResult,
-  Honeypot,
-  Honeytoken,
   RemediationPolicy,
   RemediationAction,
   ComplianceFramework,
-  ComplianceControl,
   POAM,
   ZeroTrustPolicy,
   DeviceTrust,
   STIGBenchmark,
-  STIGFinding,
   AuditEvidence,
   DFIRCase,
-  DFIRTimeline,
   IdentityThreat,
-  CredentialMonitor,
   Vulnerability,
   PatchOperation,
   SBOM,
   VendorAssessment,
   DarkWebAlert,
-  Connector,
   Agent,
   Investigation,
   Playbook,
-  PlaybookNode,
   DLPPolicy,
   DLPIncident,
   RiskScenario,
   OTAsset,
   OTZone,
   ContainerImage,
-  ContainerScan,
   DataSubjectRequest,
   PrivacyImpactAssessment,
   ThreatModel,
   AttackTree,
-  APIEndpoint,
-  DataSource,
-  DataLakePipeline,
-  WarRoom,
-  WarRoomMessage,
-  ActionItem,
   PhishingCampaign,
   PhishingResult,
 } from './types';
@@ -95,10 +74,6 @@ export const alertsApi = {
   updateAlert: async (id: string, data: Partial<Alert>): Promise<Alert> => {
     const response = await api.patch(`/alerts/${id}`, data);
     return response.data;
-  },
-
-  bulkUpdateAlerts: async (ids: string[], data: Partial<Alert>): Promise<void> => {
-    await api.post('/alerts/bulk-update', { ids, data });
   },
 };
 
@@ -186,11 +161,6 @@ export const threatIntelApi = {
     const response = await api.get('/threat-intel/indicators', { params });
     return extractData(response.data);
   },
-
-  enrichIOC: async (value: string): Promise<EnrichmentResult> => {
-    const response = await api.post('/threat-intel/enrich', { indicator: value });
-    return response.data;
-  },
 };
 
 // Hunting
@@ -260,94 +230,6 @@ export const aiApi = {
     const response = await api.get('/ai/predictions', { params });
     return extractData(response.data);
   },
-
-  runAnalysis: async (data: {
-    analysis_type: string;
-    input_data: Record<string, any>;
-  }): Promise<AnalysisResult> => {
-    const response = await api.post('/ai/analyze', data);
-    return response.data;
-  },
-
-  queryNaturalLanguage: async (query: string): Promise<{ result: string; reasoning: string }> => {
-    const response = await api.post('/ai/natural-language', { query });
-    return response.data;
-  },
-};
-
-// UEBA
-export const uebaApi = {
-  getUserBehaviors: async (params?: {
-    page?: number;
-    size?: number;
-    search?: string;
-  }): Promise<PaginatedResponse<UserBehavior>> => {
-    const response = await api.get('/ueba/behaviors', { params });
-    return extractData(response.data);
-  },
-
-  getRiskScores: async (): Promise<RiskScore[]> => {
-    const response = await api.get('/ueba/risk-scores');
-    return extractData(response.data);
-  },
-
-  getAnomalies: async (params?: {
-    page?: number;
-    size?: number;
-  }): Promise<PaginatedResponse<{ user_id: string; anomaly_type: string; risk_score: number }>> => {
-    const response = await api.get('/ueba/anomalies', { params });
-    return extractData(response.data);
-  },
-};
-
-// Attack Simulation
-export const simulationApi = {
-  getCampaigns: async (params?: {
-    page?: number;
-    size?: number;
-    status?: string;
-  }): Promise<PaginatedResponse<SimulationCampaign>> => {
-    const response = await api.get('/simulation/campaigns', { params });
-    return extractData(response.data);
-  },
-
-  launchSimulation: async (data: {
-    name: string;
-    type: string;
-    targets: string[];
-  }): Promise<SimulationCampaign> => {
-    const response = await api.post('/simulation/campaigns', data);
-    return response.data;
-  },
-
-  getResults: async (campaignId: string, params?: {
-    page?: number;
-    size?: number;
-  }): Promise<PaginatedResponse<SimulationResult>> => {
-    const response = await api.get(`/simulation/campaigns/${campaignId}/results`, { params });
-    return extractData(response.data);
-  },
-};
-
-// Deception Technology
-export const deceptionApi = {
-  getHoneypots: async (): Promise<Honeypot[]> => {
-    const response = await api.get('/deception/honeypots');
-    return extractData(response.data);
-  },
-
-  getHoneytokens: async (): Promise<Honeytoken[]> => {
-    const response = await api.get('/deception/honeytokens');
-    return extractData(response.data);
-  },
-
-  getDeceptionAlerts: async (params?: {
-    page?: number;
-    size?: number;
-  }): Promise<PaginatedResponse<{ id: string; type: string; timestamp: string; data: Record<string, any> }>> => {
-    const response = await api.get('/deception/alerts', { params });
-    return extractData(response.data);
-  },
 };
 
 // Remediation
@@ -365,31 +247,12 @@ export const remediationApi = {
     const response = await api.get('/remediation/actions', { params });
     return extractData(response.data);
   },
-
-  approveAction: async (id: string): Promise<RemediationAction> => {
-    const response = await api.post(`/remediation/actions/${id}/approve`);
-    return response.data;
-  },
-
-  executeAction: async (id: string): Promise<RemediationAction> => {
-    const response = await api.post(`/remediation/actions/${id}/execute`);
-    return response.data;
-  },
 };
 
 // Compliance
 export const complianceApi = {
   getFrameworks: async (): Promise<ComplianceFramework[]> => {
     const response = await api.get('/compliance/frameworks');
-    return extractData(response.data);
-  },
-
-  getControls: async (frameworkId: string, params?: {
-    page?: number;
-    size?: number;
-    status?: string;
-  }): Promise<PaginatedResponse<ComplianceControl>> => {
-    const response = await api.get(`/compliance/frameworks/${frameworkId}/controls`, { params });
     return extractData(response.data);
   },
 
@@ -437,47 +300,6 @@ export const stigApi = {
   getBenchmarks: async (): Promise<STIGBenchmark[]> => {
     const response = await api.get('/stig/benchmarks');
     return extractData(response.data);
-  },
-
-  runScan: async (benchmarkId: string): Promise<{ task_id: string }> => {
-    const response = await api.post(`/stig/benchmarks/${benchmarkId}/scan`);
-    return response.data;
-  },
-
-  getFindings: async (benchmarkId: string, params?: {
-    page?: number;
-    size?: number;
-    status?: string;
-  }): Promise<PaginatedResponse<STIGFinding>> => {
-    const response = await api.get(`/stig/benchmarks/${benchmarkId}/findings`, { params });
-    return extractData(response.data);
-  },
-};
-
-// Audit Evidence
-export const auditEvidenceApi = {
-  getEvidence: async (params?: {
-    page?: number;
-    size?: number;
-    type?: string;
-  }): Promise<PaginatedResponse<AuditEvidence>> => {
-    const response = await api.get('/audit/evidence', { params });
-    return extractData(response.data);
-  },
-
-  collectEvidence: async (data: {
-    type: string;
-    description: string;
-    source: string;
-    evidence_data: Record<string, any>;
-  }): Promise<AuditEvidence> => {
-    const response = await api.post('/audit/evidence', data);
-    return response.data;
-  },
-
-  getReadinessScore: async (): Promise<{ score: number; details: Record<string, any> }> => {
-    const response = await api.get('/audit/readiness-score');
-    return response.data;
   },
 };
 
@@ -585,11 +407,6 @@ export const itdrApi = {
     size?: number;
   }): Promise<PaginatedResponse<any>> => {
     const response = await api.get('/itdr/anomalies', { params });
-    return extractData(response.data);
-  },
-
-  getCredentialMonitors: async (): Promise<CredentialMonitor[]> => {
-    const response = await api.get('/itdr/credential-monitors');
     return extractData(response.data);
   },
 
@@ -867,31 +684,6 @@ export const integrationsApi = {
     const d = response.data;
     return Array.isArray(d) ? d : (d?.items ?? []);
   },
-
-  installConnector: async (connectorId: string, config: Record<string, any>): Promise<Connector> => {
-    const response = await api.post(`/integrations/connectors/${connectorId}/install`, { config });
-    return response.data;
-  },
-
-  executeAction: async (connectorId: string, action: string, params: Record<string, any>): Promise<any> => {
-    const response = await api.post(`/integrations/connectors/${connectorId}/execute`, { action, params });
-    return response.data;
-  },
-
-  configureConnector: async (connectorId: string, config: Record<string, any>): Promise<any> => {
-    const response = await api.put(`/integrations/connectors/${connectorId}/config`, config);
-    return response.data;
-  },
-
-  testConnector: async (connectorId: string): Promise<any> => {
-    const response = await api.post(`/integrations/connectors/${connectorId}/test`);
-    return response.data;
-  },
-
-  createWebhook: async (data: { name: string; url: string; event: string }): Promise<any> => {
-    const response = await api.post('/integrations/webhooks', data);
-    return response.data;
-  },
 };
 
 // Agentic Automation
@@ -912,11 +704,6 @@ export const agenticApi = {
 
   startInvestigation: async (data: { description: string; target_data: Record<string, any> }): Promise<Investigation> => {
     const response = await api.post('/agentic/investigations', data);
-    return response.data;
-  },
-
-  getReasoningChain: async (investigationId: string): Promise<{ steps: string[]; conclusion: string }> => {
-    const response = await api.get(`/agentic/investigations/${investigationId}/reasoning`);
     return response.data;
   },
 
@@ -996,11 +783,6 @@ export const playbookApi = {
   }): Promise<Playbook> => {
     const response = await api.post('/playbooks', data);
     return response.data;
-  },
-
-  getNodes: async (playbookId: string): Promise<PlaybookNode[]> => {
-    const response = await api.get(`/playbooks/${playbookId}/nodes`);
-    return extractData(response.data);
   },
 
   executePlaybook: async (playbookId: string, input_data?: Record<string, any>): Promise<{ execution_id: string }> => {
@@ -1445,22 +1227,18 @@ export const collaborationApi = {
   },
 
   getAllActionItems: async (): Promise<any[]> => {
-    // Get action items across all active rooms
-    try {
-      const roomsRes = await api.get('/collaboration/rooms', { params: { size: 50 } });
-      const rooms = extractData(roomsRes.data) ?? [];
-      const allItems: any[] = [];
-      for (const room of rooms) {
-        try {
-          const res = await api.get(`/collaboration/rooms/${room.id}/actions`);
-          const items = extractData(res.data) ?? [];
-          for (const item of items) {
-            allItems.push({ ...item, _room_name: room.name });
-          }
-        } catch { /* room may have no actions */ }
-      }
-      return allItems;
-    } catch { return []; }
+    // Action items across all active rooms. A failed request propagates so
+    // the page shows the error instead of an empty list.
+    const roomsRes = await api.get('/collaboration/rooms', { params: { size: 50 } });
+    const rooms: any[] = extractData(roomsRes.data) ?? [];
+    const perRoom = await Promise.all(
+      rooms.map(async (room) => {
+        const res = await api.get(`/collaboration/rooms/${room.id}/actions`);
+        const items: any[] = extractData(res.data) ?? [];
+        return items.map((item) => ({ ...item, _room_name: room.name }));
+      }),
+    );
+    return perRoom.flat();
   },
 
   getActionItems: async (warRoomId: string): Promise<any[]> => {
@@ -1497,10 +1275,8 @@ export const collaborationApi = {
   },
 
   getArchivedRooms: async (): Promise<any[]> => {
-    try {
-      const response = await api.get('/collaboration/rooms', { params: { status: 'archived', size: 50 } });
-      return extractData(response.data) ?? [];
-    } catch { return []; }
+    const response = await api.get('/collaboration/rooms', { params: { status: 'archived', size: 50 } });
+    return extractData(response.data) ?? [];
   },
 };
 

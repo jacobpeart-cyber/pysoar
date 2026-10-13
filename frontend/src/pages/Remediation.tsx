@@ -48,6 +48,8 @@ import { api } from '../lib/api';
 import clsx from 'clsx';
 import { remediationApi } from '../api/endpoints';
 import FormModal from '../components/FormModal';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 
 interface Tab {
   id: string;
@@ -170,34 +172,37 @@ export default function Remediation() {
   const [executionStatusFilter, setExecutionStatusFilter] = useState('');
   const [executionTriggerFilter, setExecutionTriggerFilter] = useState('');
   const [blockIPValue, setBlockIPValue] = useState('');
-  const [blockDuration, setBlockDuration] = useState('24h');
+  const [blockDuration, setBlockDuration] = useState('24');
   const [isolateHostValue, setIsolateHostValue] = useState('');
   const [isolateReason, setIsolateReason] = useState('');
   const [disableUsername, setDisableUsername] = useState('');
   const [forcePasswordReset, setForcePasswordReset] = useState(false);
   const [quarantineHost, setQuarantineHost] = useState('');
   const [quarantineFilePath, setQuarantineFilePath] = useState('');
+  const [approvalError, setApprovalError] = useState<unknown>(null);
 
   // Fetch dashboard stats
-  const { data: dashboardData, isLoading: dashboardLoading } = useQuery({
+  const { data: dashboardData, isLoading: dashboardLoading, error: dashboardError } = useQuery({
     queryKey: ['remediation-dashboard'],
     queryFn: async () => {
-      try {
       const response = await api.get('/remediation/dashboard');
       return response.data;
-      } catch { return null; }
     },
     enabled: activeTab === 'dashboard',
   });
 
   // Fetch policies
-  const { data: policiesData, isLoading: policiesLoading } = useQuery({
+  const { data: policiesData, isLoading: policiesLoading, error: policiesError } = useQuery({
     queryKey: ['remediation-policies', policyTypeFilter, policyEnabledFilter],
     queryFn: async () => {
       const response = await api.get('/remediation/policies', {
+        // Backend Query params are policy_type / enabled_only
+        // (remediation.py list_policies). enabled_only defaults to true
+        // server-side, so "All" and "Disabled" must send false; the
+        // Disabled view is then narrowed client-side.
         params: {
-          type: policyTypeFilter,
-          enabled: policyEnabledFilter,
+          policy_type: policyTypeFilter || undefined,
+          enabled_only: policyEnabledFilter === 'true',
         },
       });
       return response.data;
@@ -208,112 +213,109 @@ export default function Remediation() {
   });
 
   // Fetch executions
-  const { data: executionsData, isLoading: executionsLoading } = useQuery({
+  const { data: executionsData, isLoading: executionsLoading, error: executionsError } = useQuery({
     queryKey: ['remediation-executions', executionStatusFilter, executionTriggerFilter],
     queryFn: async () => {
       const response = await api.get('/remediation/executions', {
         params: {
-          status: executionStatusFilter,
-          trigger: executionTriggerFilter,
+          status: executionStatusFilter || undefined,
+          trigger_source: executionTriggerFilter || undefined,
         },
       });
       return response.data;
     },
-    enabled: activeTab === 'executions',
+    // The dashboard's charts and Recent Executions read this list too;
+    // /remediation/dashboard does not return recent executions.
+    enabled: activeTab === 'executions' || activeTab === 'dashboard',
   });
 
   // Fetch pending approvals
-  const { data: pendingApprovalsData, isLoading: pendingApprovalsLoading } = useQuery({
+  const { data: pendingApprovalsData, isLoading: pendingApprovalsLoading, error: pendingApprovalsError } = useQuery({
     queryKey: ['remediation-pending-approvals'],
     queryFn: async () => {
-      try {
       const response = await api.get('/remediation/executions/pending');
       return response.data;
-      } catch { return null; }
     },
     enabled: activeTab === 'executions',
   });
 
   // Fetch quick actions
-  const { data: quickActionsData, isLoading: quickActionsLoading } = useQuery({
+  const { data: quickActionsData, isLoading: quickActionsLoading, error: quickActionsError } = useQuery({
     queryKey: ['remediation-quick-actions'],
     queryFn: async () => {
-      try {
       const response = await api.get('/remediation/quick-actions');
       return response.data;
-      } catch { return null; }
     },
     enabled: activeTab === 'quick-actions',
   });
 
   // Fetch integrations
-  const { data: integrationsData, isLoading: integrationsLoading } = useQuery({
+  const { data: integrationsData, isLoading: integrationsLoading, error: integrationsError } = useQuery({
     queryKey: ['remediation-integrations'],
     queryFn: async () => {
-      try {
       const response = await api.get('/remediation/integrations');
       return response.data;
-      } catch { return null; }
     },
     enabled: activeTab === 'integrations',
   });
 
   // Fetch available connectors from marketplace (for Add Integration modal)
-  const { data: connectorsData } = useQuery({
+  const { data: connectorsData, error: connectorsError } = useQuery({
     queryKey: ['integrations-connectors'],
     queryFn: async () => {
-      try {
-        const response = await api.get('/integrations/connectors', {
-          params: { size: 100 },
-        });
-        return response.data;
-      } catch {
-        return null;
-      }
+      const response = await api.get('/integrations/connectors', {
+        params: { size: 100 },
+      });
+      return response.data;
     },
     enabled: showAddIntegrationModal,
   });
 
   // Mutations
   const blockIPMutation = useMutation({
-    mutationFn: async (data: { ip: string; duration: string }) => {
-      try {
+    mutationFn: async (data: { ip: string; duration_hours: number }) => {
       const response = await api.post('/remediation/block-ip', data);
       return response.data;
-      } catch { return null; }
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['remediation-quick-actions'] });
     },
   });
 
   const isolateHostMutation = useMutation({
     mutationFn: async (data: { hostname: string; reason: string }) => {
-      try {
       const response = await api.post('/remediation/isolate-host', data);
       return response.data;
-      } catch { return null; }
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['remediation-quick-actions'] });
     },
   });
 
   const disableAccountMutation = useMutation({
     mutationFn: async (data: { username: string; force_password_reset: boolean }) => {
-      try {
       const response = await api.post('/remediation/disable-account', data);
       return response.data;
-      } catch { return null; }
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['remediation-quick-actions'] });
     },
   });
 
   const quarantineFileMutation = useMutation({
-    mutationFn: async (data: { host: string; file_path: string }) => {
-      try {
+    mutationFn: async (data: { hostname: string; file_path: string }) => {
       const response = await api.post('/remediation/quarantine-file', data);
       return response.data;
-      } catch { return null; }
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['remediation-quick-actions'] });
     },
   });
 
   const handleBlockIP = () => {
     if (blockIPValue.trim()) {
-      blockIPMutation.mutate({ ip: blockIPValue, duration: blockDuration });
+      // Backend field is duration_hours (QuickBlockIPRequest).
+      blockIPMutation.mutate({ ip: blockIPValue, duration_hours: Number(blockDuration) });
       setBlockIPValue('');
     }
   };
@@ -336,7 +338,7 @@ export default function Remediation() {
 
   const handleQuarantineFile = () => {
     if (quarantineHost.trim() && quarantineFilePath.trim()) {
-      quarantineFileMutation.mutate({ host: quarantineHost, file_path: quarantineFilePath });
+      quarantineFileMutation.mutate({ hostname: quarantineHost, file_path: quarantineFilePath });
       setQuarantineHost('');
       setQuarantineFilePath('');
     }
@@ -379,14 +381,21 @@ export default function Remediation() {
     // `||` fallbacks substituted fabricated numbers like '1,247' / '94.2'
     // on a cold system — customers saw fake operational metrics before
     // any real remediation had ever run. Show honest zeros or '—'.
-    const fmt = (v: unknown, fallback: string = '0') =>
+    const fmt = (v: unknown, fallback: string = 'not available') =>
       v === undefined || v === null ? fallback : String(v);
 
-    const pendingApprovalsNum = typeof dashboardData?.pending_approvals === 'number'
+    const pendingApprovalsNum: number | null = typeof dashboardData?.pending_approvals === 'number'
       ? dashboardData.pending_approvals
-      : 0;
+      : null;
     const successRate = dashboardData?.overall_success_rate ?? dashboardData?.success_rate;
     const avgMinutes = dashboardData?.avg_execution_minutes ?? dashboardData?.avg_remediation_time;
+
+    // /remediation/dashboard has no recent-executions field; the newest
+    // rows come from /remediation/executions (newest first).
+    const recentExecutions: Execution[] = (Array.isArray(executionsData) ? executionsData : []).slice(0, 5);
+    const dashboardPolicyNames = new Map<string, string>(
+      (Array.isArray(policiesData) ? (policiesData as Policy[]) : []).map((p) => [p.id, p.name]),
+    );
 
     const stats: StatCard[] = [
       {
@@ -396,7 +405,7 @@ export default function Remediation() {
       },
       {
         label: 'Success Rate',
-        value: successRate !== undefined && successRate !== null ? `${successRate}%` : '—',
+        value: successRate !== undefined && successRate !== null ? `${successRate}%` : 'not available',
         icon: <CheckCircle2 className="w-6 h-6 text-green-500" />,
       },
       {
@@ -407,7 +416,7 @@ export default function Remediation() {
       },
       {
         label: 'Avg Remediation Time',
-        value: avgMinutes !== undefined && avgMinutes !== null ? `${avgMinutes}m` : '—',
+        value: avgMinutes !== undefined && avgMinutes !== null ? `${avgMinutes}m` : 'not available',
         icon: <Clock className="w-6 h-6 text-orange-500" />,
       },
       {
@@ -424,6 +433,8 @@ export default function Remediation() {
 
     return (
       <div className="space-y-6">
+        <LoadErrorBanner what="remediation dashboard" error={dashboardError} />
+        <LoadErrorBanner what="executions" error={executionsError} />
         {/* Stats Cards */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {stats.map((stat, idx) => (
@@ -546,19 +557,19 @@ export default function Remediation() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-                {dashboardData?.recent_executions?.slice(0, 5).map((execution: any, idx: number) => (
-                  <tr key={idx} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition">
+                {recentExecutions.map((execution) => (
+                  <tr key={execution.id} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition">
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-gray-100">
-                      {execution.time}
+                      {new Date(execution.created_at).toLocaleString()}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
-                      {execution.trigger}
+                      {execution.trigger_source}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
-                      {execution.target}
+                      {execution.target_entity}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
-                      {execution.policy}
+                      {execution.policy_id ? (dashboardPolicyNames.get(execution.policy_id) ?? execution.policy_id) : 'Manual'}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
                       <span
@@ -574,7 +585,9 @@ export default function Remediation() {
                       </span>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
-                      {execution.duration}s
+                      {execution.started_at && execution.completed_at
+                        ? `${Math.round((new Date(execution.completed_at).getTime() - new Date(execution.started_at).getTime()) / 1000)}s`
+                        : 'not available'}
                     </td>
                   </tr>
                 ))}
@@ -592,10 +605,14 @@ export default function Remediation() {
       return <LoadingState />;
     }
 
-    const allPolicies: Policy[] = Array.isArray(policiesData) ? policiesData : (policiesData?.items || policiesData?.policies || []);
+    const fetchedPolicies: Policy[] = Array.isArray(policiesData) ? policiesData : (policiesData?.items || policiesData?.policies || []);
+    const allPolicies: Policy[] = policyEnabledFilter === 'false'
+      ? fetchedPolicies.filter((p) => !p.is_enabled)
+      : fetchedPolicies;
 
     return (
       <div className="space-y-6">
+        <LoadErrorBanner what="policies" error={policiesError} />
         {/* Filters and Button */}
         <div className="flex flex-col lg:flex-row gap-4 items-center justify-between">
           <div className="flex flex-col sm:flex-row gap-4 items-center flex-1">
@@ -631,16 +648,6 @@ export default function Remediation() {
             <Plus className="w-5 h-5" />
             Create Policy
           </button>
-        </div>
-
-        {/* Built-in Policies Section */}
-        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-          <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
-            Built-in Policies
-          </h3>
-          <div className="text-sm text-gray-600 dark:text-gray-400 mb-4">
-            8 pre-configured policies available for immediate deployment
-          </div>
         </div>
 
         {/* Policies Table */}
@@ -703,7 +710,7 @@ export default function Remediation() {
                             });
                             queryClient.invalidateQueries({ queryKey: ['remediation-policies'] });
                           } catch (err) {
-                            console.error('Toggle policy failed:', err);
+                            alert(`Toggle policy failed. ${describeLoadError(err)}`);
                           }
                         }}
                         className="flex items-center gap-2 px-3 py-1 rounded-lg transition"
@@ -788,6 +795,11 @@ export default function Remediation() {
 
     return (
       <div className="space-y-6">
+        <LoadErrorBanner what="executions" error={executionsError} />
+        <LoadErrorBanner what="pending approvals" error={pendingApprovalsError} />
+        {approvalError ? (
+          <p role="alert" className="text-sm text-red-600 dark:text-red-400">Approve failed. {describeLoadError(approvalError)}</p>
+        ) : null}
         {/* Pending Approvals Section */}
         {pendingApprovals.length > 0 && (
           <div className="bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-700 rounded-lg p-6">
@@ -808,23 +820,27 @@ export default function Remediation() {
                   className="flex items-center justify-between bg-white dark:bg-gray-800 p-4 rounded-lg border border-yellow-100 dark:border-yellow-700"
                 >
                   <div>
-                    <p className="font-medium text-gray-900 dark:text-white">{approval.policy}</p>
+                    <p className="font-medium text-gray-900 dark:text-white">
+                      {approval.policy_id ? (policyNameById.get(approval.policy_id) || shortId(approval.policy_id)) : 'Manual execution'}
+                    </p>
                     <p className="text-sm text-gray-600 dark:text-gray-400">
-                      Target: {approval.target}
+                      Target: {approval.target_entity}
                     </p>
                   </div>
                   <div className="flex gap-2">
                     <button
                       onClick={async () => {
                         try {
+                          // The backend binds the approver to the session user.
                           await api.post(
-                            `/remediation/executions/${approval.id || approval.execution_id}/approve`,
-                            { approver_id: '' }
+                            `/remediation/executions/${approval.id}/approve`,
+                            {}
                           );
+                          setApprovalError(null);
                           queryClient.invalidateQueries({ queryKey: ['remediation-pending-approvals'] });
                           queryClient.invalidateQueries({ queryKey: ['remediation-executions'] });
                         } catch (err) {
-                          console.error('Approve execution failed:', err);
+                          setApprovalError(err);
                         }
                       }}
                       className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-medium transition"
@@ -834,8 +850,8 @@ export default function Remediation() {
                     <button
                       onClick={() =>
                         setRejectTarget({
-                          id: approval.id || approval.execution_id,
-                          policy: approval.policy,
+                          id: approval.id,
+                          policy: approval.policy_id ? policyNameById.get(approval.policy_id) : undefined,
                         })
                       }
                       className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition"
@@ -874,6 +890,9 @@ export default function Remediation() {
             <option value="anomaly">Anomaly</option>
             <option value="ueba">UEBA</option>
             <option value="deception">Deception</option>
+            <option value="manual">Manual</option>
+            <option value="manual_quick_action">Quick Action</option>
+            <option value="agent">Agent</option>
           </select>
         </div>
 
@@ -1022,8 +1041,10 @@ export default function Remediation() {
                                 ran — a decorative demo display. */}
                             {(() => {
                               const completed = Array.isArray(execution.actions_completed) ? execution.actions_completed : [];
-                              const failed = Array.isArray((execution as any).actions_failed) ? (execution as any).actions_failed : [];
-                              if (completed.length === 0 && failed.length === 0) {
+                              // ExecutionActionResult rows (schemas/remediation.py) carry
+                              // action_type/target/success/error; there is no separate
+                              // actions_failed array, failures are rows with success=false.
+                              if (completed.length === 0) {
                                 return (
                                   <p className="text-sm text-gray-500 dark:text-gray-400">
                                     No action results recorded for this execution.
@@ -1034,7 +1055,7 @@ export default function Remediation() {
                                 const label =
                                   typeof entry === 'string'
                                     ? entry
-                                    : entry?.action || entry?.name || entry?.title || JSON.stringify(entry);
+                                    : [entry?.action_type, entry?.target].filter(Boolean).join(': ') + (entry?.error ? ` (${entry.error})` : '') || JSON.stringify(entry);
                                 return (
                                   <div key={`${ok ? 'ok' : 'err'}-${idx}`} className="flex items-center gap-2">
                                     {ok ? (
@@ -1048,8 +1069,7 @@ export default function Remediation() {
                               };
                               return (
                                 <div className="space-y-2">
-                                  {completed.map((e, i) => renderItem(e, true, i))}
-                                  {failed.map((e, i) => renderItem(e, false, i))}
+                                  {completed.map((e, i) => renderItem(e, typeof e === 'string' || e?.success !== false, i))}
                                 </div>
                               );
                             })()}
@@ -1075,6 +1095,7 @@ export default function Remediation() {
 
     return (
       <div className="space-y-6">
+        <LoadErrorBanner what="recent quick actions" error={quickActionsError} />
         {/* Action Cards Grid */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           {/* Block IP Card */}
@@ -1101,10 +1122,10 @@ export default function Remediation() {
                 onChange={(e) => setBlockDuration(e.target.value)}
                 className="w-full px-3 py-2 border border-gray-200 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
               >
-                <option value="1h">1 Hour</option>
-                <option value="6h">6 Hours</option>
-                <option value="24h">24 Hours</option>
-                <option value="permanent">Permanent</option>
+                <option value="1">1 Hour</option>
+                <option value="6">6 Hours</option>
+                <option value="24">24 Hours</option>
+                <option value="168">7 Days</option>
               </select>
               <button
                 onClick={handleBlockIP}
@@ -1113,6 +1134,9 @@ export default function Remediation() {
               >
                 {blockIPMutation.isPending ? 'Blocking...' : 'Block IP'}
               </button>
+              {blockIPMutation.error ? (
+                <p role="alert" className="text-sm text-red-600 dark:text-red-400">Request failed. {describeLoadError(blockIPMutation.error)}</p>
+              ) : null}
             </div>
           </div>
 
@@ -1151,6 +1175,9 @@ export default function Remediation() {
               >
                 {isolateHostMutation.isPending ? 'Isolating...' : 'Isolate Host'}
               </button>
+              {isolateHostMutation.error ? (
+                <p role="alert" className="text-sm text-red-600 dark:text-red-400">Request failed. {describeLoadError(isolateHostMutation.error)}</p>
+              ) : null}
             </div>
           </div>
 
@@ -1193,6 +1220,9 @@ export default function Remediation() {
               >
                 {disableAccountMutation.isPending ? 'Disabling...' : 'Disable Account'}
               </button>
+              {disableAccountMutation.error ? (
+                <p role="alert" className="text-sm text-red-600 dark:text-red-400">Request failed. {describeLoadError(disableAccountMutation.error)}</p>
+              ) : null}
             </div>
           </div>
 
@@ -1235,6 +1265,9 @@ export default function Remediation() {
               >
                 {quarantineFileMutation.isPending ? 'Quarantining...' : 'Quarantine File'}
               </button>
+              {quarantineFileMutation.error ? (
+                <p role="alert" className="text-sm text-red-600 dark:text-red-400">Request failed. {describeLoadError(quarantineFileMutation.error)}</p>
+              ) : null}
             </div>
           </div>
         </div>
@@ -1306,6 +1339,7 @@ export default function Remediation() {
 
     return (
       <div className="space-y-6">
+        <LoadErrorBanner what="integrations" error={integrationsError} />
         {/* Action Buttons */}
         <div className="flex flex-col sm:flex-row gap-4">
           <button
@@ -1412,7 +1446,7 @@ export default function Remediation() {
                       ...prev,
                       [integration.id]: {
                         ok: false,
-                        message: `Failed: ${err?.response?.data?.detail || err?.message || 'connection error'}`,
+                        message: `Failed: ${describeLoadError(err)}`,
                       },
                     }));
                   }
@@ -1591,10 +1625,11 @@ export default function Remediation() {
                 });
                 setShowAddIntegrationModal(false);
                 queryClient.invalidateQueries({ queryKey: ['remediation-integrations'] });
-              } catch (err: any) { console.error('Add integration failed:', err); }
+              } catch (err: any) { alert(`Add integration failed. ${describeLoadError(err)}`); }
             }}>
               <div>
                 <label className="block text-sm font-medium mb-1">Integration Type</label>
+                <LoadErrorBanner what="available connectors" error={connectorsError} />
                 {(() => {
                   const connectors: Array<{ id: string; name?: string; display_name?: string; vendor?: string | null; category?: string }> =
                     Array.isArray(connectorsData)
@@ -1672,7 +1707,7 @@ export default function Remediation() {
           if (!rejectTarget) return;
           await api.post(
             `/remediation/executions/${rejectTarget.id}/reject`,
-            { approver_id: '', reason: values.reason }
+            { reason: values.reason }
           );
           queryClient.invalidateQueries({ queryKey: ['remediation-pending-approvals'] });
           queryClient.invalidateQueries({ queryKey: ['remediation-executions'] });

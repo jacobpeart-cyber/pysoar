@@ -14,13 +14,14 @@ import {
   Loader2,
   X,
   Edit2,
-  Trash2,
   Eye,
   FileText,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
 import FormModal from '../components/FormModal';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 
 type TabType = 'overview' | 'controls' | 'poams' | 'cui' | 'cisa';
 
@@ -97,60 +98,50 @@ export default function ComplianceDashboard() {
   const [actionError, setActionError] = useState<string | null>(null);
   const queryClient = useQueryClient();
 
-  const { data: dashboardData, isLoading: dashboardLoading } = useQuery<DashboardData>({
+  const { data: dashboardData, isLoading: dashboardLoading, error: dashboardError } = useQuery<DashboardData>({
     queryKey: ['compliance-dashboard'],
     queryFn: async () => {
-      try {
       const response = await api.get('/compliance/dashboard');
       return response.data;
-      } catch { return null; }
     },
   });
 
-  const { data: controls, isLoading: controlsLoading } = useQuery<Control[]>({
+  const { data: controls, isLoading: controlsLoading, error: controlsError } = useQuery<Control[]>({
     queryKey: ['compliance-controls', frameworkFilter, familyFilter, statusFilter],
     queryFn: async () => {
       const params = new URLSearchParams();
       if (frameworkFilter !== 'all') params.append('framework_id', frameworkFilter);
       if (familyFilter !== 'all') params.append('family', familyFilter);
       if (statusFilter !== 'all') params.append('status', statusFilter);
-      try {
       const response = await api.get(`/compliance/controls?${params}`);
       return response.data;
-      } catch { return null; }
     },
   });
 
-  const { data: poams, isLoading: poamsLoading } = useQuery<POAM[]>({
+  const { data: poams, isLoading: poamsLoading, error: poamsError } = useQuery<POAM[]>({
     queryKey: ['compliance-poams', poamStatusFilter, riskLevelFilter],
     queryFn: async () => {
       const params = new URLSearchParams();
       if (poamStatusFilter !== 'all') params.append('status', poamStatusFilter);
       if (riskLevelFilter !== 'all') params.append('risk_level', riskLevelFilter);
-      try {
       const response = await api.get(`/compliance/poams?${params}`);
       return response.data;
-      } catch { return null; }
     },
   });
 
-  const { data: cuiAssets, isLoading: cuiLoading } = useQuery<CUIAsset[]>({
+  const { data: cuiAssets, isLoading: cuiLoading, error: cuiError } = useQuery<CUIAsset[]>({
     queryKey: ['compliance-cui'],
     queryFn: async () => {
-      try {
       const response = await api.get('/compliance/cui');
       return response.data;
-      } catch { return null; }
     },
   });
 
-  const { data: cisaDirectives, isLoading: cisaLoading } = useQuery<CISADirective[]>({
+  const { data: cisaDirectives, isLoading: cisaLoading, error: cisaError } = useQuery<CISADirective[]>({
     queryKey: ['compliance-cisa'],
     queryFn: async () => {
-      try {
       const response = await api.get('/compliance/cisa/directives');
       return response.data;
-      } catch { return null; }
     },
   });
 
@@ -168,15 +159,6 @@ export default function ComplianceDashboard() {
       setActionError(
         err?.response?.data?.detail || err?.message || 'Failed to create POA&M'
       );
-    },
-  });
-
-  const deletePOAMMutation = useMutation({
-    mutationFn: async (id: string) => {
-      await api.delete(`/compliance/poams/${id}`);
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['compliance-poams'] });
     },
   });
 
@@ -243,7 +225,10 @@ export default function ComplianceDashboard() {
       </div>
 
       {/* Overview Tab */}
-      {activeTab === 'overview' && (
+      {activeTab === 'overview' && dashboardError && (
+        <LoadErrorBanner what="the compliance dashboard" error={dashboardError} />
+      )}
+      {activeTab === 'overview' && !dashboardError && (
         <OverviewTab
           data={dashboardData}
           loading={dashboardLoading}
@@ -251,7 +236,10 @@ export default function ComplianceDashboard() {
       )}
 
       {/* Controls Tab */}
-      {activeTab === 'controls' && (
+      {activeTab === 'controls' && controlsError && (
+        <LoadErrorBanner what="controls" error={controlsError} />
+      )}
+      {activeTab === 'controls' && !controlsError && (
         <ControlsTab
           controls={controls || []}
           loading={controlsLoading}
@@ -268,7 +256,10 @@ export default function ComplianceDashboard() {
       )}
 
       {/* POA&Ms Tab */}
-      {activeTab === 'poams' && (
+      {activeTab === 'poams' && poamsError && (
+        <LoadErrorBanner what="POA&Ms" error={poamsError} />
+      )}
+      {activeTab === 'poams' && !poamsError && (
         <POAMsTab
           poams={poams || []}
           loading={poamsLoading}
@@ -276,13 +267,15 @@ export default function ComplianceDashboard() {
           setStatusFilter={setPOAMStatusFilter}
           riskLevelFilter={riskLevelFilter}
           setRiskLevelFilter={setRiskLevelFilter}
-          onDeletePOAM={(id) => deletePOAMMutation.mutate(id)}
-          overduePOAMs={dashboardData?.overdue_poams || 0}
+          overduePOAMs={dashboardData?.overdue_poams ?? null}
         />
       )}
 
       {/* CUI Management Tab */}
-      {activeTab === 'cui' && (
+      {activeTab === 'cui' && cuiError && (
+        <LoadErrorBanner what="CUI assets" error={cuiError} />
+      )}
+      {activeTab === 'cui' && !cuiError && (
         <CUITab
           assets={cuiAssets || []}
           loading={cuiLoading}
@@ -291,7 +284,10 @@ export default function ComplianceDashboard() {
       )}
 
       {/* CISA Directives Tab */}
-      {activeTab === 'cisa' && (
+      {activeTab === 'cisa' && cisaError && (
+        <LoadErrorBanner what="CISA directives" error={cisaError} />
+      )}
+      {activeTab === 'cisa' && !cisaError && (
         <CISATab
           directives={cisaDirectives || []}
           loading={cisaLoading}
@@ -751,7 +747,6 @@ function POAMsTab({
   setStatusFilter,
   riskLevelFilter,
   setRiskLevelFilter,
-  onDeletePOAM,
   overduePOAMs,
 }: {
   poams: POAM[];
@@ -760,8 +755,7 @@ function POAMsTab({
   setStatusFilter: (value: string) => void;
   riskLevelFilter: string;
   setRiskLevelFilter: (value: string) => void;
-  onDeletePOAM: (id: string) => void;
-  overduePOAMs: number;
+  overduePOAMs: number | null;
 }) {
   const queryClient = useQueryClient();
   const [showCreatePOAM, setShowCreatePOAM] = useState(false);
@@ -780,7 +774,8 @@ function POAMsTab({
   // Calculate stats
   const stats = {
     open: poams.filter((p) => p.status === 'open').length,
-    overdue: overduePOAMs,
+    // The overdue count comes from the dashboard endpoint; without it there is no number to show.
+    overdue: overduePOAMs ?? 'not available',
     high_risk: poams.filter((p) => p.risk_level === 'high').length,
     completed: poams.filter((p) => p.status === 'completed').length,
   };
@@ -886,9 +881,6 @@ function POAMsTab({
               <th className="px-6 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300">
                 Days Remaining
               </th>
-              <th className="px-6 py-3 text-center text-xs font-semibold text-gray-700 dark:text-gray-300">
-                Actions
-              </th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
@@ -957,15 +949,6 @@ function POAMsTab({
                       </span>
                     );
                   })()}
-                </td>
-                <td className="px-6 py-4 text-center">
-                  <button
-                    onClick={() => onDeletePOAM(poam.id)}
-                    className="text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 p-2 rounded"
-                    title="Delete"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
                 </td>
               </tr>
             ))}
@@ -1066,6 +1049,7 @@ function CUITab({
   onRefresh: () => void;
 }) {
   const [showModal, setShowModal] = useState(false);
+  const [markError, setMarkError] = useState<string | null>(null);
 
   if (loading) {
     return (
@@ -1131,6 +1115,7 @@ function CUITab({
             <form className="p-6 space-y-4" onSubmit={async (e) => {
               e.preventDefault();
               const fd = new FormData(e.currentTarget);
+              setMarkError(null);
               try {
                 await api.post('/compliance/cui', {
                   asset_id: fd.get('asset_id'),
@@ -1143,8 +1128,13 @@ function CUITab({
                 });
                 setShowModal(false);
                 onRefresh();
-              } catch (err) { console.error('CUI marking failed:', err); }
+              } catch (err) { setMarkError(`Could not mark asset as CUI. ${describeLoadError(err)}`); }
             }}>
+              {markError && (
+                <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
+                  {markError}
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-sm font-medium mb-1">Asset ID</label>
@@ -1297,7 +1287,7 @@ function StatCard({
   color,
 }: {
   label: string;
-  value: number;
+  value: number | string;
   icon: React.ComponentType<{ className?: string }>;
   color: 'red' | 'orange' | 'green' | 'blue';
 }) {

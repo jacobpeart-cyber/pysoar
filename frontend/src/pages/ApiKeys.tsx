@@ -16,6 +16,8 @@ import {
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 
 interface APIKey {
   id: string;
@@ -51,13 +53,11 @@ export default function ApiKeys() {
   const [newApiKey, setNewApiKey] = useState<string | null>(null);
   const queryClient = useQueryClient();
 
-  const { data: keys, isLoading } = useQuery<APIKey[]>({
+  const { data: keys, isLoading, error: keysError } = useQuery<APIKey[]>({
     queryKey: ['api-keys'],
     queryFn: async () => {
-      try {
       const response = await api.get('/api-keys');
       return response.data;
-      } catch { return null; }
     },
   });
 
@@ -72,10 +72,8 @@ export default function ApiKeys() {
 
   const regenerateMutation = useMutation({
     mutationFn: async (id: string) => {
-      try {
       const response = await api.post(`/api-keys/${id}/regenerate`);
       return response.data;
-      } catch { return null; }
     },
     onSuccess: (data) => {
       setNewApiKey(data.api_key);
@@ -143,6 +141,18 @@ export default function ApiKeys() {
           </div>
         </div>
       )}
+
+      {regenerateMutation.error && (
+        <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
+          Could not regenerate API key. {describeLoadError(regenerateMutation.error)}
+        </div>
+      )}
+      {deleteMutation.error && (
+        <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
+          Could not delete API key. {describeLoadError(deleteMutation.error)}
+        </div>
+      )}
+      <LoadErrorBanner what="API keys" error={keysError} />
 
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
         <div className="overflow-x-auto">
@@ -253,7 +263,7 @@ export default function ApiKeys() {
           </table>
         </div>
 
-        {(!keys || keys.length === 0) && (
+        {!keysError && (!keys || keys.length === 0) && (
           <div className="p-12 text-center">
             <Key className="w-12 h-12 text-gray-400 mx-auto mb-4" />
             <h3 className="text-lg font-medium text-gray-900 dark:text-white">

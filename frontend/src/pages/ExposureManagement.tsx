@@ -26,6 +26,8 @@ import {
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, AreaChart, Area, PieChart, Pie, Cell } from 'recharts';
 
 interface DashboardStats {
@@ -185,18 +187,17 @@ export default function ExposureManagement() {
   const [showImportModal, setShowImportModal] = useState(false);
   const [showCreateTicketModal, setShowCreateTicketModal] = useState(false);
   const [selectedAsset, setSelectedAsset] = useState<Asset | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
-  const { data: stats, isLoading: statsLoading } = useQuery<DashboardStats>({
+  const { data: stats, isLoading: statsLoading, error: statsError } = useQuery<DashboardStats>({
     queryKey: ['exposure', 'dashboard'],
     queryFn: async () => {
-      try {
       const response = await api.get('/exposure/dashboard');
       return response.data;
-      } catch { return null; }
     },
   });
 
-  const { data: assetsData, isLoading: assetsLoading } = useQuery<any>({
+  const { data: assetsData, isLoading: assetsLoading, error: assetsError } = useQuery<any>({
     queryKey: ['exposure', 'assets', assetSearch, assetTypeFilter, environmentFilter, criticalityFilter, internetFacingFilter],
     queryFn: async () => {
       const response = await api.get('/exposure/assets', {
@@ -213,7 +214,7 @@ export default function ExposureManagement() {
   });
   const assets: Asset[] = Array.isArray(assetsData) ? assetsData : (assetsData?.items || []);
 
-  const { data: vulnData, isLoading: vulnLoading } = useQuery<any>({
+  const { data: vulnData, isLoading: vulnLoading, error: vulnError } = useQuery<any>({
     queryKey: ['exposure', 'vulnerabilities', severityFilter, exploitFilter],
     queryFn: async () => {
       const response = await api.get('/exposure/vulnerabilities', {
@@ -227,7 +228,7 @@ export default function ExposureManagement() {
   });
   const vulnerabilities: Vulnerability[] = Array.isArray(vulnData) ? vulnData : (vulnData?.items || []);
 
-  const { data: ticketData, isLoading: ticketsLoading } = useQuery<any>({
+  const { data: ticketData, isLoading: ticketsLoading, error: ticketsError } = useQuery<any>({
     queryKey: ['exposure', 'tickets', priorityFilter, ticketStatusFilter],
     queryFn: async () => {
       const response = await api.get('/exposure/tickets', {
@@ -241,18 +242,16 @@ export default function ExposureManagement() {
   });
   const tickets: RemediationTicket[] = Array.isArray(ticketData) ? ticketData : (ticketData?.items || []);
 
-  const { data: surfaceData } = useQuery<any>({
+  const { data: surfaceData, error: surfaceError } = useQuery<any>({
     queryKey: ['exposure', 'attack-surface'],
     queryFn: async () => {
-      try {
       const response = await api.get('/exposure/attack-surface');
       return response.data;
-      } catch { return null; }
     },
   });
   const attackSurfaces: AttackSurface[] = Array.isArray(surfaceData) ? surfaceData : (surfaceData?.items || []);
 
-  const { data: compliance } = useQuery<ComplianceFramework[]>({
+  const { data: compliance, error: complianceError } = useQuery<ComplianceFramework[]>({
     queryKey: ['exposure', 'compliance'],
     queryFn: async () => {
       const response = await api.get('/exposure/compliance');
@@ -350,8 +349,15 @@ export default function ExposureManagement() {
       </div>
 
       {/* Dashboard Tab */}
+      {actionError && (
+        <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
+          {actionError}
+        </div>
+      )}
+
       {activeTab === 'dashboard' && (
         <div className="space-y-6">
+          <LoadErrorBanner what="exposure statistics" error={statsError} />
           {/* Stats Grid */}
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
@@ -362,7 +368,7 @@ export default function ExposureManagement() {
                 <div>
                   <p className="text-sm text-gray-500 dark:text-gray-400">Total Assets</p>
                   <p className="text-2xl font-semibold text-gray-900 dark:text-white">
-                    {stats?.total_assets || 0}
+                    {stats?.total_assets ?? 'not available'}
                   </p>
                 </div>
               </div>
@@ -376,7 +382,7 @@ export default function ExposureManagement() {
                 <div>
                   <p className="text-sm text-gray-500 dark:text-gray-400">Internet-Facing</p>
                   <p className="text-2xl font-semibold text-gray-900 dark:text-white">
-                    {stats?.internet_facing_assets || 0}
+                    {stats?.internet_facing_assets ?? 'not available'}
                   </p>
                 </div>
               </div>
@@ -390,7 +396,7 @@ export default function ExposureManagement() {
                 <div>
                   <p className="text-sm text-gray-500 dark:text-gray-400">Critical Vulns</p>
                   <p className="text-2xl font-semibold text-gray-900 dark:text-white">
-                    {stats?.critical_vulns || 0}
+                    {stats?.critical_vulns ?? 'not available'}
                   </p>
                 </div>
               </div>
@@ -404,7 +410,7 @@ export default function ExposureManagement() {
                 <div>
                   <p className="text-sm text-gray-500 dark:text-gray-400">Overdue Tickets</p>
                   <p className="text-2xl font-semibold text-gray-900 dark:text-white">
-                    {stats?.overdue_tickets || 0}
+                    {stats?.overdue_tickets ?? 'not available'}
                   </p>
                 </div>
               </div>
@@ -418,11 +424,11 @@ export default function ExposureManagement() {
                 <div>
                   <p className="text-sm text-gray-500 dark:text-gray-400">Overall Risk Score</p>
                   <p className="text-4xl font-bold text-gray-900 dark:text-white mt-2">
-                    {stats?.overall_risk_score || 0}
+                    {stats?.overall_risk_score ?? 'not available'}
                   </p>
                 </div>
                 <div className={clsx('w-20 h-20 rounded-full flex items-center justify-center text-2xl font-bold', getRiskColor(stats?.overall_risk_score || 0))}>
-                  {stats?.overall_risk_score || 0}
+                  {stats?.overall_risk_score ?? 'not available'}
                 </div>
               </div>
             </div>
@@ -432,7 +438,7 @@ export default function ExposureManagement() {
                 <div>
                   <p className="text-sm text-gray-500 dark:text-gray-400">Mean Time to Remediate</p>
                   <p className="text-4xl font-bold text-gray-900 dark:text-white mt-2">
-                    {stats?.mean_time_to_remediate_days || 0}
+                    {stats?.mean_time_to_remediate_days ?? 'not available'}
                   </p>
                   <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">days</p>
                 </div>
@@ -580,6 +586,8 @@ export default function ExposureManagement() {
                 <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
                   {assetsLoading ? (
                     <tr><td colSpan={10} className="px-4 py-12 text-center text-gray-500"><Loader2 className="w-6 h-6 animate-spin mx-auto mb-2" />Loading assets...</td></tr>
+                  ) : assetsError ? (
+                    <tr><td colSpan={10} className="px-4 py-4"><LoadErrorBanner what="assets" error={assetsError} /></td></tr>
                   ) : assets.length === 0 ? (
                     <tr><td colSpan={10} className="px-4 py-12 text-center text-gray-500">No assets found. Add assets to start monitoring exposure.</td></tr>
                   ) : null}
@@ -659,7 +667,7 @@ export default function ExposureManagement() {
                   ))}
                 </div>
                 <button
-                  onClick={() => setShowImportModal(true)}
+                  onClick={() => { setActionError(null); setShowImportModal(true); }}
                   className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm"
                 >
                   <Download className="w-4 h-4" />
@@ -698,6 +706,8 @@ export default function ExposureManagement() {
                 <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
                   {vulnLoading ? (
                     <tr><td colSpan={9} className="px-4 py-12 text-center text-gray-500"><Loader2 className="w-6 h-6 animate-spin mx-auto mb-2" />Loading vulnerabilities...</td></tr>
+                  ) : vulnError ? (
+                    <tr><td colSpan={9} className="px-4 py-4"><LoadErrorBanner what="vulnerabilities" error={vulnError} /></td></tr>
                   ) : vulnerabilities.length === 0 ? (
                     <tr><td colSpan={9} className="px-4 py-12 text-center text-gray-500">No vulnerabilities found. Import scan results to populate.</td></tr>
                   ) : null}
@@ -835,7 +845,7 @@ export default function ExposureManagement() {
                   </div>
                 </div>
                 <button
-                  onClick={() => setShowCreateTicketModal(true)}
+                  onClick={() => { setActionError(null); setShowCreateTicketModal(true); }}
                   className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 text-sm"
                 >
                   <Plus className="w-4 h-4" />
@@ -863,6 +873,8 @@ export default function ExposureManagement() {
                 <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
                   {ticketsLoading ? (
                     <tr><td colSpan={7} className="px-4 py-12 text-center text-gray-500"><Loader2 className="w-6 h-6 animate-spin mx-auto mb-2" />Loading tickets...</td></tr>
+                  ) : ticketsError ? (
+                    <tr><td colSpan={7} className="px-4 py-4"><LoadErrorBanner what="remediation tickets" error={ticketsError} /></td></tr>
                   ) : tickets.length === 0 ? (
                     <tr><td colSpan={7} className="px-4 py-12 text-center text-gray-500">No remediation tickets. Create a ticket to track remediation efforts.</td></tr>
                   ) : null}
@@ -906,10 +918,13 @@ export default function ExposureManagement() {
       {/* Attack Surface Tab */}
       {activeTab === 'attack-surface' && (
         <div className="space-y-6">
+          <LoadErrorBanner what="attack surfaces" error={surfaceError} />
           <div className="flex items-center justify-between">
             <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Overall Attack Surface Score</h3>
             <div className="text-4xl font-bold text-gray-900 dark:text-white">
-              {Math.round((attackSurfaces?.reduce((sum, s) => sum + s.risk_score, 0) || 0) / (attackSurfaces?.length || 1))}
+              {attackSurfaces.length > 0
+                ? Math.round(attackSurfaces.reduce((sum, s) => sum + s.risk_score, 0) / attackSurfaces.length)
+                : 'not available'}
             </div>
           </div>
 
@@ -944,11 +959,12 @@ export default function ExposureManagement() {
                 </div>
                 <button
                   onClick={async () => {
+                    setActionError(null);
                     try {
                       await api.post('/exposure/attack-surface/assess', null, { params: { surface_id: surface.id } });
-                      queryClient.invalidateQueries({ queryKey: ['attackSurfaces'] });
+                      queryClient.invalidateQueries({ queryKey: ['exposure', 'attack-surface'] });
                     } catch (err) {
-                      console.error('Failed to assess attack surface:', err);
+                      setActionError(`Could not assess attack surface. ${describeLoadError(err)}`);
                     }
                   }}
                   className="w-full mt-4 px-4 py-2 bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-900/40 text-sm font-medium"
@@ -964,6 +980,7 @@ export default function ExposureManagement() {
       {/* Compliance Tab */}
       {activeTab === 'compliance' && (
         <div className="space-y-6">
+          <LoadErrorBanner what="compliance frameworks" error={complianceError} />
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {compliance?.map((framework) => (
               <div key={framework.id} className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
@@ -990,7 +1007,7 @@ export default function ExposureManagement() {
           <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
             <h4 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Compliance Trend</h4>
             <ResponsiveContainer width="100%" height={300}>
-              <AreaChart data={trendData.map(d => ({ ...d, compliance: compliance && compliance.length > 0 ? Math.round(compliance.reduce((sum, f) => sum + f.pass_percentage, 0) / (compliance.length || 1)) : 0 }))}>
+              <AreaChart data={trendData.map(d => ({ ...d, compliance: compliance && compliance.length > 0 ? Math.round(compliance.reduce((sum, f) => sum + f.pass_percentage, 0) / compliance.length) : null }))}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
                 <XAxis dataKey="date" tick={{ fontSize: 12 }} />
                 <YAxis tick={{ fontSize: 12 }} domain={[0, 100]} />
@@ -1013,6 +1030,7 @@ export default function ExposureManagement() {
               e.preventDefault();
               const form = e.target as HTMLFormElement;
               const formData = new FormData(form);
+              setActionError(null);
               try {
                 await api.post('/exposure/tickets', {
                   title: formData.get('title'),
@@ -1024,9 +1042,14 @@ export default function ExposureManagement() {
                 setShowCreateTicketModal(false);
                 queryClient.invalidateQueries({ queryKey: ['exposure'] });
               } catch (err) {
-                console.error('Failed to create ticket');
+                setActionError(`Could not create ticket. ${describeLoadError(err)}`);
               }
             }} className="p-6 space-y-4">
+              {actionError && (
+                <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
+                  {actionError}
+                </div>
+              )}
               <div>
                 <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Title *</label>
                 <input name="title" required className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white" placeholder="Remediation ticket title" />
@@ -1075,6 +1098,7 @@ export default function ExposureManagement() {
               e.preventDefault();
               const form = e.target as HTMLFormElement;
               const formData = new FormData(form);
+              setActionError(null);
               try {
                 // Backend ScannerImportRequest expects scanner_name + scan_format,
                 // not scanner_type. scan_format is the parser id (nessus, qualys,
@@ -1087,9 +1111,14 @@ export default function ExposureManagement() {
                 setShowImportModal(false);
                 queryClient.invalidateQueries({ queryKey: ['exposure'] });
               } catch (err) {
-                console.error('Failed to import scan results');
+                setActionError(`Could not import scan results. ${describeLoadError(err)}`);
               }
             }} className="p-6 space-y-4">
+              {actionError && (
+                <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
+                  {actionError}
+                </div>
+              )}
               <div>
                 <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Scanner Name *</label>
                 <input

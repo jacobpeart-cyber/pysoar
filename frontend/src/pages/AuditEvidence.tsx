@@ -26,6 +26,8 @@ import {
 import { api } from '../lib/api';
 import clsx from 'clsx';
 import FormModal from '../components/FormModal';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 
 type TabType = 'dashboard' | 'audit-trail' | 'evidence' | 'packages' | 'conmon';
 
@@ -60,27 +62,32 @@ function getRiskColor(risk: string): string {
   return riskColorMap[risk] || 'text-gray-600';
 }
 
+// Every number is either a field GET /audit-evidence/dashboard/stats
+// (AuditDashboardStats) or GET /audit-evidence/packages actually returns,
+// or null when there is no such field; null renders "not available".
 interface DashboardData {
-  auditEventsCount: number;
-  evidenceItemsCount: number;
-  activePackagesCount: number;
-  readinessScore: number;
-  evidenceCoverage: {
+  auditEventsThisMonth: number | null;
+  evidenceItemsCount: number | null;
+  activePackagesCount: number | null;
+  readinessScore: number | null;
+  // Packages whose evidence_items map is non-empty, out of all packages.
+  packageCoverage: {
     withEvidence: number;
     withoutEvidence: number;
-  };
-  recentAuditEvents: AuditEvent[];
+  } | null;
 }
 
+// AuditTrailResponse (src/schemas/audit_evidence.py)
 interface AuditEvent {
   id: string;
-  time: string;
-  type: string;
+  created_at?: string | null;
+  event_type: string;
   action: string;
-  actor: string;
-  resource: string;
-  result: 'success' | 'failure';
-  riskLevel: 'low' | 'medium' | 'high';
+  actor_id: string;
+  resource_type: string;
+  resource_id?: string;
+  result: string;
+  risk_level: string;
 }
 
 interface EvidenceItem {
@@ -126,47 +133,41 @@ export default function AuditEvidence() {
   const [actionError, setActionError] = useState<string | null>(null);
   const queryClient = useQueryClient();
 
-  const { data: dashboardData, isLoading: dashboardLoading } = useQuery<DashboardData>({
+  const { data: dashboardData, isLoading: dashboardLoading, error: dashboardError } = useQuery<DashboardData>({
     queryKey: ['audit-evidence-dashboard'],
     queryFn: async () => {
       // Previously this derived everything from /packages and
       // hardcoded auditEventsCount=0 + recentAuditEvents=[] — the
       // backend /dashboard/stats endpoint exists and returns real
       // counts + recent activity but was never called from the UI.
-      try {
-        const [pkgRes, statsRes] = await Promise.all([
-          api.get('/audit-evidence/packages'),
-          api.get('/audit-evidence/dashboard/stats').catch(() => null),
-        ]);
-        const pkgs = Array.isArray(pkgRes.data) ? pkgRes.data : (pkgRes.data?.items || []);
-        const active = pkgs.filter((p: any) => p.status !== 'approved' && p.status !== 'archived').length;
-        const withEv = pkgs.filter((p: any) => (p.evidenceCount ?? p.evidence_count ?? 0) > 0).length;
-        const stats = statsRes?.data ?? null;
-        return {
-          auditEventsCount: stats?.audit_events_last_24h ?? stats?.audit_events_24h ?? stats?.audit_events_count ?? 0,
-          evidenceItemsCount: stats?.total_evidence_items ?? pkgs.reduce((s: number, p: any) => s + (p.evidenceCount ?? p.evidence_count ?? 0), 0),
-          activePackagesCount: stats?.active_packages ?? active,
-          readinessScore: stats?.readiness_score ?? (pkgs.length > 0 ? Math.round((withEv / pkgs.length) * 100) : 0),
-          evidenceCoverage: stats?.evidence_coverage ?? {
-            withEvidence: withEv,
-            withoutEvidence: pkgs.length - withEv,
-          },
-          recentAuditEvents: stats?.recent_audit_events ?? stats?.recent_events ?? [],
-        } as DashboardData;
-      } catch {
-        return {
-          auditEventsCount: 0,
-          evidenceItemsCount: 0,
-          activePackagesCount: 0,
-          readinessScore: 0,
-          evidenceCoverage: { withEvidence: 0, withoutEvidence: 0 },
-          recentAuditEvents: [],
-        } as DashboardData;
-      }
+      // A failure of either request fails the query, so the tab shows the
+      // server's error instead of a row of zeros.
+      const [pkgRes, statsRes] = await Promise.all([
+        api.get('/audit-evidence/packages'),
+        api.get('/audit-evidence/dashboard/stats'),
+      ]);
+      const pkgs: any[] = Array.isArray(pkgRes.data) ? pkgRes.data : (pkgRes.data?.items || []);
+      const active = pkgs.filter((p: any) => p.status !== 'approved' && p.status !== 'archived').length;
+      const hasEvidence = (p: any) =>
+        p?.evidence_items && typeof p.evidence_items === 'object' && Object.keys(p.evidence_items).length > 0;
+      const withEv = pkgs.filter(hasEvidence).length;
+      const stats = statsRes.data ?? {};
+      return {
+        auditEventsThisMonth: typeof stats.audit_entries_this_month === 'number' ? stats.audit_entries_this_month : null,
+        // AuditDashboardStats has no evidence-item total and no readiness
+        // score; /readiness/check is the real readiness source and is not
+        // wired here, so neither number is invented.
+        evidenceItemsCount: null,
+        activePackagesCount: active,
+        readinessScore: null,
+        packageCoverage: pkgs.length > 0
+          ? { withEvidence: withEv, withoutEvidence: pkgs.length - withEv }
+          : null,
+      } as DashboardData;
     },
   });
 
-  const { data: auditTrail, isLoading: auditLoading } = useQuery<AuditEvent[]>({
+  const { data: auditTrail, isLoading: auditLoading, error: auditError } = useQuery<AuditEvent[]>({
     queryKey: [
       'audit-trail',
       eventTypeFilter,
@@ -179,69 +180,58 @@ export default function AuditEvidence() {
       // dateRangeFilter were silently ignored — user changed filters
       // and saw no change in results.
       const body: Record<string, any> = {};
-      if (eventTypeFilter !== 'all') body.type = eventTypeFilter;
+      if (eventTypeFilter !== 'all') body.event_type = eventTypeFilter;
       if (resultFilter !== 'all') body.result = resultFilter;
       const rangeDays: Record<string, number> = {
         '1d': 1, '7d': 7, '30d': 30, '90d': 90,
       };
       const daysBack = rangeDays[dateRangeFilter] ?? 7;
       body.date_from = new Date(Date.now() - daysBack * 86_400_000).toISOString();
-      try {
-        const response = await api.post('/audit-evidence/audit/search', body);
-        const d = response.data;
-        return Array.isArray(d) ? d : (d?.items || []);
-      } catch (err) {
-        console.error('Audit search failed:', err);
-        return [];
-      }
+      const response = await api.post('/audit-evidence/audit/search', body);
+      const d = response.data;
+      return Array.isArray(d) ? d : (d?.items || []);
     },
   });
 
-  const { data: evidenceItems, isLoading: evidenceLoading } = useQuery<EvidenceItem[]>({
+  const { data: evidenceItems, isLoading: evidenceLoading, error: evidenceError } = useQuery<EvidenceItem[]>({
     queryKey: ['evidence-items', evidenceStatusFilter, evidenceTypeFilter],
     queryFn: async () => {
-      try {
-        const params: Record<string, string> = {};
-        if (evidenceStatusFilter !== 'all') params.status = evidenceStatusFilter;
-        if (evidenceTypeFilter !== 'all') params.evidence_type = evidenceTypeFilter;
-        const response = await api.get('/audit-evidence/evidence/list', { params });
-        const d = response.data;
-        if (Array.isArray(d)) return d;
-        if (d && Array.isArray(d.items)) return d.items;
-        return [];
-      } catch { return []; }
+      const params: Record<string, string> = {};
+      if (evidenceStatusFilter !== 'all') params.status = evidenceStatusFilter;
+      if (evidenceTypeFilter !== 'all') params.evidence_type = evidenceTypeFilter;
+      const response = await api.get('/audit-evidence/evidence/list', { params });
+      const d = response.data;
+      if (Array.isArray(d)) return d;
+      if (d && Array.isArray(d.items)) return d.items;
+      return [];
     },
   });
 
-  const { data: packages, isLoading: packagesLoading } = useQuery<Package[]>({
+  const { data: packages, isLoading: packagesLoading, error: packagesError } = useQuery<Package[]>({
     queryKey: ['audit-packages'],
     queryFn: async () => {
-      try {
       const response = await api.get('/audit-evidence/packages');
       return response.data;
-      } catch { return null; }
     },
   });
 
-  const { data: conmonStatuses, isLoading: conmonLoading } = useQuery<ConMonStatus[]>({
+  const { data: conmonStatuses, isLoading: conmonLoading, error: conmonError } = useQuery<ConMonStatus[]>({
     queryKey: ['conmon-status'],
     queryFn: async () => {
-      try {
-        const response = await api.get('/audit-evidence/conmon/status');
-        const d = response.data;
-        if (Array.isArray(d)) return d;
-        // Back-compat: older /conmon/status returned an object {status, checks, last_run}
-        if (d && typeof d === 'object' && d.checks && typeof d.checks === 'object') {
-          const now = d.last_run || new Date().toISOString();
-          return Object.entries(d.checks).map(([key, val]: [string, any]) => ({
-            id: key,
-            name: key.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
-            active: val?.status === 'compliant' || val?.status === 'on_track',
-            lastRun: now,
-          }));
-        }
-        return [];
-      } catch { return []; }
+      const response = await api.get('/audit-evidence/conmon/status');
+      const d = response.data;
+      if (Array.isArray(d)) return d;
+      // Back-compat: older /conmon/status returned an object {status, checks, last_run}
+      if (d && typeof d === 'object' && d.checks && typeof d.checks === 'object') {
+        const now = d.last_run || new Date().toISOString();
+        return Object.entries(d.checks).map(([key, val]: [string, any]) => ({
+          id: key,
+          name: key.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
+          active: val?.status === 'compliant' || val?.status === 'on_track',
+          lastRun: now,
+        }));
+      }
+      return [];
     },
   });
 
@@ -274,13 +264,15 @@ export default function AuditEvidence() {
 
   const approveEvidenceMutation = useMutation({
     mutationFn: async (id: string) => {
-      try {
       const response = await api.post(`/audit-evidence/evidence/${id}/approve`);
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
+      setActionError(null);
       queryClient.invalidateQueries({ queryKey: ['evidence-items'] });
+    },
+    onError: (err: unknown) => {
+      setActionError(`Failed to approve evidence. ${describeLoadError(err)}`);
     },
   });
 
@@ -336,10 +328,21 @@ export default function AuditEvidence() {
 
       {/* Dashboard Tab */}
       {activeTab === 'dashboard' && (
-        <DashboardTab data={dashboardData} loading={dashboardLoading} />
+        <>
+          <LoadErrorBanner what="the audit dashboard" error={dashboardError} />
+          {!dashboardError && (
+            <DashboardTab
+              data={dashboardData}
+              loading={dashboardLoading}
+              recentEvents={(auditTrail || []).slice(0, 5)}
+              recentEventsError={auditError}
+            />
+          )}
+        </>
       )}
 
       {/* Audit Trail Tab */}
+      {activeTab === 'audit-trail' && <LoadErrorBanner what="the audit trail" error={auditError} />}
       {activeTab === 'audit-trail' && (
         <AuditTrailTab
           events={auditTrail || []}
@@ -356,6 +359,7 @@ export default function AuditEvidence() {
       )}
 
       {/* Evidence Tab */}
+      {activeTab === 'evidence' && <LoadErrorBanner what="evidence items" error={evidenceError} />}
       {activeTab === 'evidence' && (
         <EvidenceTab
           items={evidenceItems || []}
@@ -371,10 +375,14 @@ export default function AuditEvidence() {
 
       {/* Packages Tab */}
       {activeTab === 'packages' && (
-        <PackagesTab packages={packages || []} loading={packagesLoading} />
+        <>
+          <LoadErrorBanner what="evidence packages" error={packagesError} />
+          <PackagesTab packages={packages || []} loading={packagesLoading} />
+        </>
       )}
 
       {/* ConMon Tab */}
+      {activeTab === 'conmon' && <LoadErrorBanner what="continuous monitoring status" error={conmonError} />}
       {activeTab === 'conmon' && (
         <ConMonTab
           statuses={conmonStatuses || []}
@@ -389,10 +397,18 @@ export default function AuditEvidence() {
 function DashboardTab({
   data,
   loading,
+  recentEvents,
+  recentEventsError,
 }: {
   data?: DashboardData;
   loading: boolean;
+  recentEvents: AuditEvent[];
+  recentEventsError: unknown;
 }) {
+  const fmt = (v: number | null | undefined) => (typeof v === 'number' ? v : 'not available');
+  const cov = data?.packageCoverage ?? null;
+  const covTotal = cov ? cov.withEvidence + cov.withoutEvidence : 0;
+  const covPct = cov && covTotal > 0 ? (cov.withEvidence / covTotal) * 100 : 0;
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -406,26 +422,26 @@ function DashboardTab({
       {/* KPI Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         <KPICard
-          label="Audit Events (24h)"
-          value={data?.auditEventsCount || 0}
+          label="Audit Events (this month)"
+          value={fmt(data?.auditEventsThisMonth)}
           icon={Square}
           color="blue"
         />
         <KPICard
           label="Evidence Items"
-          value={data?.evidenceItemsCount || 0}
+          value={fmt(data?.evidenceItemsCount)}
           icon={FileText}
           color="green"
         />
         <KPICard
           label="Active Packages"
-          value={data?.activePackagesCount || 0}
+          value={fmt(data?.activePackagesCount)}
           icon={Calendar}
           color="orange"
         />
         <KPICard
           label="Readiness Score"
-          value={`${data?.readinessScore || 0}%`}
+          value={typeof data?.readinessScore === 'number' ? `${data.readinessScore}%` : 'not available'}
           icon={CheckCircle}
           color="purple"
         />
@@ -434,7 +450,7 @@ function DashboardTab({
       {/* Evidence Coverage Chart */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
         <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-6">
-          Evidence Coverage by Control
+          Evidence Coverage by Package
         </h2>
         <div className="flex items-center gap-8">
           <div className="relative w-40 h-40">
@@ -455,16 +471,14 @@ function DashboardTab({
                 fill="none"
                 stroke="currentColor"
                 strokeWidth="8"
-                strokeDasharray={`${
-                  (data?.evidenceCoverage?.withEvidence || 0) * 3.4
-                } 340`}
+                strokeDasharray={`${covPct * 3.4} 340`}
                 className="text-green-500 transition-all duration-500"
               />
             </svg>
             <div className="absolute inset-0 flex items-center justify-center">
               <div className="text-center">
                 <div className="text-2xl font-bold text-gray-900 dark:text-white">
-                  {data?.evidenceCoverage?.withEvidence || 0}
+                  {cov ? cov.withEvidence : 'not available'}
                 </div>
                 <div className="text-xs text-gray-500 dark:text-gray-400">
                   with evidence
@@ -477,27 +491,27 @@ function DashboardTab({
               <div>
                 <div className="flex items-center justify-between mb-1">
                   <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
-                    Controls with Evidence
+                    Packages with Evidence
                   </span>
                   <span className="text-sm font-semibold text-gray-900 dark:text-white">
-                    {data?.evidenceCoverage?.withEvidence || 0}
+                    {cov ? cov.withEvidence : 'not available'}
                   </span>
                 </div>
                 <div className="h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
-                  <div className="h-full bg-green-500 rounded-full" style={{ width: '75%' }} />
+                  <div className="h-full bg-green-500 rounded-full" style={{ width: `${covPct}%` }} />
                 </div>
               </div>
               <div>
                 <div className="flex items-center justify-between mb-1">
                   <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
-                    Controls without Evidence
+                    Packages without Evidence
                   </span>
                   <span className="text-sm font-semibold text-gray-900 dark:text-white">
-                    {data?.evidenceCoverage?.withoutEvidence || 0}
+                    {cov ? cov.withoutEvidence : 'not available'}
                   </span>
                 </div>
                 <div className="h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
-                  <div className="h-full bg-orange-500 rounded-full" style={{ width: '25%' }} />
+                  <div className="h-full bg-orange-500 rounded-full" style={{ width: `${cov && covTotal > 0 ? 100 - covPct : 0}%` }} />
                 </div>
               </div>
             </div>
@@ -511,7 +525,11 @@ function DashboardTab({
           Recent Audit Events
         </h2>
         <div className="space-y-2">
-          {(data?.recentAuditEvents || []).map((event) => (
+          <LoadErrorBanner what="recent audit events" error={recentEventsError} />
+          {!recentEventsError && recentEvents.length === 0 && (
+            <p className="text-sm text-gray-500 dark:text-gray-400">No audit events in the selected range.</p>
+          )}
+          {recentEvents.map((event) => (
             <div
               key={event.id}
               className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg"
@@ -521,12 +539,12 @@ function DashboardTab({
                   {event.action}
                 </div>
                 <div className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-                  {event.actor} on {event.resource}
+                  {event.actor_id} on {event.resource_type}
                 </div>
               </div>
               <div className="flex items-center gap-3">
-                <span className={clsx('text-xs font-medium', getRiskColor(event.riskLevel))}>
-                  {event.riskLevel}
+                <span className={clsx('text-xs font-medium', getRiskColor(event.risk_level))}>
+                  {event.risk_level}
                 </span>
                 <span
                   className={clsx(
@@ -576,7 +594,8 @@ function AuditTrailTab({
     );
   }
 
-  const eventTypes = ['all', 'login', 'access', 'change', 'delete'];
+  // EventTypeEnum values the search endpoint filters on.
+  const eventTypes = ['all', 'access', 'change', 'admin', 'policy', 'compliance', 'security', 'data'];
   const dateRanges = ['1d', '7d', '30d', '90d'];
 
   return (
@@ -677,19 +696,19 @@ function AuditTrailTab({
                 }
               >
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {new Date(event.time || event.timestamp || "").toLocaleTimeString()}
+                  {event.created_at ? new Date(event.created_at).toLocaleString() : '—'}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {event.type}
+                  {event.event_type}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-900 dark:text-white font-medium">
                   {event.action}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 font-mono">
-                  {event.actor}
+                  {event.actor_id}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {event.resource}
+                  {event.resource_type}{event.resource_id ? ` ${event.resource_id}` : ''}
                 </td>
                 <td className="px-6 py-4 text-sm">
                   <span
@@ -705,10 +724,10 @@ function AuditTrailTab({
                   <span
                     className={clsx(
                       'font-medium text-xs uppercase',
-                      getRiskColor(event.riskLevel)
+                      getRiskColor(event.risk_level)
                     )}
                   >
-                    {event.riskLevel}
+                    {event.risk_level}
                   </span>
                 </td>
               </tr>
@@ -778,15 +797,11 @@ function EvidenceTab({
   const [uploading, setUploading] = useState(false);
 
   // Load compliance controls so the upload form can attach evidence to a real control
-  const { data: controlsData } = useQuery<{ items?: any[] } | any[]>({
+  const { data: controlsData, error: controlsError } = useQuery<{ items?: any[] } | any[]>({
     queryKey: ['compliance-controls-for-evidence'],
     queryFn: async () => {
-      try {
-        const res = await api.get('/compliance/controls', { params: { limit: 500 } });
-        return res.data;
-      } catch {
-        return { items: [] };
-      }
+      const res = await api.get('/compliance/controls', { params: { limit: 500 } });
+      return res.data;
     },
   });
   const controlOptions: Array<{ value: string; label: string }> = (() => {
@@ -1088,7 +1103,9 @@ function EvidenceTab({
                       <option key={o.value} value={o.value}>{o.label}</option>
                     ))}
                   </select>
-                  {controlOptions.length === 0 && (
+                  {controlsError ? (
+                    <div className="mt-1"><LoadErrorBanner what="compliance controls" error={controlsError} /></div>
+                  ) : controlOptions.length === 0 && (
                     <p className="mt-1 text-xs text-yellow-700 dark:text-yellow-500">
                       No compliance controls loaded. Create controls in the Compliance module first.
                     </p>

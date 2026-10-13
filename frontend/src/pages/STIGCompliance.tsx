@@ -18,6 +18,8 @@ import {
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 
 type TabType = 'dashboard' | 'benchmarks' | 'results' | 'remediation';
 
@@ -58,7 +60,7 @@ interface Scan {
   id: string;
   host: string;
   benchmark: string;
-  status: 'completed' | 'in-progress' | 'failed';
+  status: 'completed' | 'running' | 'in-progress' | 'failed';
   compliance: number;
   findings: {
     open: number;
@@ -95,6 +97,39 @@ interface ComplianceAgent {
   status?: string;
 }
 
+// STIGRule.severity → DISA category label.
+const SEVERITY_TO_CAT: Record<string, Severity> = {
+  high: 'CAT I',
+  medium: 'CAT II',
+  low: 'CAT III',
+};
+
+// Per-rule status values the engine/ARF ingest store → UI labels.
+const RULE_STATUS_LABEL: Record<string, RuleStatus> = {
+  open: 'Open',
+  not_a_finding: 'Not a Finding',
+  not_applicable: 'N/A',
+  not_reviewed: 'Not Reviewed',
+};
+
+// STIGScanResultResponse → the Scan row shape the tables render.
+function scanFromApi(s: any): Scan {
+  return {
+    id: s.id,
+    host: s.target_host,
+    benchmark: s.benchmark_id_ref,
+    status: s.status,
+    compliance: s.compliance_percentage,
+    findings: {
+      open: s.open_findings,
+      naf: s.not_a_finding,
+      na: s.not_applicable,
+      nr: s.not_reviewed,
+    },
+    date: s.completed_at ?? s.started_at ?? s.created_at ?? '',
+  };
+}
+
 export default function STIGCompliance() {
   const [activeTab, setActiveTab] = useState<TabType>('dashboard');
   const [expandedScan, setExpandedScan] = useState<string | null>(null);
@@ -103,57 +138,46 @@ export default function STIGCompliance() {
   const [launchScanFor, setLaunchScanFor] = useState<string | null>(null);
   const queryClient = useQueryClient();
 
-  const { data: dashboardData, isLoading: dashboardLoading } = useQuery<DashboardData>({
+  const { data: dashboardData, isLoading: dashboardLoading, error: dashboardError } = useQuery<DashboardData>({
     queryKey: ['stig-dashboard'],
     queryFn: async () => {
-      try {
       const response = await api.get('/stig/dashboard/stats');
       return response.data;
-      } catch { return null; }
     },
   });
 
-  const { data: benchmarks, isLoading: benchmarksLoading } = useQuery<Benchmark[]>({
+  const { data: benchmarks, isLoading: benchmarksLoading, error: benchmarksError } = useQuery<Benchmark[]>({
     queryKey: ['stig-benchmarks', platformFilter],
     queryFn: async () => {
       const params = new URLSearchParams();
       if (platformFilter !== 'all') params.append('platform', platformFilter);
-      try {
-        const response = await api.get(`/stig/benchmarks?${params}`);
-        // Backend emits snake_case (`total_rules`, `category_1_count`,
-        // `last_scanned_at`). The UI interface uses camelCase and a
-        // nested `findings` map keyed by "CAT I/II/III". Normalize
-        // here so benchmark cards render real numbers instead of
-        // `undefined` placeholders.
-        const raw = response.data;
-        const list = Array.isArray(raw) ? raw : (raw?.items ?? raw?.benchmarks ?? []);
-        return list.map((b: any) => ({
-          id: b.id ?? '',
-          name: b.name ?? 'Unknown Benchmark',
-          platform: b.platform ?? b.os ?? '',
-          version: b.version ?? '',
-          totalRules: b.total_rules ?? b.totalRules ?? 0,
-          findings: {
-            'CAT I': b.category_1_count ?? b.findings?.['CAT I'] ?? 0,
-            'CAT II': b.category_2_count ?? b.findings?.['CAT II'] ?? 0,
-            'CAT III': b.category_3_count ?? b.findings?.['CAT III'] ?? 0,
-          },
-          lastScanDate: b.last_scanned_at ?? b.last_scan_date ?? b.lastScanDate ?? '',
-        }));
-      } catch (err) {
-        console.error('Failed to load benchmarks:', err);
-        return null;
-      }
+      const response = await api.get(`/stig/benchmarks?${params}`);
+      // Normalize STIGBenchmarkResponse (snake_case: `title`,
+      // `total_rules`, `category_N_count`, `last_scan_at`) into the
+      // camelCase card shape.
+      const raw = response.data;
+      const list = Array.isArray(raw) ? raw : (raw?.items ?? raw?.benchmarks ?? []);
+      return list.map((b: any) => ({
+        id: b.id ?? '',
+        name: b.title || b.benchmark_id || 'Untitled benchmark',
+        platform: b.platform ?? '',
+        version: b.version ?? '',
+        totalRules: b.total_rules,
+        findings: {
+          'CAT I': b.category_1_count,
+          'CAT II': b.category_2_count,
+          'CAT III': b.category_3_count,
+        },
+        lastScanDate: b.last_scan_at ?? '',
+      }));
     },
   });
 
-  const { data: scans, isLoading: scansLoading } = useQuery<Scan[]>({
+  const { data: scans, isLoading: scansLoading, error: scansError } = useQuery<Scan[]>({
     queryKey: ['stig-scans'],
     queryFn: async () => {
-      try {
       const response = await api.get('/stig/scans');
-      return response.data;
-      } catch { return null; }
+      return (Array.isArray(response.data) ? response.data : []).map(scanFromApi);
     },
     // Poll every 10s when the user is on the Scan Results tab so
     // a newly-launched scan transitions through queued → running →
@@ -162,42 +186,49 @@ export default function STIGCompliance() {
     refetchInterval: activeTab === 'results' ? 10000 : false,
   });
 
-  const { data: expandedScanResults, isLoading: scanResultsLoading } = useQuery<
+  const { data: expandedScanResults, isLoading: scanResultsLoading, error: scanResultsError } = useQuery<
     ScanResult[]
   >({
     queryKey: ['stig-scan-results', expandedScan],
     queryFn: async () => {
       if (!expandedScan) return [];
-      try {
       const response = await api.get(`/stig/scans/${expandedScan}`);
-      return response.data.results;
-      } catch { return null; }
+      // STIGScanResultResponse.findings is {rule_id: {status, severity, title?}}.
+      const findings = response.data?.findings;
+      if (!findings || typeof findings !== 'object') return [];
+      return Object.entries(findings as Record<string, any>).map(([ruleId, f]) => ({
+        id: ruleId,
+        ruleId,
+        title: f?.title ?? '',
+        severity: (SEVERITY_TO_CAT[f?.severity] ?? f?.severity ?? '') as Severity,
+        status: (RULE_STATUS_LABEL[f?.status] ?? f?.status ?? '') as RuleStatus,
+        description: f?.finding_details ?? f?.comments ?? undefined,
+      }));
     },
     enabled: !!expandedScan,
   });
 
-  const { data: remediations, isLoading: remediationsLoading } = useQuery<Remediation[]>({
+  const { data: remediations, isLoading: remediationsLoading, error: remediationsError } = useQuery<Remediation[]>({
     queryKey: ['stig-remediations', severityFilter],
     queryFn: async () => {
       const params = new URLSearchParams();
       if (severityFilter !== 'all') params.append('severity', severityFilter);
-      try {
       const response = await api.get(`/stig/scans?${params}`);
       return response.data;
-      } catch { return null; }
     },
   });
 
   const runScanMutation = useMutation({
     mutationFn: async (params: { host: string; benchmark_id: string }) => {
-      try {
       const response = await api.post('/stig/scans/launch', params);
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['stig-scans'] });
       queryClient.invalidateQueries({ queryKey: ['stig-dashboard'] });
+    },
+    onError: (err: unknown) => {
+      alert(`Scan launch failed: ${describeLoadError(err)}`);
     },
   });
 
@@ -215,16 +246,14 @@ export default function STIGCompliance() {
       const severities = (params.categories || [])
         .map((c) => catMap[c] ?? c.toLowerCase())
         .filter(Boolean);
-      try {
-        const response = await api.post('/stig/remediate/auto', {
-          scan_result_id: params.scan_result_id,
-          categories: severities,
-        });
-        return response.data;
-      } catch (err) {
-        console.error('Auto-remediate failed:', err);
-        return null;
-      }
+      const response = await api.post('/stig/remediate/auto', {
+        scan_result_id: params.scan_result_id,
+        categories: severities,
+      });
+      return response.data;
+    },
+    onError: (err: unknown) => {
+      alert(`Auto-remediate failed: ${describeLoadError(err)}`);
     },
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['stig-remediations'] });
@@ -293,10 +322,14 @@ export default function STIGCompliance() {
 
       {/* Dashboard Tab */}
       {activeTab === 'dashboard' && (
-        <DashboardTab data={dashboardData} loading={dashboardLoading} />
+        <>
+          <LoadErrorBanner what="STIG dashboard stats" error={dashboardError} />
+          <DashboardTab data={dashboardData} loading={dashboardLoading} />
+        </>
       )}
 
       {/* Benchmarks Tab */}
+      {activeTab === 'benchmarks' && <LoadErrorBanner what="STIG benchmarks" error={benchmarksError} />}
       {activeTab === 'benchmarks' && (
         <BenchmarksTab
           benchmarks={benchmarks || []}
@@ -321,6 +354,7 @@ export default function STIGCompliance() {
       )}
 
       {/* Scan Results Tab */}
+      {activeTab === 'results' && <LoadErrorBanner what="STIG scans" error={scansError} />}
       {activeTab === 'results' && (
         <ScanResultsTab
           scans={scans || []}
@@ -329,10 +363,12 @@ export default function STIGCompliance() {
           setExpandedScan={setExpandedScan}
           expandedScanResults={expandedScanResults || []}
           scanResultsLoading={scanResultsLoading}
+          scanResultsError={scanResultsError}
         />
       )}
 
       {/* Remediation Tab */}
+      {activeTab === 'remediation' && <LoadErrorBanner what="remediation rows" error={remediationsError} />}
       {activeTab === 'remediation' && (
         <RemediationTab
           remediations={remediations || []}
@@ -745,7 +781,7 @@ function BenchmarksTab({
               </div>
 
               <div className="text-xs text-gray-500 dark:text-gray-400">
-                Last scanned: {new Date(benchmark.lastScanDate || "").toLocaleDateString()}
+                Last scanned: {benchmark.lastScanDate ? new Date(benchmark.lastScanDate).toLocaleDateString() : 'never'}
               </div>
             </div>
 
@@ -848,6 +884,7 @@ function ScanResultsTab({
   setExpandedScan,
   expandedScanResults,
   scanResultsLoading,
+  scanResultsError,
 }: {
   scans: Scan[];
   loading: boolean;
@@ -855,6 +892,7 @@ function ScanResultsTab({
   setExpandedScan: (id: string | null) => void;
   expandedScanResults: ScanResult[];
   scanResultsLoading: boolean;
+  scanResultsError: unknown;
 }) {
   if (loading) {
     return (
@@ -985,6 +1023,7 @@ function ScanResultsTab({
           <h3 className="font-semibold text-gray-900 dark:text-white mb-4 mt-6">
             Per-Rule Results
           </h3>
+          <LoadErrorBanner what="per-rule results" error={scanResultsError} />
           {scanResultsLoading ? (
             <div className="flex items-center justify-center h-32">
               <Loader2 className="w-6 h-6 animate-spin text-blue-500" />
@@ -1284,29 +1323,25 @@ function LaunchScanModal({
   const [manualHost, setManualHost] = useState<string>('');
   const [useManual, setUseManual] = useState<boolean>(false);
 
-  const { data: agentsData, isLoading: agentsLoading } = useQuery<{
+  const { data: agentsData, isLoading: agentsLoading, error: agentsError } = useQuery<{
     total: number;
     agents: ComplianceAgent[];
   }>({
     queryKey: ['compliance-agents'],
     queryFn: async () => {
-      try {
-        // Backend supports `capability` filter (singular).
-        const response = await api.get('/agents', {
-          params: { capability: 'compliance' },
-        });
-        const data = response.data;
-        // Defensive parse for either {agents:[]} or array
-        if (Array.isArray(data)) {
-          return { total: data.length, agents: data };
-        }
-        return {
-          total: data?.total ?? (data?.agents?.length || 0),
-          agents: data?.agents || [],
-        };
-      } catch {
-        return { total: 0, agents: [] };
+      // Backend supports `capability` filter (singular).
+      const response = await api.get('/agents', {
+        params: { capability: 'compliance' },
+      });
+      const data = response.data;
+      // Defensive parse for either {agents:[]} or array
+      if (Array.isArray(data)) {
+        return { total: data.length, agents: data };
       }
+      return {
+        total: data?.total ?? (data?.agents?.length || 0),
+        agents: data?.agents || [],
+      };
     },
   });
 
@@ -1346,6 +1381,7 @@ function LaunchScanModal({
         </p>
 
         <form onSubmit={handleSubmit} className="space-y-4">
+          <LoadErrorBanner what="compliance agents" error={agentsError} />
           {agentsLoading ? (
             <div className="flex items-center gap-2 text-sm text-gray-500">
               <Loader2 className="w-4 h-4 animate-spin" /> Loading agents...

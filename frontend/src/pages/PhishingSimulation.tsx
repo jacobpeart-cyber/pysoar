@@ -13,6 +13,8 @@ import {
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LineChart, Line, Cell } from 'recharts';
 import clsx from 'clsx';
 import { api } from '../api/client';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 
 // ---------------------------------------------------------------------------
 // Types matching actual backend response schemas
@@ -94,9 +96,15 @@ function extractData(data: any): any {
   return data;
 }
 
-function safeRate(numerator: number, denominator: number): string {
-  if (!denominator) return '0.0';
+// No emails sent means there is no rate, not a 0% rate.
+function safeRate(numerator: number, denominator: number): string | null {
+  if (!denominator) return null;
   return ((numerator / denominator) * 100).toFixed(1);
+}
+
+function pct(numerator: number, denominator: number): string {
+  const rate = safeRate(numerator, denominator);
+  return rate == null ? 'not available' : `${rate}%`;
 }
 
 const COLORS = ['#06B6D4', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6'];
@@ -113,7 +121,7 @@ export default function PhishingSimulation() {
   // Queries
   // ---------------------------------------------------------------------------
 
-  const { data: campaigns = [] } = useQuery<Campaign[]>({
+  const { data: campaigns = [], error: campaignsError } = useQuery<Campaign[]>({
     queryKey: ['phishing-campaigns'],
     queryFn: async () => {
       const res = await api.get('/phishing_sim/campaigns');
@@ -121,7 +129,7 @@ export default function PhishingSimulation() {
     },
   });
 
-  const { data: templates = [] } = useQuery<Template[]>({
+  const { data: templates = [], error: templatesError } = useQuery<Template[]>({
     queryKey: ['phishing-templates'],
     queryFn: async () => {
       const res = await api.get('/phishing_sim/templates');
@@ -129,7 +137,7 @@ export default function PhishingSimulation() {
     },
   });
 
-  const { data: targetGroups = [] } = useQuery<TargetGroupType[]>({
+  const { data: targetGroups = [], error: groupsError } = useQuery<TargetGroupType[]>({
     queryKey: ['phishing-target-groups'],
     queryFn: async () => {
       const res = await api.get('/phishing_sim/target-groups');
@@ -137,7 +145,7 @@ export default function PhishingSimulation() {
     },
   });
 
-  const { data: awarenessScores = [] } = useQuery<AwarenessScore[]>({
+  const { data: awarenessScores = [], error: awarenessError } = useQuery<AwarenessScore[]>({
     queryKey: ['phishing-awareness-scores'],
     queryFn: async () => {
       const res = await api.get('/phishing_sim/awareness-scores');
@@ -189,11 +197,14 @@ export default function PhishingSimulation() {
     const totalReported = campaigns.reduce((sum, c) => sum + (c.reported_count || 0), 0);
     const avgClickRate = safeRate(totalClicked, totalSent);
     const avgReportRate = safeRate(totalReported, totalSent);
-    const avgAwareness = awarenessScores.length > 0
+    const avgAwareness = !awarenessError && awarenessScores.length > 0
       ? (awarenessScores.reduce((sum, s) => sum + s.overall_score, 0) / awarenessScores.length).toFixed(1)
-      : '0';
+      : null;
+    if (campaignsError) {
+      return { activeCampaigns: null, avgClickRate: null, avgReportRate: null, avgAwareness };
+    }
     return { activeCampaigns, avgClickRate, avgReportRate, avgAwareness };
-  }, [campaigns, awarenessScores]);
+  }, [campaigns, awarenessScores, campaignsError, awarenessError]);
 
   const funnelData = campaigns[0]
     ? [
@@ -224,15 +235,11 @@ export default function PhishingSimulation() {
   // 25min, 'easy' → 15min) and a synthetic completion count =
   // template.usage_count divided by 1500. None of that reflected the
   // actual training catalog.
-  const { data: trainingModulesRaw } = useQuery({
+  const { data: trainingModulesRaw, error: trainingError } = useQuery({
     queryKey: ['phishing-training-modules'],
     queryFn: async () => {
-      try {
-        const res = await api.get('/phishing_sim/training/modules');
-        return res.data;
-      } catch {
-        return null;
-      }
+      const res = await api.get('/phishing_sim/training/modules');
+      return res.data;
     },
   });
   const trainingData = useMemo(() => {
@@ -271,27 +278,27 @@ export default function PhishingSimulation() {
             <div className="flex items-start justify-between">
               <div>
                 <p className="text-gray-400 text-sm mb-2">Active Campaigns</p>
-                <p className="text-3xl font-bold">{stats.activeCampaigns}</p>
+                <p className="text-3xl font-bold">{stats.activeCampaigns ?? 'not available'}</p>
               </div>
               <Mail className="w-8 h-8 text-red-400" />
             </div>
           </div>
 
-          <div className={clsx('border rounded-lg p-6', parseFloat(stats.avgClickRate) > 15 ? 'bg-red-900/20 border-red-700' : 'bg-gray-800 border-gray-700')}>
+          <div className={clsx('border rounded-lg p-6', stats.avgClickRate != null && parseFloat(stats.avgClickRate) > 15 ? 'bg-red-900/20 border-red-700' : 'bg-gray-800 border-gray-700')}>
             <div className="flex items-start justify-between">
               <div>
                 <p className="text-gray-400 text-sm mb-2">Click Rate %</p>
-                <p className="text-3xl font-bold">{stats.avgClickRate}%</p>
+                <p className="text-3xl font-bold">{stats.avgClickRate == null ? 'not available' : `${stats.avgClickRate}%`}</p>
               </div>
               <AlertCircle className="w-8 h-8 text-yellow-400" />
             </div>
           </div>
 
-          <div className={clsx('border rounded-lg p-6', parseFloat(stats.avgReportRate) < 5 ? 'bg-yellow-900/20 border-yellow-700' : 'bg-gray-800 border-gray-700')}>
+          <div className={clsx('border rounded-lg p-6', stats.avgReportRate != null && parseFloat(stats.avgReportRate) < 5 ? 'bg-yellow-900/20 border-yellow-700' : 'bg-gray-800 border-gray-700')}>
             <div className="flex items-start justify-between">
               <div>
                 <p className="text-gray-400 text-sm mb-2">Report Rate %</p>
-                <p className="text-3xl font-bold">{stats.avgReportRate}%</p>
+                <p className="text-3xl font-bold">{stats.avgReportRate == null ? 'not available' : `${stats.avgReportRate}%`}</p>
               </div>
               <Target className="w-8 h-8 text-green-400" />
             </div>
@@ -301,7 +308,7 @@ export default function PhishingSimulation() {
             <div className="flex items-start justify-between">
               <div>
                 <p className="text-gray-400 text-sm mb-2">Avg Awareness Score</p>
-                <p className="text-3xl font-bold">{stats.avgAwareness}</p>
+                <p className="text-3xl font-bold">{stats.avgAwareness ?? 'not available'}</p>
               </div>
               <Award className="w-8 h-8 text-blue-400" />
             </div>
@@ -376,7 +383,9 @@ export default function PhishingSimulation() {
             )}
 
             {/* Campaign List */}
-            {campaigns.length === 0 ? (
+            {campaignsError ? (
+              <LoadErrorBanner what="campaigns" error={campaignsError} />
+            ) : campaigns.length === 0 ? (
               <div className="text-center py-16 text-gray-500">
                 <Mail className="w-12 h-12 mx-auto mb-4 opacity-50" />
                 <p>No campaigns yet. Create your first phishing simulation campaign.</p>
@@ -494,19 +503,19 @@ export default function PhishingSimulation() {
                     <div className="grid grid-cols-5 gap-4">
                       <div className="bg-gray-700/50 rounded p-3 text-center">
                         <p className="text-xs text-gray-400 mb-1">Opened</p>
-                        <p className="text-xl font-bold text-blue-400">{safeRate(campaign.emails_opened, campaign.emails_sent)}%</p>
+                        <p className="text-xl font-bold text-blue-400">{pct(campaign.emails_opened, campaign.emails_sent)}</p>
                       </div>
                       <div className="bg-gray-700/50 rounded p-3 text-center">
                         <p className="text-xs text-gray-400 mb-1">Clicked</p>
-                        <p className="text-xl font-bold text-yellow-400">{safeRate(campaign.links_clicked, campaign.emails_sent)}%</p>
+                        <p className="text-xl font-bold text-yellow-400">{pct(campaign.links_clicked, campaign.emails_sent)}</p>
                       </div>
                       <div className="bg-gray-700/50 rounded p-3 text-center">
                         <p className="text-xs text-gray-400 mb-1">Submitted</p>
-                        <p className="text-xl font-bold text-red-400">{safeRate(campaign.credentials_submitted, campaign.emails_sent)}%</p>
+                        <p className="text-xl font-bold text-red-400">{pct(campaign.credentials_submitted, campaign.emails_sent)}</p>
                       </div>
                       <div className="bg-gray-700/50 rounded p-3 text-center">
                         <p className="text-xs text-gray-400 mb-1">Reported</p>
-                        <p className="text-xl font-bold text-green-400">{safeRate(campaign.reported_count, campaign.emails_sent)}%</p>
+                        <p className="text-xl font-bold text-green-400">{pct(campaign.reported_count, campaign.emails_sent)}</p>
                       </div>
                       <div className="bg-gray-700/50 rounded p-3 text-center">
                         <p className="text-xs text-gray-400 mb-1">Total Emails</p>
@@ -525,7 +534,9 @@ export default function PhishingSimulation() {
         {/* ================================================================= */}
         {activeTab === 'templates' && (
           <div className="grid grid-cols-1 gap-4">
-            {templates.length === 0 ? (
+            {templatesError ? (
+              <LoadErrorBanner what="templates" error={templatesError} />
+            ) : templates.length === 0 ? (
               <div className="text-center py-16 text-gray-500">
                 <Target className="w-12 h-12 mx-auto mb-4 opacity-50" />
                 <p>No templates configured yet.</p>
@@ -615,7 +626,9 @@ export default function PhishingSimulation() {
             )}
 
             {/* Group List */}
-            {targetGroups.length === 0 ? (
+            {groupsError ? (
+              <LoadErrorBanner what="target groups" error={groupsError} />
+            ) : targetGroups.length === 0 ? (
               <div className="text-center py-16 text-gray-500">
                 <Users className="w-12 h-12 mx-auto mb-4 opacity-50" />
                 <p>No target groups configured yet.</p>
@@ -694,7 +707,9 @@ export default function PhishingSimulation() {
             )}
 
             {/* Scores Table */}
-            {awarenessScores.length === 0 ? (
+            {awarenessError ? (
+              <LoadErrorBanner what="awareness scores" error={awarenessError} />
+            ) : awarenessScores.length === 0 ? (
               <div className="text-center py-16 text-gray-500">
                 <TrendingUp className="w-12 h-12 mx-auto mb-4 opacity-50" />
                 <p>No awareness scores calculated yet.</p>
@@ -767,7 +782,9 @@ export default function PhishingSimulation() {
         {/* ================================================================= */}
         {activeTab === 'training' && (
           <div className="space-y-4">
-            {trainingData.length === 0 ? (
+            {trainingError ? (
+              <LoadErrorBanner what="training modules" error={trainingError} />
+            ) : trainingData.length === 0 ? (
               <div className="text-center py-16 text-gray-500">
                 <Award className="w-12 h-12 mx-auto mb-4 opacity-50" />
                 <p>No training modules available.</p>
@@ -836,11 +853,11 @@ export default function PhishingSimulation() {
                 </div>
                 <div>
                   <p className="text-sm text-gray-400">Click Rate</p>
-                  <p className="text-2xl font-bold text-yellow-400">{safeRate(selectedCampaign.links_clicked, selectedCampaign.emails_sent)}%</p>
+                  <p className="text-2xl font-bold text-yellow-400">{pct(selectedCampaign.links_clicked, selectedCampaign.emails_sent)}</p>
                 </div>
                 <div>
                   <p className="text-sm text-gray-400">Report Rate</p>
-                  <p className="text-2xl font-bold text-green-400">{safeRate(selectedCampaign.reported_count, selectedCampaign.emails_sent)}%</p>
+                  <p className="text-2xl font-bold text-green-400">{pct(selectedCampaign.reported_count, selectedCampaign.emails_sent)}</p>
                 </div>
                 <div>
                   <p className="text-sm text-gray-400">Total Sent</p>
@@ -955,6 +972,11 @@ export default function PhishingSimulation() {
                   <label className="block text-sm font-medium text-gray-300 mb-2">Department</label>
                   <input name="department" type="text" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500" placeholder="e.g., Engineering, Finance, HR" />
                 </div>
+                {createGroupMutation.error && (
+                  <div role="alert" className="text-sm text-red-300 bg-red-900/30 border border-red-700 rounded p-3">
+                    Could not create group. {describeLoadError(createGroupMutation.error)}
+                  </div>
+                )}
                 <div className="flex gap-4 mt-6">
                   <button type="button" onClick={() => setShowGroupModal(false)} className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors">Cancel</button>
                   <button type="submit" disabled={createGroupMutation.isPending} className="flex-1 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded transition-colors disabled:opacity-50">

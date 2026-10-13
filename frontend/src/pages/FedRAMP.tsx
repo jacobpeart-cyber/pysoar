@@ -26,6 +26,7 @@ import {
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
+import { describeLoadError } from '../lib/loadError';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -264,11 +265,12 @@ function EmptyState({ icon, title, description }: { icon: React.ReactNode; title
   );
 }
 
-function ErrorState({ message }: { message: string }) {
+function ErrorState({ message, error }: { message: string; error?: unknown }) {
   return (
     <div className="flex flex-col items-center justify-center py-20 text-red-500">
       <AlertCircle className="w-8 h-8 mb-3" />
       <p className="text-sm">{message}</p>
+      {error ? <p className="text-xs mt-1">{describeLoadError(error)}</p> : null}
     </div>
   );
 }
@@ -318,10 +320,8 @@ function ReadinessTab() {
   const { data: rawData, isLoading, error } = useQuery<any>({
     queryKey: ['fedramp', 'readiness'],
     queryFn: async () => {
-      try {
-        const r = await api.get('/fedramp/readiness');
-        return r.data;
-      } catch { return null; }
+      const r = await api.get('/fedramp/readiness');
+      return r.data;
     },
     retry: 1,
   });
@@ -339,7 +339,7 @@ function ReadinessTab() {
   });
 
   if (isLoading) return <LoadingState message="Calculating readiness..." />;
-  if (error) return <ErrorState message="Failed to load readiness data." />;
+  if (error) return <ErrorState message="Failed to load readiness data." error={error} />;
   if (!rawData) return <EmptyState icon={<BarChart3 className="w-10 h-10" />} title="No Data" description="No readiness assessment has been performed yet." />;
 
   // Safely extract data - backend returns snake_case keys
@@ -517,7 +517,7 @@ function ControlsTab() {
 
   const { data: controlsRaw, isLoading, error } = useQuery<any>({
     queryKey: ['fedramp', 'controls'],
-    queryFn: async () => { try { return (await api.get('/fedramp/controls')).data; } catch { return null; } },
+    queryFn: async () => (await api.get('/fedramp/controls')).data,
   });
   const controls: FedRAMPControl[] = Array.isArray(controlsRaw) ? controlsRaw : (controlsRaw?.controls || []);
 
@@ -560,7 +560,7 @@ function ControlsTab() {
   }, [controls, familyFilter, statusFilter, priorityFilter, searchTerm]);
 
   if (isLoading) return <LoadingState message="Loading controls..." />;
-  if (error) return <ErrorState message="Failed to load controls." />;
+  if (error) return <ErrorState message="Failed to load controls." error={error} />;
 
   return (
     <div className="space-y-4">
@@ -784,7 +784,7 @@ function ControlRow({
 function POAMTab() {
   const { data, isLoading, error } = useQuery<POAMReport>({
     queryKey: ['fedramp', 'poam', 'report'],
-    queryFn: async () => { try { return (await api.get('/fedramp/poam/report')).data; } catch { return null; } },
+    queryFn: async () => (await api.get('/fedramp/poam/report')).data,
   });
 
   const exportPOAM = useMutation({
@@ -800,7 +800,7 @@ function POAMTab() {
   });
 
   if (isLoading) return <LoadingState message="Loading POA&M report..." />;
-  if (error) return <ErrorState message="Failed to load POA&M report." />;
+  if (error) return <ErrorState message="Failed to load POA&M report." error={error} />;
   if (!data) return <EmptyState icon={<ClipboardList className="w-10 h-10" />} title="No POA&Ms" description="No plan of action and milestones items found." />;
 
   const items: any[] = Array.isArray(data?.items) ? data.items : [];
@@ -953,7 +953,7 @@ function EvidenceTab() {
   const queryClient = useQueryClient();
   const { data, isLoading, error } = useQuery<EvidenceStatus>({
     queryKey: ['fedramp', 'evidence', 'status'],
-    queryFn: async () => { try { return (await api.get('/fedramp/evidence/status')).data; } catch { return null; } },
+    queryFn: async () => (await api.get('/fedramp/evidence/status')).data,
   });
 
   const collectEvidence = useMutation({
@@ -976,7 +976,7 @@ function EvidenceTab() {
   });
 
   if (isLoading) return <LoadingState message="Loading evidence status..." />;
-  if (error) return <ErrorState message="Failed to load evidence status." />;
+  if (error) return <ErrorState message="Failed to load evidence status." error={error} />;
   if (!data) return <EmptyState icon={<FolderOpen className="w-10 h-10" />} title="No Evidence Data" description="Evidence collection has not been configured." />;
 
   const rawFamilies: any[] = Array.isArray(data?.families) ? data.families : [];
@@ -1227,15 +1227,19 @@ function DocumentsTab() {
 export default function FedRAMP() {
   const [activeTab, setActiveTab] = useState<TabType>('readiness');
 
-  const { data: readinessData } = useQuery<any>({
+  const { data: readinessData, error: readinessError } = useQuery<any>({
     queryKey: ['fedramp', 'readiness'],
-    queryFn: async () => { try { return (await api.get('/fedramp/readiness')).data; } catch { return null; } },
+    queryFn: async () => (await api.get('/fedramp/readiness')).data,
     staleTime: 60_000,
   });
 
   // Derive badge from score since backend doesn't return a badge field
-  const readinessScore = Number(readinessData?.overall_readiness_score ?? readinessData?.score ?? 0) || 0;
-  const badge: ReadinessBadge = readinessScore >= 80 ? 'Ready' : readinessScore >= 40 ? 'In Progress' : 'Not Ready';
+  // A failed or empty readiness load has no score; it must not be shown as "Not Ready".
+  const rawReadinessScore = readinessData?.overall_readiness_score ?? readinessData?.score;
+  const readinessScore =
+    rawReadinessScore == null || !Number.isFinite(Number(rawReadinessScore)) ? null : Number(rawReadinessScore);
+  const badge: ReadinessBadge | null =
+    readinessScore == null ? null : readinessScore >= 80 ? 'Ready' : readinessScore >= 40 ? 'In Progress' : 'Not Ready';
   const generatedAt = readinessData?.generated_at ?? readinessData?.lastAssessmentDate;
   const lastAssessment = generatedAt
     ? new Date(generatedAt).toLocaleDateString('en-US', {
@@ -1243,7 +1247,9 @@ export default function FedRAMP() {
         month: 'short',
         day: 'numeric',
       })
-    : 'Never';
+    : readinessData
+      ? 'Never'
+      : 'not available';
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-950 p-6">
@@ -1264,17 +1270,26 @@ export default function FedRAMP() {
               <p className="text-xs text-gray-500 dark:text-gray-400">Last Assessment</p>
               <p className="text-sm font-medium text-gray-700 dark:text-gray-300">{lastAssessment}</p>
             </div>
-            <span
-              className={clsx(
-                'inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold border',
-                badgeVariant(badge)
-              )}
-            >
-              {badge === 'Ready' && <CheckCircle2 className="w-3.5 h-3.5" />}
-              {badge === 'In Progress' && <Clock className="w-3.5 h-3.5" />}
-              {badge === 'Not Ready' && <ShieldAlert className="w-3.5 h-3.5" />}
-              {badge}
-            </span>
+            {badge ? (
+              <span
+                className={clsx(
+                  'inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold border',
+                  badgeVariant(badge)
+                )}
+              >
+                {badge === 'Ready' && <CheckCircle2 className="w-3.5 h-3.5" />}
+                {badge === 'In Progress' && <Clock className="w-3.5 h-3.5" />}
+                {badge === 'Not Ready' && <ShieldAlert className="w-3.5 h-3.5" />}
+                {badge}
+              </span>
+            ) : (
+              <span
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold border border-gray-300 text-gray-500 dark:border-gray-600 dark:text-gray-400"
+                title={readinessError ? describeLoadError(readinessError) : undefined}
+              >
+                Readiness not available
+              </span>
+            )}
           </div>
         </div>
 

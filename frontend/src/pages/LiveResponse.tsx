@@ -11,6 +11,7 @@ import {
   Play,
 } from 'lucide-react';
 import clsx from 'clsx';
+import LoadErrorBanner from '../components/LoadErrorBanner';
 
 interface Command {
   id: string;
@@ -85,44 +86,32 @@ export default function LiveResponse() {
   const [rejectReason, setRejectReason] = useState('');
   const [approveReason, setApproveReason] = useState<Record<string, string>>({});
 
-  const { data: agents } = useQuery({
+  const { data: agents, error: agentsError } = useQuery({
     queryKey: ['lr-agents'],
     queryFn: async () => {
-      try {
-        const r = await api.get<{ agents: Agent[] }>('/agents');
-        return (r.data.agents ?? []).filter(
-          (a) => a.capabilities?.includes('ir') && a.status === 'active',
-        );
-      } catch {
-        return [];
-      }
+      const r = await api.get<{ agents: Agent[] }>('/agents');
+      return (r.data.agents ?? []).filter(
+        (a) => a.capabilities?.includes('ir') && a.status === 'active',
+      );
     },
     refetchInterval: 10000,
   });
 
-  const { data: pending } = useQuery({
+  const { data: pending, error: pendingError } = useQuery({
     queryKey: ['lr-pending'],
     queryFn: async () => {
-      try {
-        const r = await api.get<Command[]>('/agents/commands/pending-approval');
-        return r.data;
-      } catch {
-        return [];
-      }
+      const r = await api.get<Command[]>('/agents/commands/pending-approval');
+      return r.data;
     },
     refetchInterval: 5000,
   });
 
-  const { data: recent } = useQuery({
+  const { data: recent, error: recentError } = useQuery({
     queryKey: ['lr-recent', selectedAgent],
     queryFn: async () => {
       if (!selectedAgent) return [];
-      try {
-        const r = await api.get<Command[]>(`/agents/${selectedAgent}/commands?limit=50`);
-        return r.data;
-      } catch {
-        return [];
-      }
+      const r = await api.get<Command[]>(`/agents/${selectedAgent}/commands?limit=50`);
+      return r.data;
     },
     enabled: !!selectedAgent,
     refetchInterval: 3000,
@@ -223,11 +212,16 @@ export default function LiveResponse() {
         <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700 bg-yellow-50 dark:bg-yellow-900/10 flex items-center gap-2">
           <ShieldAlert className="w-5 h-5 text-yellow-600 dark:text-yellow-400" />
           <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
-            Pending Approval ({pending?.length ?? 0})
+            Pending Approval{pending ? ` (${pending.length})` : ''}
           </h3>
         </div>
         <div className="divide-y divide-gray-200 dark:divide-gray-700">
-          {(!pending || pending.length === 0) && (
+          {pendingError && (
+            <div className="px-6 py-4">
+              <LoadErrorBanner what="the approval queue" error={pendingError} />
+            </div>
+          )}
+          {!pendingError && (!pending || pending.length === 0) && (
             <div className="px-6 py-6 text-sm text-gray-500 text-center">
               No actions awaiting approval.
             </div>
@@ -284,6 +278,11 @@ export default function LiveResponse() {
           <Play className="w-5 h-5 text-red-600" />
           Issue Command
         </h3>
+        {!!agentsError && (
+          <div className="mb-4">
+            <LoadErrorBanner what="IR-capable agents" error={agentsError} />
+          </div>
+        )}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div>
             <label className="block text-sm font-medium mb-1 text-gray-900 dark:text-white">
@@ -383,7 +382,14 @@ export default function LiveResponse() {
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-              {(!recent || recent.length === 0) && (
+              {!!recentError && (
+                <tr>
+                  <td colSpan={4} className="px-6 py-4">
+                    <LoadErrorBanner what="this agent's commands" error={recentError} />
+                  </td>
+                </tr>
+              )}
+              {!recentError && (!recent || recent.length === 0) && (
                 <tr>
                   <td colSpan={4} className="px-6 py-6 text-sm text-gray-500 text-center">
                     No commands for this agent yet.

@@ -13,16 +13,17 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 import { api } from '../lib/api';
-import { integrationsApi } from '../api/endpoints';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 import DetailDrawer, { DetailSection } from '../components/DetailDrawer';
 
 const getHealthColor = (health: string | null) => {
   switch (health) {
     case 'healthy':
       return 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-100';
-    case 'warning':
+    case 'degraded':
       return 'bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-100';
-    case 'error':
+    case 'unhealthy':
       return 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-100';
     default:
       return 'bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-100';
@@ -51,6 +52,8 @@ export default function IntegrationMarketplace() {
   const [executions, setExecutions] = useState<any[]>([]);
   const [webhooks, setWebhooks] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [connectorsError, setConnectorsError] = useState<unknown>(null);
+  const [installedError, setInstalledError] = useState<unknown>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [showNewWebhookModal, setShowNewWebhookModal] = useState(false);
@@ -60,16 +63,19 @@ export default function IntegrationMarketplace() {
   const loadData = async () => {
     setLoading(true);
     try {
-      const [connectorsData, installedData] = await Promise.all([
-        integrationsApi.getConnectors(),
-        integrationsApi.getInstalled(),
+      // size=100: the backend defaults to 20, which hid most of the
+      // registry's connectors. Both lists return {items, total, ...}.
+      const [connectorsRes, installedRes] = await Promise.allSettled([
+        api.get('/integrations/connectors', { params: { size: 100 } }),
+        api.get('/integrations/installed', { params: { size: 100 } }),
       ]);
-      setConnectors(connectorsData);
-      setInstalled(installedData);
+      setConnectors(connectorsRes.status === 'fulfilled' ? (connectorsRes.value.data?.items ?? []) : []);
+      setConnectorsError(connectorsRes.status === 'rejected' ? (connectorsRes.reason ?? new Error('request failed')) : null);
+      setInstalled(installedRes.status === 'fulfilled' ? (installedRes.value.data?.items ?? []) : []);
+      setInstalledError(installedRes.status === 'rejected' ? (installedRes.reason ?? new Error('request failed')) : null);
+      // Executions and webhooks are not loaded by this page yet.
       setExecutions([]);
       setWebhooks([]);
-    } catch (error) {
-      console.error('Error loading integration data:', error);
     } finally {
       setLoading(false);
     }
@@ -79,14 +85,24 @@ export default function IntegrationMarketplace() {
     loadData();
   }, []);
 
-  const availableConnectors = connectors.filter(c => !c.installed).length;
-  const installedCount = connectors.filter(c => c.installed).length;
-  const activeIntegrations = connectors.filter(c => c.installed && c.health === 'healthy').length;
-  const healthScore = Math.round((activeIntegrations / installedCount) * 100) || 0;
+  // ConnectorResponse has no installed/health fields: installation state
+  // and health come from the org's installed_integrations rows.
+  const installedByConnector = new Map<string, any>(installed.map((i: any) => [i.connector_id, i]));
+  const availableConnectors: number | null = connectorsError || installedError
+    ? null
+    : connectors.filter(c => !installedByConnector.has(c.id)).length;
+  const installedCount: number | null = installedError ? null : installed.length;
+  const activeIntegrations: number | null = installedError
+    ? null
+    : installed.filter((i: any) => i.health_status === 'healthy').length;
+  const healthScore: number | null = installedCount && activeIntegrations !== null
+    ? Math.round((activeIntegrations / installedCount) * 100)
+    : null;
+  const shown = (n: number | null, suffix = '') => (n === null ? 'not available' : `${n}${suffix}`);
 
   const categories = ['all', ...new Set(connectors.map(c => c.category))];
   const filteredConnectors = connectors.filter(c => {
-    const matchesSearch = (c.name || c.display_name || '').toLowerCase().includes(searchQuery.toLowerCase());
+    const matchesSearch = (c.display_name || c.name || '').toLowerCase().includes(searchQuery.toLowerCase());
     const matchesCategory = categoryFilter === 'all' || c.category === categoryFilter;
     return matchesSearch && matchesCategory;
   });
@@ -120,22 +136,22 @@ export default function IntegrationMarketplace() {
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
           <div className="bg-gradient-to-br from-blue-50 to-blue-100 dark:from-blue-900 dark:to-blue-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-blue-600 dark:text-blue-300">Available Connectors</p>
-            <p className="text-3xl font-bold text-blue-900 dark:text-blue-100 mt-2">{availableConnectors}</p>
+            <p className="text-3xl font-bold text-blue-900 dark:text-blue-100 mt-2">{shown(availableConnectors)}</p>
             <p className="text-xs text-blue-600 dark:text-blue-300 mt-1">ready to install</p>
           </div>
           <div className="bg-gradient-to-br from-green-50 to-green-100 dark:from-green-900 dark:to-green-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-green-600 dark:text-green-300">Installed</p>
-            <p className="text-3xl font-bold text-green-900 dark:text-green-100 mt-2">{installedCount}</p>
+            <p className="text-3xl font-bold text-green-900 dark:text-green-100 mt-2">{shown(installedCount)}</p>
             <p className="text-xs text-green-600 dark:text-green-300 mt-1">active integrations</p>
           </div>
           <div className="bg-gradient-to-br from-purple-50 to-purple-100 dark:from-purple-900 dark:to-purple-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-purple-600 dark:text-purple-300">Active</p>
-            <p className="text-3xl font-bold text-purple-900 dark:text-purple-100 mt-2">{activeIntegrations}</p>
+            <p className="text-3xl font-bold text-purple-900 dark:text-purple-100 mt-2">{shown(activeIntegrations)}</p>
             <p className="text-xs text-purple-600 dark:text-purple-300 mt-1">healthy status</p>
           </div>
           <div className="bg-gradient-to-br from-orange-50 to-orange-100 dark:from-orange-900 dark:to-orange-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-orange-600 dark:text-orange-300">Health Score</p>
-            <p className="text-3xl font-bold text-orange-900 dark:text-orange-100 mt-2">{healthScore}%</p>
+            <p className="text-3xl font-bold text-orange-900 dark:text-orange-100 mt-2">{shown(healthScore, '%')}</p>
             <p className="text-xs text-orange-600 dark:text-orange-300 mt-1">system health</p>
           </div>
         </div>
@@ -176,6 +192,8 @@ export default function IntegrationMarketplace() {
             {/* Marketplace Tab */}
             {activeTab === 'marketplace' && (
               <div className="space-y-6">
+                <LoadErrorBanner what="connectors" error={connectorsError} />
+                <LoadErrorBanner what="installed integrations" error={installedError} />
                 <div className="flex gap-4 items-end">
                   <div className="flex-1 relative">
                     <Search className="absolute left-3 top-3 w-4 h-4 text-gray-400" />
@@ -206,17 +224,22 @@ export default function IntegrationMarketplace() {
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                  {filteredConnectors.map((connector) => (
+                  {filteredConnectors.map((connector) => {
+                    const installation = installedByConnector.get(connector.id);
+                    return (
                     <div key={connector.id} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition flex flex-col">
                       <div className="flex items-start justify-between mb-3">
-                        <div className="text-3xl">{connector.icon}</div>
-                        <div className="flex items-center gap-1">
-                          <Star className="w-4 h-4 text-yellow-500 fill-yellow-500" />
-                          <span className="text-sm font-semibold">{connector.rating}</span>
-                          <span className="text-xs text-gray-600 dark:text-gray-400">({connector.reviews})</span>
-                        </div>
+                        <span className="text-xs text-gray-600 dark:text-gray-400">{connector.vendor || ''}</span>
+                        {connector.rating !== null && connector.rating !== undefined ? (
+                          <div className="flex items-center gap-1">
+                            <Star className="w-4 h-4 text-yellow-500 fill-yellow-500" />
+                            <span className="text-sm font-semibold">{connector.rating}</span>
+                          </div>
+                        ) : (
+                          <span className="text-xs text-gray-400">not rated</span>
+                        )}
                       </div>
-                      <h3 className="font-semibold text-lg mb-1">{connector.name}</h3>
+                      <h3 className="font-semibold text-lg mb-1">{connector.display_name || connector.name}</h3>
                       <div className="flex gap-2 mb-2 flex-wrap">
                         <span className="text-xs px-2 py-1 bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-100 rounded w-fit">
                           {connector.category}
@@ -235,24 +258,37 @@ export default function IntegrationMarketplace() {
                         )}
                       </div>
                       <p className="text-sm text-gray-600 dark:text-gray-400 mb-4 flex-grow">{connector.description}</p>
-                      {connector.installed ? (
+                      {installation ? (
                         <div className="space-y-2">
                           <div className="flex items-center gap-2 text-xs">
-                            <div className={`w-2 h-2 rounded-full ${connector.health === 'healthy' ? 'bg-green-600' : 'bg-yellow-600'}`} />
-                            <span className="capitalize">{connector.health}</span>
+                            <div className={`w-2 h-2 rounded-full ${installation.health_status === 'healthy' ? 'bg-green-600' : 'bg-yellow-600'}`} />
+                            <span className="capitalize">{installation.health_status || 'unknown'}</span>
                           </div>
                           <button onClick={() => setSelectedConnector(connector)} className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
                             Manage
                           </button>
                         </div>
                       ) : (
-                        <button onClick={async () => { try { await api.post('/integrations/install', { connector_id: connector.id, config: {} }); loadData(); } catch(e) { console.error(e); } }} className="w-full px-3 py-2 text-sm bg-cyan-600 hover:bg-cyan-700 text-white rounded transition flex items-center justify-center gap-2">
+                        <button onClick={async () => {
+                          try {
+                            // display_name is required by IntegrationInstallRequest.
+                            await api.post('/integrations/install', {
+                              connector_id: connector.id,
+                              display_name: connector.display_name || connector.name,
+                              config: {},
+                            });
+                            loadData();
+                          } catch (e) {
+                            alert(`Install failed: ${describeLoadError(e)}`);
+                          }
+                        }} className="w-full px-3 py-2 text-sm bg-cyan-600 hover:bg-cyan-700 text-white rounded transition flex items-center justify-center gap-2">
                           <Download className="w-4 h-4" />
                           Install
                         </button>
                       )}
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -260,41 +296,50 @@ export default function IntegrationMarketplace() {
             {/* Installed Tab */}
             {activeTab === 'installed' && (
               <div className="space-y-6">
+                <LoadErrorBanner what="installed integrations" error={installedError} />
                 <div className="grid grid-cols-1 gap-4">
                   {installed.map((integration) => (
                     <div key={integration.id} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition">
                       <div className="flex justify-between items-start mb-4">
                         <div className="flex-1">
-                          <h3 className="font-semibold text-lg">{integration.name}</h3>
-                          <p className="text-sm text-gray-600 dark:text-gray-400">v{integration.version}</p>
+                          <h3 className="font-semibold text-lg">{integration.display_name}</h3>
+                          <p className="text-sm text-gray-600 dark:text-gray-400 font-mono">{integration.connector_id}</p>
                         </div>
-                        <span className={`px-3 py-1 rounded-full text-xs font-medium ${getHealthColor(integration.health)}`}>
-                          {integration.health}
+                        <span className={`px-3 py-1 rounded-full text-xs font-medium ${getHealthColor(integration.health_status || null)}`}>
+                          {integration.health_status || 'unknown'}
                         </span>
                       </div>
                       <div className="grid grid-cols-4 gap-4 text-sm mb-4">
                         <div>
-                          <p className="text-gray-600 dark:text-gray-400">Last Sync</p>
-                          <p className="font-medium">{new Date(integration.lastSync || "").toLocaleDateString()}</p>
+                          <p className="text-gray-600 dark:text-gray-400">Last Health Check</p>
+                          <p className="font-medium">{integration.last_health_check ? new Date(integration.last_health_check).toLocaleString() : 'Never'}</p>
                         </div>
                         <div>
-                          <p className="text-gray-600 dark:text-gray-400">Frequency</p>
-                          <p className="font-medium">{integration.syncFrequency}</p>
+                          <p className="text-gray-600 dark:text-gray-400">Status</p>
+                          <p className="font-medium capitalize">{integration.status || 'not available'}</p>
                         </div>
                         <div>
-                          <p className="text-gray-600 dark:text-gray-400">Events</p>
-                          <p className="font-medium">{(integration.eventsProcessed / 1000000).toFixed(1)}M</p>
+                          <p className="text-gray-600 dark:text-gray-400">Last Successful Action</p>
+                          <p className="font-medium">{integration.last_successful_action ? new Date(integration.last_successful_action).toLocaleString() : 'Never'}</p>
                         </div>
                         <div>
-                          <p className="text-gray-600 dark:text-gray-400">Success Rate</p>
-                          <p className="font-medium">{integration.successRate}%</p>
+                          <p className="text-gray-600 dark:text-gray-400">Last Error</p>
+                          <p className="font-medium break-words">{integration.error_message || 'None'}</p>
                         </div>
                       </div>
                       <div className="flex gap-2">
                         <button onClick={() => setSelectedConnector(integration)} className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
                           Configure
                         </button>
-                        <button onClick={async () => { try { await api.post(`/integrations/installed/${integration.id}/test`); } catch(e) { console.error(e); } }} className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button onClick={async () => {
+                          try {
+                            const res = await api.post(`/integrations/installed/${integration.id}/test`);
+                            alert(`Test result: ${res.data?.status ?? 'unknown'}${res.data?.message ? ` — ${res.data.message}` : ''}`);
+                            loadData();
+                          } catch (e) {
+                            alert(`Test failed: ${describeLoadError(e)}`);
+                          }
+                        }} className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
                           Test
                         </button>
                         <button onClick={() => setSelectedConnector(integration)} className="px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
@@ -389,7 +434,7 @@ export default function IntegrationMarketplace() {
                           onClick={async () => {
                             const integrationId = (webhook as any).installation_id;
                             if (!integrationId) {
-                              console.error('Webhook missing installation_id — cannot fire test.');
+                              alert('This webhook has no installation id, so it cannot be tested.');
                               return;
                             }
                             try {
@@ -399,7 +444,7 @@ export default function IntegrationMarketplace() {
                               setDetailExec(res.data);
                               loadData();
                             } catch (err) {
-                              console.error('Webhook test failed:', err);
+                              alert(`Webhook test failed: ${describeLoadError(err)}`);
                             }
                           }}
                           className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
@@ -412,7 +457,7 @@ export default function IntegrationMarketplace() {
                             if (!window.confirm(`Delete webhook ${webhook.name}?`)) return;
                             const integrationId = (webhook as any).installation_id;
                             if (!integrationId) {
-                              console.error('Webhook missing installation_id — cannot delete');
+                              alert('This webhook has no installation id, so it cannot be deleted.');
                               return;
                             }
                             try {
@@ -421,7 +466,7 @@ export default function IntegrationMarketplace() {
                               );
                               loadData();
                             } catch (err) {
-                              console.error('Webhook delete failed:', err);
+                              alert(`Webhook delete failed: ${describeLoadError(err)}`);
                             }
                           }}
                           className="px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
@@ -447,19 +492,19 @@ export default function IntegrationMarketplace() {
               e.preventDefault();
               const fd = new FormData(e.currentTarget);
               const integrationId = fd.get('integration_id');
-              if (!integrationId) { console.error('No integration selected'); return; }
+              if (!integrationId) { alert('Select an installed integration first.'); return; }
               try {
                 await api.post(`/integrations/installed/${integrationId}/webhooks`, { endpoint_path: fd.get('url'), http_method: 'POST', event_types: [fd.get('event')] });
                 setShowNewWebhookModal(false);
                 loadData();
-              } catch (err) { console.error('Failed to create webhook:', err); }
+              } catch (err) { alert(`Create webhook failed: ${describeLoadError(err)}`); }
             }}>
               <div>
                 <label className="block text-sm font-medium mb-1">Integration</label>
                 <select name="integration_id" required className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
                   <option value="">Select an integration...</option>
                   {installed.map((inst) => (
-                    <option key={inst.id} value={inst.id}>{inst.name || inst.display_name || inst.connector_id}</option>
+                    <option key={inst.id} value={inst.id}>{inst.display_name || inst.connector_id}</option>
                   ))}
                 </select>
               </div>

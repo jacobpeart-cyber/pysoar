@@ -21,6 +21,8 @@ import {
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 import { settingsApi, healthApi } from '../api/endpoints';
 import type {
   AgenticPolicySettings as AgenticPolicySettingsData,
@@ -84,13 +86,11 @@ export default function Settings() {
   const [globalError, setGlobalError] = useState<string | null>(null);
   const queryClient = useQueryClient();
 
-  const { data: settings, isLoading } = useQuery<SettingsData>({
+  const { data: settings, isLoading, error: settingsError } = useQuery<SettingsData>({
     queryKey: ['settings'],
     queryFn: async () => {
-      try {
       const response = await api.get('/settings');
       return response.data;
-      } catch { return null; }
     },
   });
 
@@ -174,6 +174,7 @@ export default function Settings() {
 
         {/* Content */}
         <div className="flex-1 bg-white rounded-lg border border-gray-200 p-6">
+          {activeTab !== 'ai' && <LoadErrorBanner what="settings" error={settingsError} />}
           {activeTab === 'general' && settings && (
             <GeneralSettings settings={settings.general} />
           )}
@@ -424,6 +425,7 @@ function EmailSettings({
   onTest: () => void;
   testStatus: { isPending: boolean; isSuccess: boolean; isError: boolean };
 }) {
+  const [smtpError, setSmtpError] = useState<string | null>(null);
   return (
     <div className="space-y-6">
       <div>
@@ -434,6 +436,7 @@ function EmailSettings({
       <form id="smtp-form" onSubmit={async (e) => {
         e.preventDefault();
         const fd = new FormData(e.currentTarget);
+        setSmtpError(null);
         try {
           await api.patch('/settings/smtp', {
             host: fd.get('host'),
@@ -444,9 +447,16 @@ function EmailSettings({
             use_tls: fd.get('use_tls') === 'on',
           });
         } catch (err) {
-          console.error('Failed to save SMTP settings:', err);
+          setSmtpError(`Could not save SMTP settings. ${describeLoadError(err)}`);
         }
       }}>
+      {smtpError && (
+        <div className="mb-4">
+          <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
+            {smtpError}
+          </div>
+        </div>
+      )}
       <div className="grid grid-cols-2 gap-6">
         <div>
           <label className="block text-sm font-medium text-gray-700">SMTP Host</label>
@@ -1089,10 +1099,8 @@ function SecuritySettings({
   const queryClient = useQueryClient();
   const saveMutation = useMutation({
     mutationFn: async (data: { alert_correlation: any; general: any }) => {
-      try {
       const response = await api.patch('/settings/security', data);
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['settings'] });
@@ -1211,6 +1219,11 @@ function SecuritySettings({
         </div>
       </div>
 
+      {saveMutation.error && (
+        <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
+          Could not save security settings. {describeLoadError(saveMutation.error)}
+        </div>
+      )}
       <div className="flex justify-end pt-4 border-t border-gray-200">
         <button
           type="submit"
@@ -1310,7 +1323,7 @@ function parseRetentionDays(raw: string, min: number, max: number): number | nul
 function AgenticPolicySettings() {
   const queryClient = useQueryClient();
   const [error, setError] = useState<string | null>(null);
-  const { data, isLoading } = useQuery<AgenticPolicySettingsData | null>({
+  const { data, isLoading, error: loadError } = useQuery<AgenticPolicySettingsData | null>({
     queryKey: ['settings', 'agentic-policy'],
     queryFn: async () => settingsApi.getAgenticPolicy(),
   });
@@ -1352,6 +1365,17 @@ function AgenticPolicySettings() {
     if (transcriptDays !== savedTranscript) body.agent_transcript_retention_days = transcriptDays;
     mutation.mutate(body);
   };
+
+  // Without the saved policy the toggle and retention fields would show
+  // defaults that may not match the server, so show the failure instead.
+  if (loadError) {
+    return (
+      <div className="space-y-3 border-t border-gray-200 dark:border-gray-700 pt-6">
+        <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Agent approval policy</h2>
+        <LoadErrorBanner what="the agent approval policy" error={loadError} />
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-3 border-t border-gray-200 dark:border-gray-700 pt-6">
@@ -1464,12 +1488,12 @@ function AgenticPolicySettings() {
 }
 
 function AIProviderSettings() {
-  const { data: aiSettings, isLoading } = useQuery<AISettings | null>({
+  const { data: aiSettings, isLoading, error: aiError } = useQuery<AISettings | null>({
     queryKey: ['settings', 'ai'],
     queryFn: async () => settingsApi.getAi(),
   });
 
-  const { data: health, isFetching: healthFetching } = useQuery<LLMHealth | null>({
+  const { data: health, isFetching: healthFetching, error: healthError } = useQuery<LLMHealth | null>({
     queryKey: ['health', 'llm'],
     queryFn: async () => healthApi.llm(),
   });
@@ -1480,6 +1504,11 @@ function AIProviderSettings() {
         <Loader2 className="w-6 h-6 animate-spin text-blue-500" />
       </div>
     );
+  }
+
+  // A failed load must not seed the form as if no provider were configured.
+  if (aiError) {
+    return <LoadErrorBanner what="the AI provider configuration" error={aiError} />;
   }
 
   // The form is seeded from the server state through `key` rather than an
@@ -1493,12 +1522,19 @@ function AIProviderSettings() {
   ].join('|');
 
   return (
-    <AIProviderForm
-      key={formKey}
-      aiSettings={aiSettings ?? null}
-      health={health ?? null}
-      healthFetching={healthFetching}
-    />
+    <>
+      {!!healthError && (
+        <div className="mb-4">
+          <LoadErrorBanner what="LLM health" error={healthError} />
+        </div>
+      )}
+      <AIProviderForm
+        key={formKey}
+        aiSettings={aiSettings ?? null}
+        health={health ?? null}
+        healthFetching={healthFetching}
+      />
+    </>
   );
 }
 

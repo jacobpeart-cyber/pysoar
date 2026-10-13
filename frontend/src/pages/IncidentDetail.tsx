@@ -26,6 +26,8 @@ import {
 } from 'lucide-react';
 import { incidentsApi, alertsApi, playbooksApi, api } from '../lib/api';
 import type { Incident, Alert, Playbook } from '../lib/types';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 import clsx from 'clsx';
 
 const severityColors: Record<string, string> = {
@@ -121,42 +123,50 @@ export default function IncidentDetail() {
   };
 
   // ---- QUERIES ----
-  const { data: incident, isLoading } = useQuery<Incident>({
+  const { data: incident, isLoading, error: incidentError } = useQuery<Incident>({
     queryKey: ['incident', id],
     queryFn: () => incidentsApi.get(id!),
     enabled: !!id,
   });
 
-  const { data: notes = [] } = useQuery<CaseNote[]>({
+  const { data: notes = [], error: notesError } = useQuery<CaseNote[]>({
     queryKey: ['incident', id, 'notes'],
     queryFn: () => incidentsApi.listNotes(id!),
     enabled: !!id,
   });
 
-  const { data: tasks = [] } = useQuery<CaseTask[]>({
+  const { data: tasks = [], error: tasksError } = useQuery<CaseTask[]>({
     queryKey: ['incident', id, 'tasks'],
     queryFn: () => incidentsApi.listTasks(id!),
     enabled: !!id,
   });
 
-  const { data: timeline = [] } = useQuery<TimelineEvent[]>({
+  const { data: timeline = [], error: timelineError } = useQuery<TimelineEvent[]>({
     queryKey: ['incident', id, 'timeline'],
     queryFn: () => incidentsApi.listTimeline(id!),
     enabled: !!id,
   });
 
-  const { data: attachments = [] } = useQuery<Attachment[]>({
+  const { data: attachments = [], error: attachmentsError } = useQuery<Attachment[]>({
     queryKey: ['incident', id, 'attachments'],
     queryFn: () => incidentsApi.listAttachments(id!),
     enabled: !!id,
   });
 
-  const { data: playbooksData } = useQuery({
+  const { data: playbooksData, error: playbooksError } = useQuery({
     queryKey: ['playbooks'],
     queryFn: () => playbooksApi.list({ size: 100 }),
   });
 
-  const { data: alertsData } = useQuery({
+  // IncidentResponse carries only alert_count; the linked alerts come
+  // from GET /incidents/{id}/alerts (tenant-scoped).
+  const { data: linkedAlerts = [], error: linkedAlertsError } = useQuery<Alert[]>({
+    queryKey: ['incident', id, 'alerts'],
+    queryFn: async () => (await api.get(`/incidents/${id}/alerts`)).data,
+    enabled: !!id,
+  });
+
+  const { data: alertsData, error: alertsError } = useQuery({
     queryKey: ['alerts', 'available-new'],
     queryFn: () => alertsApi.list({ size: 100, status: 'new' }),
     enabled: showAddAlertModal,
@@ -170,7 +180,7 @@ export default function IncidentDetail() {
       queryClient.invalidateQueries({ queryKey: ['incidents'] });
       showToast('success', 'Incident updated');
     },
-    onError: () => showToast('error', 'Update failed'),
+    onError: (err) => showToast('error', `Update failed. ${describeLoadError(err)}`),
   });
 
   const deleteMutation = useMutation({
@@ -179,7 +189,7 @@ export default function IncidentDetail() {
       queryClient.invalidateQueries({ queryKey: ['incidents'] });
       navigate('/incidents');
     },
-    onError: () => showToast('error', 'Delete failed'),
+    onError: (err) => showToast('error', `Delete failed. ${describeLoadError(err)}`),
   });
 
   const addNoteMutation = useMutation({
@@ -190,7 +200,7 @@ export default function IncidentDetail() {
       queryClient.invalidateQueries({ queryKey: ['incident', id, 'timeline'] });
       showToast('success', 'Note added');
     },
-    onError: () => showToast('error', 'Failed to add note'),
+    onError: (err) => showToast('error', `Failed to add note. ${describeLoadError(err)}`),
   });
 
   const deleteNoteMutation = useMutation({
@@ -200,7 +210,7 @@ export default function IncidentDetail() {
       queryClient.invalidateQueries({ queryKey: ['incident', id, 'timeline'] });
       showToast('success', 'Note deleted');
     },
-    onError: () => showToast('error', 'Failed to delete note'),
+    onError: (err) => showToast('error', `Failed to delete note. ${describeLoadError(err)}`),
   });
 
   const addTaskMutation = useMutation({
@@ -212,7 +222,7 @@ export default function IncidentDetail() {
       queryClient.invalidateQueries({ queryKey: ['incident', id, 'timeline'] });
       showToast('success', 'Task added');
     },
-    onError: () => showToast('error', 'Failed to add task'),
+    onError: (err) => showToast('error', `Failed to add task. ${describeLoadError(err)}`),
   });
 
   const updateTaskMutation = useMutation({
@@ -222,7 +232,7 @@ export default function IncidentDetail() {
       queryClient.invalidateQueries({ queryKey: ['incident', id, 'tasks'] });
       queryClient.invalidateQueries({ queryKey: ['incident', id, 'timeline'] });
     },
-    onError: () => showToast('error', 'Failed to update task'),
+    onError: (err) => showToast('error', `Failed to update task. ${describeLoadError(err)}`),
   });
 
   const uploadFileMutation = useMutation({
@@ -232,7 +242,7 @@ export default function IncidentDetail() {
       queryClient.invalidateQueries({ queryKey: ['incident', id, 'timeline'] });
       showToast('success', 'File uploaded');
     },
-    onError: () => showToast('error', 'Upload failed'),
+    onError: (err) => showToast('error', `Upload failed. ${describeLoadError(err)}`),
   });
 
   const linkAlertMutation = useMutation({
@@ -243,7 +253,7 @@ export default function IncidentDetail() {
       queryClient.invalidateQueries({ queryKey: ['incident', id, 'timeline'] });
       showToast('success', 'Alert linked');
     },
-    onError: () => showToast('error', 'Failed to link alert'),
+    onError: (err) => showToast('error', `Failed to link alert. ${describeLoadError(err)}`),
   });
 
   const unlinkAlertMutation = useMutation({
@@ -252,7 +262,7 @@ export default function IncidentDetail() {
       queryClient.invalidateQueries({ queryKey: ['incident', id] });
       showToast('success', 'Alert unlinked');
     },
-    onError: () => showToast('error', 'Failed to unlink alert'),
+    onError: (err) => showToast('error', `Failed to unlink alert. ${describeLoadError(err)}`),
   });
 
   const executePlaybookMutation = useMutation({
@@ -261,13 +271,24 @@ export default function IncidentDetail() {
       setShowPlaybookModal(false);
       showToast('success', 'Playbook execution queued');
     },
-    onError: () => showToast('error', 'Playbook execution failed'),
+    onError: (err) => showToast('error', `Playbook execution failed. ${describeLoadError(err)}`),
   });
 
   if (isLoading) {
     return (
       <div className="flex items-center justify-center h-64">
         <Loader2 className="w-8 h-8 animate-spin text-blue-500 dark:text-blue-400" />
+      </div>
+    );
+  }
+
+  if (incidentError) {
+    return (
+      <div className="py-12 space-y-4">
+        <LoadErrorBanner what="this incident" error={incidentError} />
+        <Link to="/incidents" className="text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 inline-block">
+          Back to Incidents
+        </Link>
       </div>
     );
   }
@@ -355,7 +376,7 @@ export default function IncidentDetail() {
 
           {/* Related Alerts */}
           <Card
-            title={`Related Alerts (${incident.alerts?.length ?? incident.alert_count ?? 0})`}
+            title={`Related Alerts (${linkedAlertsError ? (incident.alert_count ?? 'not available') : linkedAlerts.length})`}
             action={
               <button
                 onClick={() => setShowAddAlertModal(true)}
@@ -366,9 +387,10 @@ export default function IncidentDetail() {
               </button>
             }
           >
-            {incident.alerts && incident.alerts.length > 0 ? (
+            <LoadErrorBanner what="linked alerts" error={linkedAlertsError} />
+            {linkedAlertsError ? null : linkedAlerts.length > 0 ? (
               <div className="space-y-3">
-                {incident.alerts.map((alert: Alert) => (
+                {linkedAlerts.map((alert: Alert) => (
                   <div
                     key={alert.id}
                     className="flex items-center justify-between p-3 rounded-lg border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/50"
@@ -422,6 +444,10 @@ export default function IncidentDetail() {
 
             {/* Tab Content */}
             <div className="p-6">
+              {caseTab === 'notes' && <LoadErrorBanner what="notes" error={notesError} />}
+              {caseTab === 'tasks' && <LoadErrorBanner what="tasks" error={tasksError} />}
+              {caseTab === 'timeline' && <LoadErrorBanner what="timeline" error={timelineError} />}
+              {caseTab === 'attachments' && <LoadErrorBanner what="attachments" error={attachmentsError} />}
               {caseTab === 'notes' && (
                 <div className="space-y-4">
                   <div className="flex gap-3">
@@ -678,7 +704,7 @@ export default function IncidentDetail() {
                                 document.body.removeChild(a);
                                 URL.revokeObjectURL(url);
                               } catch (err) {
-                                console.error('Attachment download failed:', err);
+                                showToast('error', `Download failed. ${describeLoadError(err)}`);
                               }
                             }}
                             className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded transition"
@@ -776,6 +802,7 @@ export default function IncidentDetail() {
       {showPlaybookModal && (
         <Modal title="Run Playbook" onClose={() => setShowPlaybookModal(false)}>
           <div className="space-y-2 max-h-64 overflow-y-auto">
+            <LoadErrorBanner what="playbooks" error={playbooksError} />
             {(playbooksData?.items || [])
               .filter((p: Playbook) => p.is_enabled)
               .map((playbook: Playbook) => (
@@ -803,10 +830,11 @@ export default function IncidentDetail() {
       {showAddAlertModal && (
         <Modal title="Link Alert to Incident" onClose={() => setShowAddAlertModal(false)}>
           <div className="space-y-2 max-h-64 overflow-y-auto">
-            {(alertsData?.items || []).length === 0 ? (
+            <LoadErrorBanner what="alerts" error={alertsError} />
+            {(alertsData?.items || []).filter((a: Alert) => !a.incident_id).length === 0 ? (
               <p className="text-sm text-gray-500 dark:text-gray-400 text-center py-4">No unlinked new alerts available</p>
             ) : (
-              alertsData?.items.map((alert: Alert) => (
+              (alertsData?.items || []).filter((a: Alert) => !a.incident_id).map((alert: Alert) => (
                 <button
                   key={alert.id}
                   onClick={() => linkAlertMutation.mutate(alert.id)}

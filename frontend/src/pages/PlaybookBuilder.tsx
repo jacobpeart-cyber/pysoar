@@ -27,6 +27,7 @@ import {
 import clsx from 'clsx';
 import { api } from '../api/client';
 import FormModal from '../components/FormModal';
+import LoadErrorBanner from '../components/LoadErrorBanner';
 
 const getStatusColor = (status: string) => {
   switch (status) {
@@ -104,6 +105,22 @@ interface Execution {
   totalNodes: number;
 }
 
+/** Map a backend execution row (snake_case) onto the table's shape. */
+function toExecution(row: any): Execution {
+  const ms = typeof row?.duration_ms === 'number' ? row.duration_ms : null;
+  return {
+    id: row?.id,
+    playbookName: row?.playbook_name ?? row?.playbook_id ?? '',
+    playbookId: row?.playbook_id,
+    status: row?.status ?? '',
+    startedAt: row?.started_at ?? row?.created_at ?? '',
+    duration: ms === null ? 'not available' : ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`,
+    triggeredBy: row?.triggered_by ?? 'not available',
+    nodesExecuted: typeof row?.nodes_executed === 'number' ? row.nodes_executed : 0,
+    totalNodes: typeof row?.total_nodes === 'number' ? row.total_nodes : 0,
+  };
+}
+
 interface BuilderNode {
   id: string;
   node_id: string;
@@ -141,6 +158,7 @@ export default function PlaybookBuilder() {
   const [showFilter, setShowFilter] = useState(false);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [notification, setNotification] = useState<{ type: string; text: string } | null>(null);
+  const [loadErrors, setLoadErrors] = useState<Record<string, unknown>>({});
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [builderPlaybook, setBuilderPlaybook] = useState<Playbook | null>(null);
   const [builderNodes, setBuilderNodes] = useState<BuilderNode[]>([]);
@@ -414,27 +432,34 @@ export default function PlaybookBuilder() {
   useEffect(() => {
     const loadData = async () => {
       setLoading(true);
-      try {
-        const [playbooksRes, templatesRes, execRes] = await Promise.all([
-          api.get('/playbook-builder').catch(() => ({ data: { items: [] } })),
-          api.get('/playbook-builder/templates').catch(() => ({ data: { items: [] } })),
-          // Real execution history — previously hardcoded to [].
-          api.get('/playbook-builder/executions', { params: { size: 50 } }).catch(() => ({ data: { items: [] } })),
-        ]);
-        const pbItems = playbooksRes.data?.items || playbooksRes.data;
+      // Each source reports its own failure; a failed request is shown as an
+      // error, never rendered as an empty list.
+      const [playbooksRes, templatesRes, execRes] = await Promise.allSettled([
+        api.get('/playbook-builder'),
+        api.get('/playbook-builder/templates'),
+        api.get('/playbook-builder/executions', { params: { size: 50 } }),
+      ]);
+      const errors: Record<string, unknown> = {};
+      if (playbooksRes.status === 'fulfilled') {
+        const pbItems = playbooksRes.value.data?.items ?? playbooksRes.value.data;
         setPlaybooks(Array.isArray(pbItems) ? pbItems : []);
-        const tplItems = templatesRes.data?.items || templatesRes.data;
-        setTemplates(Array.isArray(tplItems) ? tplItems : []);
-        const execItems = execRes.data?.items || execRes.data;
-        setExecutions(Array.isArray(execItems) ? execItems : []);
-      } catch (error) {
-        setNotification({ type: 'error', text: 'Failed to load playbook data' });
-        setPlaybooks([]);
-        setTemplates([]);
-        setExecutions([]);
-      } finally {
-        setLoading(false);
+      } else {
+        errors.playbooks = playbooksRes.reason;
       }
+      if (templatesRes.status === 'fulfilled') {
+        const tplItems = templatesRes.value.data?.items ?? templatesRes.value.data;
+        setTemplates(Array.isArray(tplItems) ? tplItems : []);
+      } else {
+        errors.templates = templatesRes.reason;
+      }
+      if (execRes.status === 'fulfilled') {
+        const execItems = execRes.value.data?.items;
+        setExecutions(Array.isArray(execItems) ? execItems.map(toExecution) : []);
+      } else {
+        errors.executions = execRes.reason;
+      }
+      setLoadErrors(errors);
+      setLoading(false);
     };
     loadData();
   }, []);
@@ -554,6 +579,27 @@ export default function PlaybookBuilder() {
 
       {/* Content */}
       <div className="p-6">
+        {notification ? (
+          <div
+            role={notification.type === 'error' ? 'alert' : 'status'}
+            className={clsx(
+              'mb-4 text-sm rounded p-3 border flex items-start justify-between gap-3',
+              notification.type === 'error'
+                ? 'text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border-red-200 dark:border-red-800'
+                : 'text-green-700 dark:text-green-300 bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800'
+            )}
+          >
+            <span>{notification.text}</span>
+            <button onClick={() => setNotification(null)} className="text-xs underline">
+              Dismiss
+            </button>
+          </div>
+        ) : null}
+        {Object.entries(loadErrors).map(([what, err]) => (
+          <div key={what} className="mb-4">
+            <LoadErrorBanner what={what} error={err} />
+          </div>
+        ))}
         {loading ? (
           <div className="flex flex-col items-center justify-center h-64 gap-3">
             <Loader2 className="w-8 h-8 text-indigo-500 animate-spin" />
@@ -1032,7 +1078,7 @@ export default function PlaybookBuilder() {
                             <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
                               <span className="inline-flex items-center gap-1">
                                 <Clock className="w-3.5 h-3.5" />
-                                {new Date(execution.startedAt || "").toLocaleString()}
+                                {execution.startedAt ? new Date(execution.startedAt).toLocaleString() : 'not available'}
                               </span>
                             </td>
                             <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
@@ -1063,7 +1109,10 @@ export default function PlaybookBuilder() {
                                     onClick={async () => {
                                       try {
                                         const res = await api.post(`/playbook-builder/${execution.playbookId}/execute`, {});
-                                        setExecutions((prev) => [...prev, res.data]);
+                                        setExecutions((prev) => [
+                                          toExecution({ ...res.data, playbook_name: execution.playbookName, total_nodes: execution.totalNodes }),
+                                          ...prev,
+                                        ]);
                                         setNotification({ type: 'success', text: 'Playbook execution started' });
                                       } catch (err) {
                                         setNotification({ type: 'error', text: 'Failed to re-run playbook' });

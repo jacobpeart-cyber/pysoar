@@ -20,6 +20,8 @@ import {
 import clsx from 'clsx';
 import { itdrApi } from '../api/endpoints';
 import { api } from '../lib/api';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 
 const getSeverityColor = (severity: string) => {
   switch (severity) {
@@ -261,7 +263,11 @@ export default function ITDRDashboard() {
     confidence_score: 80,
   });
   const [submitting, setSubmitting] = useState(false);
-  const [dashboardMetrics, setDashboardMetrics] = useState<any | null>(null);
+  // Per-list load failures, keyed by list. A failed list renders an error
+  // banner instead of an empty table.
+  const [loadErrors, setLoadErrors] = useState<Record<'threats' | 'exposures' | 'anomalies' | 'access' | 'identities', unknown>>({
+    threats: null, exposures: null, anomalies: null, access: null, identities: null,
+  });
   const [scanInProgress, setScanInProgress] = useState(false);
   const [exposureCheckInProgress, setExposureCheckInProgress] = useState(false);
   const [selectedThreat, setSelectedThreat] = useState<any | null>(null);
@@ -275,22 +281,30 @@ export default function ITDRDashboard() {
   const loadData = React.useCallback(async () => {
     setLoading(true);
     try {
-      const [threatsData, exposuresData, anomaliesData, accessData, identitiesData, metricsData] = await Promise.all([
-        itdrApi.getIdentityThreats().catch(() => null),
-        itdrApi.getCredentialExposures().catch(() => null),
-        itdrApi.getAccessAnomalies().catch(() => null),
-        itdrApi.getPrivilegedAccess().catch(() => null),
-        itdrApi.getIdentities({ size: 100 } as any).catch(() => null),
-        api.get('/itdr/dashboard/metrics').then(r => r.data).catch(() => null),
+      // itdrApi list helpers already unwrap `{items, ...}` into the items
+      // array (extractData), so reading `.items` again always gave [].
+      const asList = (data: any): any[] => (Array.isArray(data) ? data : (data?.items ?? []));
+      const [threatsRes, exposuresRes, anomaliesRes, accessRes, identitiesRes] = await Promise.allSettled([
+        itdrApi.getIdentityThreats(),
+        itdrApi.getCredentialExposures(),
+        itdrApi.getAccessAnomalies(),
+        itdrApi.getPrivilegedAccess(),
+        itdrApi.getIdentities({ size: 100 }),
       ]);
-      setIdentityThreats(threatsData?.items ?? []);
-      setCredentialExposures(exposuresData?.items ?? []);
-      setAccessAnomalies(anomaliesData?.items ?? []);
-      setPrivilegedAccess(accessData?.items ?? []);
-      setIdentities(identitiesData?.items ?? []);
-      setDashboardMetrics(metricsData);
-    } catch (error) {
-      console.error('Error loading ITDR data:', error);
+      const value = (r: PromiseSettledResult<any>) => (r.status === 'fulfilled' ? asList(r.value) : []);
+      const reason = (r: PromiseSettledResult<any>) => (r.status === 'rejected' ? (r.reason ?? new Error('request failed')) : null);
+      setIdentityThreats(value(threatsRes));
+      setCredentialExposures(value(exposuresRes));
+      setAccessAnomalies(value(anomaliesRes));
+      setPrivilegedAccess(value(accessRes));
+      setIdentities(value(identitiesRes));
+      setLoadErrors({
+        threats: reason(threatsRes),
+        exposures: reason(exposuresRes),
+        anomalies: reason(anomaliesRes),
+        access: reason(accessRes),
+        identities: reason(identitiesRes),
+      });
     } finally {
       setLoading(false);
     }
@@ -316,7 +330,7 @@ export default function ITDRDashboard() {
       const scanned = res.data?.identities_scanned ?? 0;
       alert(`Identity threat scan complete — ${newCount} new threat(s) created across ${scanned} identities.`);
     } catch (err: any) {
-      alert(`Scan failed: ${err?.response?.data?.detail || err?.message || 'unknown error'}`);
+      alert(`Scan failed: ${describeLoadError(err)}`);
     } finally {
       setScanInProgress(false);
     }
@@ -328,21 +342,34 @@ export default function ITDRDashboard() {
     // aggregate the hit counts so the button is genuinely org-wide.
     try {
       setExposureCheckInProgress(true);
-      let totalHits = 0;
+      if (loadErrors.identities) {
+        alert(`Exposure check not run: identities could not be loaded. ${describeLoadError(loadErrors.identities)}`);
+        return;
+      }
+      // Backend returns `new_exposures_created` and `leaks_matched` per
+      // identity (itdr.py check_credential_exposure).
+      let newExposures = 0;
+      let leaksMatched = 0;
       let ids = 0;
+      const failures: string[] = [];
       for (const profile of identities) {
         try {
           const r = await api.post(`/itdr/credential-exposures/check?identity_id=${encodeURIComponent(profile.id)}`);
-          totalHits += r.data?.exposures_found ?? 0;
+          newExposures += r.data?.new_exposures_created ?? 0;
+          leaksMatched += r.data?.leaks_matched ?? 0;
           ids += 1;
-        } catch {
-          /* ignore per-identity failures — sweep continues */
+        } catch (err) {
+          // The sweep continues, but every failure is reported below.
+          failures.push(`${profile.username || profile.email || profile.id}: ${describeLoadError(err)}`);
         }
       }
       await loadData();
-      alert(`Credential exposure check complete — ${totalHits} exposure(s) across ${ids} identities.`);
+      const failedNote = failures.length
+        ? `\n${failures.length} identity check(s) failed:\n${failures.slice(0, 5).join('\n')}${failures.length > 5 ? '\n…' : ''}`
+        : '';
+      alert(`Credential exposure check complete — ${newExposures} new exposure(s) from ${leaksMatched} matched leak(s) across ${ids} identities.${failedNote}`);
     } catch (err: any) {
-      alert(`Exposure check failed: ${err?.response?.data?.detail || err?.message || 'unknown error'}`);
+      alert(`Exposure check failed: ${describeLoadError(err)}`);
     } finally {
       setExposureCheckInProgress(false);
     }
@@ -357,7 +384,7 @@ export default function ITDRDashboard() {
       setShowNewThreatModal(false);
       setNewThreatForm({ threat_type: '', identity_id: '', severity: 'critical', confidence_score: 80 });
     } catch (error) {
-      console.error('Error creating threat:', error);
+      alert(`Create threat failed: ${describeLoadError(error)}`);
     } finally {
       setSubmitting(false);
     }
@@ -411,12 +438,14 @@ export default function ITDRDashboard() {
     t => t.status === 'detected' || t.status === 'investigating'
   ).length;
   const exposedCredentials = credentialExposures.filter(c => !c.is_remediated).length;
+  // confidence_score is on a 0-100 scale (schemas/itdr.py).
   const highRiskIdentities = identityThreats.filter(t => (t.confidence_score ?? 0) >= 80).length;
 
-  // Compute MFA coverage from identities data
-  const mfaCoverage = identities.length > 0
-    ? Math.round((identities.filter((i: any) => i.mfa_enabled).length / (identities.length || 1)) * 100)
-    : 0;
+  // MFA coverage over the loaded identities; with none loaded there is
+  // nothing to measure, so it reads "not available" rather than 0%.
+  const mfaCoverage: number | null = identities.length > 0
+    ? Math.round((identities.filter((i: any) => i.mfa_enabled).length / identities.length) * 100)
+    : null;
 
   const tabs = [
     { id: 'identity-threats', label: 'Identity Threats', icon: UserX },
@@ -497,24 +526,27 @@ export default function ITDRDashboard() {
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
           <div className="bg-gradient-to-br from-red-50 to-red-100 dark:from-red-900 dark:to-red-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-red-600 dark:text-red-300">Active Threats</p>
-            <p className="text-3xl font-bold text-red-900 dark:text-red-100 mt-2">{activeThreats}</p>
+            <p className="text-3xl font-bold text-red-900 dark:text-red-100 mt-2">{loadErrors.threats ? 'not available' : activeThreats}</p>
             <p className="text-xs text-red-600 dark:text-red-300 mt-1">requiring investigation</p>
           </div>
           <div className="bg-gradient-to-br from-orange-50 to-orange-100 dark:from-orange-900 dark:to-orange-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-orange-600 dark:text-orange-300">Exposed Credentials</p>
-            <p className="text-3xl font-bold text-orange-900 dark:text-orange-100 mt-2">{exposedCredentials}</p>
+            <p className="text-3xl font-bold text-orange-900 dark:text-orange-100 mt-2">{loadErrors.exposures ? 'not available' : exposedCredentials}</p>
             <p className="text-xs text-orange-600 dark:text-orange-300 mt-1">pending remediation</p>
           </div>
           <div className="bg-gradient-to-br from-purple-50 to-purple-100 dark:from-purple-900 dark:to-purple-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-purple-600 dark:text-purple-300">High-Risk Identities</p>
-            <p className="text-3xl font-bold text-purple-900 dark:text-purple-100 mt-2">{highRiskIdentities}</p>
+            <p className="text-3xl font-bold text-purple-900 dark:text-purple-100 mt-2">{loadErrors.threats ? 'not available' : highRiskIdentities}</p>
             <p className="text-xs text-purple-600 dark:text-purple-300 mt-1">confidence score &gt;= 80</p>
           </div>
           <div className="bg-gradient-to-br from-green-50 to-green-100 dark:from-green-900 dark:to-green-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-green-600 dark:text-green-300">MFA Coverage</p>
-            <p className="text-3xl font-bold text-green-900 dark:text-green-100 mt-2">{mfaCoverage}%</p>
+            <p className="text-3xl font-bold text-green-900 dark:text-green-100 mt-2">{mfaCoverage === null || loadErrors.identities ? 'not available' : `${mfaCoverage}%`}</p>
             <p className="text-xs text-green-600 dark:text-green-300 mt-1">enrolled users</p>
           </div>
+        </div>
+        <div className="mt-4">
+          <LoadErrorBanner what="identities" error={loadErrors.identities} />
         </div>
       </div>
 
@@ -596,7 +628,9 @@ export default function ITDRDashboard() {
                   </div>
                 )}
 
-                {filteredThreats.length === 0 ? (
+                {loadErrors.threats ? (
+                  <LoadErrorBanner what="identity threats" error={loadErrors.threats} />
+                ) : filteredThreats.length === 0 ? (
                   renderEmptyState('No identity threats found')
                 ) : (
                   <div className="bg-white dark:bg-gray-800 rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700">
@@ -680,7 +714,9 @@ export default function ITDRDashboard() {
                   </div>
                 </div>
 
-                {filteredCredentials.length === 0 ? (
+                {loadErrors.exposures ? (
+                  <LoadErrorBanner what="credential exposures" error={loadErrors.exposures} />
+                ) : filteredCredentials.length === 0 ? (
                   renderEmptyState('No credential exposures found')
                 ) : (
                   <div className="bg-white dark:bg-gray-800 rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700">
@@ -750,7 +786,9 @@ export default function ITDRDashboard() {
                   </div>
                 </div>
 
-                {filteredAnomalies.length === 0 ? (
+                {loadErrors.anomalies ? (
+                  <LoadErrorBanner what="access anomalies" error={loadErrors.anomalies} />
+                ) : filteredAnomalies.length === 0 ? (
                   renderEmptyState('No access anomalies found')
                 ) : (
                   <div className="grid grid-cols-1 gap-4">
@@ -823,7 +861,9 @@ export default function ITDRDashboard() {
                   </div>
                 </div>
 
-                {filteredPrivileged.length === 0 ? (
+                {loadErrors.access ? (
+                  <LoadErrorBanner what="privileged access events" error={loadErrors.access} />
+                ) : filteredPrivileged.length === 0 ? (
                   renderEmptyState('No privileged access events found')
                 ) : (
                   <div className="bg-white dark:bg-gray-800 rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700">

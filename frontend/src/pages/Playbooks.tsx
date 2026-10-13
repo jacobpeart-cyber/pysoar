@@ -19,6 +19,8 @@ import {
   Copy,
 } from 'lucide-react'
 import clsx from 'clsx'
+import LoadErrorBanner from '../components/LoadErrorBanner'
+import { describeLoadError } from '../lib/loadError'
 
 const statusColors: Record<string, string> = {
   draft: 'bg-gray-100 text-gray-700',
@@ -49,6 +51,7 @@ export default function Playbooks() {
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
   const [isLoading, setIsLoading] = useState(true)
+  const [loadError, setLoadError] = useState<unknown>(null)
   const [showCreateModal, setShowCreateModal] = useState(false)
   const [selectedPlaybook, setSelectedPlaybook] = useState<Playbook | null>(null)
   const [showExecuteModal, setShowExecuteModal] = useState(false)
@@ -57,6 +60,7 @@ export default function Playbooks() {
 
   const fetchPlaybooks = async () => {
     setIsLoading(true)
+    setLoadError(null)
     try {
       const response = await playbooksApi.list({
         page,
@@ -67,7 +71,7 @@ export default function Playbooks() {
       setPlaybooks(response.items || [])
       setTotal(response.total || 0)
     } catch (error) {
-      console.error('Failed to fetch playbooks:', error)
+      setLoadError(error)
     } finally {
       setIsLoading(false)
     }
@@ -83,7 +87,7 @@ export default function Playbooks() {
       await playbooksApi.delete(id)
       fetchPlaybooks()
     } catch (error) {
-      console.error('Failed to delete playbook:', error)
+      alert(`Delete failed: ${describeLoadError(error)}`)
     }
   }
 
@@ -170,6 +174,10 @@ export default function Playbooks() {
         {isLoading ? (
           <div className="flex items-center justify-center h-64">
             <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
+          </div>
+        ) : loadError ? (
+          <div className="p-4">
+            <LoadErrorBanner what="playbooks" error={loadError} />
           </div>
         ) : playbooks.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-64 text-gray-500">
@@ -535,6 +543,7 @@ function CreatePlaybookModal({ onClose, onCreated }: { onClose: () => void; onCr
 function PlaybookDetailsModal({ playbook, onClose }: { playbook: Playbook; onClose: () => void }) {
   const [executions, setExecutions] = useState<PlaybookExecution[]>([])
   const [isLoading, setIsLoading] = useState(true)
+  const [executionsError, setExecutionsError] = useState<unknown>(null)
 
   useEffect(() => {
     const fetchExecutions = async () => {
@@ -542,7 +551,7 @@ function PlaybookDetailsModal({ playbook, onClose }: { playbook: Playbook; onClo
         const response = await playbooksApi.getExecutions(playbook.id)
         setExecutions(response.items || [])
       } catch (error) {
-        console.error('Failed to fetch executions:', error)
+        setExecutionsError(error)
       } finally {
         setIsLoading(false)
       }
@@ -623,6 +632,8 @@ function PlaybookDetailsModal({ playbook, onClose }: { playbook: Playbook; onClo
               <div className="flex items-center justify-center py-8">
                 <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-600"></div>
               </div>
+            ) : executionsError ? (
+              <LoadErrorBanner what="recent executions" error={executionsError} />
             ) : executions.length === 0 ? (
               <p className="text-gray-500 text-sm py-4">No executions yet</p>
             ) : (
@@ -681,16 +692,18 @@ function ExecutePlaybookModal({
   const [inputData, setInputData] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [result, setResult] = useState<PlaybookExecution | null>(null)
+  const [execError, setExecError] = useState<string | null>(null)
 
   const handleExecute = async () => {
     setIsSubmitting(true)
+    setExecError(null)
     try {
       let parsedInput = {}
       if (inputData.trim()) {
         try {
           parsedInput = JSON.parse(inputData)
         } catch {
-          console.error('Invalid JSON input')
+          setExecError('Input data is not valid JSON.')
           setIsSubmitting(false)
           return
         }
@@ -698,8 +711,7 @@ function ExecutePlaybookModal({
       const execution = await playbooksApi.execute(playbook.id, { input_data: parsedInput })
       setResult(execution)
     } catch (error) {
-      console.error('Failed to execute playbook:', error)
-      console.error('Failed to execute playbook')
+      setExecError(`Could not execute playbook. ${describeLoadError(error)}`)
     } finally {
       setIsSubmitting(false)
     }
@@ -734,6 +746,12 @@ function ExecutePlaybookModal({
                   className="w-full px-3 py-2 border border-gray-300 rounded-lg font-mono text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                 />
               </div>
+
+              {execError && (
+                <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
+                  {execError}
+                </div>
+              )}
 
               <div className="flex justify-end space-x-3">
                 <button

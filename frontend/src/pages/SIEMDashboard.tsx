@@ -40,6 +40,8 @@ import {
   BookmarkPlus,
 } from 'lucide-react';
 import { api } from '../lib/api';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 import clsx from 'clsx';
 
 const severityColors: Record<string, string> = {
@@ -108,20 +110,19 @@ export default function SIEMDashboard() {
 
   const queryClient = useQueryClient();
   const [collectorError, setCollectorError] = useState<string | null>(null);
+  const [liveError, setLiveError] = useState<unknown>(null);
 
   // Fetch dashboard stats
-  const { data: stats, isLoading: statsLoading } = useQuery({
+  const { data: stats, isLoading: statsLoading, error: statsError } = useQuery({
     queryKey: ['siem-stats'],
     queryFn: async () => {
-      try {
       const response = await api.get('/siem/logs/stats');
       return response.data;
-      } catch { return null; }
     },
   });
 
   // Fetch logs for search
-  const { data: logsData, isLoading: logsLoading } = useQuery({
+  const { data: logsData, isLoading: logsLoading, error: logsError } = useQuery({
     queryKey: ['siem-logs', searchQuery, timeRange, sourceTypeFilter, severityFilter, searchPage],
     queryFn: async () => {
       const now = new Date();
@@ -142,37 +143,31 @@ export default function SIEMDashboard() {
   });
 
   // Fetch detection rules
-  const { data: rulesData, isLoading: rulesLoading } = useQuery({
+  const { data: rulesData, isLoading: rulesLoading, error: rulesError } = useQuery({
     queryKey: ['siem-rules'],
     queryFn: async () => {
-      try {
       const response = await api.get('/siem/rules');
       return response.data;
-      } catch { return null; }
     },
     enabled: activeTab === 'rules',
   });
 
   // Fetch data sources
-  const { data: sourcesData, isLoading: sourcesLoading } = useQuery({
+  const { data: sourcesData, isLoading: sourcesLoading, error: sourcesError } = useQuery({
     queryKey: ['siem-sources'],
     queryFn: async () => {
-      try {
       const response = await api.get('/siem/sources');
       return response.data;
-      } catch { return null; }
     },
     enabled: activeTab === 'sources',
   });
 
   // Fetch correlations
-  const { data: correlationsData, isLoading: correlationsLoading } = useQuery({
+  const { data: correlationsData, isLoading: correlationsLoading, error: correlationsError } = useQuery({
     queryKey: ['siem-correlations'],
     queryFn: async () => {
-      try {
       const response = await api.get('/siem/correlations');
       return response.data;
-      } catch { return null; }
     },
     enabled: activeTab === 'correlation',
   });
@@ -190,13 +185,11 @@ export default function SIEMDashboard() {
   });
 
   // Saved searches query
-  const { data: savedSearchesData } = useQuery({
+  const { data: savedSearchesData, error: savedSearchesError } = useQuery({
     queryKey: ['siem-saved-searches'],
     queryFn: async () => {
-      try {
       const response = await api.get('/siem/saved-searches');
       return response.data;
-      } catch { return null; }
     },
     enabled: activeTab === 'search',
   });
@@ -222,20 +215,16 @@ export default function SIEMDashboard() {
   // Run saved search mutation
   const runSavedSearchMutation = useMutation({
     mutationFn: async (id: string) => {
-      try {
       const response = await api.post(`/siem/saved-searches/${id}/run`);
       return response.data;
-      } catch { return null; }
     },
   });
 
   // Import rule mutation
   const importRuleMutation = useMutation({
     mutationFn: async (yaml: string) => {
-      try {
       const response = await api.post('/siem/rules/import', { yaml });
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['siem-rules'] });
@@ -245,13 +234,11 @@ export default function SIEMDashboard() {
   });
 
   // Collector status query
-  const { data: collectorData } = useQuery({
+  const { data: collectorData, error: collectorStatusError } = useQuery({
     queryKey: ['siem-collector-status'],
     queryFn: async () => {
-      try {
       const response = await api.get('/siem/collector/status');
       return response.data;
-      } catch { return null; }
     },
     enabled: activeTab === 'sources',
   });
@@ -270,9 +257,7 @@ export default function SIEMDashboard() {
     },
     onError: (err: any) => {
       console.error('Collector start failed:', err);
-      setCollectorError(
-        err?.response?.data?.detail || err?.message || 'Failed to start collector'
-      );
+      setCollectorError(`Failed to start collector. ${describeLoadError(err)}`);
     },
   });
 
@@ -287,9 +272,7 @@ export default function SIEMDashboard() {
     },
     onError: (err: any) => {
       console.error('Collector stop failed:', err);
-      setCollectorError(
-        err?.response?.data?.detail || err?.message || 'Failed to stop collector'
-      );
+      setCollectorError(`Failed to stop collector. ${describeLoadError(err)}`);
     },
   });
 
@@ -306,8 +289,9 @@ export default function SIEMDashboard() {
       });
       const items = response.data?.items || [];
       setLiveLogs(items);
-    } catch {
-      // silently ignore polling errors
+      setLiveError(null);
+    } catch (err) {
+      setLiveError(err);
     }
   }, []);
 
@@ -423,35 +407,36 @@ export default function SIEMDashboard() {
       {/* Overview Tab */}
       {activeTab === 'overview' && (
         <div className="space-y-6">
+          <LoadErrorBanner what="SIEM statistics" error={statsError} />
           {/* Stats Cards */}
           <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
             <StatsCard
               title="Total Logs"
-              value={statsLoading ? '-' : (stats?.total_logs || 0).toLocaleString()}
+              value={statsLoading ? '-' : stats?.total_logs != null ? stats.total_logs.toLocaleString() : 'not available'}
               subtext="24 hours"
               icon={Activity}
             />
             <StatsCard
               title="Events/Second"
-              value={statsLoading ? '-' : (stats?.events_per_second || 0).toFixed(1)}
+              value={statsLoading ? '-' : stats?.events_per_second != null ? stats.events_per_second.toFixed(1) : 'not available'}
               subtext="Current rate"
               icon={TrendingUp}
             />
             <StatsCard
               title="Active Rules"
-              value={statsLoading ? '-' : stats?.active_rules || 0}
+              value={statsLoading ? '-' : stats?.active_rules ?? 'not available'}
               subtext="Detection rules"
               icon={Zap}
             />
             <StatsCard
               title="Alerts (24h)"
-              value={statsLoading ? '-' : stats?.alerts_triggered_24h || 0}
+              value={statsLoading ? '-' : stats?.alerts_triggered_24h ?? 'not available'}
               subtext="Total triggered"
               icon={AlertTriangle}
             />
             <StatsCard
               title="Data Sources"
-              value={statsLoading ? '-' : stats?.active_data_sources || 0}
+              value={statsLoading ? '-' : stats?.active_data_sources ?? 'not available'}
               subtext="Connected"
               icon={Server}
             />
@@ -591,28 +576,11 @@ export default function SIEMDashboard() {
             {/* Top Alerting Rules */}
             <div className="bg-white rounded-lg border border-gray-200 p-6">
               <h3 className="text-lg font-semibold text-gray-900 mb-4">Top Alerting Rules</h3>
-              {stats?.top_rules && stats.top_rules.length > 0 ? (
-                <div className="space-y-3">
-                  {stats.top_rules.slice(0, 8).map((rule: any, idx: number) => (
-                    <div key={idx} className="flex items-center justify-between pb-3 border-b border-gray-100 last:border-0">
-                      <div className="flex items-center gap-3">
-                        <span className="text-xs font-mono text-gray-400 w-5">#{idx + 1}</span>
-                        <div>
-                          <p className="text-sm font-medium text-gray-900">{rule.name || rule.rule_name}</p>
-                          <span className={clsx('px-2 py-0.5 text-xs font-medium rounded-full border capitalize', severityColors[rule.severity] || severityColors.info)}>
-                            {rule.severity}
-                          </span>
-                        </div>
-                      </div>
-                      <span className="text-sm font-bold text-gray-900">{rule.match_count || 0}</span>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="text-center py-8 text-gray-500">
-                  <p>No alerting rules data yet</p>
-                </div>
-              )}
+              {/* /siem/logs/stats (SIEMStatsResponse) has no per-rule alert
+                  counts, so there is nothing real to rank here. */}
+              <div className="text-center py-8 text-gray-500">
+                <p>Not available: the SIEM stats endpoint does not report per-rule alert counts.</p>
+              </div>
             </div>
           </div>
         </div>
@@ -621,6 +589,9 @@ export default function SIEMDashboard() {
       {/* Log Search Tab */}
       {activeTab === 'search' && (
         <div className="space-y-6">
+          <LoadErrorBanner what="log search results" error={logsError} />
+          <LoadErrorBanner what="saved searches" error={savedSearchesError} />
+          <LoadErrorBanner what="saved search run" error={runSavedSearchMutation.error} />
           {/* Search Filters */}
           <div className="bg-white rounded-lg border border-gray-200 p-6 space-y-4">
             <div>
@@ -969,6 +940,7 @@ export default function SIEMDashboard() {
       {/* Detection Rules Tab */}
       {activeTab === 'rules' && (
         <div className="space-y-6">
+          <LoadErrorBanner what="detection rules" error={rulesError} />
           {/* Filter Buttons */}
           <div className="flex items-center gap-2 justify-between">
           <div className="flex items-center gap-2">
@@ -1343,6 +1315,9 @@ export default function SIEMDashboard() {
                       className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent font-mono text-sm"
                     />
                   </div>
+                  {importRuleMutation.error ? (
+                    <p className="text-sm text-red-600">Import failed. {describeLoadError(importRuleMutation.error)}</p>
+                  ) : null}
                   <div className="flex justify-end gap-3 pt-2 border-t">
                     <button
                       onClick={() => setShowImportRuleModal(false)}
@@ -1369,6 +1344,8 @@ export default function SIEMDashboard() {
       {/* Data Sources Tab */}
       {activeTab === 'sources' && (
         <div className="space-y-6">
+          <LoadErrorBanner what="collector status" error={collectorStatusError} />
+          <LoadErrorBanner what="data sources" error={sourcesError} />
           {/* Syslog Collector Status Card */}
           <div className="bg-white rounded-lg border border-gray-200 p-6">
             <div className="flex items-center justify-between mb-4">
@@ -1381,29 +1358,29 @@ export default function SIEMDashboard() {
               </div>
               <span className={clsx(
                 'px-3 py-1 text-xs font-semibold rounded-full',
-                collectorStatus?.status === 'running' ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'
+                collectorStatus?.running === true ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'
               )}>
-                {collectorStatus?.status === 'running' ? 'Running' : 'Stopped'}
+                {collectorStatus == null ? 'Unknown' : collectorStatus.running ? 'Running' : 'Stopped'}
               </span>
             </div>
             <div className="grid grid-cols-3 gap-4 mb-4">
               <div>
                 <span className="text-sm text-gray-500">Port</span>
-                <p className="text-sm font-medium text-gray-900">{collectorStatus?.port || 514}</p>
+                <p className="text-sm font-medium text-gray-900">{collectorStatus?.listen_port ?? 'not available'}</p>
               </div>
               <div>
                 <span className="text-sm text-gray-500">Protocol</span>
-                <p className="text-sm font-medium text-gray-900">{collectorStatus?.protocol || 'UDP/TCP'}</p>
+                <p className="text-sm font-medium text-gray-900">{collectorStatus?.protocol ?? 'not available'}</p>
               </div>
               <div>
                 <span className="text-sm text-gray-500">Messages Received</span>
-                <p className="text-sm font-medium text-gray-900">{collectorStatus?.messages_received?.toLocaleString() || 0}</p>
+                <p className="text-sm font-medium text-gray-900">{collectorStatus?.messages_received?.toLocaleString() ?? 'not available'}</p>
               </div>
             </div>
             <div className="flex gap-2">
               <button
                 onClick={() => collectorStartMutation.mutate()}
-                disabled={collectorStatus?.status === 'running' || collectorStartMutation.isPending}
+                disabled={collectorStatus?.running === true || collectorStartMutation.isPending}
                 className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 disabled:opacity-50 flex items-center gap-2"
               >
                 <Play className="w-4 h-4" />
@@ -1411,7 +1388,7 @@ export default function SIEMDashboard() {
               </button>
               <button
                 onClick={() => collectorStopMutation.mutate()}
-                disabled={collectorStatus?.status !== 'running' || collectorStopMutation.isPending}
+                disabled={collectorStatus?.running !== true || collectorStopMutation.isPending}
                 className="px-4 py-2 bg-red-600 text-white rounded-lg text-sm font-medium hover:bg-red-700 disabled:opacity-50 flex items-center gap-2"
               >
                 <Square className="w-4 h-4" />
@@ -1577,7 +1554,7 @@ export default function SIEMDashboard() {
                               <button
                                 onClick={async () => {
                                   try {
-                                    await api.put(`/siem/sources/${selectedSource.id}`, { enabled: !selectedSource.enabled });
+                                    await api.put(`/siem/sources/${selectedSource.id}`, { name: selectedSource.name, enabled: !selectedSource.enabled });
                                     setSelectedSource({ ...selectedSource, enabled: !selectedSource.enabled });
                                   } catch (err) {
                                     console.error('Source toggle failed:', err);
@@ -1689,6 +1666,7 @@ export default function SIEMDashboard() {
       {/* Correlation Tab */}
       {activeTab === 'correlation' && (
         <div className="space-y-6">
+          <LoadErrorBanner what="correlation events" error={correlationsError} />
           <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
             {correlationsLoading ? (
               <div className="flex items-center justify-center h-64">
@@ -1861,6 +1839,7 @@ export default function SIEMDashboard() {
       {/* Live Tail Tab */}
       {activeTab === 'live' && (
         <div className="space-y-6">
+          <LoadErrorBanner what="live log tail" error={liveError} />
           {/* Controls */}
           <div className="bg-white rounded-lg border border-gray-200 p-6">
             <div className="flex items-center justify-between mb-4">

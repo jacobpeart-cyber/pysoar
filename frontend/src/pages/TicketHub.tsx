@@ -33,6 +33,8 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 import { api } from '../api/client';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -322,7 +324,7 @@ function DetailPanel({
   const queryClient = useQueryClient();
   const [commentText, setCommentText] = useState('');
 
-  const { data: comments = [], isLoading: commentsLoading } = useQuery<Comment[]>({
+  const { data: comments = [], isLoading: commentsLoading, error: commentsError } = useQuery<Comment[]>({
     queryKey: ['ticketComments', ticket.source_type, ticket.source_id],
     queryFn: async () => {
       const res = await api.get(
@@ -332,7 +334,7 @@ function DetailPanel({
     },
   });
 
-  const { data: activityLog = [], isLoading: activityLoading } = useQuery<ActivityEntry[]>({
+  const { data: activityLog = [], isLoading: activityLoading, error: activityError } = useQuery<ActivityEntry[]>({
     queryKey: ['ticketActivity', ticket.source_type, ticket.source_id],
     queryFn: async () => {
       const res = await api.get(
@@ -510,6 +512,8 @@ function DetailPanel({
           </h3>
           {commentsLoading ? (
             <Spinner />
+          ) : commentsError ? (
+            <LoadErrorBanner what="comments" error={commentsError} />
           ) : comments.length === 0 ? (
             <p className="text-sm text-gray-400 dark:text-gray-500">No comments yet.</p>
           ) : (
@@ -546,6 +550,11 @@ function DetailPanel({
               <Send className="w-4 h-4" />
             </button>
           </div>
+          {addCommentMutation.error && (
+            <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
+              Could not add comment. {describeLoadError(addCommentMutation.error)}
+            </div>
+          )}
         </section>
 
         {/* Activity Log */}
@@ -555,6 +564,8 @@ function DetailPanel({
           </h3>
           {activityLoading ? (
             <Spinner />
+          ) : activityError ? (
+            <LoadErrorBanner what="the activity log" error={activityError} />
           ) : activityLog.length === 0 ? (
             <p className="text-sm text-gray-400 dark:text-gray-500">No activity recorded.</p>
           ) : (
@@ -684,6 +695,7 @@ function CreateRuleModal({
   onClose,
   onSubmit,
   isPending,
+  error,
 }: {
   onClose: () => void;
   onSubmit: (data: {
@@ -693,6 +705,7 @@ function CreateRuleModal({
     actions: string;
   }) => void;
   isPending: boolean;
+  error?: unknown;
 }) {
   const [name, setName] = useState('');
   const [triggerType, setTriggerType] = useState(TRIGGER_TYPES[0]);
@@ -770,6 +783,11 @@ function CreateRuleModal({
               className="w-full rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-sm text-gray-900 dark:text-white p-2 font-mono resize-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             />
           </div>
+          {!!error && (
+            <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
+              Could not create rule. {describeLoadError(error)}
+            </div>
+          )}
           <div className="flex justify-end gap-2 pt-2">
             <button
               type="button"
@@ -817,7 +835,7 @@ export default function TicketHub() {
   // Queries
   // ---------------------------------------------------------------------------
 
-  const { data: dashboard, isLoading: dashboardLoading } = useQuery<DashboardStats>({
+  const { data: dashboard, isLoading: dashboardLoading, error: dashboardError } = useQuery<DashboardStats>({
     queryKey: ['ticketDashboard'],
     queryFn: async () => {
       const res = await api.get('/tickethub/dashboard');
@@ -838,6 +856,7 @@ export default function TicketHub() {
     data: ticketData,
     isLoading: ticketsLoading,
     isFetching: ticketsFetching,
+    error: ticketsError,
   } = useQuery<TicketListResponse>({
     queryKey: ['tickets', ticketParams],
     queryFn: async () => {
@@ -847,7 +866,7 @@ export default function TicketHub() {
     enabled: activeTab === 'list',
   });
 
-  const { data: kanbanData, isLoading: kanbanLoading } = useQuery<KanbanResponse>({
+  const { data: kanbanData, isLoading: kanbanLoading, error: kanbanError } = useQuery<KanbanResponse>({
     queryKey: ['ticketKanban'],
     queryFn: async () => {
       const res = await api.get('/tickethub/kanban');
@@ -856,7 +875,7 @@ export default function TicketHub() {
     enabled: activeTab === 'kanban',
   });
 
-  const { data: automationRules = [], isLoading: rulesLoading } = useQuery<AutomationRule[]>({
+  const { data: automationRules = [], isLoading: rulesLoading, error: rulesError } = useQuery<AutomationRule[]>({
     queryKey: ['automationRules'],
     queryFn: async () => {
       const res = await api.get('/tickethub/automation/rules');
@@ -895,17 +914,18 @@ export default function TicketHub() {
       conditions: string;
       actions: string;
     }) => {
-      let parsedConditions: Record<string, unknown> = {};
-      let parsedActions: Record<string, unknown> = {};
+      // Invalid JSON is refused, not silently replaced with an empty object.
+      let parsedConditions: Record<string, unknown>;
+      let parsedActions: Record<string, unknown>;
       try {
         parsedConditions = JSON.parse(data.conditions);
       } catch {
-        /* keep empty */
+        throw new Error('Conditions is not valid JSON');
       }
       try {
         parsedActions = JSON.parse(data.actions);
       } catch {
-        /* keep empty */
+        throw new Error('Actions is not valid JSON');
       }
       await api.post('/tickethub/automation/rules', {
         name: data.name,
@@ -1002,7 +1022,11 @@ export default function TicketHub() {
 
       {/* Stats Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        {dashboardLoading ? (
+        {dashboardError ? (
+          <div className="sm:col-span-2 lg:col-span-4">
+            <LoadErrorBanner what="ticket statistics" error={dashboardError} />
+          </div>
+        ) : dashboardLoading ? (
           Array.from({ length: 4 }).map((_, i) => (
             <div
               key={i}
@@ -1040,7 +1064,7 @@ export default function TicketHub() {
       </div>
 
       {/* Source Breakdown */}
-      {!dashboardLoading && stats.by_source_type && Object.keys(stats.by_source_type).length > 0 && (
+      {!dashboardLoading && !dashboardError && stats.by_source_type && Object.keys(stats.by_source_type).length > 0 && (
         <div className="flex flex-wrap gap-3">
           {Object.entries(stats.by_source_type).map(([src, count]) => (
             <div
@@ -1146,6 +1170,10 @@ export default function TicketHub() {
           <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
             {ticketsLoading ? (
               <Spinner />
+            ) : ticketsError ? (
+              <div className="p-4">
+                <LoadErrorBanner what="tickets" error={ticketsError} />
+              </div>
             ) : tickets.length === 0 ? (
               <EmptyState message="No tickets found matching your filters." />
             ) : (
@@ -1284,6 +1312,8 @@ export default function TicketHub() {
         <div className="space-y-4">
           {kanbanLoading ? (
             <Spinner />
+          ) : kanbanError ? (
+            <LoadErrorBanner what="the kanban board" error={kanbanError} />
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
               {KANBAN_COLUMNS.map((column) => {
@@ -1343,10 +1373,20 @@ export default function TicketHub() {
             </button>
           </div>
 
+          {toggleRuleMutation.error && (
+            <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
+              Could not update rule. {describeLoadError(toggleRuleMutation.error)}
+            </div>
+          )}
+
           {/* Rules Table */}
           <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
             {rulesLoading ? (
               <Spinner />
+            ) : rulesError ? (
+              <div className="p-4">
+                <LoadErrorBanner what="automation rules" error={rulesError} />
+              </div>
             ) : automationRules.length === 0 ? (
               <EmptyState message="No automation rules configured." />
             ) : (
@@ -1470,9 +1510,13 @@ export default function TicketHub() {
       {/* Create Rule Modal */}
       {showCreateRule && (
         <CreateRuleModal
-          onClose={() => setShowCreateRule(false)}
+          onClose={() => {
+            setShowCreateRule(false);
+            createRuleMutation.reset();
+          }}
           onSubmit={(data) => createRuleMutation.mutate(data)}
           isPending={createRuleMutation.isPending}
+          error={createRuleMutation.error}
         />
       )}
     </div>
