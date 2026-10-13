@@ -106,6 +106,8 @@ export interface PlaybookExecution {
   input_data: Record<string, any> | null;
   output_data: Record<string, any> | null;
   step_results: Record<string, any>[] | null;
+  /** Count of steps per status (completed / failed / awaiting_integration / ...). */
+  step_summary?: Record<string, number> | null;
   error_message: string | null;
   error_step: number | null;
   triggered_by: string | null;

@@ -22,6 +22,7 @@ import type { Alert, Playbook } from '../lib/types';
 import clsx from 'clsx';
 import LoadErrorBanner from '../components/LoadErrorBanner';
 import { describeLoadError } from '../lib/loadError';
+import { describeActionError } from '../lib/automationErrors';
 
 const severityColors: Record<string, string> = {
   critical: 'bg-red-100 text-red-700 border-red-200 dark:bg-red-900/30 dark:text-red-300 dark:border-red-900/50',
@@ -109,11 +110,16 @@ export default function AlertDetail() {
 
   const executePlaybookMutation = useMutation({
     mutationFn: (playbookId: string) => playbooksApi.execute(playbookId, { alert_id: id }),
-    onSuccess: () => {
+    onSuccess: (execution) => {
       setShowPlaybookModal(false);
-      showToast('success', 'Playbook execution queued');
+      // Started, not finished: per-step results are on the Playbooks page.
+      showToast('success', `Playbook execution started (status: ${execution?.status || 'not available'}); follow its steps on the Playbooks page`);
     },
-    onError: (err) => showToast('error', `Playbook execution failed. ${describeLoadError(err)}`),
+    onError: (err) => {
+      // 403 containment_requires_admin lists the privileged steps as sent.
+      const { summary, items } = describeActionError(err);
+      showToast('error', `Playbook execution refused. ${summary}${items.length ? ` (${items.join('; ')})` : ''}`);
+    },
   });
 
   if (isLoading) {

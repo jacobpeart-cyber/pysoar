@@ -14,7 +14,6 @@ import {
   AttackSurface,
   AIPrediction,
   RemediationPolicy,
-  RemediationAction,
   ComplianceFramework,
   POAM,
   ZeroTrustPolicy,
@@ -239,15 +238,31 @@ export const remediationApi = {
     return extractData(response.data);
   },
 
-  getActions: async (params?: {
-    page?: number;
-    size?: number;
-    status?: string;
-  }): Promise<PaginatedResponse<RemediationAction>> => {
+  /**
+   * The engine's action registry (GET /remediation/actions). A policy
+   * action's `type` must be one of these `key`s; anything else is 400
+   * `unknown_action`.
+   */
+  getActions: async (params?: { action_type?: string }): Promise<RemediationActionSpec[]> => {
     const response = await api.get('/remediation/actions', { params });
-    return extractData(response.data);
+    return response.data;
   },
 };
+
+/** One entry of GET /remediation/actions. */
+export interface RemediationActionSpec {
+  key: string;
+  label: string;
+  description: string;
+  target_type: string;
+  /** How it actuates: containment / agent_command / notification. */
+  path: string;
+  parameters: { name: string; type: string; required: boolean; description?: string }[];
+  requires_approval: boolean;
+  reversible: boolean;
+  risk_level: string;
+  aliases: string[];
+}
 
 // Compliance
 export const complianceApi = {

@@ -23,11 +23,16 @@ import {
   Mail,
   Terminal,
   X,
+  AlertTriangle,
+  ListChecks,
 } from 'lucide-react';
+import { Link } from 'react-router-dom';
 import clsx from 'clsx';
 import { api } from '../api/client';
 import FormModal from '../components/FormModal';
 import LoadErrorBanner from '../components/LoadErrorBanner';
+import ActionErrorBanner from '../components/ActionErrorBanner';
+import { describeLoadError } from '../lib/loadError';
 
 const getStatusColor = (status: string) => {
   switch (status) {
@@ -43,6 +48,15 @@ const getStatusColor = (status: string) => {
       return 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-100';
     case 'paused':
       return 'bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-100';
+    case 'partial':
+    case 'awaiting_integration':
+    case 'manual_required':
+    case 'not_implemented':
+      return 'bg-amber-100 dark:bg-amber-900 text-amber-800 dark:text-amber-100';
+    case 'queued_for_approval':
+      return 'bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-100';
+    case 'forbidden_privileged_node':
+      return 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-100';
     default:
       return 'bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-100';
   }
@@ -89,8 +103,22 @@ interface Template {
   description: string;
   category: string;
   nodeCount: number;
-  popularity: number;
-  tags: string[];
+  edgeCount: number;
+  nodes: any[];
+}
+
+/** Map a backend template row (node_count / edge_count) onto the card's shape. */
+function toTemplate(row: any): Template {
+  const nodes = Array.isArray(row?.nodes) ? row.nodes : [];
+  return {
+    id: row?.id ?? '',
+    name: row?.name ?? '',
+    description: row?.description ?? '',
+    category: row?.category ?? '',
+    nodeCount: typeof row?.node_count === 'number' ? row.node_count : nodes.length,
+    edgeCount: typeof row?.edge_count === 'number' ? row.edge_count : Array.isArray(row?.edges) ? row.edges.length : 0,
+    nodes,
+  };
 }
 
 interface Execution {
@@ -100,6 +128,7 @@ interface Execution {
   status: string;
   startedAt: string;
   duration: string;
+  durationMs: number | null;
   triggeredBy: string;
   nodesExecuted: number;
   totalNodes: number;
@@ -115,6 +144,7 @@ function toExecution(row: any): Execution {
     status: row?.status ?? '',
     startedAt: row?.started_at ?? row?.created_at ?? '',
     duration: ms === null ? 'not available' : ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`,
+    durationMs: ms,
     triggeredBy: row?.triggered_by ?? 'not available',
     nodesExecuted: typeof row?.nodes_executed === 'number' ? row.nodes_executed : 0,
     totalNodes: typeof row?.total_nodes === 'number' ? row.total_nodes : 0,
@@ -145,6 +175,180 @@ interface BuilderEdge {
   priority: number;
 }
 
+/** Run statuses after which a visual execution no longer changes. */
+const TERMINAL_RUN_STATUSES = new Set(['completed', 'partial', 'failed', 'cancelled']);
+
+const NODE_STATUS_LABELS: Record<string, string> = {
+  completed: 'Completed',
+  failed: 'Failed',
+  running: 'Running',
+  pending: 'Pending',
+  skipped: 'Skipped',
+  awaiting_integration: 'Awaiting integration',
+  manual_required: 'Manual action required',
+  queued_for_approval: 'Queued for approval',
+  not_implemented: 'Not implemented',
+  forbidden_privileged_node: 'Forbidden: needs admin',
+};
+
+const PARTIAL_EXPLANATION =
+  'Partial: the run finished without errors, but at least one node did not complete. It is waiting ' +
+  'on an integration, queued for approval or needs a manual action. Only nodes marked Completed ' +
+  'actually happened.';
+
+function formatMs(ms: unknown): string {
+  if (typeof ms !== 'number') return 'not available';
+  return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
+}
+
+function formatWhen(value: unknown): string {
+  if (!value || typeof value !== 'string') return 'not available';
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? value : d.toLocaleString();
+}
+
+interface RunState {
+  playbookId: string;
+  playbookName: string;
+  executionId: string | null;
+  starting: boolean;
+  startError: unknown;
+  pollError: unknown;
+  status: any | null;
+}
+
+function BuilderRunModal({
+  run,
+  onClose,
+  onRetryPoll,
+}: {
+  run: RunState;
+  onClose: () => void;
+  onRetryPoll: () => void;
+}) {
+  const st = run.status;
+  const status: string = st?.status || (run.executionId ? 'pending' : '');
+  const terminal = TERMINAL_RUN_STATUSES.has(status);
+  const nodeSummary: Record<string, number> = st?.node_summary || {};
+  const nodeExecutions: any[] = Array.isArray(st?.node_executions) ? st.node_executions : [];
+  const path: string[] = Array.isArray(st?.execution_path) ? st.execution_path : [];
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50" onClick={onClose}>
+      <div
+        className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[85vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 dark:border-gray-700">
+          <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Run: {run.playbookName}</h2>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600"><X className="w-5 h-5" /></button>
+        </div>
+        <div className="p-6 space-y-4">
+          {run.starting && (
+            <div className="flex items-center gap-2 text-sm text-gray-500">
+              <Loader2 className="w-4 h-4 animate-spin" /> Starting execution...
+            </div>
+          )}
+          <ActionErrorBanner what="start the run" error={run.startError} />
+          {run.executionId && (
+            <>
+              <div className="rounded-lg bg-gray-50 dark:bg-gray-900 p-4 space-y-2 text-sm">
+                <div className="flex items-center gap-2">
+                  <span className={clsx('px-3 py-1 rounded-full text-xs font-medium', getStatusColor(status))}>
+                    {NODE_STATUS_LABELS[status] || status || 'not available'}
+                  </span>
+                  {!terminal && !run.pollError && (
+                    <span className="inline-flex items-center gap-1 text-xs text-gray-500">
+                      <Loader2 className="w-3 h-3 animate-spin" /> polling
+                      {typeof st?.progress_percent === 'number' ? ` · ${Math.round(st.progress_percent)}%` : ''}
+                    </span>
+                  )}
+                </div>
+                <p className="text-gray-500 dark:text-gray-400">Execution ID: {run.executionId}</p>
+                <div className="grid grid-cols-3 gap-2 text-xs text-gray-600 dark:text-gray-400">
+                  <div>Started: {formatWhen(st?.started_at)}</div>
+                  <div>Completed: {formatWhen(st?.completed_at)}</div>
+                  <div>Duration: {formatMs(st?.duration_ms)}</div>
+                </div>
+                {status === 'partial' && <p className="text-amber-800 dark:text-amber-300">{PARTIAL_EXPLANATION}</p>}
+                {st?.error_message && <p className="text-red-600 dark:text-red-400">{st.error_message}</p>}
+              </div>
+
+              {run.pollError ? (
+                <div className="space-y-2">
+                  <LoadErrorBanner what="the execution status" error={run.pollError} />
+                  <button onClick={onRetryPoll} className="text-sm text-indigo-600 hover:text-indigo-700">
+                    Retry polling
+                  </button>
+                </div>
+              ) : null}
+
+              <div>
+                <h3 className="text-sm font-semibold mb-2">Node summary</h3>
+                {Object.keys(nodeSummary).length === 0 ? (
+                  <p className="text-sm text-gray-500">No node has finished yet.</p>
+                ) : (
+                  <div className="flex flex-wrap gap-2">
+                    {Object.entries(nodeSummary).map(([k, v]) => (
+                      <span key={k} className={clsx('px-2 py-0.5 rounded-full text-xs font-medium', getStatusColor(k))}>
+                        {NODE_STATUS_LABELS[k] || k}: {v}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <h3 className="text-sm font-semibold mb-2">Execution path</h3>
+                {path.length === 0 ? (
+                  <p className="text-sm text-gray-500">not available</p>
+                ) : (
+                  <p className="text-xs font-mono text-gray-700 dark:text-gray-300 break-words">{path.join(' → ')}</p>
+                )}
+              </div>
+
+              {nodeExecutions.length > 0 && (
+                <div className="space-y-2">
+                  <h3 className="text-sm font-semibold">Nodes</h3>
+                  {nodeExecutions.map((ne) => (
+                    <div key={ne.id || ne.node_id} className="rounded-lg border border-gray-200 dark:border-gray-700 p-3 text-sm">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-medium">{ne.node_id}</span>
+                        <span className={clsx('px-2 py-0.5 rounded-full text-xs font-medium', getStatusColor(ne.status))}>
+                          {NODE_STATUS_LABELS[ne.status] || ne.status}
+                        </span>
+                      </div>
+                      {ne.error_message && (
+                        <p
+                          className={clsx(
+                            'text-xs mt-1',
+                            ne.status === 'awaiting_integration' || ne.status === 'manual_required' || ne.status === 'not_implemented'
+                              ? 'text-amber-800 dark:text-amber-300'
+                              : 'text-red-600 dark:text-red-400'
+                          )}
+                        >
+                          {ne.status === 'awaiting_integration' ? 'Missing dependency: ' : ''}
+                          {ne.error_message}
+                        </p>
+                      )}
+                      {ne.status === 'queued_for_approval' && (
+                        <p className="text-xs mt-1 text-blue-700 dark:text-blue-300">
+                          Not executed yet: waiting in the{' '}
+                          <Link to="/live-response" className="underline">agent approval queue</Link>.
+                        </p>
+                      )}
+                      <p className="text-[11px] text-gray-400 mt-1">Duration: {formatMs(ne.duration_ms)}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function PlaybookBuilder() {
   const [activeTab, setActiveTab] = useState('playbooks');
   const [playbooks, setPlaybooks] = useState<Playbook[]>([]);
@@ -153,7 +357,13 @@ export default function PlaybookBuilder() {
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedPlaybook, setSelectedPlaybook] = useState<Playbook | null>(null);
-  const [selectedExecution, setSelectedExecution] = useState<Execution | null>(null);
+  const [run, setRun] = useState<RunState | null>(null);
+  const [pollNonce, setPollNonce] = useState(0);
+  const [validation, setValidation] = useState<{
+    loading: boolean;
+    error: unknown;
+    result: { is_valid: boolean; errors: string[]; warnings: string[] } | null;
+  } | null>(null);
   const [previewTemplate, setPreviewTemplate] = useState<Template | null>(null);
   const [showFilter, setShowFilter] = useState(false);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
@@ -423,6 +633,83 @@ export default function PlaybookBuilder() {
     }
   };
 
+  /** POST /playbook-builder/{id}/run, then poll the execution until terminal. */
+  const startRun = async (playbookId: string, playbookName: string) => {
+    setRun({ playbookId, playbookName, executionId: null, starting: true, startError: null, pollError: null, status: null });
+    try {
+      const res = await api.post(`/playbook-builder/${playbookId}/run`, {});
+      const row = res.data;
+      setRun((prev) => (prev && prev.playbookId === playbookId ? { ...prev, starting: false, executionId: row?.id ?? null } : prev));
+      setExecutions((prev) => [toExecution({ ...row, playbook_name: playbookName }), ...prev]);
+    } catch (err) {
+      // 501 not_implemented (nodes listed), 422 no_trigger_node,
+      // 403 containment_requires_admin, 503 dispatch_failed: shown as sent.
+      setRun((prev) => (prev && prev.playbookId === playbookId ? { ...prev, starting: false, startError: err } : prev));
+    }
+  };
+
+  const openExecution = (execution: Execution) => {
+    setRun({
+      playbookId: execution.playbookId,
+      playbookName: execution.playbookName,
+      executionId: execution.id,
+      starting: false,
+      startError: null,
+      pollError: null,
+      status: null,
+    });
+  };
+
+  const runExecutionId = run?.executionId ?? null;
+  const runStatus: string | null = run?.status?.status ?? null;
+  const runPollError = run?.pollError ?? null;
+  useEffect(() => {
+    if (!runExecutionId || runPollError) return;
+    if (runStatus && TERMINAL_RUN_STATUSES.has(runStatus)) return;
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      try {
+        const res = await api.get(`/playbook-builder/executions/${runExecutionId}`);
+        if (cancelled) return;
+        const st = res.data;
+        setRun((prev) => (prev && prev.executionId === runExecutionId ? { ...prev, status: st } : prev));
+        setExecutions((prev) =>
+          prev.map((e) =>
+            e.id === runExecutionId
+              ? {
+                  ...e,
+                  status: st?.status ?? e.status,
+                  durationMs: typeof st?.duration_ms === 'number' ? st.duration_ms : e.durationMs,
+                  duration: typeof st?.duration_ms === 'number' ? formatMs(st.duration_ms) : e.duration,
+                  nodesExecuted: typeof st?.node_summary?.completed === 'number' ? st.node_summary.completed : e.nodesExecuted,
+                }
+              : e
+          )
+        );
+      } catch (err) {
+        if (!cancelled) {
+          setRun((prev) => (prev && prev.executionId === runExecutionId ? { ...prev, pollError: err } : prev));
+        }
+      }
+    }, runStatus === null ? 0 : 2000);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [runExecutionId, runStatus, runPollError, pollNonce, run?.status]);
+
+  /** POST /playbook-builder/{id}/validate: lists every node that cannot execute. */
+  const validateBuilderPlaybook = async () => {
+    if (!builderPlaybook) return;
+    setValidation({ loading: true, error: null, result: null });
+    try {
+      const res = await api.post(`/playbook-builder/${builderPlaybook.id}/validate`, {});
+      setValidation({ loading: false, error: null, result: res.data });
+    } catch (err) {
+      setValidation({ loading: false, error: err, result: null });
+    }
+  };
+
   const builderNodeOptions = builderNodes.map((node) => (
     <option key={node.node_id} value={node.node_id}>
       {node.display_name || node.node_type}
@@ -436,7 +723,7 @@ export default function PlaybookBuilder() {
       // error, never rendered as an empty list.
       const [playbooksRes, templatesRes, execRes] = await Promise.allSettled([
         api.get('/playbook-builder'),
-        api.get('/playbook-builder/templates'),
+        api.get('/playbook-builder/templates', { params: { size: 100 } }),
         api.get('/playbook-builder/executions', { params: { size: 50 } }),
       ]);
       const errors: Record<string, unknown> = {};
@@ -448,7 +735,8 @@ export default function PlaybookBuilder() {
       }
       if (templatesRes.status === 'fulfilled') {
         const tplItems = templatesRes.value.data?.items ?? templatesRes.value.data;
-        setTemplates(Array.isArray(tplItems) ? tplItems : []);
+        // Templates without nodes were deleted server-side; never offer one.
+        setTemplates(Array.isArray(tplItems) ? tplItems.map(toTemplate).filter((t) => t.nodeCount > 0) : []);
       } else {
         errors.templates = templatesRes.reason;
       }
@@ -753,14 +1041,21 @@ export default function PlaybookBuilder() {
                                       setNotification({ type: 'error', text: 'Failed to update playbook status' });
                                     }
                                   }}
-                                  className="p-1.5 text-gray-500 hover:text-green-600 dark:hover:text-green-400 hover:bg-gray-100 dark:hover:bg-gray-600 rounded transition"
-                                  title={playbook.status === 'active' ? 'Pause' : 'Run'}
+                                  className="p-1.5 text-gray-500 hover:text-yellow-600 dark:hover:text-yellow-400 hover:bg-gray-100 dark:hover:bg-gray-600 rounded transition"
+                                  title={playbook.status === 'active' ? 'Pause' : 'Activate'}
                                 >
                                   {playbook.status === 'active' ? (
                                     <Pause className="w-4 h-4" />
                                   ) : (
-                                    <Play className="w-4 h-4" />
+                                    <CheckCircle className="w-4 h-4" />
                                   )}
+                                </button>
+                                <button
+                                  onClick={() => startRun(playbook.id, playbook.name)}
+                                  className="p-1.5 text-gray-500 hover:text-green-600 dark:hover:text-green-400 hover:bg-gray-100 dark:hover:bg-gray-600 rounded transition"
+                                  title="Run now"
+                                >
+                                  <Play className="w-4 h-4" />
                                 </button>
                                 <button
                                   onClick={async () => {
@@ -846,22 +1141,10 @@ export default function PlaybookBuilder() {
                               {template.nodeCount} nodes
                             </span>
                             <span className="inline-flex items-center gap-1">
-                              <BarChart3 className="w-3.5 h-3.5" />
-                              {template.popularity} uses
+                              <GitBranch className="w-3.5 h-3.5" />
+                              {template.edgeCount} connections
                             </span>
                           </div>
-                          {template.tags && template.tags.length > 0 && (
-                            <div className="flex flex-wrap gap-1.5 mb-4">
-                              {template.tags.map((tag) => (
-                                <span
-                                  key={tag}
-                                  className="text-xs bg-indigo-50 dark:bg-indigo-900 text-indigo-700 dark:text-indigo-300 px-2 py-0.5 rounded"
-                                >
-                                  {tag}
-                                </span>
-                              ))}
-                            </div>
-                          )}
                           <div className="flex gap-2">
                             <button
                               disabled={actionLoading === `template-${template.id}`}
@@ -873,7 +1156,7 @@ export default function PlaybookBuilder() {
                                   setActiveTab('playbooks');
                                   setNotification({ type: 'success', text: 'Playbook created from template' });
                                 } catch (err) {
-                                  setNotification({ type: 'error', text: 'Failed to create playbook from template' });
+                                  setNotification({ type: 'error', text: `Failed to create playbook from template. ${describeLoadError(err)}` });
                                 } finally {
                                   setActionLoading(null);
                                 }
@@ -928,6 +1211,15 @@ export default function PlaybookBuilder() {
                       </div>
                       <div className="flex justify-between">
                         <span className="inline-flex items-center gap-2">
+                          <span className="w-2 h-2 bg-amber-500 rounded-full" />
+                          Partial
+                        </span>
+                        <span className="font-semibold">
+                          {executions.filter((e) => e.status === 'partial').length}
+                        </span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="inline-flex items-center gap-2">
                           <span className="w-2 h-2 bg-red-500 rounded-full" />
                           Failed
                         </span>
@@ -943,21 +1235,11 @@ export default function PlaybookBuilder() {
                     </h3>
                     <p className="text-2xl font-bold text-gray-900 dark:text-gray-100">
                       {(() => {
-                        // Previously this showed the literal string
-                        // "2m 34s" whenever any executions existed —
-                        // pure theater. Compute the mean from real
-                        // duration_seconds / completed_at - started_at.
+                        // Mean of the backend's duration_ms over runs that recorded one.
                         const durations = executions
-                          .map((e: any) => {
-                            if (typeof e.duration_seconds === 'number') return e.duration_seconds;
-                            if (e.started_at && e.completed_at) {
-                              const d = (new Date(e.completed_at).getTime() - new Date(e.started_at).getTime()) / 1000;
-                              return Number.isFinite(d) ? d : null;
-                            }
-                            return null;
-                          })
-                          .filter((d: any) => typeof d === 'number' && d >= 0);
-                        if (durations.length === 0) return '--';
+                          .map((e) => (typeof e.durationMs === 'number' && e.durationMs >= 0 ? e.durationMs / 1000 : null))
+                          .filter((d): d is number => d !== null);
+                        if (durations.length === 0) return 'not available';
                         const avg = durations.reduce((s: number, d: number) => s + d, 0) / durations.length;
                         const m = Math.floor(avg / 60);
                         const s = Math.round(avg % 60);
@@ -977,9 +1259,11 @@ export default function PlaybookBuilder() {
                               executions.length) *
                               100
                           )}%`
-                        : '--'}
+                        : 'not available'}
                     </p>
-                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">completion rate</p>
+                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                      runs where every node completed (partial runs do not count)
+                    </p>
                   </div>
                 </div>
 
@@ -1047,6 +1331,7 @@ export default function PlaybookBuilder() {
                                   <CheckCircle className="w-3 h-3" />
                                 )}
                                 {execution.status === 'failed' && <XCircle className="w-3 h-3" />}
+                                {execution.status === 'partial' && <AlertTriangle className="w-3 h-3" />}
                                 {(execution.status || '').charAt(0).toUpperCase() + execution.status.slice(1)}
                               </span>
                             </td>
@@ -1058,6 +1343,7 @@ export default function PlaybookBuilder() {
                                       'bg-blue-500': execution.status === 'running',
                                       'bg-green-500': execution.status === 'completed',
                                       'bg-red-500': execution.status === 'failed',
+                                      'bg-amber-500': execution.status === 'partial',
                                     })}
                                     style={{
                                       width: `${
@@ -1090,7 +1376,7 @@ export default function PlaybookBuilder() {
                             <td className="px-6 py-4">
                               <div className="flex items-center gap-2">
                                 <button
-                                  onClick={() => setSelectedExecution(execution)}
+                                  onClick={() => openExecution(execution)}
                                   className="p-1.5 text-gray-500 hover:text-indigo-600 dark:hover:text-indigo-400 hover:bg-gray-100 dark:hover:bg-gray-600 rounded transition"
                                   title="View Details"
                                 >
@@ -1106,18 +1392,7 @@ export default function PlaybookBuilder() {
                                 )}
                                 {execution.status !== 'running' && (
                                   <button
-                                    onClick={async () => {
-                                      try {
-                                        const res = await api.post(`/playbook-builder/${execution.playbookId}/execute`, {});
-                                        setExecutions((prev) => [
-                                          toExecution({ ...res.data, playbook_name: execution.playbookName, total_nodes: execution.totalNodes }),
-                                          ...prev,
-                                        ]);
-                                        setNotification({ type: 'success', text: 'Playbook execution started' });
-                                      } catch (err) {
-                                        setNotification({ type: 'error', text: 'Failed to re-run playbook' });
-                                      }
-                                    }}
+                                    onClick={() => startRun(execution.playbookId, execution.playbookName)}
                                     className="p-1.5 text-gray-500 hover:text-green-600 dark:hover:text-green-400 hover:bg-gray-100 dark:hover:bg-gray-600 rounded transition"
                                     title="Re-run"
                                   >
@@ -1172,7 +1447,22 @@ export default function PlaybookBuilder() {
                           <h2 className="text-2xl font-semibold text-gray-900 dark:text-white">{builderPlaybook.name}</h2>
                           <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">{builderPlaybook.description}</p>
                         </div>
-                        <div className="flex gap-2">
+                        <div className="flex gap-2 flex-wrap">
+                          <button
+                            onClick={validateBuilderPlaybook}
+                            disabled={validation?.loading}
+                            className="inline-flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 transition disabled:opacity-50"
+                          >
+                            {validation?.loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <ListChecks className="w-4 h-4" />}
+                            Validate
+                          </button>
+                          <button
+                            onClick={() => startRun(builderPlaybook.id, builderPlaybook.name)}
+                            className="inline-flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg transition"
+                          >
+                            <Play className="w-4 h-4" />
+                            Run
+                          </button>
                           <button
                             onClick={closeBuilder}
                             className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 transition"
@@ -1187,6 +1477,39 @@ export default function PlaybookBuilder() {
                           </button>
                         </div>
                       </div>
+
+                      {validation && !validation.loading && (
+                        <div className="mb-4">
+                          {validation.error ? (
+                            <ActionErrorBanner what="validate the playbook" error={validation.error} />
+                          ) : validation.result ? (
+                            <div
+                              className={clsx(
+                                'rounded p-3 text-sm border',
+                                validation.result.is_valid
+                                  ? 'text-green-700 dark:text-green-300 bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800'
+                                  : 'text-amber-800 dark:text-amber-200 bg-amber-50 dark:bg-amber-900/20 border-amber-200 dark:border-amber-800'
+                              )}
+                            >
+                              <p className="font-medium">
+                                {validation.result.is_valid
+                                  ? 'Valid: every node can execute.'
+                                  : 'Not runnable as is. These problems were reported:'}
+                              </p>
+                              {validation.result.errors.length > 0 && (
+                                <ul className="list-disc ml-5 mt-1 space-y-0.5">
+                                  {validation.result.errors.map((m, i) => <li key={i}>{m}</li>)}
+                                </ul>
+                              )}
+                              {validation.result.warnings.length > 0 && (
+                                <ul className="list-disc ml-5 mt-1 space-y-0.5 text-gray-600 dark:text-gray-400">
+                                  {validation.result.warnings.map((m, i) => <li key={`w${i}`}>Warning: {m}</li>)}
+                                </ul>
+                              )}
+                            </div>
+                          ) : null}
+                        </div>
+                      )}
 
                       <div className="mb-4 rounded-2xl border border-indigo-200 dark:border-indigo-700 bg-indigo-50 dark:bg-indigo-950 px-4 py-3 text-sm text-indigo-700 dark:text-indigo-200 shadow-sm">
                         <strong className="font-semibold">Visual builder ready:</strong> drag any node card to reposition it, then connect nodes with the toolbar on the right.
@@ -1500,6 +1823,42 @@ export default function PlaybookBuilder() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {run && (
+        <BuilderRunModal
+          run={run}
+          onClose={() => setRun(null)}
+          onRetryPoll={() => {
+            setRun((prev) => (prev ? { ...prev, pollError: null } : prev));
+            setPollNonce((n) => n + 1);
+          }}
+        />
+      )}
+
+      {previewTemplate && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50" onClick={() => setPreviewTemplate(null)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-lg mx-4 max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 dark:border-gray-700">
+              <h2 className="text-lg font-semibold text-gray-900 dark:text-white">{previewTemplate.name}</h2>
+              <button onClick={() => setPreviewTemplate(null)} className="text-gray-400 hover:text-gray-600"><X className="w-5 h-5" /></button>
+            </div>
+            <div className="p-6 space-y-3 text-sm">
+              <p className="text-gray-600 dark:text-gray-400">{previewTemplate.description || 'No description'}</p>
+              <p className="text-gray-500">
+                {previewTemplate.nodeCount} nodes · {previewTemplate.edgeCount} connections
+              </p>
+              <div className="space-y-1">
+                {previewTemplate.nodes.map((node: any, i: number) => (
+                  <div key={node.node_id || i} className="flex items-center gap-2 p-2 bg-gray-50 dark:bg-gray-700 rounded">
+                    <span className="font-medium text-gray-800 dark:text-gray-200">{node.display_name || node.node_id}</span>
+                    <span className="text-xs text-gray-500">{node.node_type}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
           </div>
         </div>
       )}

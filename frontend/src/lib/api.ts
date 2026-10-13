@@ -287,7 +287,7 @@ export const incidentsApi = {
 
 // IOCs API
 export const iocsApi = {
-  list: async (params?: { page?: number; size?: number; ioc_type?: string; threat_level?: string }) => {
+  list: async (params?: { page?: number; size?: number; ioc_type?: string; threat_level?: string; status?: string }) => {
     const response = await api.get('/iocs', { params });
     return response.data;
   },
@@ -366,6 +366,11 @@ export const playbooksApi = {
   },
   getExecutions: async (id: string, params?: { page?: number; size?: number }) => {
     const response = await api.get(`/playbooks/${id}/executions`, { params });
+    return response.data;
+  },
+  /** One execution, for polling a run until it reaches a terminal status. */
+  getExecution: async (id: string, executionId: string) => {
+    const response = await api.get(`/playbooks/${id}/executions/${executionId}`);
     return response.data;
   },
 };

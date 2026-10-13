@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { Link } from 'react-router-dom'
 import { playbooksApi } from '../lib/api'
 import type { Playbook, PlaybookExecution } from '../lib/types'
 import {
@@ -17,10 +18,12 @@ import {
   Zap,
   Edit,
   Copy,
+  AlertTriangle,
 } from 'lucide-react'
 import clsx from 'clsx'
 import LoadErrorBanner from '../components/LoadErrorBanner'
 import { describeLoadError } from '../lib/loadError'
+import ActionErrorBanner from '../components/ActionErrorBanner'
 
 const statusColors: Record<string, string> = {
   draft: 'bg-gray-100 text-gray-700',
@@ -33,9 +36,56 @@ const executionStatusColors: Record<string, string> = {
   pending: 'bg-gray-100 text-gray-700',
   running: 'bg-blue-100 text-blue-700',
   completed: 'bg-green-100 text-green-700',
+  partial: 'bg-amber-100 text-amber-800',
   failed: 'bg-red-100 text-red-700',
   cancelled: 'bg-yellow-100 text-yellow-700',
   paused: 'bg-purple-100 text-purple-700',
+}
+
+/** Run statuses after which an execution no longer changes. */
+const TERMINAL_RUN_STATUSES = new Set(['completed', 'partial', 'failed', 'cancelled'])
+
+const PARTIAL_EXPLANATION =
+  'Partial: every step ran, but at least one did not complete. It is waiting on an integration, ' +
+  'queued for approval, needs a manual action, or failed with continue-on-error. Only steps ' +
+  'marked Completed actually happened.'
+
+const stepStatusStyles: Record<string, { label: string; className: string }> = {
+  completed: { label: 'Completed', className: 'bg-green-100 text-green-700' },
+  failed: { label: 'Failed', className: 'bg-red-100 text-red-700' },
+  awaiting_integration: { label: 'Awaiting integration', className: 'bg-amber-100 text-amber-800' },
+  manual_required: { label: 'Manual action required', className: 'bg-amber-100 text-amber-800' },
+  queued_for_approval: { label: 'Queued for approval', className: 'bg-blue-100 text-blue-700' },
+  skipped: { label: 'Skipped', className: 'bg-gray-100 text-gray-600' },
+}
+
+/**
+ * Step types the backend executes (src/services/playbook_engine.py
+ * SUPPORTED_ACTIONS). `run_script` was removed server-side and is not
+ * offered; the server still rejects anything unknown with 422 invalid_steps.
+ */
+const STEP_ACTION_OPTIONS: { value: string; label: string }[] = [
+  { value: 'enrich_ip', label: 'Enrich IP' },
+  { value: 'enrich_domain', label: 'Enrich Domain' },
+  { value: 'enrich_hash', label: 'Enrich Hash' },
+  { value: 'send_notification', label: 'Send Notification' },
+  { value: 'create_ticket', label: 'Create Ticket' },
+  { value: 'update_alert', label: 'Update Alert' },
+  { value: 'update_incident', label: 'Update Incident' },
+  { value: 'create_incident', label: 'Create Incident' },
+  { value: 'add_comment', label: 'Add Comment' },
+  { value: 'assign_to', label: 'Assign To' },
+  { value: 'block_ip', label: 'Block IP (admin)' },
+  { value: 'isolate_host', label: 'Isolate Host (admin)' },
+  { value: 'disable_user', label: 'Disable User (admin)' },
+  { value: 'quarantine_file', label: 'Quarantine File (admin)' },
+  { value: 'wait', label: 'Wait' },
+]
+
+function formatTime(value: unknown): string {
+  if (!value || typeof value !== 'string') return 'not available'
+  const d = new Date(value)
+  return Number.isNaN(d.getTime()) ? value : d.toLocaleString()
 }
 
 const triggerTypeLabels: Record<string, string> = {
@@ -100,9 +150,8 @@ export default function Playbooks() {
     try {
       await playbooksApi.update(id, { status: 'active', is_enabled: true })
       fetchPlaybooks()
-    } catch (error: any) {
-      console.error('Failed to publish playbook:', error)
-      alert(`Publish failed: ${error?.response?.data?.detail || error?.message || 'unknown error'}`)
+    } catch (error) {
+      alert(`Publish failed: ${describeLoadError(error)}`)
     }
   }
 
@@ -110,9 +159,8 @@ export default function Playbooks() {
     try {
       await playbooksApi.update(id, { status: 'draft' })
       fetchPlaybooks()
-    } catch (error: any) {
-      console.error('Failed to archive playbook:', error)
-      alert(`Archive failed: ${error?.response?.data?.detail || error?.message || 'unknown error'}`)
+    } catch (error) {
+      alert(`Archive failed: ${describeLoadError(error)}`)
     }
   }
 
@@ -357,19 +405,20 @@ function CreatePlaybookModal({ onClose, onCreated }: { onClose: () => void; onCr
   })
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [error, setError] = useState('')
+  const [submitError, setSubmitError] = useState<unknown>(null)
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!formData.name.trim()) { setError('Name is required'); return; }
     setIsSubmitting(true)
     setError('')
+    setSubmitError(null)
     try {
       await playbooksApi.create(formData)
       onCreated()
-    } catch (err: any) {
-      const msg = err?.response?.data?.detail || err?.response?.data?.message || err?.message || 'Failed to create playbook'
-      setError(typeof msg === 'string' ? msg : JSON.stringify(msg))
-      console.error('Failed to create playbook:', err)
+    } catch (err) {
+      // 422 invalid_steps lists each rejected step with the server's reason.
+      setSubmitError(err)
     } finally {
       setIsSubmitting(false)
     }
@@ -490,15 +539,9 @@ function CreatePlaybookModal({ onClose, onCreated }: { onClose: () => void; onCr
                       onChange={(e) => updateStep(index, 'action', e.target.value)}
                       className="px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                     >
-                      <option value="enrich_ip">Enrich IP</option>
-                      <option value="enrich_domain">Enrich Domain</option>
-                      <option value="enrich_hash">Enrich Hash</option>
-                      <option value="send_notification">Send Notification</option>
-                      <option value="update_alert">Update Alert</option>
-                      <option value="create_incident">Create Incident</option>
-                      <option value="block_ip">Block IP</option>
-                      <option value="run_script">Run Script</option>
-                      <option value="wait">Wait</option>
+                      {STEP_ACTION_OPTIONS.map((o) => (
+                        <option key={o.value} value={o.value}>{o.label}</option>
+                      ))}
                     </select>
                   </div>
                   {formData.steps.length > 1 && (
@@ -518,6 +561,7 @@ function CreatePlaybookModal({ onClose, onCreated }: { onClose: () => void; onCr
           {error && (
             <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700">{error}</div>
           )}
+          <ActionErrorBanner what="create the playbook" error={submitError} />
           <div className="flex justify-end space-x-3 pt-4">
             <button
               type="button"
@@ -643,6 +687,7 @@ function PlaybookDetailsModal({ playbook, onClose }: { playbook: Playbook; onClo
                     <div className="flex items-center space-x-3">
                       {exec.status === 'completed' && <CheckCircle className="w-5 h-5 text-green-500" />}
                       {exec.status === 'failed' && <XCircle className="w-5 h-5 text-red-500" />}
+                      {exec.status === 'partial' && <AlertTriangle className="w-5 h-5 text-amber-500" />}
                       {exec.status === 'running' && <Clock className="w-5 h-5 text-blue-500 animate-pulse" />}
                       {exec.status === 'pending' && <Clock className="w-5 h-5 text-gray-400" />}
                       <span
@@ -654,8 +699,15 @@ function PlaybookDetailsModal({ playbook, onClose }: { playbook: Playbook; onClo
                         {exec.status}
                       </span>
                     </div>
-                    <div className="text-xs text-gray-500">
-                      {new Date(exec.created_at || "").toLocaleString()}
+                    <div className="text-xs text-gray-500 text-right">
+                      <div>{formatTime(exec.created_at)}</div>
+                      {exec.step_summary && (
+                        <div>
+                          {Object.entries(exec.step_summary)
+                            .map(([k, v]) => `${v} ${stepStatusStyles[k]?.label.toLowerCase() ?? k}`)
+                            .join(' · ')}
+                        </div>
+                      )}
                     </div>
                   </div>
                 ))}
@@ -680,6 +732,49 @@ function PlaybookDetailsModal({ playbook, onClose }: { playbook: Playbook; onClo
   )
 }
 
+function StepResultRow({ step }: { step: Record<string, any> }) {
+  const status = String(step.status || 'not available')
+  const style = stepStatusStyles[status] ?? { label: status, className: 'bg-gray-100 text-gray-700' }
+  const details = (step.result && typeof step.result === 'object' ? step.result.details : null) || {}
+  const commandId = typeof details.command_id === 'string' ? details.command_id : null
+  return (
+    <div className="p-3 bg-gray-50 rounded-lg">
+      <div className="flex items-center justify-between gap-2">
+        <div className="min-w-0">
+          <p className="text-sm font-medium text-gray-900 truncate">
+            {step.step ?? '?'}. {step.name || 'Unnamed step'}
+          </p>
+          <p className="text-xs text-gray-500">Action: {step.action || 'not available'}</p>
+        </div>
+        <span className={clsx('px-2 py-0.5 text-xs font-medium rounded-full whitespace-nowrap', style.className)}>
+          {style.label}
+        </span>
+      </div>
+      {(status === 'awaiting_integration' || status === 'manual_required') && (
+        <p className="text-xs text-amber-800 mt-2">
+          {status === 'awaiting_integration' ? 'Missing dependency: ' : 'Operator action needed: '}
+          {step.missing_dependency || 'not available'}
+        </p>
+      )}
+      {status === 'queued_for_approval' && (
+        <p className="text-xs text-blue-700 mt-2">
+          Not executed yet: the command waits in the{' '}
+          <Link to="/live-response" className="underline font-medium">
+            agent approval queue
+          </Link>
+          {commandId ? ` (command ${commandId})` : ''}.
+        </p>
+      )}
+      {status === 'failed' && (
+        <p className="text-xs text-red-700 mt-2">Error: {step.error || 'not available'}</p>
+      )}
+      <p className="text-[11px] text-gray-400 mt-1">
+        Started {formatTime(step.started_at)} · Finished {formatTime(step.finished_at)}
+      </p>
+    </div>
+  )
+}
+
 function ExecutePlaybookModal({
   playbook,
   onClose,
@@ -692,18 +787,42 @@ function ExecutePlaybookModal({
   const [inputData, setInputData] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [result, setResult] = useState<PlaybookExecution | null>(null)
-  const [execError, setExecError] = useState<string | null>(null)
+  const [inputError, setInputError] = useState<string | null>(null)
+  const [execError, setExecError] = useState<unknown>(null)
+  const [pollError, setPollError] = useState<unknown>(null)
+  const [pollNonce, setPollNonce] = useState(0)
+
+  const isTerminal = result ? TERMINAL_RUN_STATUSES.has(result.status) : false
+
+  // Poll the execution until it reaches a terminal status.
+  useEffect(() => {
+    if (!result || isTerminal || pollError) return
+    let cancelled = false
+    const timer = window.setTimeout(async () => {
+      try {
+        const next = await playbooksApi.getExecution(playbook.id, result.id)
+        if (!cancelled) setResult(next)
+      } catch (err) {
+        if (!cancelled) setPollError(err)
+      }
+    }, 2000)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [result, isTerminal, pollError, pollNonce, playbook.id])
 
   const handleExecute = async () => {
     setIsSubmitting(true)
     setExecError(null)
+    setInputError(null)
     try {
       let parsedInput = {}
       if (inputData.trim()) {
         try {
           parsedInput = JSON.parse(inputData)
         } catch {
-          setExecError('Input data is not valid JSON.')
+          setInputError('Input data is not valid JSON.')
           setIsSubmitting(false)
           return
         }
@@ -711,15 +830,18 @@ function ExecutePlaybookModal({
       const execution = await playbooksApi.execute(playbook.id, { input_data: parsedInput })
       setResult(execution)
     } catch (error) {
-      setExecError(`Could not execute playbook. ${describeLoadError(error)}`)
+      // 403 containment_requires_admin is shown as the server sent it.
+      setExecError(error)
     } finally {
       setIsSubmitting(false)
     }
   }
 
+  const steps: Record<string, any>[] = Array.isArray(result?.step_results) ? result.step_results : []
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
-      <div className="bg-white rounded-xl shadow-xl w-full max-w-lg mx-4">
+      <div className="bg-white rounded-xl shadow-xl w-full max-w-2xl mx-4 max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
           <h2 className="text-lg font-semibold text-gray-900">Execute Playbook</h2>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
@@ -747,11 +869,12 @@ function ExecutePlaybookModal({
                 />
               </div>
 
-              {execError && (
+              {inputError && (
                 <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
-                  {execError}
+                  {inputError}
                 </div>
               )}
+              <ActionErrorBanner what="execute the playbook" error={execError} />
 
               <div className="flex justify-end space-x-3">
                 <button
@@ -776,22 +899,70 @@ function ExecutePlaybookModal({
                 <div className="flex items-center space-x-2 mb-2">
                   {result.status === 'completed' && <CheckCircle className="w-5 h-5 text-green-500" />}
                   {result.status === 'failed' && <XCircle className="w-5 h-5 text-red-500" />}
-                  {(result.status === 'running' || result.status === 'pending') && (
-                    <Clock className="w-5 h-5 text-blue-500 animate-pulse" />
+                  {result.status === 'partial' && <AlertTriangle className="w-5 h-5 text-amber-500" />}
+                  {!isTerminal && <Clock className="w-5 h-5 text-blue-500 animate-pulse" />}
+                  <span
+                    className={clsx(
+                      'px-2 py-0.5 text-xs font-medium rounded-full capitalize',
+                      executionStatusColors[result.status] || 'bg-gray-100 text-gray-700'
+                    )}
+                  >
+                    {result.status || 'not available'}
+                  </span>
+                  {!isTerminal && !pollError && (
+                    <span className="text-xs text-gray-500">
+                      step {result.current_step || 0} of {result.total_steps || 0}, polling...
+                    </span>
                   )}
-                  <span className="font-medium capitalize">{result.status}</span>
                 </div>
                 <p className="text-sm text-gray-500">Execution ID: {result.id}</p>
+                <p className="text-xs text-gray-500 mt-1">
+                  Started {formatTime(result.started_at)} · Finished {formatTime(result.completed_at)}
+                </p>
+                {result.status === 'partial' && (
+                  <p className="text-sm text-amber-800 mt-2">{PARTIAL_EXPLANATION}</p>
+                )}
                 {result.error_message && (
                   <p className="text-sm text-red-600 mt-2">{result.error_message}</p>
                 )}
               </div>
+
+              {pollError ? (
+                <div className="space-y-2">
+                  <LoadErrorBanner what="the execution status" error={pollError} />
+                  <button
+                    onClick={() => {
+                      setPollError(null)
+                      setPollNonce((n) => n + 1)
+                    }}
+                    className="text-sm text-blue-600 hover:text-blue-700"
+                  >
+                    Retry polling
+                  </button>
+                </div>
+              ) : null}
+
+              <div>
+                <h4 className="text-sm font-medium text-gray-900 mb-2">Steps</h4>
+                {steps.length === 0 ? (
+                  <p className="text-sm text-gray-500">
+                    {isTerminal ? 'No step results were recorded.' : 'No step has finished yet.'}
+                  </p>
+                ) : (
+                  <div className="space-y-2">
+                    {steps.map((step, i) => (
+                      <StepResultRow key={`${step.step ?? i}-${i}`} step={step} />
+                    ))}
+                  </div>
+                )}
+              </div>
+
               <div className="flex justify-end">
                 <button
                   onClick={onExecuted}
                   className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
                 >
-                  Done
+                  {isTerminal ? 'Done' : 'Close (run continues)'}
                 </button>
               </div>
             </>

@@ -127,7 +127,8 @@ export default function Dashboard() {
         capture('Incident stats', EMPTY_INCIDENT_STATS)(incidentsApi.getStats()),
         capture('Recent alerts', { items: [], total: 0 })(alertsApi.list({ size: 5 })),
         capture('Recent incidents', { items: [], total: 0 })(incidentsApi.list({ size: 5 })),
-        capture('IOC count', { total: 0 })(iocsApi.list({ size: 1 })),
+        // "Active indicators": without status=active the backend also counts inactive rows.
+        capture('IOC count', { total: 0 })(iocsApi.list({ size: 1, status: 'active' })),
         capture('Playbook count', { total: 0 })(playbooksApi.list({ size: 1 })),
       ]);
 

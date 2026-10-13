@@ -32,9 +32,11 @@ import {
   ChevronDown,
 } from 'lucide-react';
 import clsx from 'clsx';
+import { Link } from 'react-router-dom';
 import { api } from '../api/client';
 import LoadErrorBanner from '../components/LoadErrorBanner';
 import { describeLoadError } from '../lib/loadError';
+import ActionErrorBanner from '../components/ActionErrorBanner';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -84,6 +86,11 @@ interface AutomationRule {
   cooldown_minutes: number;
   execution_count: number;
   last_triggered_at: string | null;
+  /** `active` while the evaluator runs it; `unsupported` once it stopped (see unsupported_reason). */
+  evaluation_status?: string | null;
+  unsupported_reason?: string | null;
+  /** The evaluator's per-rule cursor: when it last looked for new events. */
+  last_evaluated_at?: string | null;
   created_at: string;
 }
 
@@ -147,7 +154,6 @@ const KANBAN_COLUMNS = [
   { key: 'review', label: 'Review' },
   { key: 'closed', label: 'Closed' },
 ];
-const TRIGGER_TYPES = ['siem_alert', 'incident_created', 'ticket_status_change', 'manual'];
 
 const PAGE_SIZE = 15;
 
@@ -691,6 +697,64 @@ function KanbanCard({
 // Automation Rule Modal
 // ---------------------------------------------------------------------------
 
+/**
+ * What the beat evaluator can run (src/tickethub/rules.py). `manual` was
+ * removed (it has no triggering event, the API answers 501), and so were
+ * `run_playbook` / `create_ticket` actions. `siem_alert` / `alert` are
+ * stored aliases of `alert_created`.
+ */
+const RULE_TRIGGERS: { value: string; label: string }[] = [
+  { value: 'alert_created', label: 'Alert created' },
+  { value: 'incident_created', label: 'Incident created' },
+  { value: 'ticket_status_change', label: 'Ticket status change' },
+];
+
+const RULE_ACTIONS_BY_TRIGGER: Record<string, string[]> = {
+  alert_created: ['set_status', 'assign', 'add_tag', 'notify', 'block_ip', 'isolate_host'],
+  incident_created: ['set_status', 'assign', 'add_tag', 'notify'],
+  ticket_status_change: ['set_status', 'assign', 'notify'],
+};
+
+const RULE_CONDITION_FIELDS: Record<string, string[]> = {
+  alert_created: [
+    'severity', 'status', 'source', 'category', 'alert_type', 'hostname',
+    'source_ip', 'destination_ip', 'username', 'domain', 'title_contains',
+  ],
+  incident_created: ['severity', 'status', 'incident_type', 'priority', 'title_contains'],
+  ticket_status_change: ['source_type', 'from_status', 'to_status'],
+};
+
+/** The one parameter each action takes (null: none). */
+const RULE_ACTION_PARAM: Record<string, { key: string; label: string; required: boolean } | null> = {
+  set_status: { key: 'value', label: 'Status', required: true },
+  assign: { key: 'user_id', label: 'User ID', required: true },
+  add_tag: { key: 'tag', label: 'Tag', required: true },
+  notify: { key: 'message', label: 'Message (optional)', required: false },
+  block_ip: null,
+  isolate_host: null,
+};
+
+const RULE_ACTION_LABELS: Record<string, string> = {
+  set_status: 'Set status',
+  assign: 'Assign',
+  add_tag: 'Add tag',
+  notify: 'Notify',
+  block_ip: 'Block source IP (admin approval)',
+  isolate_host: 'Isolate host (admin approval)',
+};
+
+interface RuleActionRow {
+  type: string;
+  param: string;
+}
+
+interface CreateRulePayload {
+  name: string;
+  trigger_type: string;
+  trigger_conditions: Record<string, unknown>;
+  actions: Record<string, string>[];
+}
+
 function CreateRuleModal({
   onClose,
   onSubmit,
@@ -698,28 +762,71 @@ function CreateRuleModal({
   error,
 }: {
   onClose: () => void;
-  onSubmit: (data: {
-    name: string;
-    trigger_type: string;
-    conditions: string;
-    actions: string;
-  }) => void;
+  onSubmit: (data: CreateRulePayload) => void;
   isPending: boolean;
   error?: unknown;
 }) {
   const [name, setName] = useState('');
-  const [triggerType, setTriggerType] = useState(TRIGGER_TYPES[0]);
+  const [triggerType, setTriggerType] = useState(RULE_TRIGGERS[0].value);
   const [conditions, setConditions] = useState('{}');
-  const [actions, setActions] = useState('{}');
+  const [actions, setActions] = useState<RuleActionRow[]>([{ type: 'notify', param: '' }]);
+  const [localError, setLocalError] = useState<string | null>(null);
+
+  const allowedActions = RULE_ACTIONS_BY_TRIGGER[triggerType] ?? [];
+
+  const changeTrigger = (value: string) => {
+    setTriggerType(value);
+    const allowed = RULE_ACTIONS_BY_TRIGGER[value] ?? [];
+    setActions((prev) => prev.map((a) => (allowed.includes(a.type) ? a : { type: allowed[0] ?? '', param: '' })));
+  };
+
+  const updateAction = (index: number, patch: Partial<RuleActionRow>) => {
+    setActions((prev) => prev.map((a, i) => (i === index ? { ...a, ...patch } : a)));
+  };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    onSubmit({ name, trigger_type: triggerType, conditions, actions });
+    setLocalError(null);
+    let parsedConditions: unknown;
+    try {
+      parsedConditions = JSON.parse(conditions || '{}');
+    } catch {
+      setLocalError('Conditions is not valid JSON.');
+      return;
+    }
+    if (!parsedConditions || typeof parsedConditions !== 'object' || Array.isArray(parsedConditions)) {
+      setLocalError('Conditions must be a JSON object.');
+      return;
+    }
+    if (actions.length === 0) {
+      setLocalError('Add at least one action; a rule without actions does nothing.');
+      return;
+    }
+    const payloadActions: Record<string, string>[] = [];
+    for (const a of actions) {
+      const spec = RULE_ACTION_PARAM[a.type];
+      const out: Record<string, string> = { type: a.type };
+      if (spec) {
+        const v = a.param.trim();
+        if (spec.required && !v) {
+          setLocalError(`${RULE_ACTION_LABELS[a.type] ?? a.type} needs a ${spec.label.toLowerCase()}.`);
+          return;
+        }
+        if (v) out[spec.key] = v;
+      }
+      payloadActions.push(out);
+    }
+    onSubmit({
+      name,
+      trigger_type: triggerType,
+      trigger_conditions: parsedConditions as Record<string, unknown>,
+      actions: payloadActions,
+    });
   };
 
   return (
     <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-      <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-lg">
+      <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
           <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
             Create Automation Rule
@@ -747,19 +854,22 @@ function CreateRuleModal({
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-              Trigger Type
+              Trigger
             </label>
             <select
               value={triggerType}
-              onChange={(e) => setTriggerType(e.target.value)}
+              onChange={(e) => changeTrigger(e.target.value)}
               className="w-full rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-sm text-gray-900 dark:text-white p-2 focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             >
-              {TRIGGER_TYPES.map((t) => (
-                <option key={t} value={t}>
-                  {t.replace(/_/g, ' ')}
+              {RULE_TRIGGERS.map((t) => (
+                <option key={t.value} value={t.value}>
+                  {t.label}
                 </option>
               ))}
             </select>
+            <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+              Rules are evaluated by a background job over new events; they never fire on history.
+            </p>
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
@@ -768,26 +878,75 @@ function CreateRuleModal({
             <textarea
               value={conditions}
               onChange={(e) => setConditions(e.target.value)}
-              rows={4}
+              rows={3}
               className="w-full rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-sm text-gray-900 dark:text-white p-2 font-mono resize-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             />
+            <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+              Supported fields: {(RULE_CONDITION_FIELDS[triggerType] ?? []).join(', ')}. Values are a string,
+              a number or a list of them.
+            </p>
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-              Actions (JSON)
-            </label>
-            <textarea
-              value={actions}
-              onChange={(e) => setActions(e.target.value)}
-              rows={4}
-              className="w-full rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-sm text-gray-900 dark:text-white p-2 font-mono resize-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-            />
+            <div className="flex items-center justify-between mb-1">
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">Actions</label>
+              <button
+                type="button"
+                onClick={() => setActions((prev) => [...prev, { type: allowedActions[0] ?? '', param: '' }])}
+                disabled={actions.length >= 10}
+                className="text-xs text-blue-600 hover:text-blue-700 disabled:opacity-50"
+              >
+                + Add action
+              </button>
+            </div>
+            <div className="space-y-2">
+              {actions.map((a, i) => {
+                const spec = RULE_ACTION_PARAM[a.type];
+                return (
+                  <div key={i} className="flex items-center gap-2">
+                    <select
+                      value={a.type}
+                      onChange={(e) => updateAction(i, { type: e.target.value, param: '' })}
+                      className="flex-1 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-sm text-gray-900 dark:text-white p-2"
+                    >
+                      {allowedActions.map((t) => (
+                        <option key={t} value={t}>
+                          {RULE_ACTION_LABELS[t] ?? t}
+                        </option>
+                      ))}
+                    </select>
+                    {spec ? (
+                      <input
+                        type="text"
+                        value={a.param}
+                        onChange={(e) => updateAction(i, { param: e.target.value })}
+                        placeholder={spec.label}
+                        className="flex-1 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-sm text-gray-900 dark:text-white p-2"
+                      />
+                    ) : (
+                      <span className="flex-1 text-xs text-gray-500 dark:text-gray-400">
+                        Target taken from the alert
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setActions((prev) => prev.filter((_, j) => j !== i))}
+                      className="p-1 text-gray-400 hover:text-red-600"
+                      title="Remove action"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
           </div>
-          {!!error && (
+          {localError && (
             <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
-              Could not create rule. {describeLoadError(error)}
+              {localError}
             </div>
           )}
+          {/* 501 not_implemented / 400 invalid_rule carry the server's reason. */}
+          <ActionErrorBanner what="create rule" error={error} />
           <div className="flex justify-end gap-2 pt-2">
             <button
               type="button"
@@ -811,6 +970,164 @@ function CreateRuleModal({
 }
 
 // ---------------------------------------------------------------------------
+// Rule firings drawer
+// ---------------------------------------------------------------------------
+
+const FIRING_RESULTS: Record<string, { label: string; className: string }> = {
+  success: { label: 'Success', className: 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300' },
+  queued_for_approval: { label: 'Queued for approval', className: 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300' },
+  detection_only: { label: 'Detection only', className: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300' },
+  awaiting_integration: { label: 'Awaiting integration', className: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300' },
+  manual_required: { label: 'Manual action required', className: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300' },
+  failed: { label: 'Failed', className: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300' },
+};
+
+interface RuleFiring {
+  id: string;
+  target_type: string;
+  target_id: string;
+  event_id: string;
+  action: string;
+  result: string;
+  error: string | null;
+  detail: Record<string, unknown> | null;
+  fired_at: string;
+}
+
+interface RuleFiringsResponse {
+  items: RuleFiring[];
+  total: number;
+  page: number;
+  size: number;
+  execution_count: number;
+  evaluation_status: string | null;
+  unsupported_reason: string | null;
+}
+
+const FIRINGS_PAGE_SIZE = 50;
+
+function RuleFiringsDrawer({ rule, onClose }: { rule: AutomationRule; onClose: () => void }) {
+  const [resultFilter, setResultFilter] = useState('');
+  const [firingsPage, setFiringsPage] = useState(1);
+  const { data, isLoading, error } = useQuery<RuleFiringsResponse>({
+    queryKey: ['ruleFirings', rule.id, resultFilter, firingsPage],
+    queryFn: async () => {
+      const res = await api.get(`/tickethub/automation/rules/${rule.id}/firings`, {
+        params: { page: firingsPage, size: FIRINGS_PAGE_SIZE, ...(resultFilter ? { result: resultFilter } : {}) },
+      });
+      return res.data;
+    },
+  });
+  const items = data?.items ?? [];
+  const total = data?.total ?? 0;
+  const pages = Math.max(1, Math.ceil(total / FIRINGS_PAGE_SIZE));
+
+  return (
+    <>
+      <div className="fixed inset-0 bg-black/30 z-40" onClick={onClose} />
+      <div className="fixed right-0 top-0 h-full w-full max-w-xl bg-white dark:bg-gray-800 shadow-xl z-50 flex flex-col">
+        <div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
+          <div>
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Firings: {rule.name}</h3>
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              What the rule actually did, one row per event and action.
+            </p>
+          </div>
+          <button onClick={onClose} className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+        <div className="p-4 border-b border-gray-200 dark:border-gray-700 flex items-center gap-2">
+          <label className="text-sm text-gray-600 dark:text-gray-400">Result</label>
+          <select
+            value={resultFilter}
+            onChange={(e) => {
+              setResultFilter(e.target.value);
+              setFiringsPage(1);
+            }}
+            className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-sm text-gray-900 dark:text-white p-1.5"
+          >
+            <option value="">All</option>
+            {Object.entries(FIRING_RESULTS).map(([k, v]) => (
+              <option key={k} value={k}>
+                {v.label}
+              </option>
+            ))}
+          </select>
+          <span className="ml-auto text-xs text-gray-500 dark:text-gray-400">{data ? `${total} total` : ''}</span>
+        </div>
+        <div className="flex-1 overflow-y-auto p-4 space-y-2">
+          {data?.evaluation_status === 'unsupported' && (
+            <div className="text-sm text-amber-800 dark:text-amber-200 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded p-3">
+              The evaluator stopped running this rule: {data.unsupported_reason || 'not available'}
+            </div>
+          )}
+          {isLoading ? (
+            <Spinner />
+          ) : error ? (
+            <LoadErrorBanner what="rule firings" error={error} />
+          ) : items.length === 0 ? (
+            <EmptyState message="This rule has not fired." />
+          ) : (
+            items.map((f) => {
+              const style = FIRING_RESULTS[f.result] ?? { label: f.result, className: 'bg-gray-100 text-gray-700' };
+              return (
+                <div key={f.id} className="rounded border border-gray-200 dark:border-gray-700 p-3 text-sm">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-medium text-gray-900 dark:text-white">
+                      {RULE_ACTION_LABELS[f.action] ?? f.action}
+                    </span>
+                    <span className={clsx('px-2 py-0.5 rounded-full text-xs font-medium', style.className)}>
+                      {style.label}
+                    </span>
+                  </div>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                    {f.target_type} {f.target_id} · {formatDateTime(f.fired_at)}
+                  </p>
+                  {f.error && <p className="text-xs text-red-600 dark:text-red-400 mt-1">Error: {f.error}</p>}
+                  {f.result === 'queued_for_approval' && (
+                    <p className="text-xs text-blue-700 dark:text-blue-300 mt-1">
+                      Not executed yet: waiting in the{' '}
+                      <Link to="/live-response" className="underline">agent approval queue</Link>.
+                    </p>
+                  )}
+                  {f.detail && Object.keys(f.detail).length > 0 && (
+                    <pre className="text-[11px] text-gray-600 dark:text-gray-400 mt-1 whitespace-pre-wrap break-all">
+                      {JSON.stringify(f.detail)}
+                    </pre>
+                  )}
+                </div>
+              );
+            })
+          )}
+        </div>
+        {total > FIRINGS_PAGE_SIZE && (
+          <div className="p-3 border-t border-gray-200 dark:border-gray-700 flex items-center justify-between text-sm">
+            <button
+              onClick={() => setFiringsPage((p) => Math.max(1, p - 1))}
+              disabled={firingsPage <= 1}
+              className="p-1 rounded disabled:opacity-50"
+            >
+              <ChevronLeft className="w-4 h-4" />
+            </button>
+            <span className="text-gray-500">
+              Page {firingsPage} of {pages}
+            </span>
+            <button
+              onClick={() => setFiringsPage((p) => Math.min(pages, p + 1))}
+              disabled={firingsPage >= pages}
+              className="p-1 rounded disabled:opacity-50"
+            >
+              <ChevronRight className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Main Component
 // ---------------------------------------------------------------------------
 
@@ -830,6 +1147,7 @@ export default function TicketHub() {
 
   // Automation
   const [showCreateRule, setShowCreateRule] = useState(false);
+  const [firingsRule, setFiringsRule] = useState<AutomationRule | null>(null);
 
   // ---------------------------------------------------------------------------
   // Queries
@@ -908,31 +1226,10 @@ export default function TicketHub() {
   });
 
   const createRuleMutation = useMutation({
-    mutationFn: async (data: {
-      name: string;
-      trigger_type: string;
-      conditions: string;
-      actions: string;
-    }) => {
-      // Invalid JSON is refused, not silently replaced with an empty object.
-      let parsedConditions: Record<string, unknown>;
-      let parsedActions: Record<string, unknown>;
-      try {
-        parsedConditions = JSON.parse(data.conditions);
-      } catch {
-        throw new Error('Conditions is not valid JSON');
-      }
-      try {
-        parsedActions = JSON.parse(data.actions);
-      } catch {
-        throw new Error('Actions is not valid JSON');
-      }
-      await api.post('/tickethub/automation/rules', {
-        name: data.name,
-        trigger_type: data.trigger_type,
-        trigger_conditions: parsedConditions,
-        actions: parsedActions,
-      });
+    mutationFn: async (data: CreateRulePayload) => {
+      // The modal validated the JSON and parameters; the server re-validates
+      // and answers 501 not_implemented / 400 invalid_rule with a reason.
+      await api.post('/tickethub/automation/rules', data);
     },
     onSuccess: () => {
       setShowCreateRule(false);
@@ -1373,11 +1670,8 @@ export default function TicketHub() {
             </button>
           </div>
 
-          {toggleRuleMutation.error && (
-            <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
-              Could not update rule. {describeLoadError(toggleRuleMutation.error)}
-            </div>
-          )}
+          {/* Re-enabling a rule the evaluator cannot run answers 501 with the reason. */}
+          <ActionErrorBanner what="update rule" error={toggleRuleMutation.error} />
 
           {/* Rules Table */}
           <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
@@ -1404,10 +1698,16 @@ export default function TicketHub() {
                         Enabled
                       </th>
                       <th className="text-left p-3 font-medium text-gray-500 dark:text-gray-400">
+                        Evaluation
+                      </th>
+                      <th className="text-left p-3 font-medium text-gray-500 dark:text-gray-400">
                         Executions
                       </th>
                       <th className="text-left p-3 font-medium text-gray-500 dark:text-gray-400">
                         Last Triggered
+                      </th>
+                      <th className="text-left p-3 font-medium text-gray-500 dark:text-gray-400">
+                        Last Evaluated
                       </th>
                       <th className="text-left p-3 font-medium text-gray-500 dark:text-gray-400">
                         Actions
@@ -1459,13 +1759,42 @@ export default function TicketHub() {
                             </span>
                           </button>
                         </td>
+                        <td className="p-3">
+                          {rule.evaluation_status === 'unsupported' ? (
+                            <div className="max-w-xs">
+                              <Badge
+                                text="Not evaluated"
+                                colorClass="bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300"
+                              />
+                              <p className="text-xs text-amber-800 dark:text-amber-300 mt-1">
+                                {rule.unsupported_reason || 'not available'}
+                              </p>
+                            </div>
+                          ) : rule.evaluation_status ? (
+                            <Badge
+                              text={rule.evaluation_status === 'active' ? 'Evaluated' : rule.evaluation_status}
+                              colorClass="bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300"
+                            />
+                          ) : (
+                            <span className="text-xs text-gray-400">not available</span>
+                          )}
+                        </td>
                         <td className="p-3 text-gray-600 dark:text-gray-400">
-                          {rule.execution_count}
+                          {rule.execution_count ?? 'not available'}
                         </td>
                         <td className="p-3 text-gray-500 dark:text-gray-400 whitespace-nowrap">
-                          {formatDateTime(rule.last_triggered_at)}
+                          {rule.last_triggered_at ? formatDateTime(rule.last_triggered_at) : 'never'}
                         </td>
-                        <td className="p-3">
+                        <td className="p-3 text-gray-500 dark:text-gray-400 whitespace-nowrap">
+                          {rule.last_evaluated_at ? formatDateTime(rule.last_evaluated_at) : 'not available'}
+                        </td>
+                        <td className="p-3 whitespace-nowrap">
+                          <button
+                            onClick={() => setFiringsRule(rule)}
+                            className="text-xs font-medium px-2 py-1 rounded text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors mr-1"
+                          >
+                            Firings
+                          </button>
                           <button
                             onClick={() =>
                               toggleRuleMutation.mutate({
@@ -1506,6 +1835,8 @@ export default function TicketHub() {
           />
         </>
       )}
+
+      {firingsRule && <RuleFiringsDrawer rule={firingsRule} onClose={() => setFiringsRule(null)} />}
 
       {/* Create Rule Modal */}
       {showCreateRule && (

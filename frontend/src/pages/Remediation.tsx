@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useMemo } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   AreaChart,
@@ -9,7 +9,6 @@ import {
   YAxis,
   CartesianGrid,
   Tooltip,
-  Legend,
   ResponsiveContainer,
 } from 'recharts';
 import {
@@ -19,37 +18,27 @@ import {
   Clock,
   Activity,
   Plus,
-  Filter,
-  ChevronDown,
   ChevronRight,
-  ChevronLeft,
-  Search,
   ToggleLeft,
   ToggleRight,
-  AlertTriangle,
   Server,
   Lock,
   User,
   FileText,
   Zap,
-  CheckSquare,
-  XSquare,
   Loader,
   Shield,
   Network,
-  Smartphone,
-  Mail,
-  Ticket,
-  Cloud,
-  Globe,
-  Wifi,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
 import { remediationApi } from '../api/endpoints';
+import type { RemediationActionSpec } from '../api/endpoints';
+import { Link } from 'react-router-dom';
 import FormModal from '../components/FormModal';
 import LoadErrorBanner from '../components/LoadErrorBanner';
 import { describeLoadError } from '../lib/loadError';
+import ActionErrorBanner from '../components/ActionErrorBanner';
 
 interface Tab {
   id: string;
@@ -90,24 +79,42 @@ interface Execution {
   created_by: string | null;
   started_at: string | null;
   completed_at: string | null;
+  approval_status?: string | null;
+  error_message?: string | null;
+  rollback_status?: string | null;
+  rolled_back_at?: string | null;
 }
 
+/** GET /remediation/quick-actions rows are RemediationExecutionResponse objects. */
 interface QuickAction {
   id: string;
   trigger_source: string;
   target_entity: string;
   created_at: string;
   status: string;
+  actions_completed?: any[];
+  error_message?: string | null;
 }
 
+/** An InstalledIntegration row as GET /remediation/integrations returns it. */
 interface Integration {
   id: string;
   name: string;
+  display_name: string;
+  connector_id: string;
+  connector_name: string;
   integration_type: string;
+  category: string;
   vendor: string | null;
+  status: string;
   is_connected: boolean;
   health_status: string;
+  error_message: string | null;
   capabilities: string[];
+  /** Registry action keys this connector executes today. */
+  remediation_actions: string[];
+  /** Keys its category could serve but no connector implementation exists (awaiting_integration). */
+  awaiting_actions: string[];
   last_health_check: string | null;
 }
 
@@ -134,9 +141,14 @@ const statusColors: Record<string, string> = {
   awaiting_approval: 'bg-yellow-100 text-yellow-700',
   awaiting_manual: 'bg-amber-100 text-amber-700',
   awaiting_integration: 'bg-amber-100 text-amber-700',
+  detection_only: 'bg-amber-100 text-amber-700',
+  manual_required: 'bg-amber-100 text-amber-700',
   failed: 'bg-red-100 text-red-700',
   rolled_back: 'bg-purple-100 text-purple-700',
 };
+
+/** Execution statuses an operator resolves by hand (mark complete / failed). */
+const OPERATOR_RESOLVABLE = new Set(['awaiting_manual', 'awaiting_integration', 'detection_only', 'manual_required']);
 
 const triggerIcons: Record<string, React.ReactNode> = {
   alert: <AlertCircle className="w-4 h-4" />,
@@ -180,6 +192,11 @@ export default function Remediation() {
   const [quarantineHost, setQuarantineHost] = useState('');
   const [quarantineFilePath, setQuarantineFilePath] = useState('');
   const [approvalError, setApprovalError] = useState<unknown>(null);
+  const [disableHostname, setDisableHostname] = useState('');
+  const [rollbackError, setRollbackError] = useState<{ id: string; error: unknown } | null>(null);
+  const [rollingBack, setRollingBack] = useState<string | null>(null);
+  const [integrationNotice, setIntegrationNotice] = useState<string | null>(null);
+  const [addIntegrationError, setAddIntegrationError] = useState<unknown>(null);
 
   // Fetch dashboard stats
   const { data: dashboardData, isLoading: dashboardLoading, error: dashboardError } = useQuery({
@@ -196,13 +213,10 @@ export default function Remediation() {
     queryKey: ['remediation-policies', policyTypeFilter, policyEnabledFilter],
     queryFn: async () => {
       const response = await api.get('/remediation/policies', {
-        // Backend Query params are policy_type / enabled_only
-        // (remediation.py list_policies). enabled_only defaults to true
-        // server-side, so "All" and "Disabled" must send false; the
-        // Disabled view is then narrowed client-side.
+        // `enabled` (true/false) filters server-side; omitted lists all.
         params: {
           policy_type: policyTypeFilter || undefined,
-          enabled_only: policyEnabledFilter === 'true',
+          enabled: policyEnabledFilter || undefined,
         },
       });
       return response.data;
@@ -219,14 +233,12 @@ export default function Remediation() {
       const response = await api.get('/remediation/executions', {
         params: {
           status: executionStatusFilter || undefined,
-          trigger_source: executionTriggerFilter || undefined,
+          trigger: executionTriggerFilter || undefined,
         },
       });
       return response.data;
     },
-    // The dashboard's charts and Recent Executions read this list too;
-    // /remediation/dashboard does not return recent executions.
-    enabled: activeTab === 'executions' || activeTab === 'dashboard',
+    enabled: activeTab === 'executions',
   });
 
   // Fetch pending approvals
@@ -293,7 +305,7 @@ export default function Remediation() {
   });
 
   const disableAccountMutation = useMutation({
-    mutationFn: async (data: { username: string; force_password_reset: boolean }) => {
+    mutationFn: async (data: { username: string; force_password_reset: boolean; hostname?: string }) => {
       const response = await api.post('/remediation/disable-account', data);
       return response.data;
     },
@@ -330,8 +342,13 @@ export default function Remediation() {
 
   const handleDisableAccount = () => {
     if (disableUsername.trim()) {
-      disableAccountMutation.mutate({ username: disableUsername, force_password_reset: forcePasswordReset });
+      disableAccountMutation.mutate({
+        username: disableUsername,
+        force_password_reset: forcePasswordReset,
+        ...(disableHostname.trim() ? { hostname: disableHostname.trim() } : {}),
+      });
       setDisableUsername('');
+      setDisableHostname('');
       setForcePasswordReset(false);
     }
   };
@@ -344,32 +361,22 @@ export default function Remediation() {
     }
   };
 
-  // Derive chart data from executions API response
+  // Charts read the backend's aggregates over RemediationExecution rows
+  // (/remediation/dashboard execution_by_day and actions_by_type).
   const executionTimelineData = useMemo(() => {
-    const rawData = Array.isArray(executionsData) ? executionsData : (executionsData?.items || executionsData?.executions || []);
-    const executions: Execution[] = rawData;
-    if (executions.length === 0) return [];
-    const grouped: Record<string, { successful: number; failed: number }> = {};
-    executions.forEach((exec) => {
-      const day = new Date(exec.created_at || "").toLocaleDateString('en-US', { weekday: 'short' });
-      if (!grouped[day]) grouped[day] = { successful: 0, failed: 0 };
-      if (exec.overall_result === 'success' || exec.status === 'completed') grouped[day].successful += 1;
-      else if (exec.overall_result === 'failure' || exec.status === 'failed') grouped[day].failed += 1;
-    });
-    return Object.entries(grouped).map(([date, counts]) => ({ date, ...counts }));
-  }, [executionsData]);
+    const days: any[] = Array.isArray(dashboardData?.execution_by_day) ? dashboardData.execution_by_day : [];
+    return days.map((d) => ({
+      date: d.date,
+      successful: typeof d.success === 'number' ? d.success : 0,
+      failed: typeof d.failure === 'number' ? d.failure : 0,
+      total: typeof d.total === 'number' ? d.total : 0,
+    }));
+  }, [dashboardData]);
 
   const actionTypeData = useMemo(() => {
-    const rawData = Array.isArray(executionsData) ? executionsData : (executionsData?.items || executionsData?.executions || []);
-    const executions: Execution[] = rawData;
-    if (executions.length === 0) return [];
-    const counts: Record<string, number> = {};
-    executions.forEach((exec) => {
-      const type = exec.trigger_source || 'unknown';
-      counts[type] = (counts[type] || 0) + 1;
-    });
-    return Object.entries(counts).map(([type, count]) => ({ type, count }));
-  }, [executionsData]);
+    const rows: any[] = Array.isArray(dashboardData?.actions_by_type) ? dashboardData.actions_by_type : [];
+    return rows.map((r) => ({ type: r.action_type || 'not available', count: r.count ?? 0 }));
+  }, [dashboardData]);
 
   // Render Dashboard Tab
   const renderDashboard = () => {
@@ -390,9 +397,10 @@ export default function Remediation() {
     const successRate = dashboardData?.overall_success_rate ?? dashboardData?.success_rate;
     const avgMinutes = dashboardData?.avg_execution_minutes ?? dashboardData?.avg_remediation_time;
 
-    // /remediation/dashboard has no recent-executions field; the newest
-    // rows come from /remediation/executions (newest first).
-    const recentExecutions: Execution[] = (Array.isArray(executionsData) ? executionsData : []).slice(0, 5);
+    // Newest 10 executions straight from /remediation/dashboard.
+    const recentExecutions: Execution[] = Array.isArray(dashboardData?.recent_executions)
+      ? dashboardData.recent_executions
+      : [];
     const dashboardPolicyNames = new Map<string, string>(
       (Array.isArray(policiesData) ? (policiesData as Policy[]) : []).map((p) => [p.id, p.name]),
     );
@@ -434,7 +442,6 @@ export default function Remediation() {
     return (
       <div className="space-y-6">
         <LoadErrorBanner what="remediation dashboard" error={dashboardError} />
-        <LoadErrorBanner what="executions" error={executionsError} />
         {/* Stats Cards */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {stats.map((stat, idx) => (
@@ -472,8 +479,11 @@ export default function Remediation() {
           {/* Execution Timeline */}
           <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
             <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
-              Execution Timeline (7 Days)
+              Execution Timeline
             </h3>
+            {executionTimelineData.length === 0 && (
+              <p className="text-sm text-gray-500 dark:text-gray-400 mb-2">No executions in the period.</p>
+            )}
             <ResponsiveContainer width="100%" height={300}>
               <AreaChart data={executionTimelineData}>
                 <defs>
@@ -513,6 +523,9 @@ export default function Remediation() {
             <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
               Actions by Type
             </h3>
+            {actionTypeData.length === 0 && (
+              <p className="text-sm text-gray-500 dark:text-gray-400 mb-2">No actions recorded in the period.</p>
+            )}
             <ResponsiveContainer width="100%" height={300}>
               <BarChart data={actionTypeData}>
                 <CartesianGrid strokeDasharray="3 3" />
@@ -606,9 +619,7 @@ export default function Remediation() {
     }
 
     const fetchedPolicies: Policy[] = Array.isArray(policiesData) ? policiesData : (policiesData?.items || policiesData?.policies || []);
-    const allPolicies: Policy[] = policyEnabledFilter === 'false'
-      ? fetchedPolicies.filter((p) => !p.is_enabled)
-      : fetchedPolicies;
+    const allPolicies: Policy[] = fetchedPolicies;
 
     return (
       <div className="space-y-6">
@@ -753,7 +764,9 @@ export default function Remediation() {
                             style={{ width: `${policy.success_rate ?? 0}%` }}
                           />
                         </div>
-                        <span className="text-gray-600 dark:text-gray-400">{policy.success_rate ?? 0}%</span>
+                        <span className="text-gray-600 dark:text-gray-400">
+                          {policy.success_rate === null || policy.success_rate === undefined ? 'not available' : `${policy.success_rate}%`}
+                        </span>
                       </div>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
@@ -797,8 +810,9 @@ export default function Remediation() {
       <div className="space-y-6">
         <LoadErrorBanner what="executions" error={executionsError} />
         <LoadErrorBanner what="pending approvals" error={pendingApprovalsError} />
-        {approvalError ? (
-          <p role="alert" className="text-sm text-red-600 dark:text-red-400">Approve failed. {describeLoadError(approvalError)}</p>
+        <ActionErrorBanner what="approve the execution" error={approvalError} />
+        {rollbackError ? (
+          <ActionErrorBanner what={`roll back execution ${rollbackError.id}`} error={rollbackError.error} />
         ) : null}
         {/* Pending Approvals Section */}
         {pendingApprovals.length > 0 && (
@@ -874,8 +888,10 @@ export default function Remediation() {
           >
             <option value="">All Statuses</option>
             <option value="completed">Completed</option>
-            <option value="running">Running</option>
             <option value="awaiting_approval">Awaiting Approval</option>
+            <option value="detection_only">Detection Only</option>
+            <option value="awaiting_integration">Awaiting Integration</option>
+            <option value="manual_required">Manual Required</option>
             <option value="failed">Failed</option>
             <option value="rolled_back">Rolled Back</option>
           </select>
@@ -918,7 +934,7 @@ export default function Remediation() {
                     Status
                   </th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
-                    Actions
+                    Actuated
                   </th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
                     Duration
@@ -978,8 +994,12 @@ export default function Remediation() {
                           {execution.status}
                         </span>
                       </td>
-                      <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
-                        {execution.actions_completed?.length || 0}/{execution.actions_planned?.length || 0}
+                      <td
+                        className="px-4 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400"
+                        title="Actions that really executed / actions with a recorded result"
+                      >
+                        {(execution.actions_completed || []).filter((a: any) => (a?.status || a?.result) === 'executed').length}
+                        /{execution.actions_completed?.length || 0}
                       </td>
                       <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
                         {execution.started_at && execution.completed_at
@@ -991,7 +1011,33 @@ export default function Remediation() {
                       </td>
                       <td className="px-4 py-4 whitespace-nowrap text-right">
                         <div className="flex items-center justify-end gap-2">
-                          {(execution.status === 'awaiting_manual' || execution.status === 'awaiting_integration') && (
+                          {(execution.actions_completed || []).some((a: any) => a?.reversible) &&
+                            execution.status !== 'rolled_back' && (
+                            <button
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                if (!confirm('Roll back the reversible actions of this execution?')) return;
+                                setRollingBack(execution.id);
+                                setRollbackError(null);
+                                try {
+                                  await api.post(`/remediation/executions/${execution.id}/rollback`, {});
+                                  queryClient.invalidateQueries({ queryKey: ['remediation-executions'] });
+                                  queryClient.invalidateQueries({ queryKey: ['remediation-dashboard'] });
+                                } catch (err) {
+                                  // 409 not_reversible / already_rolled_back come back with the per-action list.
+                                  setRollbackError({ id: execution.id, error: err });
+                                } finally {
+                                  setRollingBack(null);
+                                }
+                              }}
+                              disabled={rollingBack === execution.id}
+                              className="px-2 py-1 text-xs font-medium rounded bg-purple-600 hover:bg-purple-700 text-white transition disabled:opacity-50"
+                              title="Only actions that recorded a revert handle are reversed"
+                            >
+                              {rollingBack === execution.id ? 'Rolling back...' : 'Rollback'}
+                            </button>
+                          )}
+                          {OPERATOR_RESOLVABLE.has(execution.status) && (
                             <>
                               <button
                                 onClick={(e) => {
@@ -1031,6 +1077,13 @@ export default function Remediation() {
                             <h4 className="font-semibold text-gray-900 dark:text-white">
                               Action Results
                             </h4>
+                            <p className="text-xs text-gray-500 dark:text-gray-400">
+                              Overall result: {execution.overall_result || 'not available'}
+                              {execution.rollback_status ? ` · rollback: ${execution.rollback_status}` : ''}
+                            </p>
+                            {execution.error_message && (
+                              <p className="text-sm text-red-600 dark:text-red-400">{execution.error_message}</p>
+                            )}
                             {/* Render the actual actions_completed /
                                 actions_failed arrays from the execution
                                 record. Previously this rendered a
@@ -1051,25 +1104,11 @@ export default function Remediation() {
                                   </p>
                                 );
                               }
-                              const renderItem = (entry: any, ok: boolean, idx: number) => {
-                                const label =
-                                  typeof entry === 'string'
-                                    ? entry
-                                    : [entry?.action_type, entry?.target].filter(Boolean).join(': ') + (entry?.error ? ` (${entry.error})` : '') || JSON.stringify(entry);
-                                return (
-                                  <div key={`${ok ? 'ok' : 'err'}-${idx}`} className="flex items-center gap-2">
-                                    {ok ? (
-                                      <CheckSquare className="w-4 h-4 text-green-600" />
-                                    ) : (
-                                      <XSquare className="w-4 h-4 text-red-600" />
-                                    )}
-                                    <span className="text-sm text-gray-700 dark:text-gray-300">{label}</span>
-                                  </div>
-                                );
-                              };
                               return (
                                 <div className="space-y-2">
-                                  {completed.map((e, i) => renderItem(e, typeof e === 'string' || e?.success !== false, i))}
+                                  {completed.map((e, i) => (
+                                    <ActionResultRow key={i} entry={e} />
+                                  ))}
                                 </div>
                               );
                             })()}
@@ -1104,7 +1143,7 @@ export default function Remediation() {
               <div>
                 <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Block IP</h3>
                 <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-                  Add IP to firewall blocklist
+                  Firewall rule on every enrolled endpoint agent
                 </p>
               </div>
               <Network className="w-8 h-8 text-red-500" />
@@ -1127,6 +1166,9 @@ export default function Remediation() {
                 <option value="24">24 Hours</option>
                 <option value="168">7 Days</option>
               </select>
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                The duration sets the detection IOC expiry; agent firewall rules stay until the execution is rolled back.
+              </p>
               <button
                 onClick={handleBlockIP}
                 disabled={blockIPMutation.isPending || !blockIPValue.trim()}
@@ -1134,9 +1176,8 @@ export default function Remediation() {
               >
                 {blockIPMutation.isPending ? 'Blocking...' : 'Block IP'}
               </button>
-              {blockIPMutation.error ? (
-                <p role="alert" className="text-sm text-red-600 dark:text-red-400">Request failed. {describeLoadError(blockIPMutation.error)}</p>
-              ) : null}
+              <ActionErrorBanner what="block the IP" error={blockIPMutation.error} />
+              <QuickResult data={blockIPMutation.data} />
             </div>
           </div>
 
@@ -1175,9 +1216,8 @@ export default function Remediation() {
               >
                 {isolateHostMutation.isPending ? 'Isolating...' : 'Isolate Host'}
               </button>
-              {isolateHostMutation.error ? (
-                <p role="alert" className="text-sm text-red-600 dark:text-red-400">Request failed. {describeLoadError(isolateHostMutation.error)}</p>
-              ) : null}
+              <ActionErrorBanner what="isolate the host" error={isolateHostMutation.error} />
+              <QuickResult data={isolateHostMutation.data} />
             </div>
           </div>
 
@@ -1189,7 +1229,7 @@ export default function Remediation() {
                   Disable Account
                 </h3>
                 <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-                  Lock user account
+                  Not reversible; needs an identity-provider connector or an agent on the host
                 </p>
               </div>
               <Lock className="w-8 h-8 text-yellow-500" />
@@ -1200,6 +1240,13 @@ export default function Remediation() {
                 placeholder="Enter username"
                 value={disableUsername}
                 onChange={(e) => setDisableUsername(e.target.value)}
+                className="w-full px-3 py-2 border border-gray-200 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500"
+              />
+              <input
+                type="text"
+                placeholder="Hostname (optional, for a local account)"
+                value={disableHostname}
+                onChange={(e) => setDisableHostname(e.target.value)}
                 className="w-full px-3 py-2 border border-gray-200 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500"
               />
               <label className="flex items-center gap-2 cursor-pointer">
@@ -1220,9 +1267,8 @@ export default function Remediation() {
               >
                 {disableAccountMutation.isPending ? 'Disabling...' : 'Disable Account'}
               </button>
-              {disableAccountMutation.error ? (
-                <p role="alert" className="text-sm text-red-600 dark:text-red-400">Request failed. {describeLoadError(disableAccountMutation.error)}</p>
-              ) : null}
+              <ActionErrorBanner what="disable the account" error={disableAccountMutation.error} />
+              <QuickResult data={disableAccountMutation.data} />
             </div>
           </div>
 
@@ -1265,9 +1311,8 @@ export default function Remediation() {
               >
                 {quarantineFileMutation.isPending ? 'Quarantining...' : 'Quarantine File'}
               </button>
-              {quarantineFileMutation.error ? (
-                <p role="alert" className="text-sm text-red-600 dark:text-red-400">Request failed. {describeLoadError(quarantineFileMutation.error)}</p>
-              ) : null}
+              <ActionErrorBanner what="quarantine the file" error={quarantineFileMutation.error} />
+              <QuickResult data={quarantineFileMutation.data} />
             </div>
           </div>
         </div>
@@ -1284,7 +1329,7 @@ export default function Remediation() {
               <thead className="bg-gray-50 dark:bg-gray-700">
                 <tr>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
-                    Type
+                    Action
                   </th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
                     Target
@@ -1293,15 +1338,18 @@ export default function Remediation() {
                     Timestamp
                   </th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
-                    Status
+                    Result
                   </th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-                {(Array.isArray(quickActionsData) ? quickActionsData : (quickActionsData?.recent || [])).map((action: QuickAction, idx: number) => (
-                  <tr key={idx} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition">
+                {(Array.isArray(quickActionsData) ? quickActionsData : []).map((action: QuickAction, idx: number) => {
+                  const step = Array.isArray(action.actions_completed) ? action.actions_completed[0] : undefined;
+                  const stepStatus: string | undefined = step?.status || step?.result || undefined;
+                  return (
+                  <tr key={idx} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition align-top">
                     <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-white">
-                      {action.trigger_source}
+                      {step?.action_type || 'not available'}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
                       {action.target_entity}
@@ -1309,18 +1357,20 @@ export default function Remediation() {
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
                       {action.created_at ? new Date(action.created_at || "").toLocaleString() : '-'}
                     </td>
-                    <td className="px-6 py-4 whitespace-nowrap">
-                      <span
-                        className={clsx(
-                          'inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium',
-                          statusColors[action.status] || 'bg-gray-100 text-gray-700'
-                        )}
-                      >
-                        {action.status}
-                      </span>
+                    <td className="px-6 py-4">
+                      <div className="space-y-1 max-w-sm">
+                        <ActionStatusChip status={stepStatus} />
+                        <ActionStateDetail
+                          status={stepStatus}
+                          detail={step?.detail}
+                          missingDependency={step?.missing_dependency}
+                          error={step?.error || action.error_message}
+                        />
+                      </div>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -1340,6 +1390,18 @@ export default function Remediation() {
     return (
       <div className="space-y-6">
         <LoadErrorBanner what="integrations" error={integrationsError} />
+        {integrationNotice && (
+          <div role="status" className="text-sm text-blue-800 dark:text-blue-200 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded p-3 flex justify-between gap-2">
+            <span>{integrationNotice}</span>
+            <button onClick={() => setIntegrationNotice(null)} className="text-xs underline">Dismiss</button>
+          </div>
+        )}
+        {!integrationsLoading && !integrationsError && integrations.length === 0 && (
+          <p className="text-sm text-gray-500 dark:text-gray-400">
+            No integrations installed. Containment then runs only through enrolled endpoint agents; actions
+            nothing covers report awaiting integration or detection only.
+          </p>
+        )}
         {/* Action Buttons */}
         <div className="flex flex-col sm:flex-row gap-4">
           <button
@@ -1361,57 +1423,76 @@ export default function Remediation() {
               <div className="flex items-start justify-between mb-4">
                 <div>
                   <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
-                    {integration.name}
+                    {integration.display_name || integration.name || 'not available'}
                   </h3>
                   <p className="text-sm text-gray-600 dark:text-gray-400">
-                    {integration.vendor}
+                    {integration.connector_name || integration.connector_id || 'not available'}
+                    {integration.vendor ? ` · ${integration.vendor}` : ''}
                   </p>
                 </div>
-                <div className="flex items-center gap-2">
-                  <div
-                    className={clsx(
-                      'w-3 h-3 rounded-full',
-                      integration.is_connected
-                        ? 'bg-green-500'
-                        : integration.health_status === 'error'
-                          ? 'bg-red-500'
+                <div
+                  className={clsx(
+                    'w-3 h-3 rounded-full',
+                    integration.health_status === 'healthy'
+                      ? 'bg-green-500'
+                      : integration.health_status === 'unhealthy' || integration.health_status === 'error'
+                        ? 'bg-red-500'
+                        : integration.health_status === 'degraded'
+                          ? 'bg-amber-500'
                           : 'bg-gray-400'
-                    )}
-                  />
-                </div>
+                  )}
+                  title={`health: ${integration.health_status || 'not available'}`}
+                />
               </div>
 
-              <div className="mb-4">
+              <div className="mb-4 flex flex-wrap gap-2">
                 <span
                   className={clsx(
                     'inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border',
                     integrationTypeColors[integration.integration_type] || 'bg-gray-100 text-gray-700'
                   )}
                 >
-                  {integration.integration_type}
+                  {integration.category || integration.integration_type || 'not available'}
+                </span>
+                <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300">
+                  status: {integration.status || 'not available'}
+                </span>
+                <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300">
+                  health: {integration.health_status || 'not available'}
                 </span>
               </div>
 
-              <div className="mb-4">
-                <h4 className="text-sm font-semibold text-gray-900 dark:text-white mb-2">
-                  Capabilities
-                </h4>
-                <div className="flex flex-wrap gap-1">
-                  {integration.capabilities.map((cap, capIdx) => (
-                    <span
-                      key={capIdx}
-                      className="inline-flex items-center px-2 py-1 rounded text-xs bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300"
-                    >
-                      {cap}
-                    </span>
-                  ))}
-                </div>
+              <div className="mb-4 space-y-2">
+                <h4 className="text-sm font-semibold text-gray-900 dark:text-white">Remediation actions</h4>
+                {(integration.remediation_actions || []).length === 0 && (integration.awaiting_actions || []).length === 0 ? (
+                  <p className="text-xs text-gray-500 dark:text-gray-400">This connector executes no remediation action.</p>
+                ) : (
+                  <div className="flex flex-wrap gap-1">
+                    {(integration.remediation_actions || []).map((a) => (
+                      <span key={`ok-${a}`} className="inline-flex items-center px-2 py-1 rounded text-xs bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300">
+                        {a}
+                      </span>
+                    ))}
+                    {(integration.awaiting_actions || []).map((a) => (
+                      <span
+                        key={`aw-${a}`}
+                        className="inline-flex items-center px-2 py-1 rounded text-xs bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300"
+                        title="Its category could serve this action, but PySOAR has no connector implementation: runs report awaiting_integration"
+                      >
+                        {a}: awaiting integration
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
 
-              <div className="mb-4 pb-4 border-b border-gray-200 dark:border-gray-700">
+              <div className="mb-4 pb-4 border-b border-gray-200 dark:border-gray-700 space-y-1">
                 <p className="text-xs text-gray-600 dark:text-gray-400">
                   Last health check: {integration.last_health_check ? new Date(integration.last_health_check || "").toLocaleString() : 'Never'}
                 </p>
+                {integration.error_message && (
+                  <p className="text-xs text-red-600 dark:text-red-400">{integration.error_message}</p>
+                )}
               </div>
 
               {integrationTestResults[integration.id] && (
@@ -1430,18 +1511,20 @@ export default function Remediation() {
               <button
                 onClick={async () => {
                   try {
+                    // Real probe; success is true only for a healthy verdict.
                     const res = await api.post(
-                      `/integrations/installed/${integration.id}/test`,
+                      `/remediation/integrations/${integration.id}/test`,
                       {}
                     );
                     setIntegrationTestResults((prev) => ({
                       ...prev,
                       [integration.id]: {
-                        ok: true,
-                        message: `Connection test: ${res.data?.status || 'completed'}`,
+                        ok: res.data?.success === true,
+                        message: `${res.data?.status || 'not available'}: ${res.data?.message || 'no message'}`,
                       },
                     }));
-                  } catch (err: any) {
+                    queryClient.invalidateQueries({ queryKey: ['remediation-integrations'] });
+                  } catch (err) {
                     setIntegrationTestResults((prev) => ({
                       ...prev,
                       [integration.id]: {
@@ -1455,6 +1538,24 @@ export default function Remediation() {
               >
                 Test Connection
               </button>
+              {integration.status === 'configuring' && (
+                <button
+                  onClick={async () => {
+                    try {
+                      await api.post(`/integrations/installed/${integration.id}/enable`, {});
+                      queryClient.invalidateQueries({ queryKey: ['remediation-integrations'] });
+                    } catch (err) {
+                      setIntegrationTestResults((prev) => ({
+                        ...prev,
+                        [integration.id]: { ok: false, message: `Enable failed: ${describeLoadError(err)}` },
+                      }));
+                    }
+                  }}
+                  className="w-full mt-2 px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition text-sm"
+                >
+                  Enable
+                </button>
+              )}
             </div>
           ))}
         </div>
@@ -1519,91 +1620,13 @@ export default function Remediation() {
 
       {/* Create Policy Modal */}
       {showCreatePolicyModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50" onClick={() => setShowCreatePolicyModal(false)}>
-          <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-lg mx-4 max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
-            <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700 flex justify-between items-center">
-              <h2 className="text-lg font-semibold">Create Remediation Policy</h2>
-              <button onClick={() => setShowCreatePolicyModal(false)} className="text-gray-400 hover:text-gray-600">✕</button>
-            </div>
-            <form className="p-6 space-y-4" onSubmit={async (e) => {
-              e.preventDefault();
-              const fd = new FormData(e.currentTarget);
-              try {
-                // Previous payload sent `enabled` (backend expects
-                // `is_enabled`) and `action_type`+`action_config` keys
-                // that the schema drops, leaving the new policy with
-                // an empty actions list — created but non-functional.
-                // Send matching field names + a single concrete action
-                // derived from policy_type so the policy actually runs.
-                const policyType = String(fd.get('policy_type') || 'auto_block');
-                const severity = String(fd.get('severity') || 'critical');
-                await api.post('/remediation/policies', {
-                  name: fd.get('name'),
-                  description: fd.get('description'),
-                  policy_type: policyType,
-                  trigger_type: fd.get('trigger_type'),
-                  trigger_conditions: { severity },
-                  actions: [{ type: policyType, params: {} }],
-                  is_enabled: true,
-                  priority: 50,
-                  cooldown_minutes: 15,
-                });
-                setShowCreatePolicyModal(false);
-                queryClient.invalidateQueries({ queryKey: ['remediation-policies'] });
-              } catch (err: any) {
-                console.error('Create policy failed:', err);
-                alert(`Create policy failed: ${err?.response?.data?.detail || err?.message || 'unknown error'}`);
-              }
-            }}>
-              <div>
-                <label className="block text-sm font-medium mb-1">Policy Name</label>
-                <input name="name" required className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" placeholder="e.g., Auto-block critical threats" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">Description</label>
-                <textarea name="description" rows={2} className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-sm font-medium mb-1">Policy Type</label>
-                  <select name="policy_type" required className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
-                    <option value="auto_block">Auto Block</option>
-                    <option value="auto_isolate">Auto Isolate</option>
-                    <option value="auto_patch">Auto Patch</option>
-                    <option value="auto_disable">Auto Disable</option>
-                    <option value="auto_quarantine">Auto Quarantine</option>
-                    <option value="notification">Notification</option>
-                    <option value="escalation">Escalation</option>
-                    <option value="custom">Custom</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium mb-1">Trigger</label>
-                  <select name="trigger_type" required className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
-                    <option value="alert_severity">Alert Severity</option>
-                    <option value="anomaly_score">Anomaly Score</option>
-                    <option value="threat_intel_match">Threat Intel Match</option>
-                    <option value="vulnerability_score">Vulnerability Score</option>
-                    <option value="ueba_risk">UEBA Risk</option>
-                    <option value="detection_rule">Detection Rule</option>
-                  </select>
-                </div>
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">Severity Threshold</label>
-                <select name="severity" className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
-                  <option value="critical">Critical</option>
-                  <option value="high">High</option>
-                  <option value="medium">Medium</option>
-                </select>
-              </div>
-              <div className="flex gap-3 pt-4">
-                <button type="button" onClick={() => setShowCreatePolicyModal(false)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700">Cancel</button>
-                <button type="submit" className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg">Create Policy</button>
-              </div>
-            </form>
-          </div>
-        </div>
+        <CreatePolicyModal
+          onClose={() => setShowCreatePolicyModal(false)}
+          onCreated={() => {
+            setShowCreatePolicyModal(false);
+            queryClient.invalidateQueries({ queryKey: ['remediation-policies'] });
+          }}
+        />
       )}
 
       {/* Add Integration Modal */}
@@ -1617,15 +1640,23 @@ export default function Remediation() {
             <form className="p-6 space-y-4" onSubmit={async (e) => {
               e.preventDefault();
               const fd = new FormData(e.currentTarget);
+              setAddIntegrationError(null);
+              const endpoint = String(fd.get('endpoint') || '').trim();
+              const apiKey = String(fd.get('api_key') || '');
               try {
-                await api.post('/integrations/install', {
+                await api.post('/remediation/integrations', {
                   connector_id: fd.get('connector_id'),
                   display_name: fd.get('display_name'),
-                  config: { api_key: fd.get('api_key'), endpoint: fd.get('endpoint') },
+                  config: endpoint ? { base_url: endpoint } : {},
+                  credentials: apiKey ? { api_key: apiKey } : {},
                 });
                 setShowAddIntegrationModal(false);
+                setIntegrationNotice('Integration installed in the "configuring" state. Test it, then enable it.');
                 queryClient.invalidateQueries({ queryKey: ['remediation-integrations'] });
-              } catch (err: any) { alert(`Add integration failed. ${describeLoadError(err)}`); }
+              } catch (err) {
+                // 400 unknown_connector / 409 already_installed, as sent.
+                setAddIntegrationError(err);
+              }
             }}>
               <div>
                 <label className="block text-sm font-medium mb-1">Integration Type</label>
@@ -1674,6 +1705,7 @@ export default function Remediation() {
                 <label className="block text-sm font-medium mb-1">API Key</label>
                 <input name="api_key" type="password" className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" placeholder="Enter API key" />
               </div>
+              <ActionErrorBanner what="add the integration" error={addIntegrationError} />
               <div className="flex gap-3 pt-4">
                 <button type="button" onClick={() => setShowAddIntegrationModal(false)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700">Cancel</button>
                 <button type="submit" className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg">Connect</button>
@@ -1722,7 +1754,7 @@ export default function Remediation() {
         description={
           markCompleteTarget?.target
             ? `Confirm that remediation on ${markCompleteTarget.target} was completed out of band.`
-            : 'Confirm this awaiting_manual / awaiting_integration execution was completed out of band.'
+            : 'Confirm this execution (awaiting integration, detection only or manual required) was completed out of band.'
         }
         submitLabel="Mark Complete"
         fields={[
@@ -1754,7 +1786,7 @@ export default function Remediation() {
         description={
           markFailedTarget?.target
             ? `Confirm that remediation on ${markFailedTarget.target} will not be completed.`
-            : 'Confirm this awaiting_manual / awaiting_integration execution will not be completed.'
+            : 'Confirm this execution (awaiting integration, detection only or manual required) will not be completed.'
         }
         submitLabel="Mark Failed"
         fields={[
@@ -1789,6 +1821,313 @@ function LoadingState() {
       <div className="text-center">
         <Loader className="w-12 h-12 animate-spin text-blue-600 mx-auto mb-4" />
         <p className="text-gray-600 dark:text-gray-400">Loading...</p>
+      </div>
+    </div>
+  );
+}
+
+/** Honest per-action states (ExecutionActionResult.status). */
+const ACTION_STATUS: Record<string, { label: string; className: string }> = {
+  executed: { label: 'Executed', className: 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300' },
+  queued_for_approval: { label: 'Queued for approval', className: 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300' },
+  detection_only: { label: 'Detection only', className: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300' },
+  awaiting_integration: { label: 'Awaiting integration', className: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300' },
+  manual_required: { label: 'Manual action required', className: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300' },
+  failed: { label: 'Failed', className: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300' },
+};
+
+function ActionStatusChip({ status }: { status: string | null | undefined }) {
+  const s = status || 'not available';
+  const style = ACTION_STATUS[s] ?? { label: s, className: 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300' };
+  return (
+    <span className={clsx('inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium whitespace-nowrap', style.className)}>
+      {style.label}
+    </span>
+  );
+}
+
+/** The state-specific explanation under a step: what is missing, why it failed, where it waits. */
+function ActionStateDetail({
+  status,
+  detail,
+  missingDependency,
+  error,
+}: {
+  status: string | null | undefined;
+  detail?: string | null;
+  missingDependency?: string | null;
+  error?: string | null;
+}) {
+  if (status === 'queued_for_approval') {
+    return (
+      <p className="text-xs text-blue-700 dark:text-blue-300">
+        Not executed yet: the command waits in the{' '}
+        <Link to="/live-response" className="underline">agent approval queue</Link>.
+        {detail ? ` ${detail}` : ''}
+      </p>
+    );
+  }
+  if (status === 'awaiting_integration' || status === 'detection_only' || status === 'manual_required') {
+    return (
+      <p className="text-xs text-amber-800 dark:text-amber-300">
+        Nothing was changed. {missingDependency ? `Missing: ${missingDependency}. ` : ''}
+        {detail || (missingDependency ? '' : 'not available')}
+      </p>
+    );
+  }
+  if (status === 'failed') {
+    return <p className="text-xs text-red-700 dark:text-red-300">Error: {error || detail || 'not available'}</p>;
+  }
+  return detail ? <p className="text-xs text-gray-600 dark:text-gray-400">{detail}</p> : null;
+}
+
+function ActionResultRow({ entry }: { entry: any }) {
+  if (typeof entry === 'string') {
+    return <p className="text-sm text-gray-700 dark:text-gray-300">{entry}</p>;
+  }
+  const status: string | undefined = entry?.status || entry?.result || undefined;
+  return (
+    <div className="rounded border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-800 p-3 space-y-1">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <span className="text-sm font-medium text-gray-900 dark:text-white">
+          {entry?.action_type || 'not available'}
+          {entry?.requested_type && entry.requested_type !== entry.action_type ? ` (requested ${entry.requested_type})` : ''}
+          {entry?.target ? `: ${entry.target}` : ''}
+        </span>
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] text-gray-500 dark:text-gray-400">
+            {entry?.reversible ? 'reversible' : 'not reversible'}
+          </span>
+          <ActionStatusChip status={status} />
+        </div>
+      </div>
+      <ActionStateDetail
+        status={status}
+        detail={entry?.detail}
+        missingDependency={entry?.missing_dependency}
+        error={entry?.error}
+      />
+      <p className="text-[11px] text-gray-400">
+        Path: {entry?.path || 'not available'}
+        {entry?.finished_at ? ` · finished ${new Date(entry.finished_at).toLocaleString()}` : ''}
+      </p>
+    </div>
+  );
+}
+
+/** What a quick action actually did (POST /remediation/<action> response). */
+function QuickResult({ data }: { data: any }) {
+  if (!data) return null;
+  const status: string | undefined = data.containment_status || data.result?.status || undefined;
+  return (
+    <div className="rounded border border-gray-200 dark:border-gray-600 p-3 space-y-1 text-sm">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-gray-700 dark:text-gray-300">Result for {data.target || 'not available'}</span>
+        <ActionStatusChip status={status} />
+      </div>
+      <ActionStateDetail
+        status={status}
+        detail={data.detail}
+        missingDependency={data.missing_dependency}
+        error={data.error_message}
+      />
+      <p className="text-[11px] text-gray-400">
+        Execution {data.execution_id || 'not available'} · status {data.status || 'not available'} ·{' '}
+        {data.reversible ? 'reversible (rollback from Executions)' : 'not reversible'}
+      </p>
+    </div>
+  );
+}
+
+/**
+ * Create Policy: action keys come from the engine's registry
+ * (GET /remediation/actions), never from a hard-coded list; the server
+ * still answers 400 unknown_action for anything outside it.
+ */
+function CreatePolicyModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
+  const { data: registry, isLoading, error: registryError } = useQuery<RemediationActionSpec[]>({
+    queryKey: ['remediation-action-registry'],
+    queryFn: () => remediationApi.getActions(),
+  });
+  const [selected, setSelected] = useState<Record<string, Record<string, string>>>({});
+  const [submitError, setSubmitError] = useState<unknown>(null);
+  const [localError, setLocalError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  const specs: RemediationActionSpec[] = Array.isArray(registry) ? registry : [];
+
+  const toggle = (key: string) => {
+    setSelected((prev) => {
+      const next = { ...prev };
+      if (next[key]) delete next[key];
+      else next[key] = {};
+      return next;
+    });
+  };
+
+  const setParam = (key: string, name: string, value: string) => {
+    setSelected((prev) => ({ ...prev, [key]: { ...(prev[key] || {}), [name]: value } }));
+  };
+
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    setLocalError(null);
+    setSubmitError(null);
+    const fd = new FormData(e.currentTarget);
+    const actions: { type: string; parameters: Record<string, string> }[] = [];
+    for (const spec of specs) {
+      const params = selected[spec.key];
+      if (!params) continue;
+      const parameters: Record<string, string> = {};
+      for (const p of spec.parameters || []) {
+        const v = (params[p.name] || '').trim();
+        if (p.required && !v) {
+          setLocalError(`${spec.label} needs "${p.name}".`);
+          return;
+        }
+        if (v) parameters[p.name] = v;
+      }
+      actions.push({ type: spec.key, parameters });
+    }
+    if (actions.length === 0) {
+      setLocalError('Pick at least one action; a policy without actions does nothing.');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await api.post('/remediation/policies', {
+        name: fd.get('name'),
+        description: fd.get('description') || null,
+        policy_type: String(fd.get('policy_type') || 'custom'),
+        trigger_type: fd.get('trigger_type'),
+        trigger_conditions: { severity: String(fd.get('severity') || 'critical') },
+        actions,
+        requires_approval: fd.get('requires_approval') === 'on',
+        is_enabled: true,
+      });
+      onCreated();
+    } catch (err) {
+      setSubmitError(err);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50" onClick={onClose}>
+      <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-xl mx-4 max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700 flex justify-between items-center">
+          <h2 className="text-lg font-semibold">Create Remediation Policy</h2>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600">✕</button>
+        </div>
+        <form className="p-6 space-y-4" onSubmit={handleSubmit}>
+          <div>
+            <label className="block text-sm font-medium mb-1">Policy Name</label>
+            <input name="name" required className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" placeholder="e.g., Auto-block critical threats" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Description</label>
+            <textarea name="description" rows={2} className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium mb-1">Category</label>
+              <select name="policy_type" required className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                <option value="auto_block">Auto Block</option>
+                <option value="auto_isolate">Auto Isolate</option>
+                <option value="auto_disable">Auto Disable</option>
+                <option value="auto_quarantine">Auto Quarantine</option>
+                <option value="notification">Notification</option>
+                <option value="escalation">Escalation</option>
+                <option value="custom">Custom</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Trigger</label>
+              <select name="trigger_type" required className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                <option value="alert_severity">Alert Severity</option>
+                <option value="anomaly_score">Anomaly Score</option>
+                <option value="threat_intel_match">Threat Intel Match</option>
+                <option value="vulnerability_score">Vulnerability Score</option>
+                <option value="ueba_risk">UEBA Risk</option>
+                <option value="deception_interaction">Deception Interaction</option>
+                <option value="detection_rule">Detection Rule</option>
+                <option value="manual">Manual</option>
+              </select>
+            </div>
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Severity Threshold</label>
+            <select name="severity" className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+              <option value="critical">Critical</option>
+              <option value="high">High</option>
+              <option value="medium">Medium</option>
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Actions</label>
+            {isLoading ? (
+              <p className="text-sm text-gray-500">Loading the action registry...</p>
+            ) : registryError ? (
+              <LoadErrorBanner what="the remediation action registry" error={registryError} />
+            ) : specs.length === 0 ? (
+              <p className="text-sm text-gray-500">The engine reported no executable actions.</p>
+            ) : (
+              <div className="space-y-2">
+                {specs.map((spec) => (
+                  <div key={spec.key} className="rounded border border-gray-200 dark:border-gray-600 p-2">
+                    <label className="flex items-start gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={!!selected[spec.key]}
+                        onChange={() => toggle(spec.key)}
+                        className="mt-1 rounded border-gray-300"
+                      />
+                      <span className="text-sm">
+                        <span className="font-medium">{spec.label}</span>{' '}
+                        <span className="text-xs text-gray-500">({spec.key})</span>
+                        <span className="block text-xs text-gray-500 dark:text-gray-400">
+                          {spec.description || 'No description'} · {spec.reversible ? 'reversible' : 'not reversible'}
+                          {spec.requires_approval ? ' · agent command waits for approval' : ''}
+                        </span>
+                      </span>
+                    </label>
+                    {selected[spec.key] && (spec.parameters || []).length > 0 && (
+                      <div className="mt-2 ml-6 space-y-1">
+                        {spec.parameters.map((p) => (
+                          <input
+                            key={p.name}
+                            value={selected[spec.key]?.[p.name] || ''}
+                            onChange={(e) => setParam(spec.key, p.name, e.target.value)}
+                            placeholder={`${p.name}${p.required ? ' (required)' : ' (optional)'}`}
+                            title={p.description || p.name}
+                            className="w-full border border-gray-300 dark:border-gray-600 rounded px-2 py-1 text-sm bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                          />
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+          <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" name="requires_approval" className="rounded border-gray-300" />
+            Require approval before each run
+          </label>
+          {localError && (
+            <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
+              {localError}
+            </div>
+          )}
+          <ActionErrorBanner what="create the policy" error={submitError} />
+          <div className="flex gap-3 pt-4">
+            <button type="button" onClick={onClose} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700">Cancel</button>
+            <button type="submit" disabled={submitting} className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg disabled:opacity-50">
+              {submitting ? 'Creating...' : 'Create Policy'}
+            </button>
+          </div>
+        </form>
       </div>
     </div>
   );

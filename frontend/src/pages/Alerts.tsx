@@ -16,6 +16,7 @@ import {
   Square,
 } from 'lucide-react';
 import clsx from 'clsx';
+import { describeLoadError } from '../lib/loadError';
 
 const severityColors: Record<string, string> = {
   critical: 'bg-red-100 text-red-700 border-red-200 dark:bg-red-900/30 dark:text-red-300 dark:border-red-900/50',
@@ -52,6 +53,11 @@ export default function Alerts() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [toast, setToast] = useState<Toast | null>(null);
   const [bulkLoading, setBulkLoading] = useState(false);
+  // Per-id outcome of the last POST /alerts/bulk (updated / deleted / not_found / error).
+  const [bulkResult, setBulkResult] = useState<{
+    action: string;
+    results: { id: string; status: string; error?: string }[];
+  } | null>(null);
   const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const showToast = useCallback((type: Toast['type'], text: string) => {
@@ -138,23 +144,32 @@ export default function Alerts() {
     if (selectedIds.size === 0) return;
     if (action === 'delete' && !confirm(`Delete ${selectedIds.size} alert(s)?`)) return;
     setBulkLoading(true);
+    setBulkResult(null);
     try {
       const res = await alertsApi.bulkAction({
         alert_ids: Array.from(selectedIds),
         action,
         value,
       });
-      const ok = res?.success_count ?? selectedIds.size;
-      const failed = res?.failure_count ?? 0;
+      const results: { id: string; status: string; error?: string }[] = Array.isArray(res?.results)
+        ? res.results
+        : [];
+      const ok = results.filter((r) => r.status === 'updated' || r.status === 'deleted').length;
+      const failed = results.length - ok;
+      setBulkResult({ action, results });
       showToast(
-        failed ? 'error' : 'success',
-        failed ? `${ok} updated, ${failed} failed` : `${ok} alert(s) ${action}d`,
+        failed || results.length === 0 ? 'error' : 'success',
+        results.length === 0
+          ? 'Bulk action returned no per-alert results'
+          : failed
+            ? `${ok} succeeded, ${failed} did not`
+            : `${ok} alert(s): ${action} applied`,
       );
-      setSelectedIds(new Set());
+      // Keep the ones that did not succeed selected so they can be retried.
+      setSelectedIds(new Set(results.filter((r) => r.status !== 'updated' && r.status !== 'deleted').map((r) => r.id)));
       fetchAlerts(false);
     } catch (error) {
-      console.error('Bulk action failed:', error);
-      showToast('error', 'Bulk action failed');
+      showToast('error', `Bulk action failed. ${describeLoadError(error)}`);
     } finally {
       setBulkLoading(false);
     }
@@ -282,6 +297,39 @@ export default function Alerts() {
           </div>
         </div>
       </div>
+
+      {/* Per-id result of the last bulk action */}
+      {bulkResult && (
+        <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl p-3 text-sm">
+          <div className="flex items-center justify-between gap-2">
+            <p className="font-medium text-gray-900 dark:text-white">
+              Bulk {bulkResult.action}:{' '}
+              {(['updated', 'deleted', 'not_found', 'error'] as const)
+                .map((st) => [st, bulkResult.results.filter((r) => r.status === st).length] as const)
+                .filter(([, n]) => n > 0)
+                .map(([st, n]) => `${n} ${st.replace('_', ' ')}`)
+                .join(' · ') || 'no per-alert results returned'}
+            </p>
+            <button
+              onClick={() => setBulkResult(null)}
+              className="text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
+            >
+              Dismiss
+            </button>
+          </div>
+          {bulkResult.results.some((r) => r.status !== 'updated' && r.status !== 'deleted') && (
+            <ul className="mt-2 space-y-1 max-h-40 overflow-y-auto">
+              {bulkResult.results
+                .filter((r) => r.status !== 'updated' && r.status !== 'deleted')
+                .map((r) => (
+                  <li key={r.id} className="text-xs text-red-700 dark:text-red-300 font-mono">
+                    {r.id}: {r.status === 'not_found' ? 'not found in your organization' : r.error || r.status}
+                  </li>
+                ))}
+            </ul>
+          )}
+        </div>
+      )}
 
       {/* Bulk action toolbar */}
       {selectedCount > 0 && (
