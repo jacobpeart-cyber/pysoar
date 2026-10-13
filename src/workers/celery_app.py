@@ -63,6 +63,10 @@ celery_app = Celery(
         # CTEM / exposure background pipeline — SIEM-driven asset
         # discovery and attack-surface change detection (snapshot diffing).
         "src.exposure.tasks",
+        # TicketHub automation-rule evaluator (wave 2): matches stored rules
+        # against new alerts / incidents / ticket status changes and records
+        # every firing in automation_rule_firings.
+        "src.tickethub.tasks",
         # Wave 1 (2026-10-12): every other `src/*/tasks.py` module. These
         # were never imported by the worker, so `.delay()` calls from their
         # routes went to a worker that did not know the task name. Included
@@ -200,6 +204,10 @@ celery_app.conf.task_annotations = {
     "src.darkweb.tasks.threat_correlation": dict(_HEAVY_SWEEP_LIMITS),
     "deception.reconcile_honeypot_dispatches": dict(_HEAVY_SWEEP_LIMITS),
     "playbooks.check_scheduled_playbooks": dict(_HEAVY_SWEEP_LIMITS),
+    # Runs every minute with windowed reads and per-run caps (see
+    # src/tickethub/rules.py); the short wall clock keeps one wedged run
+    # (e.g. a hung notification webhook) from overlapping many successors.
+    "tickethub.evaluate_automation_rules": {"soft_time_limit": 240, "time_limit": 300},
     "src.exposure.tasks.run_vuln_scan": dict(_HEAVY_SWEEP_LIMITS),
     "src.exposure.tasks.import_scanner_results": dict(_HEAVY_SWEEP_LIMITS),
     "src.exposure.tasks.calculate_risk_scores": dict(_HEAVY_SWEEP_LIMITS),
@@ -229,6 +237,14 @@ celery_app.conf.beat_schedule = {
     },
     "check-scheduled-playbooks": {
         "task": "playbooks.check_scheduled_playbooks",
+        "schedule": 60.0,  # Every minute
+    },
+    # --- TicketHub automation rules (src.tickethub.tasks) ---
+    # Per organisation, per enabled rule: events created since the rule's
+    # cursor (2 min settle overlap, 24 h max lookback), 200 per read, at most
+    # 1,000 events per rule and 500 rules per run; the remainder is deferred.
+    "tickethub-evaluate-automation-rules": {
+        "task": "tickethub.evaluate_automation_rules",
         "schedule": 60.0,  # Every minute
     },
     # --- Honeypot dispatch reconciliation ---

@@ -64,6 +64,45 @@ class AutomationRule(BaseModel):
     created_by: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     organization_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
 
+    # Evaluator state (wave 2, migration 024). ``evaluation_status`` is
+    # ``active`` while the beat evaluator (src/tickethub/tasks.py) can run the
+    # rule, ``unsupported`` when its trigger / conditions / actions cannot be
+    # evaluated (``unsupported_reason`` says why; the rule never fires).
+    # ``last_evaluated_at`` is the per-rule cursor: each run looks at targets
+    # created after it.
+    evaluation_status: Mapped[str] = mapped_column(
+        String(20), default="active", server_default="active", nullable=False,
+    )
+    unsupported_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    last_evaluated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AutomationRuleFiring(BaseModel):
+    """One action an automation rule executed against one target.
+
+    Written by the evaluator for every (rule, target, action) it fires, with
+    the honest outcome: ``success``, ``failed``, ``awaiting_integration``
+    (nothing configured to carry it out) or ``detection_only`` (containment
+    with no endpoint agent covering the target).
+    """
+
+    __tablename__ = "automation_rule_firings"
+
+    rule_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("automation_rules.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    organization_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    target_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    # The triggering event: the alert / incident id, or the TicketActivity id
+    # of a status change. The evaluator never fires a rule twice per event.
+    event_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    action: Mapped[str] = mapped_column(String(50), nullable=False)
+    result: Mapped[str] = mapped_column(String(30), nullable=False)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    detail: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    fired_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
 
 class TicketLink(BaseModel):
     """Links between tickets across different modules."""

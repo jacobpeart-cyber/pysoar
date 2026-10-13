@@ -27,7 +27,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import and_, select, func
+from sqlalchemy import and_, event, or_, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.alert import Alert
@@ -38,6 +38,9 @@ from src.collaboration.models import WarRoom, ActionItem
 from src.tickethub.models import TicketActivity
 
 logger = logging.getLogger(__name__)
+
+#: Alert-triggered playbooks queued per alert (the rest are logged as skipped).
+MAX_AUTO_PLAYBOOKS_PER_ALERT = 10
 
 
 class AutomationService:
@@ -78,7 +81,7 @@ class AutomationService:
 
         # Step 1: IOC matching
         try:
-            ioc_matches = await self._check_ioc_matches(alert)
+            ioc_matches = await self._check_ioc_matches(alert, org_id)
             results["ioc_matches"] = ioc_matches
             if ioc_matches:
                 logger.info(f"Alert {alert.id} matched {len(ioc_matches)} IOCs - escalated to critical")
@@ -118,9 +121,9 @@ class AutomationService:
             logger.error(f"Auto-incident creation failed for alert {alert.id}: {e}")
             failures.append({"step": "auto_incident", "error": str(e)})
 
-        # Step 4: Auto-trigger playbooks
+        # Step 4: Auto-trigger playbooks (queued as real executions)
         try:
-            triggered = await self._auto_trigger_playbooks(alert)
+            triggered = await self._auto_trigger_playbooks(alert, org_id)
             results["playbooks_triggered"] = triggered
         except Exception as e:
             logger.error(f"Playbook auto-trigger failed for alert {alert.id}: {e}")
@@ -176,7 +179,7 @@ class AutomationService:
                     f"{results.get('iocs_extracted', 0)} IOCs extracted, "
                     f"incident={'yes' if results['incident_created'] else 'no'}, "
                     f"war_room={'yes' if results['war_room_created'] else 'no'}, "
-                    f"{len(results['playbooks_triggered'])} playbooks"
+                    f"{len(results['playbooks_triggered'])} playbook executions queued"
                 ),
                 organization_id=org_id,
             )
@@ -916,8 +919,14 @@ class AutomationService:
     # INTERNAL HELPERS
     # =========================================================================
 
-    async def _check_ioc_matches(self, alert: Alert) -> list[dict]:
-        """Check alert indicators against unified threat_indicators table."""
+    async def _check_ioc_matches(self, alert: Alert, org_id: Optional[str] = None) -> list[dict]:
+        """Check alert indicators against the tenant's threat_indicators.
+
+        Matches the organisation's own indicators plus platform-wide feed
+        intel (``organization_id IS NULL``), never another tenant's. Sighting
+        counters are bumped on the organisation's own rows only.
+        """
+        org_id = org_id or getattr(alert, "organization_id", None)
         indicators = []
         for field in ("source_ip", "destination_ip", "hostname", "domain", "url", "file_hash"):
             val = getattr(alert, field, None)
@@ -932,6 +941,7 @@ class AutomationService:
                 IOC.value.in_(indicators),
                 IOC.is_active == True,  # noqa: E712
                 IOC.is_whitelisted == False,  # noqa: E712
+                or_(IOC.organization_id == org_id, IOC.organization_id.is_(None)),
             )
         )
         matches = result.scalars().all()
@@ -944,6 +954,8 @@ class AutomationService:
             # Bump sighting counters
             now = datetime.now(timezone.utc)
             for m in matches:
+                if m.organization_id != org_id:
+                    continue  # platform feed row: shared, not this tenant's to count
                 m.sighting_count = (m.sighting_count or 0) + 1
                 m.last_sighting_at = now
                 m.last_seen = now
@@ -1272,6 +1284,7 @@ class AutomationService:
             if source:
                 count_result = await self.db.execute(
                     select(func.count(Alert.id)).where(
+                        Alert.organization_id == org_id,
                         Alert.source == source,
                         Alert.created_at >= cutoff,
                     )
@@ -1409,38 +1422,102 @@ class AutomationService:
 
         return war_room
 
-    async def _auto_trigger_playbooks(self, alert: Alert) -> list[str]:
-        """Find and execute matching playbooks for this alert."""
-        try:
-            from src.models.playbook import Playbook
-            result = await self.db.execute(
-                select(Playbook).where(
-                    Playbook.is_enabled == True,
-                    Playbook.trigger_type == "alert",
-                )
+    async def _auto_trigger_playbooks(self, alert: Alert, org_id: Optional[str]) -> list[str]:
+        """Queue real executions of the tenant's alert-triggered playbooks.
+
+        Only enabled, ``active`` playbooks of ``org_id`` with
+        ``trigger_type == "alert"`` whose conditions match are considered (at
+        most ``MAX_AUTO_PLAYBOOKS_PER_ALERT``). Each gets a ``pending``
+        PlaybookExecution that is handed to the Celery runner
+        (``playbooks.run_playbook_execution``) once the caller's transaction
+        commits; the worker reads the row from its own connection, so
+        dispatching earlier would race the commit. Returns the execution ids.
+        """
+        from src.models.playbook import ExecutionStatus, Playbook, PlaybookExecution, PlaybookStatus
+
+        result = await self.db.execute(
+            select(Playbook)
+            .where(
+                Playbook.organization_id == org_id,
+                Playbook.is_enabled.is_(True),
+                Playbook.status == PlaybookStatus.ACTIVE.value,
+                Playbook.trigger_type == "alert",
             )
-            playbooks = result.scalars().all()
+            .order_by(Playbook.created_at.asc()),
+        )
+        playbooks = result.scalars().all()
 
-            triggered = []
-            for pb in playbooks:
-                conditions = {}
-                if pb.trigger_conditions:
-                    if isinstance(pb.trigger_conditions, str):
-                        try:
-                            conditions = json.loads(pb.trigger_conditions)
-                        except Exception:
-                            conditions = {}
-                    elif isinstance(pb.trigger_conditions, dict):
-                        conditions = pb.trigger_conditions
+        execution_ids: list[str] = []
+        for pb in playbooks:
+            conditions: dict = {}
+            if isinstance(pb.trigger_conditions, dict):
+                conditions = pb.trigger_conditions
+            elif pb.trigger_conditions:
+                try:
+                    conditions = json.loads(pb.trigger_conditions)
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(f"Playbook {pb.id} has unparseable trigger_conditions; not auto-triggered")
+                    continue
+            if not isinstance(conditions, dict) or not self._matches_conditions(alert, conditions):
+                continue
+            if len(execution_ids) >= MAX_AUTO_PLAYBOOKS_PER_ALERT:
+                logger.warning(
+                    f"Alert {alert.id} matched more than {MAX_AUTO_PLAYBOOKS_PER_ALERT} playbooks; "
+                    f"playbook {pb.id} not auto-triggered",
+                )
+                continue
+            steps = pb.steps if isinstance(pb.steps, list) else None
+            if steps is None and pb.steps:
+                try:
+                    steps = json.loads(pb.steps)
+                except (json.JSONDecodeError, TypeError):
+                    steps = []
+            execution = PlaybookExecution(
+                playbook_id=pb.id,
+                organization_id=org_id,
+                status=ExecutionStatus.PENDING.value,
+                total_steps=len(steps or []),
+                trigger_source=f"auto_alert:{alert.id}"[:100],
+                input_data=json.dumps({
+                    "alert_id": alert.id,
+                    "alert_title": alert.title,
+                    "alert_severity": alert.severity,
+                    "alert_category": getattr(alert, "category", None),
+                    "alert_source": alert.source,
+                    "source_ip": getattr(alert, "source_ip", None),
+                    "destination_ip": getattr(alert, "destination_ip", None),
+                    "hostname": getattr(alert, "hostname", None),
+                    "username": getattr(alert, "username", None),
+                    "organization_id": org_id,
+                }, default=str),
+            )
+            self.db.add(execution)
+            await self.db.flush()
+            execution_ids.append(execution.id)
+            logger.info(f"Queued playbook '{pb.name}' execution {execution.id} for alert {alert.id}")
 
-                if self._matches_conditions(alert, conditions):
-                    logger.info(f"Auto-triggering playbook '{pb.name}' for alert {alert.id}")
-                    triggered.append(str(pb.id))
+        if execution_ids:
+            self._dispatch_after_commit(list(execution_ids))
+        return execution_ids
 
-            return triggered
-        except Exception as e:
-            logger.error(f"Playbook auto-trigger error: {e}")
-            return []
+    def _dispatch_after_commit(self, execution_ids: list[str]) -> None:
+        """Hand pending executions to the runner once the transaction commits.
+
+        A rollback discards the rows and nothing is dispatched. A broker
+        failure leaves the execution ``pending`` (visible, not reported as
+        run) and is logged.
+        """
+
+        def _dispatch(_session: Any) -> None:
+            from src.playbooks.tasks import run_playbook_execution
+
+            for execution_id in execution_ids:
+                try:
+                    run_playbook_execution.delay(execution_id)
+                except Exception as exc:  # noqa: BLE001 - broker down must not break the commit
+                    logger.error(f"Dispatch of playbook execution {execution_id} failed; left pending: {exc}")
+
+        event.listen(self.db.sync_session, "after_commit", _dispatch, once=True)
 
     def _matches_conditions(self, alert: Alert, conditions: dict) -> bool:
         """Check if alert matches playbook trigger conditions."""

@@ -14,7 +14,7 @@ from src.core.database import async_session_factory
 from src.core.logging import get_logger
 from src.models.alert import Alert, AlertSeverity, AlertStatus
 from src.models.audit import AuditLog
-from src.models.user import UserRole
+from src.models.user import User, UserRole
 from src.schemas.alert import (
     AlertBulkAction,
     AlertCreate,
@@ -184,6 +184,7 @@ async def create_alert(
     try:
         db.add(AuditLog(
             user_id=str(current_user.id) if current_user else None,
+            organization_id=org_id,
             action="alert_create",
             resource_type="alert",
             resource_id=str(alert.id),
@@ -350,6 +351,7 @@ async def update_alert(
     try:
         db.add(AuditLog(
             user_id=str(current_user.id) if current_user else None,
+            organization_id=org_id,
             action="alert_update",
             resource_type="alert",
             resource_id=str(alert.id),
@@ -410,7 +412,16 @@ async def bulk_action(
     """Perform bulk action on alerts.
 
     Supported actions: acknowledge, in_progress, resolve, close, assign, delete.
-    `assign` requires `value` to be set to a user ID. Bulk delete is admin-only.
+    `assign` requires `value` to be an active user of the caller's
+    organisation. Bulk delete is admin-only (403 for analysts; viewers are
+    refused by the role gate).
+
+    Returns per-id ``results`` (``updated`` / ``deleted`` / ``not_found`` /
+    ``error``) plus the legacy ``success_count`` / ``failure_count`` /
+    ``failures`` summary. An id outside the caller's organisation is
+    ``not_found`` (never ``forbidden``) so the response cannot be used to
+    probe other tenants' alert ids. One AuditLog row records the action and
+    every per-id outcome.
     """
     if action_data.action == "delete" and not current_user.is_admin:
         raise HTTPException(
@@ -438,78 +449,98 @@ async def bulk_action(
             detail="A single bulk request may target at most 500 alerts.",
         )
 
-    success_count = 0
-    failures: list[dict] = []
     now_iso = datetime.now(timezone.utc).isoformat()
+    requested = list(dict.fromkeys(action_data.alert_ids))  # de-duplicated, order kept
 
-    for alert_id in action_data.alert_ids:
-        try:
-            result = await db.execute(
-                select(Alert).where(
-                    and_(Alert.id == alert_id, Alert.organization_id == org_id)
-                )
+    if action_data.action == "assign":
+        assignee = await db.execute(
+            select(User.id).where(
+                User.id == action_data.value,
+                User.organization_id == org_id,
+                User.is_active.is_(True),
+            ),
+        )
+        if assignee.scalar_one_or_none() is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "invalid_assignee", "detail": "value must be an active user of your organization"},
             )
-            alert = result.scalar_one_or_none()
 
-            if not alert:
-                failures.append({"id": alert_id, "error": "Not found"})
-                continue
+    # One tenant-scoped read for the whole batch (<= 500 ids). An id that is
+    # not in the caller's organisation reports "not_found" whether or not it
+    # exists elsewhere: the response must not reveal other tenants' ids.
+    found = await db.execute(
+        select(Alert).where(Alert.id.in_(requested), Alert.organization_id == org_id),
+    )
+    alerts_by_id = {a.id: a for a in found.scalars().all()}
 
-            if action_data.action == "acknowledge":
-                alert.status = AlertStatus.ACKNOWLEDGED.value
-            elif action_data.action == "in_progress":
-                alert.status = AlertStatus.IN_PROGRESS.value
-            elif action_data.action == "close":
-                alert.status = AlertStatus.CLOSED.value
-                if not alert.resolved_at:
+    results: list[dict] = []
+    for alert_id in requested:
+        alert = alerts_by_id.get(alert_id)
+        if alert is None:
+            results.append({"id": alert_id, "status": "not_found"})
+            continue
+        try:
+            async with db.begin_nested():
+                if action_data.action == "acknowledge":
+                    alert.status = AlertStatus.ACKNOWLEDGED.value
+                elif action_data.action == "in_progress":
+                    alert.status = AlertStatus.IN_PROGRESS.value
+                elif action_data.action == "close":
+                    alert.status = AlertStatus.CLOSED.value
+                    if not alert.resolved_at:
+                        alert.resolved_at = now_iso
+                elif action_data.action == "assign":
+                    alert.assigned_to = action_data.value
+                elif action_data.action == "resolve":
+                    alert.status = AlertStatus.RESOLVED.value
                     alert.resolved_at = now_iso
-            elif action_data.action == "assign":
-                alert.assigned_to = action_data.value
-            elif action_data.action == "resolve":
-                alert.status = AlertStatus.RESOLVED.value
-                alert.resolved_at = now_iso
-            elif action_data.action == "delete":
-                await db.delete(alert)
-
-            success_count += 1
-
-        except Exception as e:
-            failures.append({"id": alert_id, "error": str(e)})
+                elif action_data.action == "delete":
+                    await db.delete(alert)
+            results.append(
+                {"id": alert_id, "status": "deleted" if action_data.action == "delete" else "updated"}
+            )
+        except Exception as exc:  # per-id failure is reported, the rest proceed
+            logger.warning("alert_bulk_item_failed", alert_id=alert_id, action=action_data.action, error=str(exc))
+            results.append({"id": alert_id, "status": "error", "error": str(exc)})
 
     await db.flush()
 
-    # Audit: one summary row per bulk action. Recording one row per
-    # touched alert would blow up the audit_logs table on big bulk
-    # ops (N up to 500), so we keep the fan-out small by writing one
-    # row describing the action and the full ID list.
-    try:
-        db.add(AuditLog(
-            user_id=str(current_user.id) if current_user else None,
-            action=f"alert_bulk_{action_data.action}",
-            resource_type="alert",
-            resource_id=None,
-            description=(
-                f"Bulk {action_data.action} on {success_count}/{len(action_data.alert_ids)} alerts"
-                + (f" (value={action_data.value})" if action_data.value else "")
-            ),
-            new_value=json.dumps({
-                "action": action_data.action,
-                "value": action_data.value,
-                "alert_ids": action_data.alert_ids,
-                "success_count": success_count,
-                "failure_count": len(failures),
-                "failures": failures,
-            }, default=str),
-            ip_address=(request.client.host if request and request.client else None),
-            user_agent=(request.headers.get("user-agent") if request else None),
-            success=(len(failures) == 0),
-        ))
-        await db.flush()
-    except Exception as _e:
-        import logging as _logging
-        _logging.getLogger(__name__).warning(f"Failed to write audit_log for alert_bulk: {_e}")
+    succeeded = [r["id"] for r in results if r["status"] in ("updated", "deleted")]
+    failures = [
+        {"id": r["id"], "error": r.get("error") or r["status"]}
+        for r in results
+        if r["status"] not in ("updated", "deleted")
+    ]
+    success_count = len(succeeded)
+
+    # Audit: one summary row per bulk action carrying the per-id outcome.
+    # Recording one row per touched alert would blow up the audit_logs table
+    # on big bulk ops (N up to 500).
+    db.add(AuditLog(
+        user_id=str(current_user.id),
+        organization_id=org_id,
+        action=f"alert_bulk_{action_data.action}",
+        resource_type="alert",
+        resource_id=None,
+        description=(
+            f"Bulk {action_data.action} on {success_count}/{len(requested)} alerts"
+            + (f" (value={action_data.value})" if action_data.value else "")
+        ),
+        new_value=json.dumps({
+            "action": action_data.action,
+            "value": action_data.value,
+            "results": results,
+        }, default=str),
+        ip_address=(request.client.host if request and request.client else None),
+        user_agent=(request.headers.get("user-agent") if request else None),
+        success=(len(failures) == 0),
+    ))
+    await db.flush()
 
     return {
+        "action": action_data.action,
+        "results": results,
         "success_count": success_count,
         "failure_count": len(failures),
         "failures": failures,

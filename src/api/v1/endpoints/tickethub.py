@@ -6,12 +6,26 @@ from datetime import datetime, timezone
 from typing import Optional, List
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
-from sqlalchemy import select, func, desc
+from sqlalchemy import delete, desc, func, select
 
 from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
 from src.models.user import UserRole
-from src.tickethub.models import TicketComment, TicketActivity, AutomationRule, TicketLink
+from src.tickethub.models import (
+    AutomationRule,
+    AutomationRuleFiring,
+    TicketActivity,
+    TicketComment,
+    TicketLink,
+)
 from src.tickethub.engine import TicketAggregator
+from src.tickethub.rules import (
+    RuleInvalidError,
+    RuleSpec,
+    RuleUnsupportedError,
+    get_scoped_ticket,
+    parse_rule,
+    ticket_model_for,
+)
 
 router = APIRouter(prefix="/tickethub", tags=["ticket-hub"])
 
@@ -425,6 +439,49 @@ async def list_automation_rules(
     return list(result.scalars().all())
 
 
+def _validated_rule(trigger_type, trigger_conditions, actions) -> RuleSpec:
+    """Validate a rule the evaluator must be able to run, or refuse it.
+
+    501 ``not_implemented`` when the trigger / condition / action cannot be
+    evaluated by the platform (the rule would never do anything), 400
+    ``invalid_rule`` when the input is malformed.
+    """
+    try:
+        return parse_rule(trigger_type, trigger_conditions, actions)
+    except RuleUnsupportedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail={"error": "not_implemented", "reason": exc.reason},
+        ) from exc
+    except RuleInvalidError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "invalid_rule", "reason": exc.reason},
+        ) from exc
+
+
+def _int_field(data: dict, key: str) -> int:
+    try:
+        return int(data.get(key) or 0)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400, detail={"error": "invalid_rule", "reason": f"{key} must be an integer"}
+        ) from exc
+
+
+async def _get_rule_or_404(db, rule_id: str, org_id: str) -> AutomationRule:
+    result = await db.execute(
+        select(AutomationRule).where(
+            AutomationRule.id == rule_id,
+            AutomationRule.organization_id == org_id,
+        )
+    )
+    rule = result.scalars().first()
+    if not rule:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    return rule
+
+
 @router.post("/automation/rules", status_code=status.HTTP_201_CREATED, dependencies=_ADMIN_WRITE)
 async def create_automation_rule(
     org_id: OrganizationId,
@@ -432,19 +489,30 @@ async def create_automation_rule(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Create an automation rule."""
+    """Create an automation rule the beat evaluator will run.
+
+    Rules the platform cannot evaluate are refused with 501 and the reason
+    (see ``src/tickethub/rules.py`` for the supported grammar).
+    """
+    name = data.get("name").strip() if isinstance(data.get("name"), str) else ""
+    if not name:
+        raise HTTPException(status_code=400, detail={"error": "invalid_rule", "reason": "name is required"})
+    spec = _validated_rule(data.get("trigger_type"), data.get("trigger_conditions"), data.get("actions"))
     rule = AutomationRule(
         id=str(uuid.uuid4()),
-        name=data.get("name", "New Rule"),
+        name=name[:255],
         description=data.get("description"),
-        is_enabled=data.get("is_enabled", True),
-        trigger_type=data.get("trigger_type", "manual"),
-        trigger_conditions=json.dumps(data.get("trigger_conditions", {})),
-        actions=json.dumps(data.get("actions", [])),
-        priority=data.get("priority", 0),
-        cooldown_minutes=data.get("cooldown_minutes", 0),
+        is_enabled=bool(data.get("is_enabled", True)),
+        trigger_type=str(data["trigger_type"]).strip().lower(),
+        trigger_conditions=spec.conditions,
+        actions=spec.actions,
+        priority=_int_field(data, "priority"),
+        cooldown_minutes=max(0, _int_field(data, "cooldown_minutes")),
         created_by=str(current_user.id),
         organization_id=org_id,
+        evaluation_status="active",
+        # Fires on events from now on, never on history.
+        last_evaluated_at=datetime.now(timezone.utc),
     )
     db.add(rule)
     await db.flush()
@@ -460,28 +528,102 @@ async def update_automation_rule(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Update an automation rule (tenant-scoped)."""
-    result = await db.execute(
-        select(AutomationRule).where(
-            AutomationRule.id == rule_id,
-            AutomationRule.organization_id == org_id,
-        )
-    )
-    rule = result.scalars().first()
-    if not rule:
-        raise HTTPException(status_code=404, detail="Rule not found")
+    """Update an automation rule (tenant-scoped, re-validated)."""
+    rule = await _get_rule_or_404(db, rule_id, org_id)
 
-    for field in ["name", "description", "is_enabled", "trigger_type", "priority", "cooldown_minutes"]:
-        if field in data:
-            setattr(rule, field, data[field])
-    if "trigger_conditions" in data:
-        rule.trigger_conditions = json.dumps(data["trigger_conditions"])
-    if "actions" in data:
-        rule.actions = json.dumps(data["actions"])
+    rule_shape_changed = any(k in data for k in ("trigger_type", "trigger_conditions", "actions"))
+    if rule_shape_changed:
+        spec = _validated_rule(
+            data.get("trigger_type", rule.trigger_type),
+            data.get("trigger_conditions", rule.trigger_conditions),
+            data.get("actions", rule.actions),
+        )
+        if "trigger_type" in data:
+            rule.trigger_type = str(data["trigger_type"]).strip().lower()
+        rule.trigger_conditions = spec.conditions
+        rule.actions = spec.actions
+        rule.evaluation_status = "active"
+        rule.unsupported_reason = None
+
+    if "name" in data:
+        if not isinstance(data["name"], str) or not data["name"].strip():
+            raise HTTPException(status_code=400, detail={"error": "invalid_rule", "reason": "name is required"})
+        rule.name = data["name"].strip()[:255]
+    if "description" in data:
+        rule.description = data["description"]
+    if "priority" in data:
+        rule.priority = _int_field(data, "priority")
+    if "cooldown_minutes" in data:
+        rule.cooldown_minutes = max(0, _int_field(data, "cooldown_minutes"))
+    if "is_enabled" in data:
+        enable = bool(data["is_enabled"])
+        if enable and not rule.is_enabled:
+            if not rule_shape_changed:
+                # Re-enabling a stored rule: refuse one the evaluator cannot run.
+                _validated_rule(rule.trigger_type, rule.trigger_conditions, rule.actions)
+                rule.evaluation_status = "active"
+                rule.unsupported_reason = None
+            # A paused rule resumes on new events, not on the backlog.
+            rule.last_evaluated_at = datetime.now(timezone.utc)
+        rule.is_enabled = enable
 
     await db.flush()
     await db.refresh(rule)
     return rule
+
+
+@router.get("/automation/rules/{rule_id}/firings")
+async def list_automation_rule_firings(
+    rule_id: str,
+    org_id: OrganizationId,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    page: int = Query(1, ge=1),
+    size: int = Query(50, ge=1, le=200),
+    result: Optional[str] = Query(None, description="Filter by outcome (success, failed, ...)"),
+):
+    """What this rule actually did: one row per (event, action), newest first."""
+    rule = await _get_rule_or_404(db, rule_id, org_id)
+    base = select(AutomationRuleFiring).where(
+        AutomationRuleFiring.rule_id == rule.id,
+        AutomationRuleFiring.organization_id == org_id,
+    )
+    if result:
+        base = base.where(AutomationRuleFiring.result == result)
+    total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar() or 0
+    rows = (
+        await db.execute(
+            base.order_by(desc(AutomationRuleFiring.fired_at), AutomationRuleFiring.id)
+            .offset((page - 1) * size)
+            .limit(size)
+        )
+    ).scalars().all()
+    return {
+        "rule_id": rule.id,
+        "execution_count": rule.execution_count,
+        "last_triggered_at": rule.last_triggered_at,
+        "evaluation_status": rule.evaluation_status,
+        "unsupported_reason": rule.unsupported_reason,
+        "items": [
+            {
+                "id": f.id,
+                "rule_id": f.rule_id,
+                "organization_id": f.organization_id,
+                "target_type": f.target_type,
+                "target_id": f.target_id,
+                "event_id": f.event_id,
+                "action": f.action,
+                "result": f.result,
+                "error": f.error,
+                "detail": f.detail,
+                "fired_at": f.fired_at,
+            }
+            for f in rows
+        ],
+        "total": total,
+        "page": page,
+        "size": size,
+    }
 
 
 @router.delete("/automation/rules/{rule_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=_ADMIN_WRITE)
@@ -501,6 +643,13 @@ async def delete_automation_rule(
     rule = result.scalars().first()
     if not rule:
         raise HTTPException(status_code=404, detail="Rule not found")
+    # Firing history goes with the rule (the AuditLog rows stay).
+    await db.execute(
+        delete(AutomationRuleFiring).where(
+            AutomationRuleFiring.rule_id == rule.id,
+            AutomationRuleFiring.organization_id == org_id,
+        )
+    )
     await db.delete(rule)
     await db.flush()
 
@@ -587,23 +736,8 @@ async def get_dashboard(
 
 
 async def _get_scoped_record(db, model, source_id: str, org_id: str):
-    """Load a source record only if it belongs to ``org_id``.
-
-    Case tasks carry no organization_id; they are scoped through the owning
-    incident. Every other source model has its own organization_id.
-    """
-    from src.models.case import Task
-    from src.models.incident import Incident
-
-    stmt = select(model).where(model.id == source_id)
-    if model is Task:
-        stmt = stmt.where(
-            Task.incident_id.in_(select(Incident.id).where(Incident.organization_id == org_id))
-        )
-    else:
-        stmt = stmt.where(model.organization_id == org_id)
-    result = await db.execute(stmt)
-    return result.scalars().first()
+    """Load a source record only if it belongs to ``org_id`` (see ``get_scoped_ticket``)."""
+    return await get_scoped_ticket(db, model, source_id, org_id)
 
 
 async def _require_ticket(db, source_type: str, source_id: str, org_id: str) -> None:
@@ -617,22 +751,4 @@ async def _require_ticket(db, source_type: str, source_id: str, org_id: str) -> 
 
 def _get_source_model(source_type: str):
     """Get the SQLAlchemy model for a source type."""
-    try:
-        if source_type == "incident":
-            from src.models.incident import Incident
-            return Incident
-        elif source_type == "case_task":
-            from src.models.case import Task
-            return Task
-        elif source_type == "remediation_ticket":
-            from src.exposure.models import RemediationTicket
-            return RemediationTicket
-        elif source_type == "action_item":
-            from src.collaboration.models import ActionItem
-            return ActionItem
-        elif source_type == "poam":
-            from src.compliance.models import POAM
-            return POAM
-    except ImportError:
-        pass
-    return None
+    return ticket_model_for(source_type)
