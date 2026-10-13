@@ -1490,23 +1490,43 @@ async def list_integrations(
     return items
 
 
+_HOST_CONFIG_KEYS = frozenset({"host", "hostname", "server", "address", "endpoint"})
+
+
+def _outbound_candidates(config: dict) -> list[tuple[str, str]]:
+    """Every (field, url) in ``config`` that an outbound call could target:
+    any http(s) URL value regardless of key, plus bare hosts under host-like
+    keys. Checking by value rather than by a fixed key list keeps this
+    validator aligned with whatever key a connector or the probe reads."""
+    found: list[tuple[str, str]] = []
+    for key, value in (config or {}).items():
+        if not isinstance(value, str) or not value.strip():
+            continue
+        text = value.strip()
+        lowered = text.lower()
+        if lowered.startswith(("http://", "https://")):
+            found.append((str(key), text))
+        elif str(key).lower() in _HOST_CONFIG_KEYS and "://" not in lowered:
+            found.append((str(key), f"https://{text}"))
+    return found
+
+
 async def _refuse_private_base_url(config: dict) -> None:
-    """400 when the client-supplied base URL resolves to a private, loopback,
-    link-local or metadata address (same guard the engine applies before any
-    outbound call), so a stored integration can never point the API host at
-    its own network."""
-    base_url = config.get("base_url") or config.get("url")
-    if not base_url:
-        return
+    """400 when any client-supplied outbound target (base URL, webhook URL,
+    bare host, ...) resolves to a private, loopback, link-local or metadata
+    address: the same guard the engine applies before a call, applied when the
+    value is stored so an integration can never point the API host at its own
+    network."""
     from src.integrations.engine import ActionExecutor, OutboundTargetRefused
 
-    try:
-        await ActionExecutor()._resolve_generic_target("/", {**config, "base_url": base_url})
-    except OutboundTargetRefused as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": "outbound_target_refused", "field": "base_url", "detail": str(exc)},
-        ) from None
+    for field, url in _outbound_candidates(config):
+        try:
+            await ActionExecutor()._resolve_generic_target("/", {"base_url": url})
+        except OutboundTargetRefused as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "outbound_target_refused", "field": field, "detail": str(exc)},
+            ) from None
 
 @router.post("/integrations", response_model=RemediationIntegrationResponse, status_code=status.HTTP_201_CREATED, dependencies=_ADMIN_WRITE)
 async def create_integration(

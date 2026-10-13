@@ -17,7 +17,9 @@ import json
 from datetime import timedelta
 
 import pytest
+from httpx import AsyncClient
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agents.models import AgentCommand, EndpointAgent
 from src.integrations.models import InstalledIntegration, IntegrationConnector
@@ -604,3 +606,47 @@ async def test_integration_base_url_cannot_point_at_internal_networks(
     )
     assert loopback.status_code == 400, loopback.text
     assert loopback.json()["detail"]["error"] == "outbound_target_refused"
+
+
+async def test_every_outbound_config_value_is_guarded_not_only_base_url(
+    client: AsyncClient, db_session: AsyncSession, org_a_admin_headers: dict[str, str],
+) -> None:
+    """The validator checks by value (any http(s) URL, bare hosts under host-like
+    keys), so it cannot drift from whichever key a connector or the probe reads."""
+    await _connector(db_session, "slack", "notification")
+    await _connector(db_session, "splunk", "siem")
+    hook = await client.post(
+        f"{API}/integrations",
+        json={"connector_id": "slack", "name": "ops", "config": {"webhook_url": "http://169.254.169.254/hook"}},
+        headers=org_a_admin_headers,
+    )
+    assert hook.status_code == 400, hook.text
+    assert hook.json()["detail"] == {**hook.json()["detail"], "error": "outbound_target_refused", "field": "webhook_url"}
+
+    host = await client.post(
+        f"{API}/integrations",
+        json={"connector_id": "splunk", "name": "splunk", "config": {"host": "127.0.0.1", "port": 8089}},
+        headers=org_a_admin_headers,
+    )
+    assert host.status_code == 400, host.text
+    assert host.json()["detail"]["field"] == "host"
+
+
+async def test_connection_probe_refuses_internal_targets_before_connecting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The probe itself applies the outbound guard, so a health check can never
+    reach loopback, link-local or metadata addresses even for stored rows."""
+    import httpx
+
+    from src.integrations.engine import ConnectorRegistry, IntegrationManager
+
+    class _NeverConnect:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("httpx must not be used for a refused target")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _NeverConnect)
+    manager = IntegrationManager(ConnectorRegistry())
+    health, message = await manager._probe_connector("webhook", {"webhook_url": "http://127.0.0.1:9/x"}, {})
+    assert health == "unhealthy"
+    assert message.startswith("outbound target refused")
+    health2, message2 = await manager._probe_connector("splunk", {"base_url": "http://169.254.169.254"}, {})
+    assert health2 == "unhealthy" and message2.startswith("outbound target refused")

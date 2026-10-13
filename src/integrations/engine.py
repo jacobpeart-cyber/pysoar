@@ -866,6 +866,17 @@ class IntegrationManager:
         import httpx
 
         base_url = (config.get("base_url") or config.get("url") or "").rstrip("/")
+        # The probe opens connections from the API host: every URL it could
+        # hit goes through the same private/loopback/link-local refusal as
+        # action calls, so a health check cannot be used to reach internal
+        # services.
+        for candidate in (base_url, str(config.get("webhook_url") or "").strip()):
+            if not candidate:
+                continue
+            try:
+                await ActionExecutor()._resolve_generic_target("/", {"base_url": candidate})
+            except OutboundTargetRefused as exc:
+                return HealthStatus.UNHEALTHY.value, f"outbound target refused: {exc}"
         timeout = httpx.Timeout(5.0, connect=5.0)
 
         # Bearer/API-key/HTTP-basic helpers
