@@ -11,6 +11,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from src.core.config import settings
 from src.core.exceptions import IntegrationError
 from src.core.logging import get_logger
+from src.integrations.netguard import PinnedTransport
 
 logger = get_logger(__name__)
 
@@ -70,10 +71,16 @@ class BaseConnector(ABC):
     async def get_client(self) -> httpx.AsyncClient:
         """Get or create HTTP client"""
         if self._client is None or self._client.is_closed:
+            # PinnedTransport resolves each request's host once, refuses
+            # internal addresses and connects to the vetted IP (Host / TLS SNI
+            # keep the hostname), so a tenant-supplied domain or path segment
+            # cannot reach the API host's network, even via DNS rebinding.
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
                 timeout=float(self.timeout),
                 headers=self._get_headers(),
+                transport=PinnedTransport(),
+                follow_redirects=False,
             )
         return self._client
 
@@ -165,7 +172,7 @@ class BaseConnector(ABC):
         try:
             start_time = time.time()
             client = await self.get_client()
-            response = await client.head(self.base_url, follow_redirects=True)
+            response = await client.head(self.base_url, follow_redirects=False)
             latency = time.time() - start_time
 
             return {

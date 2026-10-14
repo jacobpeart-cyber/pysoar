@@ -22,6 +22,13 @@ from src.integrations.connectors import (
     SlackConnector,
     VirusTotalConnector,
 )
+from src.integrations.netguard import (
+    OutboundTargetRefused,
+    VettedTarget,
+    merge_pinned_kwargs,
+    pinned_request_kwargs,
+    resolve_and_vet,
+)
 from src.integrations.models import (
     ActionType,
     AuthType,
@@ -867,17 +874,40 @@ class IntegrationManager:
 
         base_url = (config.get("base_url") or config.get("url") or "").rstrip("/")
         # The probe opens connections from the API host: every URL it could
-        # hit goes through the same private/loopback/link-local refusal as
-        # action calls, so a health check cannot be used to reach internal
-        # services.
+        # hit is resolved once, refused if any answer is private / loopback /
+        # link-local / metadata, and then contacted at that vetted IP (Host
+        # and TLS SNI keep the hostname), so neither a stored URL nor a DNS
+        # answer that changes after the check can reach internal services.
+        vetted: list[VettedTarget] = []
         for candidate in (base_url, str(config.get("webhook_url") or "").strip()):
             if not candidate:
                 continue
             try:
-                await ActionExecutor()._resolve_generic_target("/", {"base_url": candidate})
+                vetted.append(await resolve_and_vet(candidate))
             except OutboundTargetRefused as exc:
                 return HealthStatus.UNHEALTHY.value, f"outbound target refused: {exc}"
         timeout = httpx.Timeout(5.0, connect=5.0)
+
+        async def _pinned(url: str) -> tuple[str, VettedTarget]:
+            # Reuse a target vetted above when the URL is on its origin, so the
+            # configured host is resolved exactly once; vendor URLs fixed in
+            # code are vetted the same way.
+            for target in vetted:
+                try:
+                    return target.pin(url), target
+                except OutboundTargetRefused:
+                    continue
+            target = await resolve_and_vet(url)
+            return target.pinned_url, target
+
+        async def _send(method: str, url: str, headers: Optional[dict[str, str]] = None, **kwargs: Any) -> Any:
+            pinned_url, target = await _pinned(url)
+            pin_kwargs = merge_pinned_kwargs(target, headers)
+            return await client.request(
+                method, pinned_url,
+                headers=pin_kwargs["headers"], extensions=pin_kwargs["extensions"],
+                **kwargs,
+            )
 
         # Bearer/API-key/HTTP-basic helpers
         api_key = credentials.get("api_key") or credentials.get("token")
@@ -888,7 +918,9 @@ class IntegrationManager:
         def _bearer_headers() -> dict[str, str]:
             return {"Authorization": f"Bearer {bearer or api_key}"} if (bearer or api_key) else {}
 
-        async with httpx.AsyncClient(timeout=timeout, verify=config.get("verify_tls", True)) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout, verify=config.get("verify_tls", True), follow_redirects=False,
+        ) as client:
             try:
                 if connector_type == "splunk":
                     if not base_url:
@@ -897,8 +929,8 @@ class IntegrationManager:
                     headers = _bearer_headers()
                     if not headers and username and password:
                         auth = (username, password)
-                    resp = await client.get(
-                        f"{base_url}/services/server/info?output_mode=json",
+                    resp = await _send(
+                        "GET", f"{base_url}/services/server/info?output_mode=json",
                         headers=headers, auth=auth,
                     )
                     return _classify_response(resp)
@@ -908,21 +940,21 @@ class IntegrationManager:
                         return HealthStatus.UNHEALTHY.value, f"{connector_type} base_url not configured"
                     auth = (username, password) if username and password else None
                     headers = _bearer_headers() if not auth else {}
-                    resp = await client.get(f"{base_url}/", headers=headers, auth=auth)
+                    resp = await _send("GET", f"{base_url}/", headers=headers, auth=auth)
                     return _classify_response(resp)
 
                 if connector_type == "qradar":
                     if not base_url:
                         return HealthStatus.UNHEALTHY.value, "QRadar base_url not configured"
                     headers = {"SEC": api_key} if api_key else {}
-                    resp = await client.get(f"{base_url}/api/system/about", headers=headers)
+                    resp = await _send("GET", f"{base_url}/api/system/about", headers=headers)
                     return _classify_response(resp)
 
                 if connector_type == "slack":
                     if not (bearer or api_key):
                         return HealthStatus.UNHEALTHY.value, "Slack token not configured"
-                    resp = await client.post(
-                        "https://slack.com/api/auth.test",
+                    resp = await _send(
+                        "POST", "https://slack.com/api/auth.test",
                         headers={"Authorization": f"Bearer {bearer or api_key}"},
                     )
                     if resp.status_code != 200:
@@ -935,8 +967,8 @@ class IntegrationManager:
                 if connector_type == "virustotal":
                     if not api_key:
                         return HealthStatus.UNHEALTHY.value, "VirusTotal x-apikey not configured"
-                    resp = await client.get(
-                        "https://www.virustotal.com/api/v3/users/current",
+                    resp = await _send(
+                        "GET", "https://www.virustotal.com/api/v3/users/current",
                         headers={"x-apikey": api_key},
                     )
                     return _classify_response(resp)
@@ -944,8 +976,8 @@ class IntegrationManager:
                 if connector_type == "misp":
                     if not base_url or not api_key:
                         return HealthStatus.UNHEALTHY.value, "MISP base_url or api_key missing"
-                    resp = await client.get(
-                        f"{base_url}/users/view/me",
+                    resp = await _send(
+                        "GET", f"{base_url}/users/view/me",
                         headers={"Authorization": api_key, "Accept": "application/json"},
                     )
                     return _classify_response(resp)
@@ -953,8 +985,8 @@ class IntegrationManager:
                 if connector_type == "cortex":
                     if not base_url or not (bearer or api_key):
                         return HealthStatus.UNHEALTHY.value, "Cortex base_url or token missing"
-                    resp = await client.get(
-                        f"{base_url}/api/analyzer",
+                    resp = await _send(
+                        "GET", f"{base_url}/api/analyzer",
                         headers={"Authorization": f"Bearer {bearer or api_key}"},
                     )
                     return _classify_response(resp)
@@ -963,13 +995,15 @@ class IntegrationManager:
                     url = config.get("webhook_url") or base_url
                     if not url:
                         return HealthStatus.UNHEALTHY.value, "Webhook URL not configured"
-                    resp = await client.head(url)
+                    resp = await _send("HEAD", url)
                     # Webhooks frequently return 405 to HEAD — that's
                     # still a sign the endpoint is reachable.
                     if resp.status_code in (200, 201, 202, 204, 405):
                         return HealthStatus.HEALTHY.value, None
                     return HealthStatus.UNHEALTHY.value, f"Webhook HEAD HTTP {resp.status_code}"
 
+            except OutboundTargetRefused as exc:
+                return HealthStatus.UNHEALTHY.value, f"outbound target refused: {exc}"
             except httpx.TimeoutException:
                 return HealthStatus.UNHEALTHY.value, "Probe timed out after 5s"
             except httpx.HTTPError as exc:
@@ -1057,8 +1091,25 @@ class IntegrationManager:
             }
 
 
-class OutboundTargetRefused(ValueError):
-    """A generic HTTP action asked for a URL outside the integration's base URL."""
+class PinnedTarget(str):
+    """The vetted URL returned by ``ActionExecutor._resolve_generic_target``.
+
+    The string value is the URL with its host replaced by the vetted IP
+    literal (identical to the input when the host already is an IP).
+    ``target`` is the ``VettedTarget`` and ``request_kwargs`` the httpx
+    ``headers`` / ``extensions`` that keep Host and TLS SNI on the original
+    hostname. It is a ``str`` so callers that only check for refusal, or
+    compare the URL, keep working.
+    """
+
+    target: VettedTarget
+    request_kwargs: dict[str, Any]
+
+    def __new__(cls, target: VettedTarget) -> "PinnedTarget":
+        obj = super().__new__(cls, target.pinned_url)
+        obj.target = target
+        obj.request_kwargs = pinned_request_kwargs(target)
+        return obj
 
 
 class ActionExecutor:
@@ -1178,18 +1229,19 @@ class ActionExecutor:
             return port
         return {"http": 80, "https": 443}.get(scheme)
 
-    async def _resolve_generic_target(self, requested_url: str, config: dict[str, Any]) -> str:
+    async def _resolve_generic_target(self, requested_url: str, config: dict[str, Any]) -> PinnedTarget:
         """Pin a generic HTTP action to the integration's configured base URL.
 
         The caller may give a path (joined to the base URL) or an absolute
         URL with the same scheme, host and port as the stored config. The
-        final host must not resolve to a private, loopback, link-local or
-        reserved address. Raises OutboundTargetRefused otherwise.
+        final host is resolved once and must not resolve to a private,
+        loopback, link-local, metadata or reserved address. Returns a
+        ``PinnedTarget``: the URL with its host replaced by the vetted IP,
+        plus the Host / SNI request kwargs, so the request connects to the
+        address that was checked rather than resolving again. Raises
+        OutboundTargetRefused otherwise.
         """
-        import asyncio
         from urllib.parse import urljoin, urlsplit
-
-        from src.core.url_validator import validate_url
 
         base_url = str(config.get("base_url") or config.get("url") or "").strip()
         base = urlsplit(base_url)
@@ -1213,10 +1265,11 @@ class ActionExecutor:
         if not same_origin:
             raise OutboundTargetRefused("url must target the integration's configured base_url")
 
-        ok, reason = await asyncio.to_thread(validate_url, target_url)
-        if not ok:
-            raise OutboundTargetRefused(f"url refused: {reason}")
-        return target_url
+        try:
+            vetted = await resolve_and_vet(target_url)
+        except OutboundTargetRefused as exc:
+            raise OutboundTargetRefused(f"url refused: {exc}") from exc
+        return PinnedTarget(vetted)
 
     async def _call_generic_http_action(
         self,
@@ -1245,17 +1298,20 @@ class ActionExecutor:
         if not url or not isinstance(url, str):
             raise ValueError("Input data must include a 'url' field")
 
-        url = await self._resolve_generic_target(url, config or {})
+        pinned = await self._resolve_generic_target(url, config or {})
 
         # Add installation context header
         headers.setdefault("X-Installation-Id", installation_id)
         headers.setdefault("X-Action-Name", action_name)
+        # Connect to the vetted IP; Host and TLS SNI carry the hostname.
+        pin_kwargs = merge_pinned_kwargs(pinned.target, headers)
 
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
             response = await client.request(
                 method=method,
-                url=url,
-                headers=headers,
+                url=str(pinned),
+                headers=pin_kwargs["headers"],
+                extensions=pin_kwargs["extensions"],
                 json=body if method in ("POST", "PUT", "PATCH") else None,
                 params=params if method == "GET" else None,
             )

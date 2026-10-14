@@ -1,5 +1,6 @@
 """Microsoft Sentinel API connector for security logs and incident management"""
 
+import re
 import time
 from typing import Any, Dict, Optional
 
@@ -8,6 +9,24 @@ from src.core.logging import get_logger
 
 logger = get_logger(__name__)
 
+
+
+_AZURE_RESOURCE_PATH_RE = re.compile(r"^/subscriptions/[A-Za-z0-9-]+(?:/[A-Za-z0-9._~-]+)+$")
+
+
+def azure_resource_path(value: str) -> str:
+    """Return ``value`` when it is a plain ARM resource path, else raise ValueError.
+
+    Incident and playbook ids come from action parameters and are appended to
+    ``base_url``; a value such as ``@evil.example/x`` or one carrying ``?``/``#``
+    would redirect the request (and its bearer token) to another host. Only
+    ``/subscriptions/<id>/<segment>/...`` with safe segment characters is
+    accepted; no ``..``, ``//``, ``@``, ``?``, ``#`` or whitespace.
+    """
+    text = str(value or "").strip()
+    if not _AZURE_RESOURCE_PATH_RE.fullmatch(text) or "/../" in text or text.endswith("/.."):
+        raise ValueError("invalid Azure resource path")
+    return text
 
 class MicrosoftSentinelConnector(BaseConnector):
     """Microsoft Sentinel connector for KQL queries and incident management"""
@@ -185,7 +204,11 @@ class MicrosoftSentinelConnector(BaseConnector):
 
             subscription_id = self.credentials.get("subscription_id")
 
-            api_url = f"{self.base_url}{incident_id}"
+            try:
+                resource_path = azure_resource_path(incident_id)
+            except ValueError:
+                return {"error": "invalid incident_id: expected an ARM resource path", "incident_id": incident_id}
+            api_url = f"{self.base_url}{resource_path}"
 
             update_data = {
                 "properties": {
@@ -322,8 +345,12 @@ class MicrosoftSentinelConnector(BaseConnector):
             token = await self._get_oauth_token()
             headers = {**self._get_headers(), "Authorization": f"Bearer {token}"}
 
+            try:
+                resource_path = azure_resource_path(playbook_id)
+            except ValueError:
+                return {"error": "invalid playbook_id: expected an ARM resource path", "playbook_id": playbook_id}
             api_url = (
-                f"{self.base_url}{playbook_id}"
+                f"{self.base_url}{resource_path}"
                 f"/triggers/manual/listCallbackUrl"
             )
 
