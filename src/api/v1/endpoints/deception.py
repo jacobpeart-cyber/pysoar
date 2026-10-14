@@ -9,7 +9,7 @@ import uuid
 from typing import Any, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,6 +21,7 @@ from src.deception.models import (
     DecoyInteraction,
     DeceptionCampaign,
     HoneyToken,
+    HoneyTokenTrigger,
 )
 from src.schemas.deception import (
     CampaignEffectivenessResponse,
@@ -40,6 +41,8 @@ from src.schemas.deception import (
     HoneyTokenGenerateRequest,
     HoneyTokenGenerateResponse,
     HoneyTokenResponse,
+    HoneyTokenTriggerResponse,
+    HoneyTokenTypeInfo,
     InteractionAnalysisResponse,
     InteractionInvestigationRequest,
     InteractionInvestigationResponse,
@@ -48,6 +51,7 @@ from src.schemas.deception import (
     RecommendationsResponse,
 )
 
+from src.models.audit import AuditLog
 from src.models.user import User, UserRole
 from src.services.automation import AutomationService
 
@@ -62,6 +66,10 @@ _ADMIN_ROLES = [UserRole.ADMIN]
 # Request fields that must never be taken from the client: the tenant and
 # the deploying user come from the session.
 _SERVER_OWNED_DECOY_FIELDS = {"organization_id", "deployed_by"}
+# On update the deployment state is also server-owned: it follows the agent
+# command result, never the request body.
+_SERVER_OWNED_DECOY_UPDATE_FIELDS = _SERVER_OWNED_DECOY_FIELDS | {"status"}
+_SERVER_OWNED_CONFIG_KEYS = ("listener", "deployment", "removal")
 
 router = APIRouter(prefix="/deception", tags=["deception"])
 
@@ -139,6 +147,38 @@ async def get_campaign_or_404(
     return campaign
 
 
+async def _audit(
+    db: AsyncSession,
+    org_id: str,
+    *,
+    user: Optional[User],
+    action: str,
+    resource_type: str,
+    resource_id: Optional[str],
+    description: str,
+    payload: dict[str, Any],
+    success: bool = True,
+    error: Optional[str] = None,
+) -> None:
+    """One AuditLog row per deception actuation (agent command or canary trigger)."""
+    import json as _json
+
+    db.add(
+        AuditLog(
+            user_id=str(user.id) if user is not None else None,
+            organization_id=org_id,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            description=description[:4000],
+            new_value=_json.dumps(payload, default=str),
+            success=success,
+            error_message=error,
+        )
+    )
+    await db.flush()
+
+
 # ============================================================================
 # DECOY ENDPOINTS
 # ============================================================================
@@ -155,13 +195,25 @@ async def deploy_decoy(
     current_user: User = Depends(require_role(_ADMIN_ROLES)),
     org_id: OrganizationId = None,
 ):
-    """Deploy a new decoy asset."""
+    """Deploy a new decoy asset.
+
+    Honeypots go to a deception agent as ``deploy_honeypot`` (``record_only``
+    without one); honeyfile / honeycred / canary_file / breadcrumb /
+    honeytoken decoys go as ``deploy_decoy``. Either way the decoy is
+    ``deploying`` until the agent's result arrives, then ``active`` or
+    ``failed``. Without an agent, or for a type no agent can deploy
+    (honeydns, honeynet), it is ``not_deployed`` with the reason in
+    ``configuration.deployment``. The status is never set from the request.
+    """
     try:
         data = request.model_dump(exclude=_SERVER_OWNED_DECOY_FIELDS)
         data["deployed_by"] = str(current_user.id)
         data["deployed_at"] = datetime.utcnow()
-        data["status"] = "active"
+        data["status"] = "inactive"
         data["organization_id"] = org_id
+        data["configuration"] = {
+            k: v for k, v in (data.get("configuration") or {}).items() if k not in _SERVER_OWNED_CONFIG_KEYS
+        }
 
         decoy = Decoy(**data)
         db.add(decoy)
@@ -173,8 +225,19 @@ async def deploy_decoy(
         # instead of pretending to be live (audit gap #9).
         if decoy.decoy_type == "honeypot":
             from src.deception.engine import dispatch_honeypot_to_agent
-            await dispatch_honeypot_to_agent(db, decoy)
-            await db.flush()
+            outcome = await dispatch_honeypot_to_agent(db, decoy)
+        else:
+            from src.deception.engine import dispatch_decoy_to_agent
+            outcome = await dispatch_decoy_to_agent(db, decoy, issued_by=str(current_user.id))
+        await db.flush()
+        await _audit(
+            db, org_id, user=current_user, action="deception_deploy_decoy", resource_type="decoy",
+            resource_id=decoy.id,
+            description=f"deploy {decoy.decoy_type} decoy '{decoy.name}': {decoy.status}",
+            payload={"decoy_type": decoy.decoy_type, "status": decoy.status, **outcome},
+            success=bool(outcome.get("dispatched")),
+            error=None if outcome.get("dispatched") else str(outcome.get("reason")),
+        )
 
         logger.info(
             f"Deployed decoy: {decoy.name}",
@@ -233,6 +296,26 @@ async def list_decoys(
         result = await db.execute(query)
         decoys = list(result.scalars().all())
 
+        # Interaction counts come from the interaction rows: the agent
+        # honeypot ingest writes rows without touching the decoy counters.
+        stats: dict[str, tuple[int, Any]] = {}
+        if decoys:
+            for decoy_ref, count, last_at in (
+                await db.execute(
+                    select(
+                        DecoyInteraction.decoy_id,
+                        func.count(DecoyInteraction.id),
+                        func.max(DecoyInteraction.created_at),
+                    )
+                    .where(
+                        DecoyInteraction.organization_id == org_id,
+                        DecoyInteraction.decoy_id.in_([d.id for d in decoys]),
+                    )
+                    .group_by(DecoyInteraction.decoy_id)
+                )
+            ).all():
+                stats[decoy_ref] = (int(count), last_at)
+
         logger.info(
             "Listed decoys",
             extra={
@@ -245,7 +328,14 @@ async def list_decoys(
             },
         )
 
-        return [DecoyResponse.model_validate(d) for d in decoys]
+        out = []
+        for d in decoys:
+            item = DecoyResponse.model_validate(d)
+            count, last_at = stats.get(d.id, (0, None))
+            item.interaction_count = count
+            item.last_interaction_at = last_at
+            out.append(item)
+        return out
 
     except Exception as e:
         logger.error(f"Failed to list decoys: {e}")
@@ -323,8 +413,17 @@ async def update_decoy(
         # organization_id / deployed_by in the body are ignored: a decoy can
         # never be moved to another tenant through this route.
         update_data = request.model_dump(
-            exclude_unset=True, exclude=_SERVER_OWNED_DECOY_FIELDS
+            exclude_unset=True, exclude=_SERVER_OWNED_DECOY_UPDATE_FIELDS
         )
+        if "configuration" in update_data:
+            # The agent dispatch records stay as the server wrote them.
+            current = dict(decoy.configuration or {})
+            incoming = {
+                k: v for k, v in (update_data["configuration"] or {}).items()
+                if k not in _SERVER_OWNED_CONFIG_KEYS
+            }
+            incoming.update({k: current[k] for k in _SERVER_OWNED_CONFIG_KEYS if k in current})
+            update_data["configuration"] = incoming
         for key, value in update_data.items():
             setattr(decoy, key, value)
 
@@ -355,14 +454,23 @@ async def disable_decoy(
     current_user: User = Depends(require_role(_ANALYST_ROLES)),
     org_id: OrganizationId = None,
 ):
-    """Disable a decoy."""
+    """Disable a decoy; a dispatched decoy is also stopped / removed on its agent."""
     try:
         decoy = await get_decoy_or_404(
             db, decoy_id, org_id
         )
+        from src.deception.engine import remove_decoy_from_agent
+
+        removal = await remove_decoy_from_agent(db, decoy, issued_by=str(current_user.id))
         decoy.status = "disabled"
 
         await db.flush()
+        await _audit(
+            db, org_id, user=current_user, action="deception_disable_decoy", resource_type="decoy",
+            resource_id=decoy.id, description=f"disable decoy '{decoy.name}': agent removal {removal}",
+            payload=removal, success=removal.get("sent", False) or removal.get("reason") == "never_dispatched",
+            error=removal.get("error"),
+        )
 
         logger.info(
             f"Disabled decoy: {decoy_id}",
@@ -521,10 +629,20 @@ async def undeploy_decoy(
     current_user: User = Depends(require_role(_ADMIN_ROLES)),
     org_id: OrganizationId = None,
 ):
-    """Undeploy and delete a decoy."""
+    """Undeploy and delete a decoy (stop_honeypot / remove_decoy goes to its agent first)."""
     try:
         decoy = await get_decoy_or_404(
             db, decoy_id, org_id
+        )
+        from src.deception.engine import remove_decoy_from_agent
+
+        removal = await remove_decoy_from_agent(db, decoy, issued_by=str(current_user.id))
+        await _audit(
+            db, org_id, user=current_user, action="deception_delete_decoy", resource_type="decoy",
+            resource_id=decoy.id, description=f"delete decoy '{decoy.name}': agent removal {removal}",
+            payload={"name": decoy.name, "decoy_type": decoy.decoy_type, **removal},
+            success=removal.get("sent", False) or removal.get("reason") == "never_dispatched",
+            error=removal.get("error"),
         )
         await db.delete(decoy)
         await db.flush()
@@ -549,6 +667,80 @@ async def undeploy_decoy(
 # ============================================================================
 
 
+_CANARY_PATH = "/api/v1/deception/canary/{token_id}"
+
+
+def _canary_path(token_id: str) -> str:
+    return _CANARY_PATH.format(token_id=token_id)
+
+
+def _trigger_mechanism(token_type: str) -> str:
+    from src.deception.engine import SUPPORTED_TOKEN_TYPES
+
+    return SUPPORTED_TOKEN_TYPES.get(
+        (token_type or "").lower(),
+        "Only a request to the canary URL fires this token (created before wave 3; its value was not kept).",
+    )
+
+
+async def _trigger_counts(db: AsyncSession, org_id: str, token_ids: list[str]) -> dict[str, tuple[int, int]]:
+    """token_id -> (triggers, triggers that presented the token value), from rows."""
+    if not token_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(
+                HoneyTokenTrigger.token_id,
+                func.count(HoneyTokenTrigger.id),
+                func.count(HoneyTokenTrigger.id).filter(HoneyTokenTrigger.value_presented.is_(True)),
+            )
+            .where(
+                HoneyTokenTrigger.organization_id == org_id,
+                HoneyTokenTrigger.token_id.in_(token_ids),
+            )
+            .group_by(HoneyTokenTrigger.token_id)
+        )
+    ).all()
+    return {r[0]: (int(r[1]), int(r[2])) for r in rows}
+
+
+def _token_fields(token: HoneyToken, triggered: int) -> dict[str, Any]:
+    return {
+        "id": token.id,
+        "name": token.name,
+        "token_type": token.token_type,
+        "status": token.status,
+        "deployment_location": token.deployment_location,
+        "deployment_context": token.deployment_context,
+        "expires_at": token.expires_at,
+        "alert_severity": token.alert_severity,
+        "deployed_by": token.deployed_by,
+        "token_hash": token.token_hash,
+        "triggered_count": triggered,
+        "last_triggered_at": token.last_triggered_at,
+        "last_triggered_by": token.last_triggered_by,
+        "created_at": token.created_at,
+        "updated_at": token.updated_at,
+        "token_preview": token.token_value,  # the column holds the preview only
+        "canary_path": _canary_path(token.id),
+        "trigger_mechanism": _trigger_mechanism(token.token_type),
+    }
+
+
+@router.get("/tokens/types", response_model=list[HoneyTokenTypeInfo])
+async def list_token_types(org_id: OrganizationId = None):
+    """Token types and how each one fires (or why it cannot be generated)."""
+    from src.deception.engine import SUPPORTED_TOKEN_TYPES, UNSUPPORTED_TOKEN_TYPES
+
+    return [
+        HoneyTokenTypeInfo(token_type=t, supported=True, trigger_mechanism=m)
+        for t, m in SUPPORTED_TOKEN_TYPES.items()
+    ] + [
+        HoneyTokenTypeInfo(token_type=t, supported=False, reason=r)
+        for t, r in UNSUPPORTED_TOKEN_TYPES.items()
+    ]
+
+
 @router.post(
     "/tokens",
     response_model=HoneyTokenGenerateResponse,
@@ -556,63 +748,67 @@ async def undeploy_decoy(
 )
 async def generate_token(
     request: HoneyTokenGenerateRequest,
+    http_request: Request,
     db: DatabaseSession = None,
     current_user: User = Depends(require_role(_ANALYST_ROLES)),
     org_id: OrganizationId = None,
 ):
-    """Generate a new honeytoken."""
+    """Generate a honeytoken wired to its canary URL.
+
+    The value is generated here and returned in this response only
+    (``token_value``, ``planting``); PySOAR keeps its SHA-256 and a short
+    preview. Any request to ``canary_url`` records a trigger and raises an
+    alert. Types whose use cannot reach the canary are refused with 400
+    ``unsupported_token_type`` (see GET /deception/tokens/types).
+    """
+    from src.deception.engine import (
+        UnsupportedTokenTypeError,
+        generate_honeytoken,
+        token_hash,
+        token_preview,
+    )
+
+    token_type = (request.token_type or "").lower()
+    token_id = str(uuid.uuid4())
+    canary_url = str(http_request.base_url).rstrip("/") + _canary_path(token_id)
     try:
-        import hashlib
-
-        data = request.model_dump()
-        token_type = data.pop("token_type").lower()
-        # Remove extra request fields not on the model
-        service = data.pop("service", None)
-        db_type = data.pop("db_type", None)
-        domain = data.pop("domain", None)
-        doc_type = data.pop("doc_type", None)
-        doc_title = data.pop("doc_title", None)
-
-        token_value = data.get("token_value", "")
-        if not token_value:
-            # Generate a placeholder token value based on type
-            import secrets
-
-            token_value = secrets.token_urlsafe(32)
-
-        token_hash = hashlib.sha256(token_value.encode()).hexdigest()
-
-        token = HoneyToken(
-            name=data.get("name") or f"{token_type}-{token_hash[:8]}",
-            token_type=token_type,
-            token_value=token_value,
-            token_hash=token_hash,
-            status="active",
-            organization_id=org_id,
-            deployed_by=str(current_user.id),
-        )
-
-        db.add(token)
-        await db.flush()
-        await db.refresh(token)
-
-        logger.info(
-            f"Generated honeytoken: {token.name}",
-            extra={
-                "token_id": token.id,
-                "token_type": token_type,
-                "user_id": str(getattr(current_user, 'id', '')) if current_user else '',
-            },
-        )
-
-        return HoneyTokenGenerateResponse.model_validate(token)
-
-    except Exception as e:
-        logger.error(f"Failed to generate token: {e}")
+        generated = generate_honeytoken(token_type, canary_url)
+    except UnsupportedTokenTypeError as exc:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to generate token",
-        )
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "unsupported_token_type",
+                "detail": f"{exc.token_type or 'token'} honeytokens are not supported: {exc.reason}",
+            },
+        ) from None
+
+    hashed = token_hash(generated["match_material"])
+    token = HoneyToken(
+        id=token_id,
+        name=request.name or f"{token_type}-{hashed[:8]}",
+        token_type=token_type,
+        token_value=token_preview(generated["value"]),
+        token_hash=hashed,
+        deployment_location=request.deployment_location,
+        deployment_context=request.deployment_context,
+        status="active",
+        organization_id=org_id,
+        deployed_by=str(current_user.id),
+    )
+    db.add(token)
+    await db.flush()
+    await db.refresh(token)
+
+    logger.info(
+        "honeytoken_generated",
+        token_id=token.id, token_type=token_type, organization_id=org_id, user_id=str(current_user.id),
+    )
+    return HoneyTokenGenerateResponse(
+        **_token_fields(token, 0),
+        token_value=generated["value"],
+        canary_url=canary_url,
+        planting=generated["planting"],
+    )
 
 
 @router.get("/tokens", response_model=list[HoneyTokenResponse])
@@ -624,45 +820,16 @@ async def list_tokens(
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
 ):
-    """List all honeytokens with optional filtering.
-
-    Authenticated and org-scoped. Results are limited to the caller's
-    organization; there is no client-supplied ``organization_id``.
-    """
-    try:
-        query = select(HoneyToken)
-
-        filters = []
-        if token_type:
-            filters.append(HoneyToken.token_type == token_type)
-        if token_status:
-            filters.append(HoneyToken.status == token_status)
-        filters.append(HoneyToken.organization_id == org_id)
-
-        if filters:
-            query = query.where(and_(*filters))
-
-        query = query.order_by(HoneyToken.created_at.desc()).offset(skip).limit(limit)
-
-        result = await db.execute(query)
-        tokens = list(result.scalars().all())
-
-        logger.info(
-            "Listed tokens",
-            extra={
-                "filters": {"type": token_type, "status": token_status},
-                "count": len(tokens),
-            },
-        )
-
-        return [HoneyTokenResponse.model_validate(t) for t in tokens]
-
-    except Exception as e:
-        logger.error(f"Failed to list tokens: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve tokens",
-        )
+    """List honeytokens (org-scoped); trigger counts come from the trigger rows."""
+    query = select(HoneyToken).where(HoneyToken.organization_id == org_id)
+    if token_type:
+        query = query.where(HoneyToken.token_type == token_type)
+    if token_status:
+        query = query.where(HoneyToken.status == token_status)
+    query = query.order_by(HoneyToken.created_at.desc()).offset(skip).limit(limit)
+    tokens = list((await db.execute(query)).scalars().all())
+    counts = await _trigger_counts(db, org_id, [t.id for t in tokens])
+    return [HoneyTokenResponse(**_token_fields(t, counts.get(t.id, (0, 0))[0])) for t in tokens]
 
 
 @router.get("/tokens/{token_id}", response_model=HoneyTokenResponse)
@@ -671,24 +838,32 @@ async def get_token(
     db: DatabaseSession = None,
     org_id: OrganizationId = None,
 ):
-    """Get details about a specific honeytoken."""
-    try:
-        token = await get_token_or_404(
-            db, token_id, org_id
+    """Get details about a specific honeytoken (never its value)."""
+    token = await get_token_or_404(db, token_id, org_id)
+    counts = await _trigger_counts(db, org_id, [token.id])
+    return HoneyTokenResponse(**_token_fields(token, counts.get(token.id, (0, 0))[0]))
+
+
+@router.get("/tokens/{token_id}/triggers", response_model=list[HoneyTokenTriggerResponse])
+async def list_token_triggers(
+    token_id: UUID,
+    db: DatabaseSession = None,
+    org_id: OrganizationId = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """Recorded canary calls for a token, newest first."""
+    token = await get_token_or_404(db, token_id, org_id)
+    rows = (
+        await db.execute(
+            select(HoneyTokenTrigger)
+            .where(HoneyTokenTrigger.token_id == token.id, HoneyTokenTrigger.organization_id == org_id)
+            .order_by(HoneyTokenTrigger.created_at.desc())
+            .offset(skip)
+            .limit(limit)
         )
-
-        logger.info(f"Retrieved token: {token_id}")
-
-        return HoneyTokenResponse.model_validate(token)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to get token: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve token",
-        )
+    ).scalars().all()
+    return [HoneyTokenTriggerResponse.model_validate(r) for r in rows]
 
 
 @router.post("/tokens/{token_id}/check", response_model=HoneyTokenCheckResponse)
@@ -698,37 +873,19 @@ async def check_token(
     _current_user: User = Depends(require_role(_ANALYST_ROLES)),
     org_id: OrganizationId = None,
 ):
-    """Check if a honeytoken has been used/triggered."""
-    try:
-        token = await get_token_or_404(
-            db, token_id, org_id
-        )
-
-        logger.info(
-            f"Checked token usage: {token_id}",
-            extra={
-                "token_id": str(token_id),
-                "triggered": token.triggered_count > 0,
-            },
-        )
-
-        return HoneyTokenCheckResponse(
-            token_id=token_id,
-            token_hash=token.token_hash,
-            has_been_used=token.triggered_count > 0,
-            triggered_count=token.triggered_count,
-            last_triggered_at=token.last_triggered_at,
-            last_triggered_by=token.last_triggered_by,
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to check token: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to check token",
-        )
+    """Whether a honeytoken has fired, counted from its trigger rows."""
+    token = await get_token_or_404(db, token_id, org_id)
+    total, with_value = (await _trigger_counts(db, org_id, [token.id])).get(token.id, (0, 0))
+    return HoneyTokenCheckResponse(
+        token_id=token_id,
+        token_hash=token.token_hash,
+        has_been_used=total > 0,
+        triggered_count=total,
+        last_triggered_at=token.last_triggered_at,
+        last_triggered_by=token.last_triggered_by,
+        triggers_with_value_presented=with_value,
+        status=token.status,
+    )
 
 
 @router.delete("/tokens/{token_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -781,6 +938,207 @@ async def rotate_tokens(
             "are not deployed anywhere, so the route no longer reports success",
         },
     )
+
+
+# ============================================================================
+# CANARY CALLBACK (unauthenticated)
+# ============================================================================
+
+#: Bytes of a canary request body kept in the trigger record.
+_CANARY_BODY_EXCERPT = 2048
+#: Bodies larger than this are not read at all.
+_CANARY_MAX_BODY = 64 * 1024
+#: A second trigger from the same source inside this window joins the open alert.
+_CANARY_ALERT_DEDUPE = timedelta(minutes=10)
+_CANARY_HEADERS_KEPT = ("user-agent", "referer", "content-type", "x-forwarded-for", "x-real-ip", "host")
+
+
+def _presented_values(request: Request, body_json: Any) -> list[str]:
+    """Credential-looking values a canary caller presented (never stored raw)."""
+    import base64
+    import re
+
+    found: list[str] = []
+    auth = request.headers.get("authorization", "")
+    scheme, _, rest = auth.partition(" ")
+    if scheme.lower() == "bearer" and rest.strip():
+        found.append(rest.strip())
+    elif scheme.lower() == "basic" and rest.strip():
+        try:
+            user, _, password = base64.b64decode(rest.strip()).decode("utf-8", "replace").partition(":")
+            found.extend(v for v in (user, password) if v)
+        except ValueError:
+            pass
+    elif scheme.upper().startswith("AWS4-HMAC-SHA256"):
+        match = re.search(r"Credential=([A-Z0-9]{16,128})/", auth)
+        if match:
+            found.append(match.group(1))
+    for header in ("x-api-key", "x-auth-token"):
+        if request.headers.get(header):
+            found.append(request.headers[header])
+    for param in ("token", "api_key", "key", "access_key_id"):
+        if request.query_params.get(param):
+            found.append(request.query_params[param])
+    if isinstance(body_json, dict):
+        for field in ("token", "api_key", "key", "access_key_id"):
+            if isinstance(body_json.get(field), str):
+                found.append(body_json[field])
+    return [v[:8192] for v in found]
+
+
+@router.api_route("/canary/{token_id}", methods=["POST", "GET"])
+async def canary_callback(
+    token_id: str,
+    request: Request,
+    db: DatabaseSession = None,
+):
+    """Record a honeytoken firing. Unauthenticated by design.
+
+    Keyed by the token's unguessable id (UUID4) from its canary URL. Each
+    call stores a ``honey_token_triggers`` row with the caller's source
+    address, forwarded-for chain, user agent, selected headers and a body
+    excerpt; bumps the token's trigger count; and raises a ``deception``
+    alert for the owning organisation (calls from the same source within
+    10 minutes join the open alert). If the call presents the token's
+    secret it is marked ``value_presented``. GET is accepted for URL
+    canaries opened in a browser or mail client.
+    """
+    import hmac
+    import json as _json
+
+    from src.deception.engine import token_hash
+    from src.models.alert import Alert
+
+    if len(token_id) > 64:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "not_found"})
+    token = (await db.execute(select(HoneyToken).where(HoneyToken.id == token_id))).scalar_one_or_none()
+    if token is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "not_found"})
+
+    raw = b""
+    length = request.headers.get("content-length")
+    if request.method == "POST" and (length is None or (length.isdigit() and int(length) <= _CANARY_MAX_BODY)):
+        raw = (await request.body())[:_CANARY_MAX_BODY]
+    body_json: Any = None
+    if raw and "json" in request.headers.get("content-type", ""):
+        try:
+            body_json = _json.loads(raw)
+        except ValueError:
+            body_json = None
+
+    presented = _presented_values(request, body_json)
+    if presented:
+        value_presented: Optional[bool] = any(
+            hmac.compare_digest(token_hash(v), token.token_hash) for v in presented
+        )
+    else:
+        value_presented = None
+
+    source_ip = request.client.host if request.client else None
+    forwarded_for = request.headers.get("x-forwarded-for")
+    auth_scheme = request.headers.get("authorization", "").partition(" ")[0][:40] or None
+    metadata = {
+        "headers": {h: request.headers[h][:500] for h in _CANARY_HEADERS_KEPT if h in request.headers},
+        "authorization_scheme": auth_scheme,
+        "query": str(request.url.query)[:1000] or None,
+        "body_excerpt": raw[:_CANARY_BODY_EXCERPT].decode("utf-8", "replace") if raw else None,
+        "body_bytes": len(raw),
+        "credentials_presented": len(presented),
+    }
+    now = datetime.now(timezone.utc)
+    trigger = HoneyTokenTrigger(
+        id=str(uuid.uuid4()),
+        token_id=token.id,
+        organization_id=token.organization_id,
+        source_ip=(source_ip or "")[:45] or None,
+        forwarded_for=forwarded_for[:500] if forwarded_for else None,
+        user_agent=(request.headers.get("user-agent") or "")[:500] or None,
+        http_method=request.method,
+        request_metadata=metadata,
+        value_presented=value_presented,
+    )
+    db.add(trigger)
+
+    token.triggered_count = (token.triggered_count or 0) + 1
+    token.last_triggered_at = now
+    token.last_triggered_by = (forwarded_for or source_ip or "unknown")[:255]
+    if token.status == "active":
+        token.status = "triggered"
+
+    alert_id: Optional[str] = None
+    new_alert: Optional[Alert] = None
+    if token.status != "disabled":
+        recent = (
+            await db.execute(
+                select(HoneyTokenTrigger.alert_id)
+                .where(
+                    HoneyTokenTrigger.token_id == token.id,
+                    HoneyTokenTrigger.alert_id.is_not(None),
+                    HoneyTokenTrigger.source_ip == trigger.source_ip,
+                    HoneyTokenTrigger.created_at >= now - _CANARY_ALERT_DEDUPE,
+                )
+                .order_by(HoneyTokenTrigger.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if recent:
+            alert_id = recent
+        else:
+            new_alert = Alert(
+                id=str(uuid.uuid4()),
+                title=f"Honeytoken triggered: {token.name} ({token.token_type})",
+                description=(
+                    f"The {token.token_type} honeytoken '{token.name}' was used from "
+                    f"{trigger.source_ip or 'an unknown address'}"
+                    + (f" (forwarded for {forwarded_for})" if forwarded_for else "")
+                    + (". The caller presented the token value." if value_presented else ".")
+                    + (f" Planted at: {token.deployment_location}." if token.deployment_location else "")
+                ),
+                severity=token.alert_severity or "critical",
+                status="new",
+                source="deception",
+                source_id=trigger.id,
+                alert_type="honeytoken_trigger",
+                category="honeytoken",
+                source_ip=trigger.source_ip,
+                raw_data=_json.dumps({
+                    "token_id": token.id,
+                    "token_type": token.token_type,
+                    "trigger_id": trigger.id,
+                    "value_presented": value_presented,
+                    "user_agent": trigger.user_agent,
+                    "forwarded_for": forwarded_for,
+                }),
+                organization_id=token.organization_id,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(new_alert)
+            alert_id = new_alert.id
+    trigger.alert_id = alert_id
+    await db.flush()
+    await _audit(
+        db, token.organization_id, user=None, action="deception_honeytoken_triggered",
+        resource_type="honey_token", resource_id=token.id,
+        description=f"honeytoken '{token.name}' fired from {trigger.source_ip}",
+        payload={"trigger_id": trigger.id, "alert_id": alert_id, "value_presented": value_presented},
+    )
+
+    if new_alert is not None:
+        # The alert pipeline (IOC match, incident, playbooks) must not undo
+        # the recorded trigger if one of its steps fails.
+        try:
+            async with db.begin_nested():
+                await AutomationService(db).on_alert_created(new_alert, token.organization_id)
+        except Exception as exc:  # noqa: BLE001 - trigger and alert are already recorded
+            logger.error("honeytoken_alert_pipeline_failed", token_id=token.id, error=str(exc))
+
+    logger.warning(
+        "honeytoken_triggered",
+        token_id=token.id, organization_id=token.organization_id, source_ip=trigger.source_ip,
+        value_presented=value_presented, alert_id=alert_id,
+    )
+    return {"status": "recorded"}
 
 
 # ============================================================================

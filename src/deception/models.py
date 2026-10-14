@@ -206,3 +206,32 @@ class HoneyToken(BaseModel):
     organization_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("organizations.id"), nullable=False
     )
+
+
+class HoneyTokenTrigger(BaseModel):
+    """One call to a honeytoken's canary callback (wave 3, migration 028).
+
+    Written by the unauthenticated ``POST /deception/canary/{token_id}``
+    route; ``HoneyToken.triggered_count`` is the count of these rows.
+    ``value_presented`` is True when the request carried the token's secret
+    (its SHA-256 matched ``HoneyToken.token_hash``), False when it carried a
+    credential that did not match, and NULL when it carried none.
+    """
+
+    __tablename__ = "honey_token_triggers"
+
+    token_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("honey_tokens.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    organization_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("organizations.id"), nullable=False, index=True,
+    )
+    source_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    forwarded_for: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    http_method: Mapped[str] = mapped_column(String(10), nullable=False, default="POST")
+    request_metadata: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, nullable=False,
+    )  # selected headers, query string, body excerpt (never the raw Authorization header)
+    value_presented: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    alert_id: Mapped[str | None] = mapped_column(String(36), nullable=True)

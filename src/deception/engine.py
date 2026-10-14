@@ -865,3 +865,295 @@ async def dispatch_honeypot_to_agent(db, decoy: Decoy) -> dict[str, Any]:
         f"({service} on :{port}, command {cmd.id})"
     )
     return {"dispatched": True, "agent_id": agent.id, "command_id": cmd.id, "port": int(port)}
+
+
+
+# ---------------------------------------------------------------------------
+# Agent-deployed non-listener decoys and decoy removal (wave 3, 2026-10-13)
+#
+# Honeyfiles, honeycreds, canary files, breadcrumbs and honeytoken decoys are
+# planted by a deception-capable endpoint agent through a ``deploy_decoy``
+# command; the decoy stays ``deploying`` until the agent's result arrives
+# (src/deception/tasks.py reconciles it to active / failed). Types no agent
+# can deploy, or an org with no deception agent, are marked ``not_deployed``
+# with the reason in ``configuration["deployment"]``. Disabling or deleting
+# a dispatched decoy sends ``stop_honeypot`` / ``remove_decoy``.
+# ---------------------------------------------------------------------------
+
+AGENT_DEPLOYABLE_DECOY_TYPES = frozenset(
+    {"honeyfile", "honeycred", "canary_file", "breadcrumb", "honeytoken"},
+)
+_NO_AGENT_MECHANISM = {
+    "honeydns": "a DNS decoy needs an authoritative DNS server, which PySOAR does not run",
+    "honeynet": "a decoy network needs network infrastructure that no endpoint agent provisions",
+}
+
+
+async def _deception_agents(db, organization_id: str) -> list:
+    from sqlalchemy import select
+
+    from src.agents.capabilities import AgentCapability
+    from src.agents.models import EndpointAgent
+
+    query = select(EndpointAgent).where(
+        EndpointAgent.status == "active",
+        EndpointAgent.organization_id == organization_id,
+    )
+    return [
+        a for a in (await db.execute(query)).scalars().all()
+        if AgentCapability.DECEPTION.value in (a.capabilities or [])
+    ]
+
+
+async def dispatch_decoy_to_agent(db, decoy: Decoy, issued_by: str | None = None) -> dict[str, Any]:
+    """Deploy a non-honeypot decoy through a deception agent, or mark it not_deployed.
+
+    Mutates ``decoy.status`` / ``decoy.configuration`` (caller flushes).
+    """
+    from src.agents.capabilities import AgentAction
+    from src.agents.service import AgentService, AgentServiceError
+
+    config = dict(decoy.configuration or {})
+    decoy_type = (decoy.decoy_type or "").lower()
+
+    def _not_deployed(state: str, note: str) -> dict[str, Any]:
+        decoy.status = "not_deployed"
+        config["deployment"] = {"state": state, "note": note}
+        decoy.configuration = config
+        logger.warning(f"Decoy {decoy.id} ({decoy_type}) not deployed: {state}")
+        return {"dispatched": False, "reason": state, "detail": note}
+
+    if decoy_type not in AGENT_DEPLOYABLE_DECOY_TYPES:
+        reason = _NO_AGENT_MECHANISM.get(
+            decoy_type, f"PySOAR has no deployment mechanism for decoy type '{decoy.decoy_type}'",
+        )
+        return _not_deployed("unsupported_decoy_type", f"Not deployed: {reason}. The decoy is a record only.")
+
+    agents = await _deception_agents(db, decoy.organization_id)
+    agent = None
+    if decoy.deployment_target:
+        agent = next((a for a in agents if a.hostname == decoy.deployment_target), None)
+        if agent is None:
+            return _not_deployed(
+                "no_deception_agent",
+                f"No active deception-capable agent on {decoy.deployment_target}: the decoy is a record only.",
+            )
+    elif agents:
+        agent = agents[0]
+    if agent is None:
+        return _not_deployed(
+            "no_deception_agent",
+            "No active deception-capable agent enrolled in this org: the decoy is a record only.",
+        )
+
+    payload = {
+        "decoy_id": decoy.id,
+        "decoy_type": decoy_type,
+        "category": decoy.category,
+        "name": decoy.name,
+        "configuration": {k: v for k, v in config.items() if k not in ("deployment", "listener", "removal")},
+    }
+    try:
+        cmd = await AgentService(db).issue_command(
+            agent=agent, action=AgentAction.DEPLOY_DECOY.value, payload=payload, issued_by=issued_by,
+        )
+    except AgentServiceError as exc:
+        return _not_deployed("agent_refused", f"Agent {agent.hostname} refused deploy_decoy: {exc}")
+
+    decoy.status = "deploying"
+    if not decoy.deployment_target:
+        decoy.deployment_target = agent.hostname
+    config["deployment"] = {
+        "state": "dispatched",
+        "agent_id": agent.id,
+        "agent_hostname": agent.hostname,
+        "command_id": cmd.id,
+        "dispatched_at": datetime.utcnow().isoformat(),
+    }
+    decoy.configuration = config
+    logger.info(f"Decoy {decoy.id} ({decoy_type}) dispatched to agent {agent.hostname} (command {cmd.id})")
+    return {"dispatched": True, "agent_id": agent.id, "command_id": cmd.id}
+
+
+async def remove_decoy_from_agent(db, decoy: Decoy, issued_by: str | None = None) -> dict[str, Any]:
+    """Send stop_honeypot / remove_decoy to the agent holding ``decoy``, if any.
+
+    Returns ``{"sent": False, "reason": ...}`` when the decoy was never
+    dispatched or its agent is gone; mutates ``decoy.configuration``.
+    """
+    from sqlalchemy import select
+
+    from src.agents.capabilities import AgentAction
+    from src.agents.models import EndpointAgent
+    from src.agents.service import AgentService, AgentServiceError
+
+    config = dict(decoy.configuration or {})
+    is_honeypot = (decoy.decoy_type or "").lower() == "honeypot"
+    placement = dict(config.get("listener" if is_honeypot else "deployment") or {})
+    agent_id = placement.get("agent_id")
+    if not agent_id:
+        return {"sent": False, "reason": "never_dispatched"}
+    agent = (
+        await db.execute(
+            select(EndpointAgent).where(
+                EndpointAgent.id == agent_id,
+                EndpointAgent.organization_id == decoy.organization_id,
+            ),
+        )
+    ).scalar_one_or_none()
+    if agent is None:
+        config["removal"] = {"state": "agent_gone", "agent_id": agent_id}
+        decoy.configuration = config
+        return {"sent": False, "reason": "agent_gone"}
+    action = AgentAction.STOP_HONEYPOT.value if is_honeypot else AgentAction.REMOVE_DECOY.value
+    payload: dict[str, Any] = {"decoy_id": decoy.id}
+    if not is_honeypot:
+        payload["decoy_type"] = decoy.decoy_type
+    try:
+        cmd = await AgentService(db).issue_command(agent=agent, action=action, payload=payload, issued_by=issued_by)
+    except AgentServiceError as exc:
+        config["removal"] = {"state": "agent_refused", "agent_id": agent.id, "error": str(exc)[:300]}
+        decoy.configuration = config
+        return {"sent": False, "reason": "agent_refused", "error": str(exc)}
+    config["removal"] = {
+        "state": "dispatched",
+        "agent_id": agent.id,
+        "agent_hostname": agent.hostname,
+        "command_id": cmd.id,
+        "action": action,
+        "dispatched_at": datetime.utcnow().isoformat(),
+    }
+    decoy.configuration = config
+    return {"sent": True, "action": action, "command_id": cmd.id, "agent_id": agent.id}
+
+
+# ---------------------------------------------------------------------------
+# Honeytoken values (wave 3, 2026-10-13)
+#
+# Each token gets a canary URL (POST /api/v1/deception/canary/{token_id}).
+# The secret value is generated here, returned to the creator once, and only
+# its SHA-256 (over the "match material": the part a user of the token
+# presents) is stored. Types whose use cannot reach the canary are refused.
+# ---------------------------------------------------------------------------
+
+SUPPORTED_TOKEN_TYPES: dict[str, str] = {
+    "url_canary": "Any request to the canary URL fires the token (the URL is the token).",
+    "api_key": (
+        "Plant the key together with the canary URL as its API endpoint. A request to the canary "
+        "that presents the key (Authorization: Bearer, X-Api-Key, or a 'token' field) fires the token "
+        "with value_presented=true."
+    ),
+    "jwt_token": (
+        "Plant the JWT together with the canary URL (its 'iss' claim also carries it). A request to the "
+        "canary that presents the JWT as a Bearer token fires the token with value_presented=true."
+    ),
+    "aws_key": (
+        "Plant the credentials file and the config snippet (endpoint_url = canary URL). AWS CLI / SDK "
+        "calls made with the profile are sent to the canary and signed with the access key id, which "
+        "fires the token with value_presented=true. Calls sent to AWS itself are not seen by PySOAR."
+    ),
+}
+
+UNSUPPORTED_TOKEN_TYPES: dict[str, str] = {
+    "database_cred": "no database listener reports credential use to PySOAR",
+    "ssh_key": "no SSH service reports key use to PySOAR",
+    "certificate": "no TLS endpoint reports certificate use to PySOAR",
+    "dns_canary": "PySOAR runs no authoritative DNS server for canary domains",
+    "email_canary": "PySOAR runs no inbound mail receiver for canary addresses",
+    "document_beacon": "PySOAR does not generate beaconing documents",
+}
+
+
+class UnsupportedTokenTypeError(ValueError):
+    def __init__(self, token_type: str, reason: str):
+        super().__init__(reason)
+        self.token_type = token_type
+        self.reason = reason
+
+
+def token_hash(material: str) -> str:
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def token_preview(value: str) -> str:
+    """A non-secret preview kept in ``HoneyToken.token_value`` (never the value)."""
+    flat = value.replace("\n", " ").strip()
+    if len(flat) <= 12:
+        return flat[:4] + "..."
+    return f"{flat[:8]}...{flat[-4:]}"
+
+
+def _b64url(raw: bytes) -> str:
+    import base64
+
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def generate_honeytoken(token_type: str, canary_url: str) -> dict[str, Any]:
+    """Generate a token of ``token_type`` wired to ``canary_url``.
+
+    Returns ``{"value", "match_material", "planting"}``. Raises
+    ``UnsupportedTokenTypeError`` for types whose use cannot reach the canary.
+    """
+    token_type = (token_type or "").lower()
+    if token_type not in SUPPORTED_TOKEN_TYPES:
+        reason = UNSUPPORTED_TOKEN_TYPES.get(token_type, f"unknown token type '{token_type}'")
+        raise UnsupportedTokenTypeError(token_type, reason)
+
+    if token_type == "url_canary":
+        return {
+            "value": canary_url,
+            "match_material": canary_url,
+            "planting": {"instructions": SUPPORTED_TOKEN_TYPES[token_type]},
+        }
+    if token_type == "api_key":
+        key = "sk_live_" + "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32))
+        return {
+            "value": key,
+            "match_material": key,
+            "planting": {
+                "instructions": SUPPORTED_TOKEN_TYPES[token_type],
+                "env_snippet": f"API_BASE_URL={canary_url}\nAPI_KEY={key}",
+            },
+        }
+    if token_type == "jwt_token":
+        import hmac
+        import time
+
+        header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
+        claims = {
+            "sub": f"svc-{secrets.token_hex(4)}",
+            "iss": canary_url,
+            "jti": secrets.token_hex(16),
+            "iat": int(time.time()),
+        }
+        body = _b64url(json.dumps(claims, separators=(",", ":")).encode())
+        signing_key = secrets.token_bytes(32)  # discarded: nobody can mint a matching token
+        sig = _b64url(hmac.new(signing_key, f"{header}.{body}".encode(), hashlib.sha256).digest())
+        jwt = f"{header}.{body}.{sig}"
+        return {
+            "value": jwt,
+            "match_material": jwt,
+            "planting": {
+                "instructions": SUPPORTED_TOKEN_TYPES[token_type],
+                "env_snippet": f"AUTH_SERVER_URL={canary_url}\nSERVICE_TOKEN={jwt}",
+            },
+        }
+    # aws_key
+    access_key_id = "AKIA" + "".join(secrets.choice(string.ascii_uppercase + "234567") for _ in range(16))
+    secret_access_key = "".join(secrets.choice(string.ascii_letters + string.digits + "/+") for _ in range(40))
+    credentials = (
+        "[default]\n"
+        f"aws_access_key_id = {access_key_id}\n"
+        f"aws_secret_access_key = {secret_access_key}\n"
+    )
+    return {
+        "value": credentials,
+        "match_material": access_key_id,
+        "planting": {
+            "instructions": SUPPORTED_TOKEN_TYPES[token_type],
+            "credentials_file": credentials,
+            "config_snippet": f"[default]\nregion = us-east-1\nendpoint_url = {canary_url}\n",
+            "access_key_id": access_key_id,
+        },
+    }

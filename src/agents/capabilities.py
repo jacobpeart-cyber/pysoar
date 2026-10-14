@@ -76,6 +76,10 @@ class AgentAction(str, Enum):
     # --- Deception ---
     DEPLOY_HONEYPOT = "deploy_honeypot"  # payload = {decoy_id, port, banner, service}
     STOP_HONEYPOT = "stop_honeypot"      # payload = {decoy_id}
+    # Non-listener decoys (honeyfile, honeycred, breadcrumb, ...): the agent
+    # plants / removes the artefact. Status comes from the command result.
+    DEPLOY_DECOY = "deploy_decoy"        # payload = {decoy_id, decoy_type, category, configuration}
+    REMOVE_DECOY = "remove_decoy"        # payload = {decoy_id, decoy_type}
 
 
 # Which actions each capability unlocks
@@ -109,6 +113,8 @@ CAPABILITY_ACTIONS: dict[AgentCapability, set[AgentAction]] = {
     AgentCapability.DECEPTION: {
         AgentAction.DEPLOY_HONEYPOT,
         AgentAction.STOP_HONEYPOT,
+        AgentAction.DEPLOY_DECOY,
+        AgentAction.REMOVE_DECOY,
     },
 }
 

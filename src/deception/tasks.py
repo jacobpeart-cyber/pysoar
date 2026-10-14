@@ -1,7 +1,7 @@
 """
 Celery tasks for Deception Technology module.
 
-Only the honeypot dispatch reconciliation below is real. Seven placeholder
+Only the decoy dispatch reconciliation below is real. Seven placeholder
 tasks (monitor_decoy_interactions, rotate_honey_tokens, check_token_canaries,
 analyze_new_interactions, update_campaign_stats, deploy_scheduled_decoys,
 cleanup_expired_tokens) were deleted in wave 1: each returned a hard-coded
@@ -22,6 +22,10 @@ logger = get_logger(__name__)
 # status="deploying" with the command id stored in configuration. This
 # beat task closes the loop: when the agent's result arrives the decoy
 # flips to active (listener confirmed) or failed (bind error etc).
+#
+# Wave 3: non-listener decoys (honeyfile, honeycred, ...) dispatched with
+# deploy_decoy are reconciled the same way; their command lives under
+# configuration["deployment"] instead of configuration["listener"].
 # ---------------------------------------------------------------------------
 
 import asyncio
@@ -47,6 +51,11 @@ RECONCILE_BATCH_SIZE = 1_000
 MAX_RECONCILE_DECOYS_PER_RUN = 20_000
 
 
+def _placement_key(decoy) -> str:
+    """Where a decoy's dispatch record lives in its configuration."""
+    return "listener" if (decoy.decoy_type or "").lower() == "honeypot" else "deployment"
+
+
 async def _reconcile_honeypot_dispatches() -> dict:
     from src.agents.models import AgentCommand, AgentResult
     from src.deception.models import Decoy
@@ -59,10 +68,7 @@ async def _reconcile_honeypot_dispatches() -> dict:
     async with _AsyncSessionLocal() as db:
         while scanned < MAX_RECONCILE_DECOYS_PER_RUN:
             window = min(RECONCILE_BATCH_SIZE, MAX_RECONCILE_DECOYS_PER_RUN - scanned)
-            stmt = select(Decoy).where(
-                Decoy.decoy_type == "honeypot",
-                Decoy.status == "deploying",
-            )
+            stmt = select(Decoy).where(Decoy.status == "deploying")
             if last_id is not None:
                 stmt = stmt.where(Decoy.id > last_id)
             decoys = list(
@@ -74,7 +80,7 @@ async def _reconcile_honeypot_dispatches() -> dict:
             scanned += len(decoys)
 
             command_ids = {
-                (dict((d.configuration or {}).get("listener") or {})).get("command_id")
+                (dict((d.configuration or {}).get(_placement_key(d)) or {})).get("command_id")
                 for d in decoys
             }
             command_ids.discard(None)
@@ -104,7 +110,8 @@ async def _reconcile_honeypot_dispatches() -> dict:
 
             for decoy in decoys:
                 config = dict(decoy.configuration or {})
-                listener = dict(config.get("listener") or {})
+                key = _placement_key(decoy)
+                listener = dict(config.get(key) or {})
                 command_id = listener.get("command_id")
                 if not command_id:
                     continue
@@ -113,7 +120,7 @@ async def _reconcile_honeypot_dispatches() -> dict:
                 if result is not None:
                     if result.status == "success":
                         decoy.status = "active"
-                        listener["state"] = "listening"
+                        listener["state"] = "listening" if key == "listener" else "deployed"
                         activated += 1
                     else:
                         decoy.status = "failed"
@@ -131,7 +138,7 @@ async def _reconcile_honeypot_dispatches() -> dict:
                         pending += 1
                         continue
 
-                config["listener"] = listener
+                config[key] = listener
                 decoy.configuration = config
 
             await db.commit()
@@ -157,5 +164,5 @@ async def _reconcile_honeypot_dispatches() -> dict:
 
 @shared_task(name="deception.reconcile_honeypot_dispatches")
 def reconcile_honeypot_dispatches() -> dict:
-    """Flip deploying honeypots to active/failed from agent results."""
+    """Flip deploying decoys (honeypots and agent-planted decoys) to active/failed from agent results."""
     return asyncio.run(_reconcile_honeypot_dispatches())

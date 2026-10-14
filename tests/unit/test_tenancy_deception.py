@@ -313,7 +313,9 @@ async def test_rotation_routes_are_honest_501s(
     assert _error_key(resp) == "not_implemented"
     # Rotation no longer wipes evidence counters or touches the row.
     row = (await db_session.execute(select(Decoy).where(Decoy.id == decoy_id))).scalar_one()
-    assert row.status == "active"
+    # Wave 3: with no deception agent a honeyfile is honestly "not_deployed" (it used to be
+    # stored as "active" with nothing deployed); rotation leaves that untouched.
+    assert row.status == "not_deployed"
 
     resp = await client.post(f"{BASE}/tokens/rotate", params={"token_type": "api_key"}, headers=org_a_admin_headers)
     assert resp.status_code == 501, resp.text

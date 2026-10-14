@@ -188,6 +188,14 @@ class ForensicEvidence(BaseModel):
     # Notes
     handling_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # Endpoint-agent collection (wave 3, migration 028). NULL for uploads and
+    # registered objects. ``collection_status`` follows the agent command:
+    # awaiting_approval / pending / collected / collected_on_host / failed.
+    collection_status: Mapped[Optional[str]] = mapped_column(String(30), nullable=True, index=True)
+    collection_command_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    collection_agent_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    collection_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     # Organization multi-tenancy
     organization_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
 

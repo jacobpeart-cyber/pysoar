@@ -9,15 +9,20 @@ import uuid as uuid_mod
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
+from src.core.csvsafe import csv_safe
+from src.core.logging import get_logger
 from src.core.utils import safe_json_loads
+from src.dfir.storage import EvidencePathRefusedError, relative_location, resolve_tenant_evidence_path
 from src.models.user import User, UserRole
+
+logger = get_logger(__name__)
 
 # Case, evidence, timeline, artifact and legal-hold writes need analyst or
 # admin; releasing a legal hold needs admin. Viewers are read-only.
@@ -68,19 +73,23 @@ def _validate_client_storage_location(location: Optional[str]) -> str:
     )
 
 
-def _local_evidence_path(location: str) -> str:
-    """Resolve a stored local path and refuse anything outside DFIR_UPLOAD_ROOT."""
-    root = os.path.realpath(DFIR_UPLOAD_ROOT)
-    real = os.path.realpath(location)
-    if real != root and not real.startswith(root + os.sep):
+def _local_evidence_path(location: str, org_id: Optional[str] = None) -> str:
+    """Resolve a stored local evidence location, confined to the tenant's subtree.
+
+    Every route passes the caller's ``org_id``: the path must resolve inside
+    ``DFIR_UPLOAD_ROOT/<org_id>`` (403 ``evidence_path_outside_tenant_root``
+    otherwise, e.g. a legacy row pointing into another tenant's directory) and
+    always inside the root (403 ``evidence_path_outside_storage_root``).
+    Relative locations (what new rows store) are taken relative to the root.
+    """
+    try:
+        return resolve_tenant_evidence_path(DFIR_UPLOAD_ROOT, location, org_id)
+    except EvidencePathRefusedError as exc:
+        logger.warning("dfir_evidence_path_refused", reason=exc.reason, organization_id=org_id)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "error": "evidence_path_outside_storage_root",
-                "detail": "this evidence item points outside the evidence storage root and cannot be served",
-            },
-        )
-    return real
+            detail={"error": exc.reason, "detail": exc.detail},
+        ) from None
 
 
 def _hash_file(path: str, algorithm: str) -> str:
@@ -89,8 +98,13 @@ def _hash_file(path: str, algorithm: str) -> str:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-from src.dfir.engine import (
-    ArtifactAnalyzer,
+from src.dfir.analysis import reconstruct_timeline, scan_case_iocs
+from src.dfir.collection import (
+    PENDING_STATES,
+    CollectionRequestError,
+    build_payload,
+    reconcile_evidence,
+    request_collection,
 )
 from src.dfir.models import (
     CaseStatus,
@@ -108,7 +122,11 @@ from src.schemas.dfir import (
     ChainOfCustodyReportResponse,
     ChainOfCustodyUpdateRequest,
     DFIRDashboardResponse,
+    EvidenceCollectRequest,
+    EvidenceCollectResponse,
+    EvidenceVerification,
     EvidenceVerifyRequest,
+    EvidenceVerifyResponse,
     ForensicArtifactCreate,
     ForensicArtifactListResponse,
     ForensicArtifactResponse,
@@ -128,6 +146,7 @@ from src.schemas.dfir import (
     LegalHoldResponse,
     LegalHoldUpdate,
     TimelineExportResponse,
+    TimelineReconstructResponse,
 )
 
 router = APIRouter(prefix="/dfir", tags=["DFIR"])
@@ -177,6 +196,20 @@ async def get_evidence_or_404(db: AsyncSession, evidence_id: str, org_id: str) -
             detail="Evidence not found",
         )
     return evidence
+
+
+def _case_response(case: ForensicCase) -> ForensicCaseResponse:
+    """Case response with ``evidence_count`` from the loaded evidence rows."""
+    out = ForensicCaseResponse.model_validate(case)
+    out.evidence_count = len(case.evidence or [])
+    return out
+
+
+async def _reconcile_pending(db: AsyncSession, rows: list[ForensicEvidence]) -> None:
+    """Bring agent-collected rows up to date with their command results."""
+    for row in rows:
+        if row.collection_status in PENDING_STATES and row.collection_command_id:
+            await reconcile_evidence(db, row, root=DFIR_UPLOAD_ROOT)
 
 
 # ============================================================================
@@ -244,7 +277,7 @@ async def list_cases(
     result = await db.execute(query)
     cases = list(result.scalars().all())
 
-    items = [ForensicCaseResponse.model_validate(case) for case in cases]
+    items = [_case_response(case) for case in cases]
 
     return ForensicCaseListResponse(
         items=items,
@@ -263,7 +296,7 @@ async def get_case(
 ):
     """Get a specific forensic case"""
     case = await get_case_or_404(db, case_id, org_id)
-    return ForensicCaseResponse.model_validate(case)
+    return _case_response(case)
 
 
 @router.post("/cases", response_model=ForensicCaseResponse, status_code=status.HTTP_201_CREATED)
@@ -429,6 +462,7 @@ async def list_evidence(
 
     result = await db.execute(query)
     evidence_list = list(result.scalars().all())
+    await _reconcile_pending(db, evidence_list)
 
     items = [ForensicEvidenceResponse.model_validate(e) for e in evidence_list]
 
@@ -449,6 +483,7 @@ async def get_evidence(
 ):
     """Get a specific evidence item"""
     evidence = await get_evidence_or_404(db, evidence_id, org_id)
+    await _reconcile_pending(db, [evidence])
     return ForensicEvidenceResponse.model_validate(evidence)
 
 
@@ -460,6 +495,9 @@ async def download_evidence(
     db: DatabaseSession = None,
 ):
     """Download forensic evidence, appending a chain-of-custody entry.
+
+    The path is checked before the custody entry is written, so a refused
+    read leaves no "accessed" record.
 
     Supports local filesystem ``storage_location`` paths (streams the file)
     and HTTP(S) URLs (returns a 307 redirect to the signed URL). Every
@@ -479,6 +517,10 @@ async def download_evidence(
             detail="No storage_location set for this evidence item",
         )
 
+    loc = evidence.storage_location
+    if "://" not in loc:
+        _local_evidence_path(loc, org_id)
+
     # Append chain-of-custody entry for this access
     chain = dict(evidence.chain_of_custody_log or {})
     entries = list(chain.get("entries", []))
@@ -492,7 +534,6 @@ async def download_evidence(
     evidence.chain_of_custody_log = chain
     await db.flush()
 
-    loc = evidence.storage_location
     # Remote object URL: redirect, but only to the schemes a client may register.
     if loc.startswith(_REMOTE_EVIDENCE_SCHEMES):
         return RedirectResponse(url=loc)
@@ -502,8 +543,8 @@ async def download_evidence(
             detail={"error": "invalid_storage_location", "detail": "only https:// and s3:// evidence URLs are served"},
         )
 
-    # Local path: must resolve inside the evidence storage root (403 otherwise).
-    path = _local_evidence_path(loc)
+    # Local path: must resolve inside this tenant's evidence directory (403 otherwise).
+    path = _local_evidence_path(loc, org_id)
     if not os.path.isfile(path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -600,7 +641,7 @@ async def upload_evidence_file(
     """Stream-upload forensic evidence file, hash it, and register a ForensicEvidence row.
 
     - Streams the multipart body into ``/app/uploads/dfir/<org>/<case>/<uuid>_<name>``.
-    - Computes SHA-256 and SHA-512 over the bytes while writing (no double pass).
+    - Computes SHA-256, MD5 and SHA-512 over the bytes while writing (no double pass).
     - Captures the collector + timestamp as the first chain-of-custody entry.
     - Transactional: if the DB insert fails the on-disk file is deleted so we
       never leave an orphan.
@@ -623,6 +664,7 @@ async def upload_evidence_file(
 
     # Stream the file to disk while hashing
     sha256 = hashlib.sha256()
+    md5 = hashlib.md5(usedforsecurity=False)
     sha512 = hashlib.sha512()
     total_bytes = 0
     CHUNK = 1024 * 1024  # 1 MiB
@@ -634,6 +676,7 @@ async def upload_evidence_file(
                 if not chunk:
                     break
                 sha256.update(chunk)
+                md5.update(chunk)
                 sha512.update(chunk)
                 out_fh.write(chunk)
                 total_bytes += len(chunk)
@@ -663,6 +706,7 @@ async def upload_evidence_file(
         )
 
     sha256_hex = sha256.hexdigest()
+    md5_hex = md5.hexdigest()
     sha512_hex = sha512.hexdigest()
 
     # Build chain-of-custody entry. The actor is the session user; a
@@ -685,8 +729,9 @@ async def upload_evidence_file(
         source_ip=source_ip,
         acquisition_method=acquisition_method,
         original_hash_sha256=sha256_hex,
-        original_hash_md5=None,
-        storage_location=final_path,
+        original_hash_md5=md5_hex,
+        # Relative to DFIR_UPLOAD_ROOT (<org>/<case>/<file>); always server-chosen.
+        storage_location=relative_location(DFIR_UPLOAD_ROOT, final_path),
         file_size_bytes=total_bytes,
         handling_notes=merged_notes or None,
         organization_id=org_id,
@@ -697,6 +742,7 @@ async def upload_evidence_file(
                     "actor": actor,
                     "action": "collected",
                     "hash": sha256_hex,
+                    "hash_md5": md5_hex,
                     "hash_sha512": sha512_hex,
                     "size_bytes": total_bytes,
                     "original_filename": file.filename or sanitized,
@@ -727,7 +773,7 @@ async def upload_evidence_file(
     return ForensicEvidenceResponse.model_validate(evidence)
 
 
-@router.post("/evidence/{evidence_id}/verify", response_model=ForensicEvidenceResponse)
+@router.post("/evidence/{evidence_id}/verify", response_model=EvidenceVerifyResponse)
 async def verify_evidence_integrity(
     evidence_id: str,
     verify_data: EvidenceVerifyRequest,
@@ -735,35 +781,38 @@ async def verify_evidence_integrity(
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Verify evidence integrity through hash comparison"""
+    """Verify evidence integrity by re-hashing the stored bytes.
+
+    The stored file (inside this tenant's evidence directory) is re-hashed
+    and compared with the hash recorded at collection; an optional
+    ``evidence_hash`` from the client is compared with the same reference.
+    The recorded hashes are never overwritten. Remote objects (https / s3)
+    have no local bytes, so only a client hash can be checked against the
+    recorded one. A local file that has gone missing fails verification.
+    """
     evidence = await get_evidence_or_404(db, evidence_id, org_id)
 
-    # Integrity check against a reference the client does not control: the
-    # file's actual digest when it is stored locally, otherwise the hash
-    # recorded at collection. (The previous version compared two client-sent
-    # strings and then overwrote the stored hash with one of them.)
     algorithm = (verify_data.hash_algorithm or "sha256").lower()
     if algorithm not in ("sha256", "md5"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"error": "unsupported_hash_algorithm", "detail": "hash_algorithm must be sha256 or md5"},
         )
-    claimed = (verify_data.evidence_hash or "").strip().lower()
-    if not claimed:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": "missing_evidence_hash", "detail": "evidence_hash is required"},
-        )
+    claimed = (verify_data.evidence_hash or "").strip().lower() or None
 
     computed: Optional[str] = None
+    file_missing = False
     loc = evidence.storage_location or ""
     if loc and "://" not in loc:
-        path = _local_evidence_path(loc)
+        path = _local_evidence_path(loc, org_id)
         if os.path.isfile(path):
             computed = _hash_file(path, algorithm)
-    stored = evidence.original_hash_sha256 if algorithm == "sha256" else evidence.original_hash_md5
-    reference = computed or (stored.strip().lower() if stored else None)
-    if reference is None:
+        else:
+            file_missing = True
+    stored_raw = evidence.original_hash_sha256 if algorithm == "sha256" else evidence.original_hash_md5
+    stored = stored_raw.strip().lower() if stored_raw else None
+    reference = computed or stored
+    if reference is None and not file_missing:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
@@ -771,28 +820,124 @@ async def verify_evidence_integrity(
                 "detail": f"no stored {algorithm} hash and no local file to compute one from",
             },
         )
+    if computed is None and claimed is None and not file_missing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "nothing_to_compare",
+                "detail": "the evidence bytes are not held by PySOAR; supply evidence_hash to compare with the recorded hash",
+            },
+        )
 
-    is_valid = claimed == reference
+    file_matches = (computed == stored) if (computed and stored) else None
+    claim_matches = (claimed == reference) if (claimed and reference) else None
+    is_valid = (
+        not file_missing
+        and file_matches is not False
+        and claim_matches is not False
+        and (file_matches is True or claim_matches is True)
+    )
+    verification = EvidenceVerification(
+        algorithm=algorithm,
+        reference="file" if computed else "stored_hash",
+        computed_hash=computed,
+        stored_hash=stored,
+        file_matches_stored_hash=file_matches,
+        claimed_hash_matches=claim_matches,
+        is_valid=is_valid,
+    )
+
     evidence.is_verified = is_valid
     evidence.verified_by = _session_actor(current_user)
     evidence.verification_date = datetime.now(timezone.utc).isoformat()
 
     chain = dict(evidence.chain_of_custody_log or {})
     entries = list(chain.get("entries", []))
-    entries.append({
+    entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "actor": evidence.verified_by,
         "action": "verified" if is_valid else "verification_failed",
         "algorithm": algorithm,
-        "reference": "file" if computed else "stored_hash",
-    })
+        "reference": verification.reference,
+        "hash": computed,
+        "stored_hash_matches": file_matches,
+        "claimed_hash_matches": claim_matches,
+    }
+    if file_missing:
+        entry["details"] = "stored evidence file is missing"
+    entries.append(entry)
     chain["entries"] = entries
     evidence.chain_of_custody_log = chain
 
     await db.flush()
     await db.refresh(evidence)
 
-    return ForensicEvidenceResponse.model_validate(evidence)
+    out = EvidenceVerifyResponse.model_validate(evidence)
+    out.verification = verification
+    return out
+
+
+@router.post(
+    "/cases/{case_id}/evidence/collect",
+    response_model=EvidenceCollectResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def collect_evidence_from_agent(
+    case_id: str,
+    body: EvidenceCollectRequest,
+    response: Response,
+    current_user: User = Depends(require_role(_ANALYST_ROLES)),
+    org_id: OrganizationId = None,
+    db: DatabaseSession = None,
+):
+    """Collect evidence from a host through its endpoint agent.
+
+    Issues a ``collect_process_list`` / ``collect_network_connections`` /
+    ``collect_file`` / ``collect_memory_dump`` command (memory dumps wait for
+    a second approver). Returns 202 with the new evidence row
+    (``collection_status`` pending / awaiting_approval); the row moves to
+    collected / collected_on_host / failed from the command result. With no
+    enrolled agent able to run the command, returns 200 ``awaiting_agent``
+    and creates nothing.
+    """
+    from src.agents.service import AgentServiceError
+
+    await get_case_or_404(db, case_id, org_id)
+    try:
+        payload = build_payload(body.collection_type, body.path, body.max_bytes, body.pid)
+    except CollectionRequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "invalid_collection_request", "detail": str(exc)},
+        ) from None
+    try:
+        outcome = await request_collection(
+            db,
+            org_id=org_id,
+            case_id=case_id,
+            hostname=body.hostname.strip(),
+            collection_type=body.collection_type,
+            payload=payload,
+            actor_user_id=str(current_user.id),
+            actor_name=_session_actor(current_user),
+            notes=body.notes,
+        )
+    except AgentServiceError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"error": "agent_refused", "detail": str(exc)},
+        ) from None
+
+    if outcome.evidence is not None:
+        response.status_code = status.HTTP_202_ACCEPTED
+    return EvidenceCollectResponse(
+        status=outcome.status,
+        detail=outcome.detail,
+        evidence=ForensicEvidenceResponse.model_validate(outcome.evidence) if outcome.evidence is not None else None,
+        command_id=outcome.command_id,
+        agent_id=outcome.agent_id,
+        agent_hostname=outcome.agent_hostname,
+    )
 
 
 @router.post("/evidence/{evidence_id}/chain-of-custody", response_model=ForensicEvidenceResponse)
@@ -922,14 +1067,49 @@ async def add_timeline_event(
     return ForensicTimelineResponse.model_validate(event)
 
 
+@router.post(
+    "/cases/{case_id}/timeline/reconstruct",
+    response_model=TimelineReconstructResponse,
+)
+async def reconstruct_case_timeline(
+    case_id: str,
+    _current_user: User = Depends(require_role(_ANALYST_ROLES)),
+    org_id: OrganizationId = None,
+    db: DatabaseSession = None,
+):
+    """Derive timeline events from the case's stored material.
+
+    One event per chain-of-custody entry of every evidence item and one per
+    timestamp field found in stored artifacts (top level and record lists).
+    Re-running adds only what is new (rows carry ``artifact_data.derived_from``).
+    """
+    await get_case_or_404(db, case_id, org_id)
+    out = await reconstruct_timeline(db, case_id=case_id, org_id=org_id)
+    return TimelineReconstructResponse(
+        case_id=case_id,
+        created=out.created,
+        already_present=out.already_present,
+        from_custody=out.from_custody,
+        from_artifacts=out.from_artifacts,
+        truncated=out.truncated,
+    )
+
+
+_TIMELINE_CSV_COLUMNS = (
+    "event_timestamp", "event_type", "source", "source_evidence_id", "description",
+    "mitre_technique_id", "severity_score", "is_pivotal", "id",
+)
+
+
 @router.post("/cases/{case_id}/timeline/export", response_model=TimelineExportResponse)
 async def export_timeline(
     case_id: str,
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
+    export_format: str = Query("json", alias="format", pattern="^(json|csv)$"),
 ):
-    """Export case timeline"""
-    case = await get_case_or_404(db, case_id, org_id)
+    """Export the case timeline stored for this case (``format=json`` or ``csv``)."""
+    await get_case_or_404(db, case_id, org_id)
 
     timeline_stmt = (
         select(ForensicTimeline)
@@ -939,6 +1119,21 @@ async def export_timeline(
     timeline_stmt = timeline_stmt.where(ForensicTimeline.organization_id == org_id)
     result = await db.execute(timeline_stmt)
     events = list(result.scalars().all())
+
+    if export_format == "csv":
+        import csv
+        import io
+
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(_TIMELINE_CSV_COLUMNS)
+        for e in events:
+            writer.writerow([csv_safe(getattr(e, col)) for col in _TIMELINE_CSV_COLUMNS])
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="timeline-{case_id}.csv"'},
+        )
 
     return TimelineExportResponse(
         case_id=case_id,
@@ -1055,44 +1250,33 @@ async def analyze_artifact(
 @router.post("/cases/{case_id}/artifacts/extract-iocs", response_model=IOCExtractionResponse)
 async def extract_case_iocs(
     case_id: str,
+    _current_user: User = Depends(require_role(_ANALYST_ROLES)),
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Extract all IOCs from case artifacts"""
+    """Extract IOCs from the case's stored artifacts and stored evidence bytes.
+
+    Artifacts: every string in ``artifact_data``; results persisted to
+    ``ioc_extracted``. Evidence: the printable strings of the first 8 MiB of
+    each file held in this tenant's evidence directory; results persisted as
+    one ``evidence_ioc_scan`` artifact per file. Evidence without local bytes
+    (remote objects, pending collections) is listed in ``evidence_skipped``.
+    """
     await get_case_or_404(db, case_id, org_id)
-
-    artifact_stmt = select(ForensicArtifact).where(ForensicArtifact.case_id == case_id)
-    artifact_stmt = artifact_stmt.where(ForensicArtifact.organization_id == org_id)
-    result = await db.execute(artifact_stmt)
-    artifacts = list(result.scalars().all())
-
-    analyzer = ArtifactAnalyzer()
-    aggregated_iocs = {
-        "ipv4_addresses": set(),
-        "ipv6_addresses": set(),
-        "domains": set(),
-        "file_hashes": set(),
-        "email_addresses": set(),
-        "urls": set(),
-    }
-
-    for artifact in artifacts:
-        ioc_result = analyzer.extract_iocs(artifact.artifact_data or {}, artifact.artifact_type)
-        if ioc_result["status"] == "success":
-            iocs = ioc_result.get("iocs", {})
-            for ioc_type, values in iocs.items():
-                aggregated_iocs[ioc_type].update(values)
-
-    # Convert sets to lists
-    final_iocs = {k: list(v) for k, v in aggregated_iocs.items()}
-    total = sum(len(v) for v in final_iocs.values())
+    scan = await scan_case_iocs(db, case_id=case_id, org_id=org_id, root=DFIR_UPLOAD_ROOT)
 
     from src.schemas.dfir import IOCData
 
     return IOCExtractionResponse(
         status="success",
-        iocs=IOCData(**final_iocs),
-        total_extracted=total,
+        iocs=IOCData(**scan.iocs),
+        total_extracted=scan.total,
+        iocs_extracted=scan.total,
+        artifacts_scanned=scan.artifacts_scanned,
+        evidence_files_scanned=scan.evidence_files_scanned,
+        evidence_files_truncated=scan.evidence_files_truncated,
+        evidence_skipped=scan.evidence_skipped,
+        scan_artifacts_written=scan.scan_artifacts_written,
     )
 
 
@@ -1310,7 +1494,30 @@ async def get_dfir_dashboard(
     cases_with_holds = await db.execute(holds_cases_query)
     holds_cases = cases_with_holds.scalar() or 0
 
+    async def _count(stmt) -> int:
+        return (await db.execute(stmt)).scalar() or 0
+
+    critical_count = await _count(
+        select(func.count()).select_from(ForensicCase).where(
+            ForensicCase.organization_id == org_id, ForensicCase.severity == "critical",
+        ),
+    )
+    high_count = await _count(
+        select(func.count()).select_from(ForensicCase).where(
+            ForensicCase.organization_id == org_id, ForensicCase.severity == "high",
+        ),
+    )
+    collections_pending = await _count(
+        select(func.count()).select_from(ForensicEvidence).where(
+            ForensicEvidence.organization_id == org_id,
+            ForensicEvidence.collection_status.in_(PENDING_STATES),
+        ),
+    )
+
     return DFIRDashboardResponse(
+        critical_cases=critical_count,
+        high_cases=high_count,
+        collections_pending=collections_pending,
         total_cases=total_cases,
         active_cases=active_count,
         cases_in_analysis=analysis_count,

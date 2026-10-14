@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Any, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 from src.schemas.base import DBModel
 
@@ -58,6 +58,8 @@ class ForensicCaseResponse(ForensicCaseBase, DBModel):
     created_by: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # Wave 3: number of evidence rows on the case (set by the list/get routes).
+    evidence_count: int = 0
 
     class Config:
         from_attributes = True
@@ -138,11 +140,65 @@ class ForensicEvidenceResponse(ForensicEvidenceBase, DBModel):
     verified_by: Optional[str] = None
     verification_date: Optional[str] = None
     handling_notes: Optional[str] = None
+    # Wave 3: endpoint-agent collection. NULL for uploads / registered objects;
+    # otherwise awaiting_approval | pending | collected | collected_on_host | failed.
+    collection_status: Optional[str] = None
+    collection_command_id: Optional[str] = None
+    collection_agent_id: Optional[str] = None
+    collection_error: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def storage_kind(self) -> str:
+        """``local`` (bytes held by PySOAR), ``remote`` (https/s3 object) or ``none``."""
+        if not self.storage_location:
+            return "none"
+        return "remote" if "://" in self.storage_location else "local"
+
     class Config:
         from_attributes = True
+
+
+class EvidenceVerification(BaseModel):
+    """Outcome of one integrity verification (POST /dfir/evidence/{id}/verify)."""
+
+    algorithm: str = "sha256"
+    reference: str = ""  # "file" (stored bytes re-hashed) or "stored_hash" (no local file)
+    computed_hash: Optional[str] = None
+    stored_hash: Optional[str] = None
+    file_matches_stored_hash: Optional[bool] = None
+    claimed_hash_matches: Optional[bool] = None
+    is_valid: bool = False
+
+
+class EvidenceVerifyResponse(ForensicEvidenceResponse):
+    """Evidence row plus the verification just performed."""
+
+    verification: Optional[EvidenceVerification] = None
+
+
+class EvidenceCollectRequest(BaseModel):
+    """Collect evidence from a host through its endpoint agent."""
+
+    hostname: str = Field(..., min_length=1, max_length=255)
+    collection_type: str = Field(..., description="process_list, network_connections, file, memory_dump")
+    path: Optional[str] = Field(None, description="file collections: absolute path on the host")
+    max_bytes: Optional[int] = Field(None, ge=1, description="file collections: refuse larger files")
+    pid: Optional[int] = Field(None, ge=1, description="memory dumps: process id")
+    notes: Optional[str] = None
+
+
+class EvidenceCollectResponse(BaseModel):
+    """``awaiting_agent`` (nothing created), ``awaiting_approval`` or ``pending``."""
+
+    status: str = ""
+    detail: str = ""
+    evidence: Optional[ForensicEvidenceResponse] = None
+    command_id: Optional[str] = None
+    agent_id: Optional[str] = None
+    agent_hostname: Optional[str] = None
 
 
 class ForensicEvidenceListResponse(BaseModel):
@@ -156,7 +212,11 @@ class ForensicEvidenceListResponse(BaseModel):
 
 
 class EvidenceVerifyRequest(BaseModel):
-    """Request to verify evidence integrity"""
+    """Request to verify evidence integrity.
+
+    ``evidence_hash`` is optional: without it the stored file is re-hashed and
+    compared with the hash recorded at collection.
+    """
 
     evidence_hash: str = ""
     hash_algorithm: str = "sha256"
@@ -296,6 +356,12 @@ class ForensicArtifactResponse(ForensicArtifactBase, DBModel):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ioc_count(self) -> int:
+        """Indicators persisted on this artifact by the last IOC extraction."""
+        return sum(len(v) for v in (self.ioc_extracted or {}).values() if isinstance(v, list))
+
     class Config:
         from_attributes = True
 
@@ -328,11 +394,18 @@ class ArtifactAnalysisResponse(BaseModel):
 
 
 class IOCExtractionResponse(BaseModel):
-    """Response from IOC extraction"""
+    """Response from IOC extraction over the case's stored artifacts and evidence bytes"""
 
     status: str = ""
     iocs: IOCData
     total_extracted: int = 0
+    # Wave 3 (the UI read these names; total_extracted is kept).
+    iocs_extracted: int = 0
+    artifacts_scanned: int = 0
+    evidence_files_scanned: int = 0
+    evidence_files_truncated: int = 0
+    evidence_skipped: list[dict[str, str]] = Field(default_factory=list)
+    scan_artifacts_written: int = 0
 
 
 # ============================================================================
@@ -439,6 +512,17 @@ class CaseReportResponse(BaseModel):
     investigation_duration_days: int = 0
 
 
+class TimelineReconstructResponse(BaseModel):
+    """Timeline rows derived from custody logs and stored artifacts."""
+
+    case_id: str = ""
+    created: int = 0
+    already_present: int = 0
+    from_custody: int = 0
+    from_artifacts: int = 0
+    truncated: bool = False
+
+
 class TimelineExportResponse(BaseModel):
     """Timeline export response"""
 
@@ -487,3 +571,5 @@ class DFIRDashboardResponse(BaseModel):
     critical_cases: int = 0
     high_cases: int = 0
     cases_with_legal_holds: int = 0
+    # Wave 3: agent collections not yet resolved (pending / awaiting_approval).
+    collections_pending: int = 0
