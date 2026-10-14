@@ -44,6 +44,9 @@ class FindingType(str, Enum):
     LEAKED_SOURCE_CODE = "leaked_source_code"
     EXPOSED_API_KEY = "exposed_api_key"
     EXECUTIVE_PII_EXPOSURE = "executive_pii_exposure"
+    # A threat-intel feed item (URLhaus / ThreatFox / OTX) that mentions one
+    # of the monitor's terms. Not a dark-web post.
+    THREAT_FEED_MATCH = "threat_feed_match"
 
 
 class SourcePlatform(str, Enum):
@@ -58,6 +61,8 @@ class SourcePlatform(str, Enum):
     BREACH_DATABASE = "breach_database"
     CODE_REPOSITORY = "code_repository"
     SOCIAL_MEDIA = "social_media"
+    # Public threat-intelligence feeds (abuse.ch URLhaus / ThreatFox, OTX).
+    THREAT_INTEL_FEED = "threat_intel_feed"
 
 
 class AlertSeverity(str, Enum):

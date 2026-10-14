@@ -4,17 +4,16 @@ import io
 import ipaddress
 import json
 import re
-import socket
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
-from urllib.parse import urlparse
 
-import aiohttp
+import httpx
 
 from src.core.config import settings
 from src.core.logging import get_logger
 from src.intel.models import ThreatFeed, ThreatIndicator
+from src.intel.outbound import IntelOutboundRefused, guarded_get_bytes
 
 logger = get_logger(__name__)
 
@@ -40,26 +39,28 @@ MAX_INDICATORS_PER_POLL = 200_000  # parsed indicators kept per poll
 FEED_INGEST_BATCH = 1_000          # rows per existence-check + commit window
 
 
-def _validate_url_not_internal(url: str) -> bool:
-    """Prevent SSRF by blocking requests to internal/private IP ranges."""
+#: Timeouts for feed downloads (large public blocklists stream for a while).
+FEED_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
+
+
+async def _fetch_guarded(url: str, headers: dict[str, str]) -> tuple[Optional[bytes], Optional[str]]:
+    """Download a feed body through the intel outbound guard.
+
+    Private / loopback / link-local / metadata targets are refused, redirects
+    are not followed and the body is capped at ``MAX_FEED_BYTES``. Returns
+    ``(body, None)`` or ``(None, error)``.
+    """
     try:
-        parsed = urlparse(url)
-        hostname = parsed.hostname
-        if not hostname:
-            return False
-        # Block common internal hostnames
-        blocked_hostnames = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "metadata.google.internal", "169.254.169.254"}
-        if hostname.lower() in blocked_hostnames:
-            return False
-        # Resolve and check IP ranges
-        resolved_ips = socket.getaddrinfo(hostname, None)
-        for family, type_, proto, canonname, sockaddr in resolved_ips:
-            ip = ipaddress.ip_address(sockaddr[0])
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                return False
-        return True
-    except Exception:
-        return False
+        _status, body, error = await guarded_get_bytes(
+            url, headers=headers, max_bytes=MAX_FEED_BYTES, timeout=FEED_TIMEOUT,
+        )
+    except IntelOutboundRefused as exc:
+        return None, f"URL refused: {exc}"
+    except httpx.TimeoutException:
+        return None, "feed fetch timed out"
+    except httpx.HTTPError as exc:
+        return None, f"feed fetch failed: {type(exc).__name__}: {exc}"
+    return body, error
 
 
 class FeedParser(ABC):
@@ -483,57 +484,18 @@ class TAXIIFeedClient:
         Returns:
             Raw TAXII response data (STIX bundle)
         """
-        try:
-            headers = self._build_headers()
-            url = f"{self.server_url}/collections/{self.collection_id}/objects"
+        headers = self._build_headers()
+        url = f"{self.server_url}/collections/{self.collection_id}/objects"
+        if modified_after:
+            # ISO 8601 format required by TAXII
+            url = str(httpx.URL(url, params={"added_after": modified_after.isoformat()}))
 
-            # SSRF protection
-            if not _validate_url_not_internal(url):
-                self.logger.error("URL validation failed: blocked internal/private address", url=url)
-                return b""
-
-            params = {}
-            if modified_after:
-                # ISO 8601 format required by TAXII
-                params["added_after"] = modified_after.isoformat()
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, params=params, timeout=30) as resp:
-                    if resp.status == 200:
-                        # Same chunked read + MAX_FEED_BYTES ceiling as
-                        # FeedManager._fetch_feed_data: a TAXII collection is
-                        # just as operator-uncontrolled as a plain blocklist,
-                        # and `resp.read()` pulls the whole bundle into the
-                        # worker in one allocation.
-                        chunks: list[bytes] = []
-                        total = 0
-                        async for chunk in resp.content.iter_chunked(64 * 1024):
-                            total += len(chunk)
-                            if total > MAX_FEED_BYTES:
-                                self.logger.error(
-                                    "TAXII bundle exceeds the size ceiling; refusing to ingest",
-                                    collection=self.collection_id,
-                                    max_bytes=MAX_FEED_BYTES,
-                                )
-                                return b""
-                            chunks.append(chunk)
-                        self.logger.info(
-                            "TAXII fetch successful",
-                            collection=self.collection_id,
-                            bytes=total,
-                        )
-                        return b"".join(chunks)
-                    else:
-                        self.logger.error(
-                            "TAXII fetch failed",
-                            collection=self.collection_id,
-                            status=resp.status,
-                        )
-                        return b""
-
-        except Exception as e:
-            self.logger.error("Error fetching from TAXII", error=str(e))
+        body, error = await _fetch_guarded(url, headers)
+        if error:
+            self.logger.error("TAXII fetch failed", collection=self.collection_id, error=error)
             return b""
+        self.logger.info("TAXII fetch successful", collection=self.collection_id, bytes=len(body or b""))
+        return body or b""
 
     def _build_headers(self) -> dict[str, str]:
         """Build headers for TAXII request including authentication"""
@@ -721,6 +683,21 @@ class FeedManager:
                 self.logger.warning("Feed is disabled, skipping", feed_id=feed_id)
                 return 0
 
+            if feed.organization_id is None and not feed.is_builtin:
+                # Only the built-in feeds registered at startup produce
+                # platform intel (NULL organisation, readable by every
+                # tenant). A NULL-organisation feed that is not built-in has
+                # no owner; ingesting it would publish an unvetted source to
+                # every tenant, so it is refused and the reason recorded.
+                self.logger.warning("Refusing to poll an ownerless non-builtin feed", feed_id=feed_id)
+                feed.last_error = (
+                    "feed has no organisation and is not a built-in feed; "
+                    "assign it to an organisation to poll it"
+                )
+                feed.last_poll_at = datetime.now(timezone.utc)
+                await session.commit()
+                return 0
+
             # Fetch raw data from feed URL
             raw_data = await self._fetch_feed_data(feed)
             if not raw_data:
@@ -734,7 +711,11 @@ class FeedManager:
             # configured in builtin_feeds[] — known-C2 feeds get HIGH,
             # hijacked-netblock feeds get CRITICAL, generic attacker
             # blocklists stay MEDIUM.
-            feed_default_severity = self._feed_default_severity(feed.name)
+            feed_default_severity = (
+                self._feed_default_severity(feed.name)
+                if feed.is_builtin and feed.organization_id is None
+                else "medium"
+            )
             if feed.feed_type == "plain":
                 parser = PlainListFeedParser(default_severity=feed_default_severity)
             else:
@@ -875,32 +856,57 @@ class FeedManager:
             self.logger.info("Feed poll complete", feed_id=feed_id, new_indicators=new_count)
             return new_count
 
-    async def poll_all_feeds(self) -> dict[str, int]:
-        """Poll all enabled threat feeds
+    async def poll_all_feeds(self, *, only_due: bool = True) -> dict[str, int]:
+        """Poll every enabled feed (every tenant's plus the platform built-ins).
+
+        With ``only_due`` (the scheduled path) a feed is skipped until
+        ``poll_interval_minutes`` have passed since its last poll. Each feed's
+        indicators are stamped with that feed's organisation (NULL only for
+        built-in platform feeds, see ``poll_feed``). A feed whose poll raises
+        is recorded on ``feed.last_error`` and reported as -1 in the result,
+        never silently counted as zero new indicators.
 
         Returns:
             Dict with feed_id as key and count of new indicators as value
+            (-1 for a failed poll).
         """
         from src.core.database import async_session_factory
         from sqlalchemy import select
 
         self.logger.info("Polling all enabled feeds")
-        results = {}
+        results: dict[str, int] = {}
+        now = datetime.now(timezone.utc)
 
         async with async_session_factory() as session:
-            query = select(ThreatFeed).where(ThreatFeed.is_enabled == True)
-            result = await session.execute(query)
-            feeds = list(result.scalars().all())
+            query = select(
+                ThreatFeed.id, ThreatFeed.name, ThreatFeed.last_poll_at, ThreatFeed.poll_interval_minutes,
+            ).where(ThreatFeed.is_enabled == True)
+            rows = (await session.execute(query)).all()
 
-        self.logger.info("Found enabled feeds to poll", count=len(feeds))
+        due: list[tuple[str, str]] = []
+        for feed_id, name, last_poll_at, interval in rows:
+            if only_due and last_poll_at is not None:
+                last = last_poll_at if last_poll_at.tzinfo else last_poll_at.replace(tzinfo=timezone.utc)
+                if now - last < timedelta(minutes=max(int(interval or 60), 1)):
+                    continue
+            due.append((feed_id, name))
 
-        for feed in feeds:
+        self.logger.info("Found enabled feeds to poll", count=len(due), enabled=len(rows))
+
+        for feed_id, name in due:
             try:
-                count = await self.poll_feed(feed.id)
-                results[feed.id] = count
+                results[feed_id] = await self.poll_feed(feed_id)
             except Exception as e:
-                self.logger.error("Failed to poll feed", feed_id=feed.id, feed_name=feed.name, error=str(e))
-                results[feed.id] = 0
+                self.logger.error("Failed to poll feed", feed_id=feed_id, feed_name=name, error=str(e))
+                results[feed_id] = -1
+                async with async_session_factory() as session:
+                    feed = (
+                        await session.execute(select(ThreatFeed).where(ThreatFeed.id == feed_id))
+                    ).scalar_one_or_none()
+                    if feed is not None:
+                        feed.last_error = f"poll failed: {type(e).__name__}: {e}"[:1000]
+                        feed.last_poll_at = datetime.now(timezone.utc)
+                        await session.commit()
 
         return results
 
@@ -917,60 +923,14 @@ class FeedManager:
             self.logger.warning("Feed has no URL", feed_id=feed.id)
             return b""
 
-        # SSRF protection
-        if not _validate_url_not_internal(feed.url):
-            self.logger.error("URL validation failed: blocked internal/private address", feed_id=feed.id, url=feed.url)
-            feed.last_error = "URL validation failed: blocked internal/private address"
+        # Outbound guard: internal targets refused, no redirects, size cap.
+        body, error = await _fetch_guarded(feed.url, self._build_feed_headers(feed))
+        if error:
+            self.logger.error("Feed fetch failed", feed_id=feed.id, feed_name=feed.name, error=error)
+            feed.last_error = error[:1000]
             return b""
-
-        try:
-            headers = self._build_feed_headers(feed)
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(feed.url, headers=headers, timeout=30) as resp:
-                    if resp.status == 200:
-                        # Chunked read with a hard ceiling instead of
-                        # `resp.read()`, which pulls an arbitrarily large body
-                        # into the worker in one allocation. A feed over the
-                        # ceiling is rejected loudly rather than parsed from a
-                        # truncated (and therefore wrong) body.
-                        chunks: list[bytes] = []
-                        total = 0
-                        async for chunk in resp.content.iter_chunked(64 * 1024):
-                            total += len(chunk)
-                            if total > MAX_FEED_BYTES:
-                                self.logger.error(
-                                    "Feed body exceeds the size ceiling; refusing to ingest",
-                                    feed_id=feed.id,
-                                    feed_name=feed.name,
-                                    max_bytes=MAX_FEED_BYTES,
-                                )
-                                feed.last_error = (
-                                    f"Feed body exceeds the {MAX_FEED_BYTES} byte ceiling"
-                                )
-                                return b""
-                            chunks.append(chunk)
-                        self.logger.info(
-                            "Feed fetch successful",
-                            feed_id=feed.id,
-                            feed_name=feed.name,
-                            bytes=total,
-                        )
-                        return b"".join(chunks)
-                    else:
-                        self.logger.error(
-                            "Feed fetch failed",
-                            feed_id=feed.id,
-                            feed_name=feed.name,
-                            status=resp.status,
-                        )
-                        feed.last_error = f"HTTP {resp.status}"
-                        return b""
-
-        except Exception as e:
-            self.logger.error("Error fetching feed", feed_id=feed.id, error=str(e))
-            feed.last_error = str(e)
-            return b""
+        self.logger.info("Feed fetch successful", feed_id=feed.id, feed_name=feed.name, bytes=len(body or b""))
+        return body or b""
 
     def _build_feed_headers(self, feed: ThreatFeed) -> dict[str, str]:
         """Build HTTP headers for feed request including authentication"""
@@ -1086,30 +1046,6 @@ class FeedManager:
             await db.commit()
             await db.refresh(new_indicator)
             return new_indicator
-
-    async def enable_feed(self, feed_id: str) -> bool:
-        """Enable a threat feed"""
-        self.logger.info("Enabling feed", feed_id=feed_id)
-        return True
-
-    async def disable_feed(self, feed_id: str) -> bool:
-        """Disable a threat feed"""
-        self.logger.info("Disabling feed", feed_id=feed_id)
-        return True
-
-    async def get_feed_stats(self, feed_id: str) -> dict[str, Any]:
-        """Get statistics for a threat feed
-
-        Returns:
-            Dict with feed stats (indicator_count, last_poll, success_rate, etc.)
-        """
-        return {
-            "feed_id": feed_id,
-            "total_indicators": 0,
-            "last_poll_at": None,
-            "last_success_at": None,
-            "success_rate": 0.0,
-        }
 
     # Feeds that used to be built-in but are deprecated/upstream-dead.
     # Rows with these names (is_builtin=True) are removed on startup.

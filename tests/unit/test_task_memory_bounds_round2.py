@@ -1064,6 +1064,7 @@ async def test_darkweb_cross_org_sweep_pages_monitors_outside_the_loop(
     assert result == {
         "orgs_scanned": 3,
         "monitors_scanned": 2_500,
+        "monitors_failed": 0,
         "findings_created": 2_500,
         "truncated": False,
     }

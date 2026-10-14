@@ -1,12 +1,24 @@
 """Dark Web Monitoring Engine
 
-Integrates free threat intel feeds:
-- Have I Been Pwned (HIBP) — credential breach lookup
-- AlienVault OTX — threat intel pulses and IOCs
-- Abuse.ch URLhaus — malicious URLs
-- Abuse.ch ThreatFox — malware IOCs
+The sources a dark-web monitor is checked against. Each fetcher is a real
+call through the intel outbound guard (``src/intel/outbound.py`` over
+``src/integrations/netguard.py``: vetted and pinned address, timeouts, no
+redirects) and raises ``DarkWebSourceError`` on failure; nothing here turns
+an error into an empty result.
+
+- Have I Been Pwned: per-account lookups (``HIBP_API_KEY``), per-domain
+  breach lookups and the recent breach catalogue (both keyless).
+- abuse.ch URLhaus and ThreatFox recent items (``ABUSECH_AUTH_KEY``).
+- AlienVault OTX subscribed pulses (``OTX_API_KEY``).
+- An operator-configured marketplace feed (``DARKWEB_MARKETPLACE_FEED_URL``).
+
+URLhaus, ThreatFox and OTX are threat-intelligence feeds, not paste sites,
+Tor forums or Telegram channels; findings from them are labelled
+``threat_intel_feed`` and only recorded when an item mentions one of the
+monitor's own terms (see ``src/darkweb/monitor_scan.py``).
 """
 
+import asyncio
 import hashlib
 import json
 import os
@@ -14,11 +26,13 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from difflib import SequenceMatcher
+from urllib.parse import quote
 
 import httpx
 
 from src.core.config import settings
 from src.core.logging import get_logger
+from src.intel.outbound import IntelOutboundRefused, guarded_request
 
 logger = get_logger(__name__)
 
@@ -27,91 +41,95 @@ OTX_API = "https://otx.alienvault.com/api/v1"
 ABUSECH_URLHAUS = "https://urlhaus-api.abuse.ch/v1"
 ABUSECH_THREATFOX = "https://threatfox-api.abuse.ch/api/v1"
 
+USER_AGENT = "PySOAR-DarkWebMonitor"
+SOURCE_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
 
-class DarkWebMarketplaceScanner:
-    """Dedicated marketplace feed ingestion for dark web listings."""
+#: Spacing between HIBP account calls (HIBP Pwned 1: 10 requests/minute).
+HIBP_REQUEST_SPACING_SECONDS = 1.7
+#: Accounts / domains looked up per monitor scan; the rest wait for the next
+#: scan and the source status says so.
+MAX_EMAILS_PER_SCAN = 50
+MAX_DOMAINS_PER_SCAN = 50
+#: Items read from each threat feed per scan.
+FEED_ITEM_LIMIT = 500
 
-    def __init__(self):
-        self.feed_url = (
-            getattr(settings, "darkweb_marketplace_feed_url", None)
-            or os.environ.get("DARKWEB_MARKETPLACE_FEED_URL")
-        )
 
-    async def search_marketplaces(self) -> list[dict[str, Any]]:
-        """Search marketplace feeds or infer marketplace listings from public dark web sources."""
-        if self.feed_url:
-            return await self._fetch_marketplace_feed()
-        return await self._infer_marketplace_listings()
+class DarkWebSourceError(Exception):
+    """A dark-web source could not be read (HTTP error, refusal, bad body)."""
 
-    async def _fetch_marketplace_feed(self) -> list[dict[str, Any]]:
-        findings = []
-        try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                resp = await client.get(self.feed_url)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    for item in data if isinstance(data, list) else data.get("results", []):
-                        findings.append({
-                            "source": "marketplace_feed",
-                            "marketplace_name": item.get("marketplace") or item.get("site") or "marketplace",
-                            "marketplace_url": item.get("url") or item.get("onion_url"),
-                            "title": item.get("title") or item.get("description") or "marketplace listing",
-                            "description": item.get("description") or item.get("details") or "",
-                            "confidence": int(item.get("confidence", 50) or 50),
-                            "content_hash": hashlib.sha256(
-                                json.dumps(item, sort_keys=True, default=str).encode()
-                            ).hexdigest(),
-                        })
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Marketplace feed search failed: {exc}")
-        return findings
+    def __init__(self, source: str, message: str) -> None:
+        self.source = source
+        self.message = message
+        super().__init__(f"{source}: {message}")
 
-    async def _infer_marketplace_listings(self) -> list[dict[str, Any]]:
-        findings = []
-        try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                resp = await client.post(ABUSECH_URLHAUS + "/urls/recent/", data={"limit": "50"})
-                if resp.status_code == 200:
-                    data = resp.json()
-                    for url_entry in (data.get("urls") or [])[:50]:
-                        url = url_entry.get("url", "")
-                        title = url_entry.get("threat", "malicious_url")
-                        if any(k in url.lower() for k in ("market", "shop", "store", "vendor", "onion", "blackmarket")):
-                            findings.append({
-                                "source": "urlhaus_marketplace",
-                                "marketplace_name": "urlhaus",
-                                "marketplace_url": url,
-                                "title": title,
-                                "description": url_entry.get("tags") or [],
-                                "confidence": 60,
-                                "content_hash": hashlib.sha256(url.encode()).hexdigest(),
-                            })
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Marketplace inference failed: {exc}")
-        return findings
+
+def _env_value(attr: str, env: str) -> Optional[str]:
+    value = getattr(settings, attr, None) or os.environ.get(env)
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def hibp_api_key() -> Optional[str]:
+    return _env_value("hibp_api_key", "HIBP_API_KEY")
+
+
+def abusech_auth_key() -> Optional[str]:
+    return _env_value("abusech_auth_key", "ABUSECH_AUTH_KEY")
+
+
+def otx_api_key() -> Optional[str]:
+    return _env_value("otx_api_key", "OTX_API_KEY")
+
+
+def marketplace_feed_url() -> Optional[str]:
+    return _env_value("darkweb_marketplace_feed_url", "DARKWEB_MARKETPLACE_FEED_URL")
+
+
+def _stable_hash(*parts: Any) -> str:
+    return hashlib.sha256("::".join(str(p) for p in parts).encode()).hexdigest()
+
+
+async def _request_json(
+    source: str,
+    method: str,
+    url: str,
+    *,
+    ok_statuses: tuple[int, ...] = (200,),
+    headers: Optional[dict[str, str]] = None,
+    **kwargs: Any,
+) -> tuple[int, Any]:
+    """One guarded call; ``(status, json body)`` for an accepted status.
+
+    Any other status, a refused target, a transport failure or a non-JSON
+    body raises ``DarkWebSourceError`` naming the source. A 404 (when
+    accepted) or an empty body answers ``None``.
+    """
+    merged = {"User-Agent": USER_AGENT, "Accept": "application/json", **(headers or {})}
+    try:
+        resp = await guarded_request(method, url, headers=merged, timeout=SOURCE_TIMEOUT, **kwargs)
+    except IntelOutboundRefused as exc:
+        raise DarkWebSourceError(source, f"outbound target refused: {exc}") from exc
+    except httpx.TimeoutException as exc:
+        raise DarkWebSourceError(source, "timed out") from exc
+    except httpx.HTTPError as exc:
+        raise DarkWebSourceError(source, f"unreachable: {type(exc).__name__}: {exc}") from exc
+    if resp.status_code not in ok_statuses:
+        if resp.status_code in (401, 403):
+            raise DarkWebSourceError(source, f"rejected the API key (HTTP {resp.status_code})")
+        if resp.status_code == 429:
+            raise DarkWebSourceError(source, "rate limit reached (HTTP 429)")
+        if 300 <= resp.status_code < 400:
+            raise DarkWebSourceError(source, f"answered a redirect (HTTP {resp.status_code}); not followed")
+        raise DarkWebSourceError(source, f"answered HTTP {resp.status_code}")
+    if resp.status_code == 404 or not resp.content:
+        return resp.status_code, None
+    try:
+        return resp.status_code, resp.json()
+    except ValueError as exc:
+        raise DarkWebSourceError(source, "answered a non-JSON body") from exc
 
 
 class DarkWebScanner:
-    """Dark web scanning engine for credential and threat detection"""
-
-    def __init__(self):
-        """Initialize dark web scanner"""
-        self.paste_sites = [
-            "pastebin.com",
-            "ghostbin.com",
-            "hastebin.com",
-            "paste.ubuntu.com",
-            "textsnip.com",
-        ]
-        self.breach_databases = [
-            "hibp",
-            "breachdb",
-            "leaked.email",
-            "weleakinfo",
-            "snusbase",
-        ]
-        self.forums = ["exploit", "darknetmarket", "hackforum"]
-        self.platforms = ["telegram", "discord", "reddit"]
+    """Fetchers for the sources a dark-web monitor is checked against."""
 
     def configure_monitors(
         self,
@@ -129,305 +147,255 @@ class DarkWebScanner:
             "configured_at": datetime.now(timezone.utc).isoformat(),
         }
 
-    async def run_scan_cycle(self) -> dict[str, Any]:
-        """Run complete scan cycle across all monitored sources"""
-        results = {
-            "paste_sites": await self.search_paste_sites(),
-            "breach_databases": await self.search_breach_databases(),
-            "forums": await self.search_forums(),
-            "telegram": await self.search_telegram_channels(),
-            "marketplaces": await self.search_marketplaces(),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        return await self.aggregate_findings(results)
-
-    async def search_paste_sites(self) -> list[dict[str, Any]]:
-        """Search Abuse.ch URLhaus for malicious URLs (real API, free, no key)."""
-        findings = []
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(ABUSECH_URLHAUS + "/urls/recent/", data={"limit": "25"})
-                if resp.status_code == 200:
-                    data = resp.json()
-                    for url_entry in (data.get("urls") or [])[:25]:
-                        findings.append({
-                            "site": "urlhaus.abuse.ch",
-                            "url": url_entry.get("url", ""),
-                            "title": url_entry.get("threat", "malicious_url"),
-                            "content_hash": hashlib.sha256(url_entry.get("url", "").encode()).hexdigest(),
-                            "posted_date": url_entry.get("date_added", ""),
-                            "tags": url_entry.get("tags") or [],
-                            "threat_type": url_entry.get("threat", ""),
-                            "status": url_entry.get("url_status", ""),
-                        })
-                    logger.info(f"URLhaus: found {len(findings)} malicious URLs")
-        except Exception as e:
-            logger.warning(f"URLhaus search failed: {e}")
-        return findings
-
     async def search_breach_databases(self) -> list[dict[str, Any]]:
-        """Search HIBP for recent breaches (free, no key needed for breach list)."""
-        findings = []
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(
-                    f"{HIBP_API}/breaches",
-                    headers={"User-Agent": "PySOAR-DarkWebMonitor"},
-                )
-                if resp.status_code == 200:
-                    breaches = resp.json()
-                    # Get recent breaches (last 90 days)
-                    cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d")
-                    for breach in breaches:
-                        if breach.get("AddedDate", "") >= cutoff:
-                            findings.append({
-                                "database": "haveibeenpwned",
-                                "breach_name": breach.get("Name", ""),
-                                "affected_count": breach.get("PwnCount", 0),
-                                "breach_date": breach.get("BreachDate", ""),
-                                "compromised_data": breach.get("DataClasses", []),
-                                "domain": breach.get("Domain", ""),
-                                "description": breach.get("Description", "")[:200],
-                                "is_verified": breach.get("IsVerified", False),
-                            })
-                    logger.info(f"HIBP: found {len(findings)} recent breaches")
-        except Exception as e:
-            logger.warning(f"HIBP breach search failed: {e}")
-        return findings
+        """HIBP breach catalogue: breaches added in the last 90 days (keyless).
 
-    async def search_forums(self) -> list[dict[str, Any]]:
-        """Search Abuse.ch ThreatFox for recent IOCs (real API, free, no key)."""
-        findings = []
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(
-                    ABUSECH_THREATFOX,
-                    json={"query": "get_iocs", "days": 7},
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    for ioc in (data.get("data") or [])[:25]:
-                        findings.append({
-                            "forum": "threatfox.abuse.ch",
-                            "post_id": str(ioc.get("id", "")),
-                            "author": ioc.get("reporter", "anonymous"),
-                            "title": f"{ioc.get('threat_type', 'malware')}: {ioc.get('malware', 'unknown')}",
-                            "content_snippet": f"IOC: {ioc.get('ioc', '')} ({ioc.get('ioc_type', '')})",
-                            "timestamp": ioc.get("first_seen_utc", ""),
-                            "ioc_value": ioc.get("ioc", ""),
-                            "ioc_type": ioc.get("ioc_type", ""),
-                            "malware": ioc.get("malware", ""),
-                            "confidence": ioc.get("confidence_level", 0),
-                        })
-                    logger.info(f"ThreatFox: found {len(findings)} IOCs")
-        except Exception as e:
-            logger.warning(f"ThreatFox search failed: {e}")
-        return findings
-
-    async def search_telegram_channels(self) -> list[dict[str, Any]]:
-        """Search AlienVault OTX for recent threat pulses (free, no key needed for public)."""
-        findings = []
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(
-                    f"{OTX_API}/pulses/subscribed",
-                    params={"limit": 20, "modified_since": (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")},
-                    headers={"X-OTX-API-KEY": os.environ.get("OTX_API_KEY", "")},
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    for pulse in (data.get("results") or [])[:20]:
-                        findings.append({
-                            "platform": "alienvault_otx",
-                            "channel": pulse.get("author_name", "OTX"),
-                            "message_id": pulse.get("id", ""),
-                            "sender": pulse.get("author_name", ""),
-                            "message": pulse.get("name", ""),
-                            "description": pulse.get("description", "")[:300],
-                            "timestamp": pulse.get("modified", ""),
-                            "tags": pulse.get("tags", []),
-                            "adversary": pulse.get("adversary", ""),
-                            "indicator_count": len(pulse.get("indicators", [])),
-                            "tlp": pulse.get("tlp", "white"),
-                        })
-                    logger.info(f"OTX: found {len(findings)} threat pulses")
-                elif resp.status_code == 403:
-                    logger.info("OTX: no API key configured, skipping")
-        except Exception as e:
-            logger.warning(f"OTX search failed: {e}")
-        return findings
-
-    async def search_marketplaces(self) -> list[dict[str, Any]]:
-        """Search dark web marketplaces and marketplace feeds."""
-        return await DarkWebMarketplaceScanner().search_marketplaces()
-
-    async def hibp_lookup_emails(self, emails: list[str]) -> list[dict[str, Any]]:
-        """Tier 2 — per-email HIBP lookup.
-
-        Calls ``/breachedaccount/{email}`` and ``/stealerlogsbyemail/{email}``
-        for each email in ``emails``. Returns one finding dict per
-        (email × breach) pair. Requires an HIBP API key in
-        ``settings.hibp_api_key``; returns [] with a logged note when
-        the key is absent so Tier 1 keeps working.
-
-        HIBP Pwned 1 ($3.50/mo) allows 10 req/min — we space requests
-        1.7s apart. At typical monitor size (< 50 emails) this finishes
-        in well under a minute per scan.
+        A catalogue entry is general breach news; the monitor scan keeps only
+        the entries that mention a monitor term or watched domain.
         """
-        from src.core.config import settings as _settings
-        key = getattr(_settings, "hibp_api_key", None) or os.environ.get("HIBP_API_KEY", "")
+        _status, breaches = await _request_json("hibp_breach_catalogue", "GET", f"{HIBP_API}/breaches")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d")
+        findings = []
+        for breach in breaches or []:
+            if str(breach.get("AddedDate", "")) >= cutoff:
+                findings.append({
+                    "database": "haveibeenpwned",
+                    "breach_name": breach.get("Name", ""),
+                    "title": f"Breach: {breach.get('Title') or breach.get('Name', '')}",
+                    "affected_count": breach.get("PwnCount", 0),
+                    "breach_date": breach.get("BreachDate", ""),
+                    "compromised_data": breach.get("DataClasses", []),
+                    "domain": breach.get("Domain", ""),
+                    "description": (breach.get("Description") or "")[:500],
+                    "is_verified": breach.get("IsVerified", False),
+                    "content_hash": _stable_hash("hibp_catalogue", breach.get("Name", "")),
+                })
+        return findings
+
+    async def fetch_urlhaus_recent(self) -> list[dict[str, Any]]:
+        """abuse.ch URLhaus: recently reported malicious URLs (``ABUSECH_AUTH_KEY``)."""
+        _status, data = await _request_json(
+            "urlhaus",
+            "GET",
+            f"{ABUSECH_URLHAUS}/urls/recent/limit/{FEED_ITEM_LIMIT}/",
+            headers={"Auth-Key": abusech_auth_key() or ""},
+        )
+        items = []
+        for entry in (data or {}).get("urls") or []:
+            url = entry.get("url", "")
+            items.append({
+                "url": url,
+                "title": f"URLhaus: {entry.get('threat') or 'malicious_url'} URL",
+                "description": url,
+                "threat_type": entry.get("threat", ""),
+                "status": entry.get("url_status", ""),
+                "tags": entry.get("tags") or [],
+                "host": entry.get("host", ""),
+                "posted_date": entry.get("date_added", ""),
+                "reference": entry.get("urlhaus_reference", ""),
+                "content_hash": _stable_hash("urlhaus", entry.get("id") or url),
+            })
+        return items
+
+    async def fetch_threatfox_recent(self) -> list[dict[str, Any]]:
+        """abuse.ch ThreatFox: IOCs reported in the last 7 days (``ABUSECH_AUTH_KEY``)."""
+        _status, data = await _request_json(
+            "threatfox",
+            "POST",
+            f"{ABUSECH_THREATFOX}/",
+            headers={"Auth-Key": abusech_auth_key() or ""},
+            json={"query": "get_iocs", "days": 7},
+        )
+        rows = (data or {}).get("data")
+        if not isinstance(rows, list):
+            # ThreatFox answers {"query_status": "..."} without a data list
+            # on errors (for example an unknown key).
+            query_status = (data or {}).get("query_status")
+            if query_status and query_status not in ("ok", "no_result"):
+                raise DarkWebSourceError("threatfox", f"query_status={query_status}")
+            rows = []
+        items = []
+        for ioc in rows[:FEED_ITEM_LIMIT]:
+            malware = ioc.get("malware_printable") or ioc.get("malware") or "unknown"
+            items.append({
+                "title": f"ThreatFox: {ioc.get('threat_type', 'malware')} IOC ({malware})",
+                "description": f"IOC: {ioc.get('ioc', '')} ({ioc.get('ioc_type', '')})",
+                "ioc_value": ioc.get("ioc", ""),
+                "ioc_type": ioc.get("ioc_type", ""),
+                "malware": ioc.get("malware", ""),
+                "tags": ioc.get("tags") or [],
+                "reporter": ioc.get("reporter", ""),
+                "timestamp": ioc.get("first_seen", ""),
+                "confidence": ioc.get("confidence_level"),
+                "content_hash": _stable_hash("threatfox", ioc.get("id") or ioc.get("ioc", "")),
+            })
+        return items
+
+    async def fetch_otx_pulses(self) -> list[dict[str, Any]]:
+        """AlienVault OTX: subscribed pulses modified in the last 7 days (``OTX_API_KEY``)."""
+        since = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
+        _status, data = await _request_json(
+            "otx",
+            "GET",
+            f"{OTX_API}/pulses/subscribed",
+            headers={"X-OTX-API-KEY": otx_api_key() or ""},
+            params={"limit": 50, "modified_since": since},
+        )
+        items = []
+        for pulse in (data or {}).get("results") or []:
+            indicators = pulse.get("indicators") or []
+            items.append({
+                "title": f"OTX pulse: {pulse.get('name', '')}",
+                "description": (pulse.get("description") or "")[:500],
+                "author": pulse.get("author_name", ""),
+                "tags": pulse.get("tags") or [],
+                "adversary": pulse.get("adversary", ""),
+                "targeted_countries": pulse.get("targeted_countries") or [],
+                "industries": pulse.get("industries") or [],
+                "indicator_values": [str(i.get("indicator", "")) for i in indicators[:200]],
+                "indicator_count": len(indicators),
+                "tlp": pulse.get("tlp", "white"),
+                "timestamp": pulse.get("modified", ""),
+                "content_hash": _stable_hash("otx", pulse.get("id", ""), pulse.get("modified", "")),
+            })
+        return items
+
+    async def fetch_marketplace_feed(self) -> list[dict[str, Any]]:
+        """The operator-configured marketplace feed (``DARKWEB_MARKETPLACE_FEED_URL``)."""
+        url = marketplace_feed_url()
+        if not url:
+            raise DarkWebSourceError("marketplace_feed", "DARKWEB_MARKETPLACE_FEED_URL is not set")
+        _status, data = await _request_json("marketplace_feed", "GET", url)
+        rows = data if isinstance(data, list) else (data or {}).get("results") or []
+        items = []
+        for item in rows[:FEED_ITEM_LIMIT]:
+            if not isinstance(item, dict):
+                continue
+            items.append({
+                "marketplace_name": item.get("marketplace") or item.get("site") or "marketplace",
+                "url": item.get("url") or item.get("onion_url") or "",
+                "title": item.get("title") or item.get("description") or "marketplace listing",
+                "description": item.get("description") or item.get("details") or "",
+                "confidence": item.get("confidence"),
+                "content_hash": hashlib.sha256(
+                    json.dumps(item, sort_keys=True, default=str).encode()
+                ).hexdigest(),
+            })
+        return items
+
+    async def hibp_lookup_emails(self, emails: list[str]) -> tuple[list[dict[str, Any]], list[str]]:
+        """Per-account HIBP lookups (``HIBP_API_KEY``).
+
+        For each address: ``/breachedaccount`` (breaches the account is in),
+        ``/stealerlogsbyemail`` (infostealer logs; needs an HIBP subscription
+        that includes them) and ``/pasteaccount`` (pastes). A 404 means the
+        account is not listed. Returns ``(findings, errors)``; a rejected key
+        raises ``DarkWebSourceError`` because no further call can succeed.
+        """
+        key = hibp_api_key()
         if not key:
-            logger.info("HIBP per-email lookup skipped: HIBP_API_KEY not set")
-            return []
-
+            raise DarkWebSourceError("hibp_account", "HIBP_API_KEY is not set")
+        auth = {"hibp-api-key": key}
         findings: list[dict[str, Any]] = []
-        headers = {
-            "hibp-api-key": key,
-            "User-Agent": "PySOAR-DarkWebMonitor",
-        }
-        # HIBP Pwned 1 tier: 10 req/min -> 6s between bursts of 5 is safe
-        import asyncio as _asyncio
-        async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
-            for email in emails:
-                email = (email or "").strip()
-                if not email or "@" not in email:
-                    continue
-                # 1. Full breach list for this account (password hashes
-                # are NOT returned by HIBP — it returns the breach names
-                # the account appears in).
-                try:
-                    resp = await client.get(
-                        f"{HIBP_API}/breachedaccount/{email}",
-                        params={"truncateResponse": "false"},
-                    )
-                    if resp.status_code == 200:
-                        for b in resp.json():
-                            findings.append({
-                                "source": "hibp_account",
-                                "lookup_kind": "breached_account",
-                                "email": email,
-                                "breach_name": b.get("Name"),
-                                "breach_date": b.get("BreachDate"),
-                                "affected_count": b.get("PwnCount", 0),
-                                "compromised_data": b.get("DataClasses", []),
-                                "is_verified": b.get("IsVerified", False),
-                                "domain": b.get("Domain"),
-                                "description": (b.get("Description") or "")[:300],
-                                "content_hash": hashlib.sha256(
-                                    f"hibp_ba::{email}::{b.get('Name')}".encode()
-                                ).hexdigest(),
-                                "title": f"{email} exposed in {b.get('Name')}",
-                            })
-                    elif resp.status_code == 404:
-                        # Account not in any breach — clean; skip
-                        pass
-                    elif resp.status_code == 401:
-                        logger.warning("HIBP returned 401 — API key invalid")
-                        return findings
-                    elif resp.status_code == 429:
-                        logger.warning("HIBP rate-limited; backing off")
-                        await _asyncio.sleep(6)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"HIBP breachedaccount({email}) failed: {exc}")
+        errors: list[str] = []
 
-                await _asyncio.sleep(1.7)
+        async def _call(kind: str, url: str, **kwargs: Any) -> Any:
+            try:
+                status, body = await _request_json(
+                    "hibp_account", "GET", url, ok_statuses=(200, 404), headers=auth, **kwargs,
+                )
+            except DarkWebSourceError as exc:
+                if kind == "breachedaccount" and exc.message.startswith("rejected the API key"):
+                    raise
+                errors.append(f"{kind}: {exc.message}")
+                return None
+            finally:
+                if HIBP_REQUEST_SPACING_SECONDS:
+                    await asyncio.sleep(HIBP_REQUEST_SPACING_SECONDS)
+            return body if status == 200 else None
 
-                # 2. Stealer logs (infostealer malware exfils).
-                try:
-                    resp = await client.get(
-                        f"{HIBP_API}/stealerlogsbyemail/{email}",
-                    )
-                    if resp.status_code == 200:
-                        for site in resp.json() or []:
-                            findings.append({
-                                "source": "hibp_stealer",
-                                "lookup_kind": "stealer_log",
-                                "email": email,
-                                "site": site,
-                                "content_hash": hashlib.sha256(
-                                    f"hibp_sl::{email}::{site}".encode()
-                                ).hexdigest(),
-                                "title": f"{email} in infostealer log for {site}",
-                                "description": f"Credentials for {site} exfiltrated by infostealer malware targeting {email}",
-                            })
-                    elif resp.status_code == 404:
-                        pass
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"HIBP stealerlogsbyemail({email}) failed: {exc}")
+        for email in emails:
+            email = (email or "").strip()
+            if not email or "@" not in email:
+                continue
+            quoted = quote(email, safe="@")
+            breaches = await _call(
+                "breachedaccount", f"{HIBP_API}/breachedaccount/{quoted}", params={"truncateResponse": "false"},
+            )
+            for b in breaches or []:
+                findings.append({
+                    "source": "hibp_account",
+                    "lookup_kind": "breached_account",
+                    "email": email,
+                    "breach_name": b.get("Name"),
+                    "breach_date": b.get("BreachDate"),
+                    "affected_count": b.get("PwnCount", 0),
+                    "compromised_data": b.get("DataClasses", []),
+                    "is_verified": b.get("IsVerified", False),
+                    "domain": b.get("Domain"),
+                    "description": (b.get("Description") or "")[:300],
+                    "content_hash": _stable_hash("hibp_ba", email, b.get("Name")),
+                    "title": f"{email} exposed in {b.get('Name')}",
+                })
+            for site in await _call("stealerlogsbyemail", f"{HIBP_API}/stealerlogsbyemail/{quoted}") or []:
+                findings.append({
+                    "source": "hibp_stealer",
+                    "lookup_kind": "stealer_log",
+                    "email": email,
+                    "site": site,
+                    "content_hash": _stable_hash("hibp_sl", email, site),
+                    "title": f"{email} in infostealer log for {site}",
+                    "description": f"Credentials for {site} exfiltrated by infostealer malware targeting {email}",
+                })
+            for p in await _call("pasteaccount", f"{HIBP_API}/pasteaccount/{quoted}") or []:
+                findings.append({
+                    "source": "hibp_paste",
+                    "lookup_kind": "paste",
+                    "email": email,
+                    "paste_source": p.get("Source"),
+                    "paste_id": p.get("Id"),
+                    "paste_title": p.get("Title"),
+                    "paste_date": p.get("Date"),
+                    "email_count": p.get("EmailCount"),
+                    "content_hash": _stable_hash("hibp_paste", email, p.get("Source"), p.get("Id")),
+                    "title": f"{email} in paste: {p.get('Source')}/{p.get('Id')}",
+                    "description": (p.get("Title") or "")[:300],
+                })
+        return findings, errors
 
-                await _asyncio.sleep(1.7)
+    async def hibp_lookup_domains(self, domains: list[str]) -> tuple[list[dict[str, Any]], list[str]]:
+        """Breaches HIBP lists for each watched domain (keyless ``/breaches?domain=``).
 
-                # 3. Pastes containing the account.
-                try:
-                    resp = await client.get(f"{HIBP_API}/pasteaccount/{email}")
-                    if resp.status_code == 200:
-                        for p in resp.json() or []:
-                            findings.append({
-                                "source": "hibp_paste",
-                                "lookup_kind": "paste",
-                                "email": email,
-                                "paste_source": p.get("Source"),
-                                "paste_id": p.get("Id"),
-                                "paste_title": p.get("Title"),
-                                "paste_date": p.get("Date"),
-                                "email_count": p.get("EmailCount"),
-                                "content_hash": hashlib.sha256(
-                                    f"hibp_paste::{email}::{p.get('Source')}::{p.get('Id')}".encode()
-                                ).hexdigest(),
-                                "title": f"{email} in paste: {p.get('Source')}/{p.get('Id')}",
-                                "description": (p.get("Title") or "")[:300],
-                            })
-                    elif resp.status_code == 404:
-                        pass
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"HIBP pasteaccount({email}) failed: {exc}")
-
-                await _asyncio.sleep(1.7)
-
-        logger.info(f"HIBP per-email lookup: {len(findings)} findings across {len(emails)} emails")
-        return findings
-
-    async def hibp_lookup_domains(self, domains: list[str]) -> list[dict[str, Any]]:
-        """Tier 2 — per-domain HIBP breach lookup.
-
-        Returns all breaches that affected the given domain(s). Uses
-        ``GET /breaches?domain=...`` which is free (no key required) but
-        limited — for domain subscription lookups (all accounts in the
-        domain) you need a paid subscription. This method is key-free
-        and always runs when a monitor has domains_watched set.
+        Returns ``(findings, errors)``.
         """
         findings: list[dict[str, Any]] = []
-        async with httpx.AsyncClient(timeout=15.0, headers={"User-Agent": "PySOAR-DarkWebMonitor"}) as client:
-            for domain in domains:
-                domain = (domain or "").strip().lower()
-                if not domain:
-                    continue
-                try:
-                    resp = await client.get(
-                        f"{HIBP_API}/breaches",
-                        params={"domain": domain},
-                    )
-                    if resp.status_code == 200:
-                        for b in resp.json() or []:
-                            findings.append({
-                                "source": "hibp_domain",
-                                "lookup_kind": "domain_breach",
-                                "domain": domain,
-                                "breach_name": b.get("Name"),
-                                "breach_date": b.get("BreachDate"),
-                                "affected_count": b.get("PwnCount", 0),
-                                "compromised_data": b.get("DataClasses", []),
-                                "is_verified": b.get("IsVerified", False),
-                                "description": (b.get("Description") or "")[:300],
-                                "content_hash": hashlib.sha256(
-                                    f"hibp_dom::{domain}::{b.get('Name')}".encode()
-                                ).hexdigest(),
-                                "title": f"{domain} in {b.get('Name')}",
-                            })
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"HIBP breaches({domain}) failed: {exc}")
-        logger.info(f"HIBP per-domain lookup: {len(findings)} findings across {len(domains)} domains")
-        return findings
+        errors: list[str] = []
+        for domain in domains:
+            domain = (domain or "").strip().lower()
+            if not domain:
+                continue
+            try:
+                _status, breaches = await _request_json(
+                    "hibp_domain", "GET", f"{HIBP_API}/breaches", params={"domain": domain},
+                )
+            except DarkWebSourceError as exc:
+                errors.append(f"{domain}: {exc.message}")
+                continue
+            for b in breaches or []:
+                findings.append({
+                    "source": "hibp_domain",
+                    "lookup_kind": "domain_breach",
+                    "domain": domain,
+                    "breach_name": b.get("Name"),
+                    "breach_date": b.get("BreachDate"),
+                    "affected_count": b.get("PwnCount", 0),
+                    "compromised_data": b.get("DataClasses", []),
+                    "is_verified": b.get("IsVerified", False),
+                    "description": (b.get("Description") or "")[:300],
+                    "content_hash": _stable_hash("hibp_dom", domain, b.get("Name")),
+                    "title": f"{domain} in {b.get('Name')}",
+                })
+        return findings, errors
 
     async def aggregate_findings(self, results: dict[str, Any]) -> dict[str, Any]:
         """Aggregate and deduplicate findings from multiple sources"""
@@ -888,38 +856,6 @@ class BrandProtection:
             "detected": similarity > 0.70,
             "recommendation": "Initiate takedown if similarity > 0.85",
         }
-
-    def monitor_certificate_transparency_logs(
-        self, monitored_domains: list[str]
-    ) -> list[dict[str, Any]]:
-        """Query crt.sh for certificate transparency logs (free, no key)."""
-        detected_certs = []
-
-        for domain in monitored_domains:
-            try:
-                resp = httpx.get(
-                    f"https://crt.sh/?q=%.{domain}&output=json",
-                    timeout=15.0,
-                )
-                if resp.status_code == 200:
-                    certs = resp.json()
-                    for cert in certs[:10]:
-                        name_value = cert.get("name_value", "")
-                        is_suspicious = domain not in name_value or name_value.count(".") > domain.count(".") + 1
-                        detected_certs.append({
-                            "domain": domain,
-                            "issued_to": name_value,
-                            "issuer": cert.get("issuer_name", ""),
-                            "issued_date": cert.get("not_before", ""),
-                            "valid_until": cert.get("not_after", ""),
-                            "serial_number": cert.get("serial_number", ""),
-                            "risk": "high" if is_suspicious else "low",
-                        })
-                    logger.info(f"crt.sh: found {len(certs)} certs for {domain}")
-            except Exception as e:
-                logger.warning(f"crt.sh query failed for {domain}: {e}")
-
-        return detected_certs
 
     def detect_phishing_kits(self, site_content: str) -> dict[str, Any]:
         """Detect phishing kits by analyzing brand asset usage"""

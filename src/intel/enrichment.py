@@ -64,10 +64,13 @@ class IndicatorEnricher:
                 enrichment_data["error"] = "Indicator not found"
                 return enrichment_data
 
-            # Query external providers based on indicator type
-            import httpx
+            # External providers run through src/intel/providers.py: the
+            # indicator's organisation keys (installed integration, then
+            # Settings > Integrations), else the platform keys this enricher
+            # was built with; every call goes through the outbound guard.
+            from src.intel import providers as intel_providers
 
-            is_ip = indicator.indicator_type in ("ipv4", "ipv6")
+            is_ip = intel_providers.dispatch_bucket(indicator.indicator_type) == "ip"
 
             # Providers PySOAR declares but has no query implementation
             # for. With a key set, the analyst must be told it's the code
@@ -82,80 +85,51 @@ class IndicatorEnricher:
                     else:
                         _skip(provider, "no API key configured")
 
-            if is_ip and not self.vt_available:
-                _skip("virustotal", "no API key configured")
-            if indicator.indicator_type == "ipv4" and not self.abuseipdb_available:
-                _skip("abuseipdb", "no API key configured")
-            if indicator.indicator_type == "domain" and not self.vt_available:
-                _skip("virustotal", "no API key configured")
-
-            if is_ip and self.vt_available:
-                try:
-                    async with httpx.AsyncClient() as client:
-                        resp = await client.get(
-                            f"https://www.virustotal.com/api/v3/ip_addresses/{indicator.value}",
-                            headers={"x-apikey": settings.virustotal_api_key},
-                            timeout=15,
-                        )
-                        if resp.status_code == 200:
-                            vt_data = resp.json()
-                            stats = vt_data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
-                            malicious = stats.get("malicious", 0)
-                            total = sum(stats.values()) if stats else 1
-                            enrichment_data["sources"].append({
-                                "provider": "virustotal",
-                                "score": int((malicious / max(total, 1)) * 100),
-                                "malicious_count": malicious,
-                                "total_engines": total,
-                            })
-                except Exception as e:
-                    self.logger.warning("VirusTotal enrichment failed", error=str(e))
-                    _skip("virustotal", f"query failed: {e}")
-
-            if indicator.indicator_type in ("ipv4",) and self.abuseipdb_available:
-                try:
-                    async with httpx.AsyncClient() as client:
-                        resp = await client.get(
-                            "https://api.abuseipdb.com/api/v2/check",
-                            params={"ipAddress": indicator.value, "maxAgeInDays": 90},
-                            headers={"Key": settings.abuseipdb_api_key, "Accept": "application/json"},
-                            timeout=15,
-                        )
-                        if resp.status_code == 200:
-                            abuse_data = resp.json().get("data", {})
-                            enrichment_data["sources"].append({
-                                "provider": "abuseipdb",
-                                "score": abuse_data.get("abuseConfidenceScore", 0),
-                                "total_reports": abuse_data.get("totalReports", 0),
-                                "country_code": abuse_data.get("countryCode"),
-                                "isp": abuse_data.get("isp"),
-                            })
-                except Exception as e:
-                    self.logger.warning("AbuseIPDB enrichment failed", error=str(e))
-                    _skip("abuseipdb", f"query failed: {e}")
-
-            if indicator.indicator_type == "domain" and self.vt_available:
-                try:
-                    async with httpx.AsyncClient() as client:
-                        resp = await client.get(
-                            f"https://www.virustotal.com/api/v3/domains/{indicator.value}",
-                            headers={"x-apikey": settings.virustotal_api_key},
-                            timeout=15,
-                        )
-                        if resp.status_code == 200:
-                            vt_data = resp.json()
-                            stats = vt_data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
-                            malicious = stats.get("malicious", 0)
-                            total = sum(stats.values()) if stats else 1
-                            enrichment_data["sources"].append({
-                                "provider": "virustotal",
-                                "score": int((malicious / max(total, 1)) * 100),
-                                "malicious_count": malicious,
-                                "total_engines": total,
-                            })
-                except Exception as e:
-                    self.logger.warning("VirusTotal domain enrichment failed", error=str(e))
-                    _skip("virustotal", f"query failed: {e}")
+            platform_keys = {
+                "virustotal": settings.virustotal_api_key if self.vt_available else None,
+                "abuseipdb": settings.abuseipdb_api_key if self.abuseipdb_available else None,
+                "otx": intel_providers.platform_key("otx"),
+            }
+            outcomes = await intel_providers.enrich_value(
+                session,
+                indicator.organization_id,
+                intel_providers.dispatch_bucket(indicator.indicator_type),
+                indicator.value,
+                use_cache=False,
+                platform_keys=platform_keys,
+            )
+            for outcome in outcomes:
+                if outcome.status == "ok" and outcome.result is not None:
+                    raw = outcome.result.get("raw") or {}
+                    entry: dict[str, Any] = {
+                        "provider": outcome.provider,
+                        "score": int(outcome.result.get("confidence") or 0),
+                        "verdict": outcome.result.get("verdict"),
+                        "key_source": outcome.key_source,
+                    }
+                    stats = raw.get("last_analysis_stats")
+                    if isinstance(stats, dict):
+                        entry["malicious_count"] = int(stats.get("malicious") or 0)
+                        entry["total_engines"] = sum(int(v or 0) for v in stats.values())
+                    if outcome.provider == "abuseipdb":
+                        entry["total_reports"] = raw.get("total_reports")
+                        entry["country_code"] = raw.get("country_code")
+                        entry["isp"] = raw.get("isp")
+                    if outcome.provider == "otx":
+                        entry["pulse_count"] = raw.get("pulse_count")
+                    enrichment_data["sources"].append(entry)
+                elif outcome.status == "not_configured":
+                    _skip(outcome.provider, f"no API key configured ({outcome.detail})")
+                elif outcome.status == "credentials_unreadable":
+                    _skip(outcome.provider, f"credentials unreadable: {outcome.error}")
+                elif outcome.status == "error":
+                    self.logger.warning(
+                        "Indicator enrichment provider failed",
+                        provider=outcome.provider,
+                        error=outcome.error,
+                    )
+                    _skip(outcome.provider, f"query failed: {outcome.error}")
+                # unsupported_type: the provider does not cover this type.
 
             # Calculate composite score from all provider results
             if enrichment_data["sources"]:

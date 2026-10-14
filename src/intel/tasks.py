@@ -35,11 +35,16 @@ def poll_threat_feeds(self) -> dict[str, Any]:
             return await manager.poll_all_feeds()
 
         per_feed = asyncio.run(_run())
-        total = sum(int(v or 0) for v in per_feed.values())
+        # poll_all_feeds reports a failed poll as -1 (the reason is on
+        # feed.last_error); failures are counted, never summed as indicators.
+        failed = [feed_id for feed_id, count in per_feed.items() if count is not None and count < 0]
+        total = sum(int(v) for v in per_feed.values() if v is not None and v > 0)
 
         results = {
             "task": "poll_threat_feeds",
             "feeds_polled": len(per_feed),
+            "feeds_failed": len(failed),
+            "failed_feed_ids": failed,
             "total_indicators_ingested": total,
             "per_feed": per_feed,
         }

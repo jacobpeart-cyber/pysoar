@@ -4,12 +4,11 @@ API routes for dark web monitor management, findings investigation,
 credential leak handling, and brand threat tracking.
 """
 
-import json
 import math
 from datetime import datetime, timezone
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, Depends, Path, BackgroundTasks, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Path, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,9 +25,7 @@ from src.darkweb.models import (
     DarkWebMonitor,
 )
 from src.darkweb.tasks import (
-    brand_monitoring_scan,
     credential_leak_check,
-    scheduled_dark_web_scan,
     threat_correlation,
 )
 from src.schemas.darkweb import (
@@ -194,13 +191,9 @@ async def create_monitor(
         name=monitor.name,
         description=monitor.description,
         monitor_type=monitor.monitor_type,
-        search_terms=json.dumps(monitor.search_terms) if monitor.search_terms else None,
-        domains_watched=json.dumps(monitor.domains_watched)
-        if monitor.domains_watched
-        else None,
-        emails_watched=json.dumps(monitor.emails_watched)
-        if monitor.emails_watched
-        else None,
+        search_terms=monitor.search_terms or None,
+        domains_watched=monitor.domains_watched or None,
+        emails_watched=monitor.emails_watched or None,
         enabled=monitor.enabled,
         alert_severity=monitor.alert_severity,
     )
@@ -250,11 +243,11 @@ async def update_monitor(
     if update.monitor_type is not None:
         monitor.monitor_type = update.monitor_type
     if update.search_terms is not None:
-        monitor.search_terms = json.dumps(update.search_terms)
+        monitor.search_terms = update.search_terms
     if update.domains_watched is not None:
-        monitor.domains_watched = json.dumps(update.domains_watched)
+        monitor.domains_watched = update.domains_watched
     if update.emails_watched is not None:
-        monitor.emails_watched = json.dumps(update.emails_watched)
+        monitor.emails_watched = update.emails_watched
     if update.enabled is not None:
         monitor.enabled = update.enabled
     if update.alert_severity is not None:
@@ -297,181 +290,85 @@ async def trigger_monitor_scan(
     db: DatabaseSession = None,
     monitor_id: str = Path(...),
 ):
-    """Run a dark web scan synchronously and persist findings.
+    """Scan this monitor's own terms now and persist new findings.
 
-    Previously this endpoint queued ``scheduled_dark_web_scan`` via
-    FastAPI's BackgroundTasks — but that's a Celery ``@shared_task``
-    with ``bind=True``, which expects ``self`` as the first arg
-    injected by Celery. Calling it without Celery crashed the
-    background worker with ``TypeError: missing 1 required
-    positional argument: 'self'`` AND the task body was hardcoded
-    theater (returned a static 6-finding dict without calling the
-    real DarkWebScanner engine). So every "Scan now" click: fake
-    scan_id to the UI, crash in the background, zero real data.
+    Runs ``src.darkweb.monitor_scan.scan_monitor`` inline (the same code as
+    the scheduled sweep): HIBP lookups for the watched emails (with
+    ``HIBP_API_KEY``) and domains, plus HIBP-catalogue and threat-feed items
+    (URLhaus, ThreatFox, OTX, the operator marketplace feed) that mention
+    one of the monitor's terms. ``sources`` reports every source's status;
+    a source without its key is ``not_configured``, never silently empty.
+    ``quick`` consults the HIBP sources only.
 
-    Now runs the real engine inline (DarkWebScanner.run_scan_cycle
-    hits URLhaus / HIBP / ThreatFox / AlienVault OTX — all free
-    APIs the module already integrates), persists the findings to
-    the DarkWebFinding table scoped to this org, fires
-    automation.on_darkweb_finding per critical finding, and
-    returns real counts.
+    Answers 502 ``darkweb_scan_failed`` when every usable source failed
+    (nothing is recorded) and ``status="no_terms"`` when the monitor has no
+    search terms, domains or emails (nothing is searched).
     """
-    from src.darkweb.engine import DarkWebScanner
-    import hashlib as _hashlib
+    from src.darkweb.monitor_scan import scan_monitor
 
     monitor = await get_monitor_or_404(db, monitor_id, org_id)
-
     start_time = datetime.now(timezone.utc)
-    logger.info(f"Running inline dark web scan for monitor: {monitor_id}")
+    scan_type = "quick" if scan_request.scan_type == "quick" else "full"
 
-    scanner = DarkWebScanner()
     try:
-        marketplaces = []
-        if scan_request.scan_type == "quick":
-            # Quick = only breach DB (HIBP) since it's the cheapest
-            pastes = []
-            breaches = await scanner.search_breach_databases()
-            forums = []
-            channels = []
-        else:
-            pastes = await scanner.search_paste_sites()
-            breaches = await scanner.search_breach_databases()
-            forums = await scanner.search_forums()
-            channels = await scanner.search_telegram_channels()
-            marketplaces = await scanner.search_marketplaces()
-    except Exception as exc:
-        # Previously swallowed into a "completed" scan with zero findings.
-        logger.warning(
-            "Dark web scan engine call failed", monitor_id=monitor_id, error=str(exc)
-        )
+        outcome = await scan_monitor(db, monitor, scan_type=scan_type)
+    except Exception as exc:  # noqa: BLE001 - an engine fault is a failed scan, reported as such
+        logger.warning("Dark web scan engine call failed", monitor_id=monitor_id, error=str(exc))
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={"error": "darkweb_scan_failed", "detail": str(exc)[:300]},
         ) from exc
-
-    persisted_findings: list[DarkWebFinding] = []
-
-    def _add_finding(
-        finding_type: str,
-        source_platform: str,
-        title: str,
-        description: str,
-        severity: str = "medium",
-        raw: Optional[dict] = None,
-    ) -> None:
-        # Hash the canonical JSON of the raw payload — the full payload,
-        # not a truncated sample. A truncated hash would collide across
-        # otherwise-distinct findings whose first 2000 bytes happen to match.
-        raw_str = json.dumps(raw or {}, sort_keys=True, default=str)
-        raw_hash = _hashlib.sha256(raw_str.encode("utf-8")).hexdigest()
-
-        # `title` column is VARCHAR(500) — cap matches the schema.
-        # `description` is TEXT (unbounded) — persist in full.
-        # `source_url_hash` is VARCHAR(64) to match SHA-256 hex length.
-        finding = DarkWebFinding(
-            organization_id=org_id,
-            monitor_id=monitor_id,
-            finding_type=finding_type,
-            source_platform=source_platform,
-            title=title[:500],
-            description=description,
-            affected_assets=None,
-            affected_count=0,
-            severity=severity,
-            confidence_score=75.0,
-            source_url_hash=raw_hash[:64],
-            raw_data_hash=raw_hash,
-            status="new",
-        )
-        db.add(finding)
-        persisted_findings.append(finding)
-
-    for p in pastes:
-        _add_finding(
-            "malicious_url",
-            p.get("site", "urlhaus"),
-            f"Malicious URL: {p.get('threat_type', 'unknown')}",
-            f"{p.get('url', '')} — {p.get('status', 'unknown')}",
-            severity="high" if p.get("status") == "online" else "medium",
-            raw=p,
-        )
-    for b in breaches:
-        _add_finding(
-            "data_breach",
-            "haveibeenpwned",
-            f"Breach: {b.get('breach_name', 'unknown')}",
-            b.get("description", "")[:500],
-            severity="high" if (b.get("affected_count") or 0) > 1_000_000 else "medium",
-            raw=b,
-        )
-    for f in forums:
-        _add_finding(
-            "ioc",
-            "threatfox.abuse.ch",
-            f.get("title", "IOC"),
-            f"{f.get('ioc_type', '')}: {f.get('ioc_value', '')}",
-            severity="high",
-            raw=f,
-        )
-    for c in channels:
-        _add_finding(
-            "threat_intel",
-            c.get("platform", "otx"),
-            f"OTX pulse: {c.get('sender', 'unknown')}",
-            c.get("message_id", "")[:500],
-            severity="medium",
-            raw=c,
-        )
-    for m in marketplaces:
-        _add_finding(
-            "marketplace_listing",
-            m.get("source", "marketplace"),
-            m.get("title", "Marketplace listing")[:500],
-            m.get("description", "")[:1000],
-            severity="critical" if (m.get("confidence", 50) or 50) >= 75 else "medium",
-            raw=m,
+    if outcome.status == "failed":
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "error": "darkweb_scan_failed",
+                "detail": outcome.detail,
+                "sources": outcome.sources,
+            },
         )
 
-    await db.flush()
-
-    # Fire automation on critical/high findings
-    # The findings are already persisted; a failing automation rule for one
-    # finding is logged and does not undo the scan.
-    critical_count = 0
+    # Fire automation on critical findings. The findings are already
+    # persisted; a failing automation rule is logged and counted, and does
+    # not undo the scan.
+    critical_fired = 0
     automation = AutomationService(db)
-    for f in persisted_findings:
-        if f.severity in ("critical", "high"):
-            critical_count += 1
-            try:
-                await automation.on_darkweb_finding(
-                    finding_type=f.finding_type or "unknown",
-                    description=f.description or "",
-                    severity=f.severity,
-                    organization_id=org_id,
-                )
-            except Exception as inner_exc:  # noqa: BLE001
-                logger.warning(
-                    "on_darkweb_finding failed", finding_id=f.id, error=str(inner_exc)
-                )
-
-    # Record the scan on the monitor (``last_check``; the old code wrote a
-    # non-existent ``last_scan_date`` attribute inside a swallowed try).
-    monitor.last_check = start_time.isoformat()
+    for c in outcome.criticals:
+        try:
+            await automation.on_darkweb_finding(
+                finding_type=c["finding_type"],
+                description=c["description"],
+                source_url=c["source_url"],
+                severity=c["severity"],
+                organization_id=org_id,
+            )
+            critical_fired += 1
+        except Exception as inner_exc:  # noqa: BLE001
+            logger.warning("on_darkweb_finding failed", finding_id=c["finding_id"], error=str(inner_exc))
     await db.flush()
 
-    scan_id = f"scan_{monitor_id}_{int(start_time.timestamp())}"
     logger.info(
-        f"Dark web scan completed: monitor={monitor_id} total_findings="
-        f"{len(persisted_findings)} critical_fired={critical_count}"
-    )
-
-    return ScanStatusResponse(
-        scan_id=scan_id,
+        "Dark web scan completed",
         monitor_id=monitor_id,
-        status="completed",
-        start_time=start_time.isoformat(),
-        findings=len(persisted_findings),
-        new_findings=len(persisted_findings),
+        status=outcome.status,
+        matched=outcome.matched,
+        created=outcome.created,
+        critical_fired=critical_fired,
+    )
+    return ScanStatusResponse(
+        scan_id=f"scan_{monitor_id}_{int(start_time.timestamp())}",
+        monitor_id=monitor_id,
+        status=outcome.status,
+        start_time=outcome.started_at,
+        completion_time=outcome.finished_at,
+        findings=outcome.matched,
+        new_findings=outcome.created,
+        detail=outcome.detail,
+        terms_searched=outcome.terms_searched,
+        sources=outcome.sources,
+        skipped_duplicate=outcome.skipped_duplicate,
+        credential_leaks_created=outcome.credential_leaks_created,
+        critical_fired=critical_fired,
     )
 
 
@@ -923,37 +820,32 @@ async def bulk_remediate_credentials(
     if len(credentials) != len(action.credential_ids):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
 
-    # Apply remediation
-    password_reset_sent = 0
-    account_disabled = 0
-    mfa_enforced = 0
-    failed_actions = 0
-
-    # Records the remediation decision on each leak (no external action is
-    # executed here); nothing in this loop can fail per credential, so a
-    # database error surfaces as an error response instead of a count.
+    # Records the remediation decision on each leak. No password reset,
+    # account disable or MFA change is executed here (the leaked accounts
+    # live in the customer's identity provider), so the action counters stay
+    # 0 and ``execution`` says the decision was recorded only.
     for credential in credentials:
         credential.remediation_action = action.action
         credential.is_remediated = True
 
-        if action.action == "password_reset":
-            password_reset_sent += 1
-        elif action.action == "account_disabled":
-            account_disabled += 1
-        elif action.action == "mfa_enforced":
-            mfa_enforced += 1
-
     await db.commit()
 
-    logger.info(f"Bulk remediated {len(credentials)} credentials")
+    logger.info(f"Recorded remediation for {len(credentials)} credentials")
 
     return CredentialRemediationReport(
         total_affected=len(credentials),
-        password_reset_sent=password_reset_sent,
-        account_disabled=account_disabled,
-        mfa_enforced=mfa_enforced,
-        failed_actions=failed_actions,
+        password_reset_sent=0,
+        account_disabled=0,
+        mfa_enforced=0,
+        failed_actions=0,
         remediation_date=datetime.now(timezone.utc),
+        recorded=len(credentials),
+        execution="recorded_only",
+        detail=(
+            f"'{action.action}' recorded on {len(credentials)} credential leak(s); "
+            "no identity-provider action was executed. Perform it in the identity "
+            "provider (or through ITDR response actions)."
+        ),
     )
 
 
@@ -1047,49 +939,40 @@ async def initiate_takedown(
     current_user: AnalystUser = None,
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
-    background_tasks: BackgroundTasks = None,
     threat_id: str = Path(...),
 ):
-    """Initiate takedown for brand threat"""
+    """Takedown submission: 501, no takedown provider is integrated.
+
+    The threat is looked up first (404 outside the tenant). Nothing is
+    recorded and nothing is queued: the takedown has to be filed with the
+    registrar / hosting provider's abuse contact, and its progress tracked
+    with ``PATCH /darkweb/brand-threats/{id}`` (``takedown_status``).
+    """
     result = await db.execute(
-        select(BrandThreat).where(
+        select(BrandThreat.id).where(
             and_(
                 BrandThreat.id == threat_id,
                 BrandThreat.organization_id == org_id,
             )
         )
     )
-    threat = result.scalar_one_or_none()
-
-    if not threat:
+    if result.first() is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
-    # Queue background task
-    background_tasks.add_task(
-        brand_monitoring_scan,
-        monitor_id="brand_monitor",
-        target_brand=threat.target_brand or "unknown",
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "reason": "no_takedown_provider",
+            "detail": (
+                "No takedown provider is integrated, so PySOAR cannot submit a "
+                "takedown. File it with the registrar or hosting abuse contact and "
+                "record progress with PATCH /darkweb/brand-threats/{id} "
+                "(takedown_status)."
+            ),
+            "threat_id": threat_id,
+        },
     )
-
-    threat.takedown_status = "takedown_requested"
-    await db.commit()
-
-    logger.info(f"Recorded takedown request for threat: {threat_id}")
-
-    # Honest response: the request is RECORDED on the threat and brand
-    # monitoring is re-queued, but no takedown provider is integrated —
-    # nothing is submitting an abuse/takedown request on the analyst's
-    # behalf. The takedown itself must be actioned manually.
-    return {
-        "status": "takedown_requested",
-        "threat_id": threat_id,
-        "execution": "recorded_only",
-        "detail": (
-            "Takedown request recorded on the threat and brand monitoring "
-            "re-queued. No takedown provider is integrated, so the takedown "
-            "must be actioned manually (registrar/hosting abuse contact)."
-        ),
-    }
 
 
 # Dashboard endpoints
@@ -1354,8 +1237,14 @@ async def get_dashboard(
     lv = last_scan_rows.scalar()
     if lv:
         last_scan_iso = lv.isoformat() if hasattr(lv, "isoformat") else str(lv)
+    scan_interval_minutes: Optional[int] = None
     if active_monitors > 0:
-        scan_frequency = "daily"
+        scan_interval_minutes = _sweep_interval_minutes()
+        scan_frequency = (
+            f"every {scan_interval_minutes} minutes"
+            if scan_interval_minutes
+            else "not scheduled (no beat entry for the dark-web sweep)"
+        )
 
     return DarkWebDashboard(
         exposure_summary=DarkWebExposureSummary(
@@ -1390,7 +1279,63 @@ async def get_dashboard(
         monitored_items=monitored_items,
         active_monitors=active_monitors,
         scan_frequency=scan_frequency,
+        scan_interval_minutes=scan_interval_minutes,
+        sources=_source_configuration(),
+        source_platform_labels=dict(SOURCE_PLATFORM_LABELS),
     )
+
+
+#: Honest description of every ``source_platform`` value on a finding.
+SOURCE_PLATFORM_LABELS: dict[str, str] = {
+    "breach_database": "Breach database (Have I Been Pwned)",
+    "paste_site": "Paste site (as indexed by Have I Been Pwned)",
+    "threat_intel_feed": "Threat-intelligence feed (abuse.ch URLhaus / ThreatFox, AlienVault OTX); not a dark-web forum",
+    "marketplace": "Operator-configured marketplace feed",
+    "tor_forum": "Tor forum (recorded manually; no Tor source is integrated)",
+    "telegram": "Telegram (recorded manually; no Telegram source is integrated)",
+    "discord": "Discord (recorded manually; no Discord source is integrated)",
+    "ransomware_blog": "Ransomware leak site (recorded manually; no leak-site source is integrated)",
+    "code_repository": "Code repository (recorded manually)",
+    "social_media": "Social media (recorded manually)",
+}
+
+
+def _sweep_interval_minutes() -> Optional[int]:
+    """Minutes between runs of the beat entry that scans every enabled monitor."""
+    from datetime import timedelta as _td
+
+    from src.workers.celery_app import celery_app
+
+    entry = (celery_app.conf.beat_schedule or {}).get("darkweb-cross-org-sweep") or {}
+    schedule = entry.get("schedule")
+    if isinstance(schedule, (int, float)):
+        return max(1, int(schedule // 60))
+    if isinstance(schedule, _td):
+        return max(1, int(schedule.total_seconds() // 60))
+    run_every = getattr(schedule, "run_every", None)
+    if isinstance(run_every, _td):
+        return max(1, int(run_every.total_seconds() // 60))
+    return None
+
+
+def _source_configuration() -> dict[str, dict]:
+    """Which monitor-scan sources the platform can use right now."""
+    from src.darkweb import engine as dw_engine
+    from src.darkweb.monitor_scan import SOURCE_LABELS
+
+    requirement = {
+        "hibp_account": ("HIBP_API_KEY", dw_engine.hibp_api_key() is not None),
+        "hibp_domain": (None, True),
+        "hibp_breach_catalogue": (None, True),
+        "urlhaus": ("ABUSECH_AUTH_KEY", dw_engine.abusech_auth_key() is not None),
+        "threatfox": ("ABUSECH_AUTH_KEY", dw_engine.abusech_auth_key() is not None),
+        "otx": ("OTX_API_KEY", dw_engine.otx_api_key() is not None),
+        "marketplace_feed": ("DARKWEB_MARKETPLACE_FEED_URL", dw_engine.marketplace_feed_url() is not None),
+    }
+    return {
+        source: {"label": label, "configured": requirement[source][1], "requires": requirement[source][0]}
+        for source, label in SOURCE_LABELS.items()
+    }
 
 
 # ---------------------------------------------------------------------------

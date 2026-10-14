@@ -8,8 +8,6 @@ analyst can tell "no data because nothing checked" from "checked and
 clean".
 """
 
-from unittest.mock import patch
-
 import pytest
 
 from src.intel.models import ThreatIndicator
@@ -71,8 +69,25 @@ async def test_unimplemented_provider_with_key_says_so(db_session, ip_indicator)
 
 
 @pytest.mark.asyncio
-async def test_provider_query_failure_reported(db_session, ip_indicator):
+async def test_provider_query_failure_reported(db_session, ip_indicator, monkeypatch):
+    """Provider calls go through src/intel/outbound.py (wave 3); the failure
+    is injected at the transport boundary."""
+    import httpx
+
+    from src.core.config import settings
+    from src.integrations import netguard
+    from src.intel import outbound
     from src.intel.enrichment import IndicatorEnricher
+
+    async def public_dns(host, port):
+        return [(None, None, None, "", ("93.184.216.34", port))]
+
+    def boom(request):
+        raise httpx.ConnectTimeout("boom", request=request)
+
+    monkeypatch.setattr(netguard, "_getaddrinfo", public_dns)
+    monkeypatch.setattr(outbound, "TRANSPORT", httpx.MockTransport(boom))
+    monkeypatch.setattr(settings, "virustotal_api_key", "vt-test-key")
 
     enricher = IndicatorEnricher()
     enricher.vt_available = True
@@ -80,20 +95,7 @@ async def test_provider_query_failure_reported(db_session, ip_indicator):
     enricher.shodan_available = False
     enricher.greynoise_available = False
 
-    import httpx
-
-    class BoomClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return False
-
-        async def get(self, *a, **k):
-            raise httpx.ConnectTimeout("boom")
-
-    with patch("httpx.AsyncClient", BoomClient):
-        result = await enricher.enrich_indicator(ip_indicator.id)
+    result = await enricher.enrich_indicator(ip_indicator.id)
 
     skipped = {s["provider"]: s["reason"] for s in result["skipped"]}
     assert "virustotal" in skipped and "failed" in skipped["virustotal"]

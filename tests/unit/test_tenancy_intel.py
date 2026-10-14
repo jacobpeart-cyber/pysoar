@@ -341,8 +341,9 @@ async def test_tenant_admin_cannot_run_platform_feed_actions(client, org_a_admin
 async def test_platform_superuser_can_poll_all(client, superuser_headers, monkeypatch):
     called = {}
 
-    async def fake_poll_all(self):
+    async def fake_poll_all(self, *, only_due=True):
         called["yes"] = True
+        called["only_due"] = only_due
         return {}
 
     monkeypatch.setattr(FeedManager, "poll_all_feeds", fake_poll_all)
@@ -350,6 +351,8 @@ async def test_platform_superuser_can_poll_all(client, superuser_headers, monkey
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "poll_started"
     assert called.get("yes")
+    # An explicit "poll everything now" ignores the per-feed interval (wave 3).
+    assert called["only_due"] is False
 
 
 async def test_viewer_can_read(client, viewer_headers):

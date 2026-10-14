@@ -18,20 +18,19 @@ Tenancy (wave 1, docs/audit/2026-10-08/PLAN.md):
   ``admin``; viewers are read-only.
 """
 
-import asyncio
+import csv
+import io
 import logging
 import math
-import re
-import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-import httpx
 from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Path, HTTPException, Query, status
-from sqlalchemy import and_, desc, func, or_, select
+from fastapi.responses import Response
+from sqlalchemy import String, and_, cast, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import (
@@ -41,7 +40,7 @@ from src.api.deps import (
     PlatformSuperUser,
     require_role,
 )
-from src.core.secrets import _decrypt_secret_json
+from src.intel import providers as intel_providers
 from src.intel.models import (
     IndicatorSighting,
     IntelReport,
@@ -50,7 +49,6 @@ from src.intel.models import (
     ThreatFeed,
     ThreatIndicator,
 )
-from src.integrations.models import InstalledIntegration, IntegrationConnector
 from src.models.user import User, UserRole
 
 logger = logging.getLogger(__name__)
@@ -59,299 +57,51 @@ logger = logging.getLogger(__name__)
 AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
 AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
 
+#: Row cap for GET /export.
+EXPORT_MAX_ROWS = 50_000
+#: Indicators counted for the dashboard's top tags.
+TOP_TAGS_SAMPLE = 5_000
+
 # ---------------------------------------------------------------------------
-# In-process TTL cache for external IOC enrichment
+# External enrichment (VirusTotal / AbuseIPDB / AlienVault OTX)
 # ---------------------------------------------------------------------------
-# External intel APIs (VirusTotal free tier = 4 req/min, AbuseIPDB daily caps)
-# rate-limit us aggressively, so we cache lookups for 1 hour per
-# (provider, indicator_type, value) tuple. This keeps the UI snappy on repeat
-# lookups and avoids burning quota on the same indicator.
-# The key also carries the organisation id: each tenant enriches with its own
-# installed API keys, so one tenant's lookups never serve another tenant.
-_IOC_CACHE_TTL_SECONDS = 3600
-_ioc_lookup_cache: dict[tuple[str, ...], tuple[float, dict[str, Any]]] = {}
+# Keys, caching, the outbound guard and provider error reporting live in
+# ``src/intel/providers.py`` (shared with indicator enrichment and the IOC
+# router). Results are cached per organisation for an hour.
 
 
-def _cache_get(key: tuple[str, ...]) -> Optional[dict[str, Any]]:
-    entry = _ioc_lookup_cache.get(key)
-    if not entry:
-        return None
-    expires_at, value = entry
-    if expires_at < time.time():
-        _ioc_lookup_cache.pop(key, None)
-        return None
-    return value
-
-
-def _cache_set(key: tuple[str, ...], value: dict[str, Any]) -> None:
-    _ioc_lookup_cache[key] = (time.time() + _IOC_CACHE_TTL_SECONDS, value)
-
-
-def _detect_indicator_type(value: str) -> str:
-    """Best-effort IOC type detection when the caller passes type='auto'."""
-    v = value.strip()
-    # URL
-    if v.lower().startswith(("http://", "https://")):
-        return "url"
-    # Hash — length-based heuristic
-    if re.fullmatch(r"[a-fA-F0-9]{32}", v):
-        return "md5"
-    if re.fullmatch(r"[a-fA-F0-9]{40}", v):
-        return "sha1"
-    if re.fullmatch(r"[a-fA-F0-9]{64}", v):
-        return "sha256"
-    # IPv4
-    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", v):
-        return "ip"
-    # IPv6 (very loose)
-    if ":" in v and re.fullmatch(r"[0-9a-fA-F:]+", v):
-        return "ip"
-    # Domain
-    if re.fullmatch(r"[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}", v):
-        return "domain"
-    return "unknown"
-
-
-def _normalize_type(t: str) -> str:
-    """Collapse fine-grained IOC types to a dispatch bucket."""
-    t = (t or "").lower()
-    if t in ("ipv4", "ipv6", "ip"):
-        return "ip"
-    if t in ("md5", "sha1", "sha256", "hash"):
-        return "hash"
-    if t == "url":
-        return "url"
-    if t == "domain":
-        return "domain"
-    return t
-
-
-async def _load_intel_integrations(
-    db: AsyncSession,
-    org_id: str,
-) -> tuple[dict[str, dict[str, Any]], list[str]]:
-    """Load the caller organisation's VirusTotal / AbuseIPDB credentials.
-
-    Returns ``({connector_name: credentials_dict}, errors)``. Only the
-    caller's own installations are considered (one tenant's API key never
-    serves another tenant). Credentials are stored as an ``enc:v1:``
-    envelope in ``auth_credentials_encrypted``; an installation whose
-    credentials cannot be read is reported in ``errors`` instead of being
-    silently treated as "not configured".
-    """
-    q = (
-        select(InstalledIntegration, IntegrationConnector)
-        .join(
-            IntegrationConnector,
-            IntegrationConnector.id == InstalledIntegration.connector_id,
-        )
-        .where(
-            IntegrationConnector.name.in_(("virustotal", "abuseipdb")),
-            InstalledIntegration.organization_id == org_id,
-        )
-    )
-    result = await db.execute(q)
-    integrations: dict[str, dict[str, Any]] = {}
-    errors: list[str] = []
-    for inst, conn in result.all():
-        creds = _decrypt_secret_json(inst.auth_credentials_encrypted)
-        if not creds and inst.auth_credentials_encrypted:
-            errors.append(f"{conn.name.lower()}: credentials_unreadable")
-            continue
-        # Only surface integrations that have a usable key.
-        if conn.name.lower() in ("virustotal", "abuseipdb") and (
-            creds.get("api_key") or creds.get("apikey") or creds.get("key")
-        ):
-            integrations[conn.name.lower()] = creds
-    return integrations, errors
-
-
-def _vt_verdict(stats: dict[str, Any]) -> tuple[str, int]:
-    """Map VT last_analysis_stats -> (verdict, confidence[0-100])."""
-    malicious = int(stats.get("malicious") or 0)
-    suspicious = int(stats.get("suspicious") or 0)
-    harmless = int(stats.get("harmless") or 0)
-    undetected = int(stats.get("undetected") or 0)
-    total = malicious + suspicious + harmless + undetected
-    if malicious >= 3:
-        verdict = "malicious"
-    elif malicious >= 1 or suspicious >= 3:
-        verdict = "suspicious"
-    elif total > 0 and harmless > 0:
-        verdict = "clean"
-    else:
-        verdict = "unknown"
-    confidence = 0
-    if total > 0:
-        confidence = min(100, int(((malicious + suspicious) / total) * 100))
-    return verdict, confidence
-
-
-async def _vt_lookup(
-    client: httpx.AsyncClient,
-    api_key: str,
-    ioc_type: str,
-    value: str,
-) -> dict[str, Any]:
-    """Call VirusTotal v3 directly. Returns an ``external_sources`` entry."""
-    import base64 as _b64
-
-    headers = {"x-apikey": api_key, "Accept": "application/json"}
-    if ioc_type == "ip":
-        endpoint = f"https://www.virustotal.com/api/v3/ip_addresses/{value}"
-    elif ioc_type == "domain":
-        endpoint = f"https://www.virustotal.com/api/v3/domains/{value}"
-    elif ioc_type == "hash":
-        endpoint = f"https://www.virustotal.com/api/v3/files/{value}"
-    elif ioc_type == "url":
-        url_id = _b64.urlsafe_b64encode(value.encode()).decode().strip("=")
-        endpoint = f"https://www.virustotal.com/api/v3/urls/{url_id}"
-    else:
-        return {
-            "name": "virustotal",
-            "verdict": "unsupported",
-            "confidence": 0,
-            "error": f"VirusTotal does not support type '{ioc_type}'",
-        }
-
-    resp = await client.get(endpoint, headers=headers)
-    if resp.status_code == 404:
-        return {
-            "name": "virustotal",
-            "verdict": "unknown",
-            "confidence": 0,
-            "raw": {"not_found": True, "status": 404},
-        }
-    resp.raise_for_status()
-    body = resp.json() or {}
-    attributes = (body.get("data") or {}).get("attributes") or {}
-    stats = attributes.get("last_analysis_stats") or {}
-    verdict, confidence = _vt_verdict(stats)
-    return {
-        "name": "virustotal",
-        "verdict": verdict,
-        "confidence": confidence,
-        "raw": {
-            "last_analysis_stats": stats,
-            "reputation": attributes.get("reputation"),
-            "country": attributes.get("country"),
-            "as_owner": attributes.get("as_owner"),
-            "asn": attributes.get("asn"),
-            "tags": attributes.get("tags", []),
-            "last_analysis_date": attributes.get("last_analysis_date"),
-        },
-    }
-
-
-async def _abuseipdb_lookup(
-    client: httpx.AsyncClient,
-    api_key: str,
-    value: str,
-) -> dict[str, Any]:
-    """Call AbuseIPDB /check directly."""
-    headers = {"Key": api_key, "Accept": "application/json"}
-    params = {"ipAddress": value, "maxAgeInDays": 90, "verbose": True}
-    resp = await client.get(
-        "https://api.abuseipdb.com/api/v2/check",
-        headers=headers,
-        params=params,
-    )
-    resp.raise_for_status()
-    body = resp.json() or {}
-    data = body.get("data") or {}
-    score = int(data.get("abuseConfidenceScore") or 0)
-    if score >= 75:
-        verdict = "malicious"
-    elif score >= 25:
-        verdict = "suspicious"
-    elif score > 0:
-        verdict = "low_risk"
-    else:
-        verdict = "clean"
-    return {
-        "name": "abuseipdb",
-        "verdict": verdict,
-        "confidence": score,
-        "raw": {
-            "abuse_confidence_score": score,
-            "total_reports": data.get("totalReports"),
-            "country_code": data.get("countryCode"),
-            "usage_type": data.get("usageType"),
-            "isp": data.get("isp"),
-            "domain": data.get("domain"),
-            "is_public": data.get("isPublic"),
-            "is_whitelisted": data.get("isWhitelisted"),
-            "last_reported_at": data.get("lastReportedAt"),
-        },
-    }
-
-
-async def _enrich_external(
-    ioc_type: str,
-    value: str,
-    integrations: dict[str, dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[str]]:
-    """Call configured external providers in parallel.
-
-    Returns ``(sources, errors)`` where ``sources`` matches the
-    ``external_sources`` schema and ``errors`` is a list of free-form
-    strings describing any per-provider failures.
-    """
-    tasks: list[tuple[str, asyncio.Task]] = []
-    errors: list[str] = []
-
-    def _get_key(creds: dict[str, Any]) -> Optional[str]:
-        return creds.get("api_key") or creds.get("apikey") or creds.get("key")
-
-    # Build per-provider task list from the type dispatcher.
-    timeout = httpx.Timeout(8.0, connect=5.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        if ioc_type == "ip":
-            if "abuseipdb" in integrations:
-                key = _get_key(integrations["abuseipdb"])
-                if key:
-                    tasks.append((
-                        "abuseipdb",
-                        asyncio.create_task(_abuseipdb_lookup(client, key, value)),
-                    ))
-            if "virustotal" in integrations:
-                key = _get_key(integrations["virustotal"])
-                if key:
-                    tasks.append((
-                        "virustotal",
-                        asyncio.create_task(_vt_lookup(client, key, "ip", value)),
-                    ))
-        elif ioc_type in ("domain", "url", "hash"):
-            if "virustotal" in integrations:
-                key = _get_key(integrations["virustotal"])
-                if key:
-                    tasks.append((
-                        "virustotal",
-                        asyncio.create_task(_vt_lookup(client, key, ioc_type, value)),
-                    ))
-
-        if not tasks:
-            return [], errors
-
-        results = await asyncio.gather(
-            *(t for _, t in tasks), return_exceptions=True
-        )
-
+def _external_sources(outcomes: list[intel_providers.ProviderOutcome]) -> list[dict[str, Any]]:
+    """``external_sources`` entries: one per provider that answered or failed."""
     sources: list[dict[str, Any]] = []
-    for (name, _task), result in zip(tasks, results):
-        if isinstance(result, Exception):
-            err_msg = f"{name}: {type(result).__name__}: {result}"
-            errors.append(err_msg)
-            logger.warning("IOC enrichment failed: %s", err_msg)
+    for outcome in outcomes:
+        if outcome.status == "ok" and outcome.result is not None:
+            entry = dict(outcome.result)
+            entry["cached"] = outcome.cached
+            entry["key_source"] = outcome.key_source
+            # The UI reads ``details``; ``raw`` is kept for existing clients.
+            entry.setdefault("details", entry.get("raw"))
+            sources.append(entry)
+        elif outcome.status == "error":
             sources.append({
-                "name": name,
+                "name": outcome.provider,
                 "verdict": "error",
                 "confidence": 0,
-                "error": str(result)[:200],
+                "error": outcome.error,
+                "key_source": outcome.key_source,
             })
-            continue
-        sources.append(result)
-    return sources, errors
+    return sources
+
+
+def _external_errors(outcomes: list[intel_providers.ProviderOutcome]) -> list[str]:
+    errors: list[str] = []
+    for outcome in outcomes:
+        if outcome.status == "error":
+            errors.append(f"{outcome.provider}: {outcome.error}")
+        elif outcome.status == "credentials_unreadable":
+            errors.append(f"{outcome.provider}: credentials_unreadable")
+    return errors
+
+
 from src.schemas.intel import (
     BulkIndicatorImport,
     IntelDashboardStats,
@@ -481,7 +231,7 @@ async def get_threat_intel_stats(
             select(func.count(ThreatIndicator.id)).where(
                 and_(
                     org_filter(ThreatIndicator),
-                    ThreatIndicator.indicator_type.in_(["ipv4", "ipv6", "ip"]),
+                    ThreatIndicator.indicator_type.in_(["ipv4", "ipv6", "ip", "cidr"]),
                     ThreatIndicator.severity.in_(malicious_severities),
                 )
             )
@@ -546,26 +296,23 @@ async def lookup_ioc(
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> dict:
-    """Look up an IOC and enrich with external feeds.
+    """Look up an IOC locally and enrich it with external providers.
 
-    Order of operations:
-      1. Query the local ``threat_indicators`` table for a match (fast
-         path, returns local reputation + tags).
-      2. Detect IOC type if caller passed ``type='auto'``.
-      3. Enrich via installed VirusTotal / AbuseIPDB integrations:
-         - ``ip``     -> AbuseIPDB + VirusTotal (parallel)
-         - ``domain`` -> VirusTotal
-         - ``url``    -> VirusTotal
-         - ``hash``   -> VirusTotal
-      4. Merge: local reputation is kept if set, but external results
-         are appended under ``external_sources``. If no integrations are
-         installed, ``external_enrichment = "no_integrations_configured"``
-         makes that explicit — we never silently drop the enrichment.
+    1. Local match in ``threat_indicators`` (own plus platform intel). A UI
+       type such as ``ip`` or ``hash`` matches every stored variant
+       (``ipv4``/``ipv6``/``cidr``, ``md5``/``sha1``/``sha256``).
+    2. External enrichment through ``src/intel/providers.py``: VirusTotal
+       (ip, domain, url, hash), AbuseIPDB (ip) and AlienVault OTX (ip,
+       domain, url, hash), with the organisation's keys or the platform's.
+       ``providers`` reports each provider's state (``ok``,
+       ``not_configured``, ``credentials_unreadable``, ``error``,
+       ``unsupported_type``); ``not_configured`` lists the providers that
+       apply but have no key. Errors are listed, never dropped.
 
     Frontend POSTs ``{ indicator: string, type: string }``.
     """
     indicator_value = (payload.get("indicator") or "").strip()
-    indicator_type = payload.get("type", "auto")
+    indicator_type = (payload.get("type") or "auto").strip() or "auto"
 
     if not indicator_value:
         raise HTTPException(
@@ -580,10 +327,12 @@ async def lookup_ioc(
             ThreatIndicator.value == indicator_value,
         )
     )
-    if indicator_type and indicator_type != "auto":
-        query = query.where(ThreatIndicator.indicator_type == indicator_type)
+    if indicator_type != "auto":
+        query = query.where(
+            ThreatIndicator.indicator_type.in_(intel_providers.type_variants(indicator_type))
+        )
 
-    result = await db.execute(query.order_by(desc(ThreatIndicator.last_seen)))
+    result = await db.execute(query.order_by(desc(ThreatIndicator.last_seen)).limit(100))
     indicators = result.scalars().all()
 
     severity_to_reputation = {
@@ -605,6 +354,7 @@ async def lookup_ioc(
                 "name": ind.source or "Internal",
                 "verdict": severity_to_reputation.get(ind.severity or "", "unknown"),
                 "last_seen": ind.last_seen.isoformat() if ind.last_seen else None,
+                "platform_intel": ind.organization_id is None,
             }
             for ind in indicators
         ]
@@ -626,73 +376,14 @@ async def lookup_ioc(
         last_seen_iso = None
 
     # --- External enrichment -----------------------------------------------
-    # Resolve dispatch type (ip/domain/url/hash) — either user-supplied or
-    # best-effort detected from the value itself.
-    dispatch_type = _normalize_type(
-        resolved_type if resolved_type and resolved_type != "auto" else indicator_type
-    )
-    if dispatch_type in ("", "auto", "unknown"):
-        dispatch_type = _normalize_type(_detect_indicator_type(indicator_value))
-    if dispatch_type in ("", "unknown"):
-        # still resolve as-is; skip external if unclassifiable
-        dispatch_type = _normalize_type(indicator_type)
+    if resolved_type in ("", "auto"):
+        resolved_type = intel_providers.detect_type(indicator_value)
+    dispatch_type = intel_providers.dispatch_bucket(resolved_type)
 
-    external_sources: list[dict[str, Any]] = []
-    external_errors: list[str] = []
-    external_status = "ok"
-
-    integrations, credential_errors = await _load_intel_integrations(db, org_id)
-    external_errors.extend(credential_errors)
-
-    if not integrations and credential_errors:
-        external_status = "integration_credentials_unreadable"
-    elif not integrations:
-        external_status = "no_integrations_configured"
-    elif dispatch_type not in ("ip", "domain", "url", "hash"):
-        external_status = "unsupported_indicator_type"
-    else:
-        # Pull providers that will actually be called so we can check cache
-        # first and only hit the network for cache misses.
-        providers_for_type = {
-            "ip": ["abuseipdb", "virustotal"],
-            "domain": ["virustotal"],
-            "url": ["virustotal"],
-            "hash": ["virustotal"],
-        }[dispatch_type]
-        providers_to_call = [p for p in providers_for_type if p in integrations]
-
-        cached_hits: list[dict[str, Any]] = []
-        missing: list[str] = []
-        for provider in providers_to_call:
-            cache_key = (org_id, provider, dispatch_type, indicator_value)
-            cached = _cache_get(cache_key)
-            if cached is not None:
-                cached_hits.append(cached)
-            else:
-                missing.append(provider)
-
-        # Call only missing providers
-        fresh_sources: list[dict[str, Any]] = []
-        if missing:
-            sub_integrations = {k: v for k, v in integrations.items() if k in missing}
-            try:
-                fresh_sources, provider_errors = await _enrich_external(
-                    dispatch_type, indicator_value, sub_integrations
-                )
-                external_errors.extend(provider_errors)
-            except Exception as e:
-                logger.exception("External IOC enrichment crashed: %s", e)
-                external_errors.append(f"enrichment_crashed: {e}")
-                fresh_sources = []
-                external_status = "enrichment_failed"
-            # Populate cache for successful results only
-            for src in fresh_sources:
-                if src.get("verdict") not in ("error",):
-                    _cache_set((org_id, src["name"], dispatch_type, indicator_value), src)
-
-        external_sources = cached_hits + fresh_sources
-        if not external_sources and external_status == "ok":
-            external_status = "no_results"
+    outcomes = await intel_providers.enrich_value(db, org_id, dispatch_type, indicator_value)
+    external_sources = _external_sources(outcomes)
+    external_errors = _external_errors(outcomes)
+    external_status = intel_providers.overall_status(outcomes)
 
     # --- Merge: prefer local reputation; escalate if external is worse -----
     verdict_rank = {
@@ -714,13 +405,15 @@ async def lookup_ioc(
 
     return {
         "indicator": indicator_value,
-        "type": resolved_type if resolved_type not in (None, "", "auto") else dispatch_type,
+        "type": resolved_type if resolved_type not in (None, "", "auto", "unknown") else dispatch_type,
         "reputation": merged_reputation,
         "confidence": merged_confidence,
         "sources": local_sources,
         "external_sources": external_sources,
         "external_enrichment": external_status,
         "external_errors": external_errors,
+        "providers": [o.summary() for o in outcomes],
+        "not_configured": [o.provider for o in outcomes if o.status == "not_configured"],
         "tags": unique_tags,
         "first_seen": first_seen_iso,
         "last_seen": last_seen_iso,
@@ -996,7 +689,7 @@ async def poll_all_threat_feeds(
 async def _run_all_feed_polls() -> None:
     from src.intel.feeds import FeedManager
 
-    results = await FeedManager().poll_all_feeds()
+    results = await FeedManager().poll_all_feeds(only_due=False)
     logger.info("Platform-wide feed poll completed", extra={"feeds": len(results)})
 
 
@@ -1116,6 +809,21 @@ async def bulk_import_indicators(
     }
 
 
+def _with_tags(query: Any, tags: Optional[list[str]]) -> Any:
+    """Indicators carrying every tag in ``tags``.
+
+    ``tags`` is a JSON array column; matching its text form against the
+    quoted tag works on PostgreSQL and SQLite alike.
+    """
+    for tag in tags or []:
+        tag = (tag or "").strip()
+        if not tag:
+            continue
+        escaped = tag.replace("\\", "\\\\").replace('"', '\\"')
+        query = query.where(cast(ThreatIndicator.tags, String).like(f'%"{escaped}"%'))
+    return query
+
+
 @router.get("/indicators", response_model=ThreatIndicatorListResponse, operation_id="list_indicators")
 async def list_indicators(
     current_user: CurrentUser = None,
@@ -1179,6 +887,7 @@ async def list_indicators(
         query = query.where(ThreatIndicator.created_at >= date_from)
     if date_to:
         query = query.where(ThreatIndicator.created_at <= date_to)
+    query = _with_tags(query, tags)
 
     count_query = select(func.count()).select_from(query.subquery())
     total = (await db.execute(count_query)).scalar() or 0
@@ -1263,23 +972,44 @@ async def enrich_indicator(
     db: DatabaseSession = None,
     indicator_id: str = Path(...),
 ) -> dict:
-    """
-    Trigger enrichment for a threat indicator.
+    """Enrich one of the caller's indicators through VirusTotal / AbuseIPDB / OTX now.
+
+    Runs the same providers as ``POST /lookup`` with the organisation's keys
+    (or the platform's) and stores the outcome on the indicator under
+    ``context.external_enrichment``. ``status`` is ``enriched`` when at least
+    one provider answered, otherwise the reason (``not_configured``,
+    ``enrichment_failed``, ``integration_credentials_unreadable``,
+    ``unsupported_indicator_type``). Platform intel answers 403.
     """
     indicator = await _get_owned_indicator(db, indicator_id, org_id)
 
-    # Mark as enrichment pending in context
-    enrichment_data = indicator.context or {}
-    enrichment_data["enrichment_status"] = "scheduled"
-    enrichment_data["enrichment_requested_at"] = datetime.now(timezone.utc).isoformat()
-    indicator.context = enrichment_data
+    bucket = intel_providers.dispatch_bucket(indicator.indicator_type)
+    outcomes = await intel_providers.enrich_value(db, org_id, bucket, indicator.value, use_cache=False)
+    overall = intel_providers.overall_status(outcomes)
+    checked_at = datetime.now(timezone.utc).isoformat()
+
+    context = dict(indicator.context or {})
+    context["external_enrichment"] = {
+        "status": overall,
+        "checked_at": checked_at,
+        "providers": [o.summary() for o in outcomes],
+        "sources": _external_sources(outcomes),
+    }
+    context.pop("enrichment_status", None)
+    context.pop("enrichment_requested_at", None)
+    indicator.context = context
 
     await db.flush()
     await db.refresh(indicator)
 
     return {
-        "status": "enrichment_scheduled",
+        "status": "enriched" if overall == "ok" else overall,
         "indicator_id": indicator_id,
+        "checked_at": checked_at,
+        "providers": [o.summary() for o in outcomes],
+        "external_sources": _external_sources(outcomes),
+        "external_errors": _external_errors(outcomes),
+        "not_configured": [o.provider for o in outcomes if o.status == "not_configured"],
     }
 
 
@@ -1998,7 +1728,6 @@ async def get_dashboard_stats(
     indicators_by_severity = dict(severity_result.all())
 
     # Recent sightings (last 7 days)
-    from datetime import timedelta
     seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
     recent_sightings = (
         await db.execute(
@@ -2028,8 +1757,40 @@ async def get_dashboard_stats(
         )
     ).scalar() or 0
 
-    # Coverage score: simple heuristic based on feed count and indicator count
-    coverage_score = min(100.0, (feeds_enabled * 10.0) + (min(total_indicators, 1000) / 10.0))
+    # Coverage score: the share of enabled feeds (own plus platform) whose
+    # last successful poll is within the last 24 hours, as a percentage.
+    day_ago = datetime.now(timezone.utc) - timedelta(days=1)
+    feeds_fresh = (
+        await db.execute(
+            _scope(
+                select(func.count(ThreatFeed.id)).where(
+                    ThreatFeed.is_enabled == True,
+                    ThreatFeed.last_success_at >= day_ago,
+                ),
+                ThreatFeed,
+            )
+        )
+    ).scalar() or 0
+    coverage_score = round(100.0 * feeds_fresh / feeds_enabled, 1) if feeds_enabled else 0.0
+
+    # Top tags over the most recent TOP_TAGS_SAMPLE indicators (own plus
+    # platform). JSON array aggregation is dialect-specific, so the tags are
+    # counted here over a bounded sample; ``top_tags_sample_size`` says how
+    # many indicators were counted.
+    tag_rows = (
+        await db.execute(
+            _scope(select(ThreatIndicator.tags), ThreatIndicator)
+            .order_by(desc(ThreatIndicator.created_at))
+            .limit(TOP_TAGS_SAMPLE)
+        )
+    ).all()
+    tag_counts: dict[str, int] = {}
+    for (row_tags,) in tag_rows:
+        if isinstance(row_tags, list):
+            for tag in row_tags:
+                if isinstance(tag, str) and tag:
+                    tag_counts[tag] = tag_counts.get(tag, 0) + 1
+    top_tags = [tag for tag, _ in sorted(tag_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:10]]
 
     return IntelDashboardStats(
         total_indicators=total_indicators,
@@ -2041,8 +1802,11 @@ async def get_dashboard_stats(
         recent_sightings=recent_sightings,
         actors_tracked=actors_tracked,
         active_campaigns=active_campaigns,
-        top_tags=[],  # Would require JSON array aggregation which is DB-specific
+        top_tags=top_tags,
         coverage_score=coverage_score,
+        coverage_basis="enabled feeds with a successful poll in the last 24 hours",
+        feeds_polled_24h=feeds_fresh,
+        top_tags_sample_size=len(tag_rows),
     )
 
 
@@ -2055,9 +1819,14 @@ async def export_indicators(
     indicator_types: Optional[list[str]] = Query(None),
     severity: Optional[list[str]] = Query(None),
     tags: Optional[list[str]] = Query(None),
-) -> dict:
-    """
-    Export threat indicators in various formats (JSON, CSV, STIX).
+) -> Any:
+    """Export active threat indicators (own plus platform intel).
+
+    ``json`` returns ``{format, count, truncated, indicators}``; ``csv``
+    returns a ``text/csv`` attachment; ``stix`` returns a STIX 2.1 bundle of
+    ``indicator`` objects. At most ``EXPORT_MAX_ROWS`` rows are exported,
+    newest first; ``truncated`` (JSON), ``x_pysoar_truncated`` (STIX) and the
+    ``X-PySOAR-Truncated`` header (CSV) say whether the cap cut the set.
     """
     if format not in ["json", "csv", "stix"]:
         raise HTTPException(
@@ -2065,18 +1834,24 @@ async def export_indicators(
             detail="Invalid export format. Must be json, csv, or stix",
         )
 
-    query = select(ThreatIndicator)
-
-    query = query.where(_visible_to(ThreatIndicator, org_id))
-
+    query = select(ThreatIndicator).where(_visible_to(ThreatIndicator, org_id))
     if indicator_types:
-        query = query.where(ThreatIndicator.indicator_type.in_(indicator_types))
+        expanded: list[str] = []
+        for itype in indicator_types:
+            expanded.extend(intel_providers.type_variants(itype))
+        query = query.where(ThreatIndicator.indicator_type.in_(expanded))
     if severity:
         query = query.where(ThreatIndicator.severity.in_(severity))
+    query = _with_tags(query, tags)
 
-    query = query.where(ThreatIndicator.is_active == True).order_by(desc(ThreatIndicator.created_at))
-    result = await db.execute(query)
-    indicators = result.scalars().all()
+    query = (
+        query.where(ThreatIndicator.is_active == True)
+        .order_by(desc(ThreatIndicator.created_at))
+        .limit(EXPORT_MAX_ROWS + 1)
+    )
+    indicators = list((await db.execute(query)).scalars().all())
+    truncated = len(indicators) > EXPORT_MAX_ROWS
+    indicators = indicators[:EXPORT_MAX_ROWS]
 
     export_data = []
     for ind in indicators:
@@ -2093,10 +1868,88 @@ async def export_indicators(
             "tags": ind.tags,
             "mitre_tactics": ind.mitre_tactics,
             "mitre_techniques": ind.mitre_techniques,
+            "platform_intel": ind.organization_id is None,
         })
+
+    if format == "csv":
+        buffer = io.StringIO()
+        columns = [
+            "id", "indicator_type", "value", "source", "confidence", "severity", "tlp",
+            "first_seen", "last_seen", "tags", "mitre_techniques", "platform_intel",
+        ]
+        writer = csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        for row in export_data:
+            flat = dict(row)
+            flat["tags"] = ";".join(str(x) for x in (row.get("tags") or []))
+            flat["mitre_techniques"] = ";".join(str(x) for x in (row.get("mitre_techniques") or []))
+            writer.writerow(flat)
+        return Response(
+            content=buffer.getvalue(),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": 'attachment; filename="threat-indicators.csv"',
+                "X-PySOAR-Truncated": "true" if truncated else "false",
+            },
+        )
+
+    if format == "stix":
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        objects = []
+        for row in export_data:
+            pattern = _stix_pattern(row["indicator_type"], row["value"])
+            if pattern is None:
+                continue
+            created = row["first_seen"] or now_iso
+            objects.append({
+                "type": "indicator",
+                "spec_version": "2.1",
+                "id": f"indicator--{uuid.uuid5(uuid.NAMESPACE_URL, 'pysoar:' + row['id'])}",
+                "created": created,
+                "modified": row["last_seen"] or created,
+                "name": row["value"],
+                "pattern": pattern,
+                "pattern_type": "stix",
+                "valid_from": created,
+                "confidence": row["confidence"],
+                "labels": [x for x in (row.get("tags") or []) if isinstance(x, str)],
+                "x_pysoar_severity": row["severity"],
+                "x_pysoar_source": row["source"],
+            })
+        return {
+            "type": "bundle",
+            "id": f"bundle--{uuid.uuid4()}",
+            "objects": objects,
+            "x_pysoar_truncated": truncated,
+            "x_pysoar_skipped_untyped": len(export_data) - len(objects),
+        }
 
     return {
         "format": format,
         "count": len(export_data),
+        "truncated": truncated,
         "indicators": export_data,
     }
+
+
+def _stix_pattern(indicator_type: Optional[str], value: str) -> Optional[str]:
+    """A STIX 2.1 pattern for one indicator, or None for a type STIX cannot express."""
+    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+    itype = (indicator_type or "").lower()
+    if itype in ("ipv4", "ip") and ":" not in value:
+        return f"[ipv4-addr:value = '{escaped}']"
+    if itype in ("ipv6", "ip"):
+        return f"[ipv6-addr:value = '{escaped}']"
+    if itype == "cidr":
+        kind = "ipv6-addr" if ":" in value else "ipv4-addr"
+        return f"[{kind}:value = '{escaped}']"
+    if itype in ("domain", "hostname"):
+        return f"[domain-name:value = '{escaped}']"
+    if itype == "url":
+        return f"[url:value = '{escaped}']"
+    if itype == "email":
+        return f"[email-addr:value = '{escaped}']"
+    if itype in ("md5", "sha1", "sha256", "sha512"):
+        name = {"md5": "MD5", "sha1": "SHA-1", "sha256": "SHA-256", "sha512": "SHA-512"}[itype]
+        return f"[file:hashes.'{name}' = '{escaped}']"
+    return None

@@ -438,3 +438,9 @@ class IntelDashboardStats(BaseModel):
     active_campaigns: int = 0
     top_tags: list[str]
     coverage_score: float = Field(ge=0.0, le=100.0)
+    #: What ``coverage_score`` measures (wave 3: computed, not a heuristic).
+    coverage_basis: Optional[str] = None
+    #: Enabled feeds whose last successful poll is within 24 hours.
+    feeds_polled_24h: int = 0
+    #: How many of the newest indicators ``top_tags`` was counted over.
+    top_tags_sample_size: int = 0

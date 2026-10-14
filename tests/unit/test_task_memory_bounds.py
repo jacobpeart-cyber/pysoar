@@ -346,7 +346,10 @@ async def test_poll_feed_ingest_is_batched(
                 "feed_type": "plain",
                 "url": "https://feed.invalid/list.txt",
                 "is_enabled": True,
-                "is_builtin": False,
+                # A NULL-organisation feed is only polled when it is a
+                # built-in platform feed (wave 3: an ownerless custom feed
+                # would publish unvetted intel to every tenant).
+                "is_builtin": True,
                 "poll_interval_minutes": 60,
                 "total_indicators": 0,
                 "confidence_weight": 1.0,

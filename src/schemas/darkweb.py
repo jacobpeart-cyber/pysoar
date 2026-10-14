@@ -301,6 +301,14 @@ class DarkWebDashboard(BaseModel):
     monitored_items: int = 0
     active_monitors: int = 0
     scan_frequency: str = ""
+    #: Minutes between scheduled sweeps of every enabled monitor (None when
+    #: the organisation has no enabled monitor).
+    scan_interval_minutes: Optional[int] = None
+    #: Every source a monitor scan can consult: label, whether the platform
+    #: has what it needs (``configured``) and the setting that enables it.
+    sources: dict[str, Any] = Field(default_factory=dict)
+    #: Honest label per ``source_platform`` value stored on findings.
+    source_platform_labels: dict[str, str] = Field(default_factory=dict)
 
 
 class BulkFindingAction(BaseModel):
@@ -330,6 +338,12 @@ class CredentialRemediationReport(BaseModel):
     failed_actions: int = 0
     remediation_date: datetime
     estimated_completion: Optional[str] = None
+    #: Credentials whose remediation decision was recorded. No password
+    #: reset, account disable or MFA change is executed by this route, so
+    #: the three action counters above stay 0.
+    recorded: int = 0
+    execution: str = "recorded_only"
+    detail: Optional[str] = None
 
 
 class ScanTriggerRequest(BaseModel):
@@ -349,3 +363,13 @@ class ScanStatusResponse(BaseModel):
     completion_time: Optional[str] = None
     findings: int = 0
     new_findings: int = 0
+    #: Why the scan ended as it did (``no_terms``, nothing configured, ...).
+    detail: Optional[str] = None
+    #: Lower-case terms matched against feed items.
+    terms_searched: list[str] = Field(default_factory=list)
+    #: Per source: label, status (ok / not_configured / error / skipped),
+    #: checked, matched, error or reason.
+    sources: dict[str, Any] = Field(default_factory=dict)
+    skipped_duplicate: int = 0
+    credential_leaks_created: int = 0
+    critical_fired: int = 0

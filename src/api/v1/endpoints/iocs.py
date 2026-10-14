@@ -23,6 +23,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
+from src.intel import providers as intel_providers
 from src.intel.models import ThreatIndicator
 from src.models.user import User, UserRole
 from src.schemas.ioc import (
@@ -194,7 +195,11 @@ async def list_iocs(
         query = query.where(ThreatIndicator.value.ilike(search_filter))
 
     if ioc_type:
-        query = query.where(ThreatIndicator.indicator_type == ioc_type)
+        # A UI type such as ``ip`` or ``hash`` covers every stored variant
+        # (ipv4/ipv6/cidr, md5/sha1/sha256).
+        query = query.where(
+            ThreatIndicator.indicator_type.in_(intel_providers.type_variants(ioc_type)),
+        )
 
     if ioc_status:
         if ioc_status == "active":
@@ -429,11 +434,17 @@ async def enrich_ioc(
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Enrich an IOC by aggregating all matching threat indicators by value.
+    """Enrich one of the organisation's IOCs.
 
-    Because ioc and threat_indicators are now the same table, enrichment
-    means "look for other rows with the same value across different feeds
-    and fold their context together."
+    Two parts, both stored under ``enrichment_data``:
+
+    * local intel: the organisation's own rows and platform feed intel with
+      the same value, folded together (other tenants' rows never);
+    * ``enrichment_data.external``: VirusTotal / AbuseIPDB / AlienVault OTX
+      through ``src/intel/providers.py`` with the organisation's keys (or
+      the platform's), with each provider's status (``ok``,
+      ``not_configured``, ``credentials_unreadable``, ``error``,
+      ``unsupported_type``). A provider error is recorded, never dropped.
     """
     ioc = await get_ioc_or_404(db, ioc_id, org_id)
 
@@ -473,8 +484,24 @@ async def enrich_ioc(
             enrichment["composite_confidence"] = int(sum(scores) / len(scores))
             enrichment["source_count"] = len(siblings) + 1
 
+    outcomes = await intel_providers.enrich_value(
+        db,
+        org_id,
+        intel_providers.dispatch_bucket(ioc.indicator_type),
+        ioc.value,
+        use_cache=False,
+    )
+    checked_at = datetime.now(timezone.utc).isoformat()
+    enrichment["external"] = {
+        "status": intel_providers.overall_status(outcomes),
+        "checked_at": checked_at,
+        "providers": [o.summary() for o in outcomes],
+        "results": {o.provider: o.result for o in outcomes if o.status == "ok" and o.result is not None},
+        "not_configured": [o.provider for o in outcomes if o.status == "not_configured"],
+    }
+
     ctx["enrichment_data"] = enrichment
-    ctx["last_enriched"] = datetime.now(timezone.utc).isoformat()
+    ctx["last_enriched"] = checked_at
     ioc.context = ctx
 
     await db.flush()

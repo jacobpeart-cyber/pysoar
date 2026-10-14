@@ -1,7 +1,9 @@
 """Celery Tasks for Dark Web Monitoring
 
-Scheduled and background tasks for dark web scanning, credential leak detection,
-brand monitoring, and threat intelligence correlation.
+Scheduled and background tasks for dark web monitor scans (each monitor's own
+terms, see src/darkweb/monitor_scan.py), credential leak checks and threat
+intelligence correlation. Brand monitoring and takedown-status tasks were
+removed in wave 3: their output was discarded and no takedown provider exists.
 """
 
 import asyncio
@@ -15,16 +17,14 @@ from src.core.config import settings
 from src.core.database import async_session_factory
 from src.core.logging import get_logger
 from src.darkweb.engine import (
-    BrandProtection,
     CredentialAnalyzer,
-    DarkWebScanner,
     ThreatIntelCorrelator,
 )
 from src.darkweb.models import (
-    CredentialLeak,
     DarkWebFinding,
     DarkWebMonitor,
 )
+from src.darkweb.monitor_scan import parse_term_list
 from src.intel.models import ThreatIndicator as IOC
 from src.models.incident import Incident
 
@@ -56,307 +56,50 @@ def _fresh_darkweb_session_factory():
     return e, sessionmaker(e, class_=AsyncSession, expire_on_commit=False)
 
 
-def _map_source_to_finding_types(source: str) -> tuple[str, str]:
-    """Return (source_platform, finding_type) enum values for a scanner source key."""
-    mapping = {
-        "paste_sites": ("paste_site", "paste_site_exposure"),           # URLhaus malicious URLs
-        "breach_databases": ("breach_database", "data_breach_listing"),
-        "forums": ("tor_forum", "forum_mention"),                        # ThreatFox IOCs
-        "telegram": ("telegram", "forum_mention"),                       # OTX pulses
-        # Tier 2 HIBP sources — per-email / per-domain lookups
-        "hibp_account": ("breach_database", "credential_leak"),
-        "hibp_stealer": ("breach_database", "credential_leak"),
-        "hibp_paste": ("paste_site", "credential_leak"),
-        "hibp_domain": ("breach_database", "data_breach_listing"),
-    }
-    return mapping.get(source, ("breach_database", "data_breach_listing"))
-
-
-def _derive_finding_severity(source: str, raw: dict) -> str:
-    """Pick severity from the underlying feed payload.
-
-    - URLhaus "threat" containing malware/ransomware → critical
-    - HIBP breach with > 10M accounts or IsVerified=True → critical
-    - ThreatFox confidence_level >= 75 → high
-    - OTX with TLP amber/red → high
-    - everything else → medium
-    """
-    threat_type = str(raw.get("threat_type", "")).lower()
-    if source == "paste_sites" and any(k in threat_type for k in ("malware", "ransomware", "phishing", "c2")):
-        return "critical"
-    if source == "breach_databases":
-        if int(raw.get("affected_count") or 0) >= 10_000_000 or raw.get("is_verified"):
-            return "critical"
-        return "high"
-    if source == "forums":
-        try:
-            if int(raw.get("confidence", 0) or 0) >= 75:
-                return "high"
-        except (TypeError, ValueError):
-            pass
-        return "medium"
-    if source == "telegram":
-        tlp = str(raw.get("tlp", "")).lower()
-        return "high" if tlp in ("amber", "red") else "medium"
-    # Tier 2 HIBP — employee credentials in a breach is always serious
-    if source in ("hibp_account", "hibp_stealer"):
-        return "critical"
-    if source == "hibp_paste":
-        return "high"
-    if source == "hibp_domain":
-        # Domain-scoped breach: severity scales with affected count
-        if int(raw.get("affected_count") or 0) >= 10_000_000 or raw.get("is_verified"):
-            return "critical"
-        return "high"
-    return "medium"
-
-
-async def _persist_findings(
-    db,
-    organization_id: str,
-    monitor_id: str | None,
-    findings: list[dict],
-    monitor_alert_severity: str = "medium",
-) -> tuple[int, int, list[dict], int]:
-    """Write findings to darkweb_findings with dedup by content_hash.
-
-    For Tier 2 HIBP per-email findings (sources hibp_account, hibp_stealer,
-    hibp_paste) we also create a CredentialLeak row linked to the
-    DarkWebFinding so the Credentials tab / remediation flow works.
-
-    Returns (created_count, skipped_duplicate_count,
-             critical_findings_for_automation, credential_leaks_created).
-    """
-    created = 0
-    skipped = 0
-    cred_leaks_created = 0
-    criticals: list[dict] = []
-    for f in findings:
-        content_hash = f.get("content_hash")
-        if not content_hash:
-            # Engine already stamps a hash; if missing, skip — without a
-            # stable identity we'd duplicate rows on every scan.
-            skipped += 1
-            continue
-        # Dedup inside this org.
-        existing = (await db.execute(
-            select(DarkWebFinding).where(
-                DarkWebFinding.organization_id == organization_id,
-                DarkWebFinding.raw_data_hash == content_hash,
-            ),
-        )).scalar_one_or_none()
-        if existing is not None:
-            skipped += 1
-            continue
-
-        source_key = f.get("source") or ""
-        source_platform, finding_type = _map_source_to_finding_types(source_key)
-        severity = _derive_finding_severity(source_key, f)
-
-        # Pack a sensible title + description from whichever fields the
-        # underlying feed used (each feed's payload shape differs).
-        title = (
-            f.get("title")
-            or f.get("breach_name")
-            or f.get("message")
-            or f.get("url")
-            or f.get("ioc_value")
-            or "dark web finding"
-        )
-        description = (
-            f.get("description")
-            or f.get("content_snippet")
-            or f.get("malware")
-            or ""
-        )
-        source_url = f.get("url") or f.get("source_url") or ""
-        import hashlib
-        source_url_hash = (
-            hashlib.sha256(source_url.encode()).hexdigest()
-            if source_url else None
-        )
-
-        row = DarkWebFinding(
-            organization_id=organization_id,
-            monitor_id=monitor_id,
-            finding_type=finding_type,
-            source_platform=source_platform,
-            source_url_hash=source_url_hash,
-            title=str(title)[:500],
-            description=str(description)[:4000],
-            raw_data_hash=str(content_hash)[:128],
-            affected_count=int(f.get("affected_count") or 1),
-            severity=severity,
-            confidence_score=int(f.get("confidence") or 50),
-            status="new",
-            discovered_date=datetime.now(timezone.utc).isoformat(),
-        )
-        db.add(row)
-        await db.flush()  # assign row.id so CredentialLeak can reference it
-        created += 1
-
-        # Tier 2 HIBP per-email hit -> CredentialLeak row.
-        if source_key in ("hibp_account", "hibp_stealer", "hibp_paste"):
-            email = f.get("email")
-            if email:
-                db.add(CredentialLeak(
-                    organization_id=organization_id,
-                    finding_id=row.id,
-                    email=str(email)[:255],
-                    username=str(email).split("@", 1)[0][:255] if "@" in str(email) else None,
-                    password_hash=None,  # HIBP doesn't expose password hashes
-                    password_type="unknown",
-                    breach_source=(
-                        f.get("breach_name")
-                        or f.get("site")
-                        or f.get("paste_source")
-                        or "hibp"
-                    )[:255],
-                    breach_date=f.get("breach_date") or f.get("paste_date"),
-                    is_valid=False,  # Requires confirmation via /unifiedsearch workflow
-                    is_remediated=False,
-                ))
-                cred_leaks_created += 1
-
-        if severity == "critical":
-            criticals.append({
-                "finding_type": finding_type,
-                "description": str(description or title)[:500],
-                "source_url": source_url,
-                "severity": severity,
-            })
-    if created:
-        await db.commit()
-    return created, skipped, criticals, cred_leaks_created
-
-
 @shared_task(bind=True, max_retries=3)
 def scheduled_dark_web_scan(
     self,
-    monitor_id: str | None = None,
+    monitor_id: str,
     scan_type: str = "full",
-    organization_id: str | None = None,
 ) -> dict[str, Any]:
-    """
-    Real dark web scan against URLhaus, HIBP /breaches, ThreatFox, and
-    OTX (when API key is set). Persists findings into darkweb_findings
-    with dedup by content_hash. Fires ``AutomationService.on_darkweb_finding``
-    on critical findings so the agentic SOC pipeline opens an alert →
-    investigator chain. Updates the monitor's ``last_check`` and
-    ``findings_count`` so the UI can show a real "last scan" timestamp.
+    """Scan one dark-web monitor against its own terms.
+
+    Delegates to ``src.darkweb.monitor_scan.scan_monitor`` (the same code the
+    trigger-scan route runs): HIBP lookups for the watched emails and
+    domains, plus threat-feed items that mention the monitor's terms. New
+    findings are committed (dedup by content hash inside the organisation),
+    ``last_check`` / ``findings_count`` are updated, and
+    ``AutomationService.on_darkweb_finding`` fires for critical findings.
+    The result carries every source's status; a scan in which every usable
+    source failed reports ``status="failed"`` and is not retried (the next
+    sweep tries again).
 
     Args:
-        monitor_id: Optional specific monitor to scan. If omitted, scans
-            at org-level (requires organization_id) and attributes
-            findings to no specific monitor.
-        scan_type: "full" for all sources, "quick" to skip OTX/paste feeds.
-        organization_id: Required when monitor_id is None. Scoping is
-            enforced: findings only land against this org.
+        monitor_id: the monitor to scan (findings belong to its organisation).
+        scan_type: "full" for every source, "quick" for the HIBP sources only.
     """
-    async def _run():
+    from src.darkweb.monitor_scan import scan_monitor
+
+    async def _run() -> dict[str, Any]:
         engine, factory = _fresh_darkweb_session_factory()
         try:
             async with factory() as db:
-                monitor = None
-                org_id = organization_id
-                if monitor_id:
-                    monitor = (await db.execute(
-                        select(DarkWebMonitor).where(DarkWebMonitor.id == monitor_id),
-                    )).scalar_one_or_none()
-                    if monitor is None:
-                        return {"status": "error", "error": f"monitor {monitor_id} not found"}
-                    org_id = monitor.organization_id
-                if not org_id:
-                    return {"status": "error", "error": "organization_id required when monitor_id is not provided"}
+                monitor = (await db.execute(
+                    select(DarkWebMonitor).where(DarkWebMonitor.id == monitor_id),
+                )).scalar_one_or_none()
+                if monitor is None:
+                    return {"status": "error", "error": f"monitor {monitor_id} not found"}
+                org_id = monitor.organization_id
 
-                scanner = DarkWebScanner()
-                if scan_type == "quick":
-                    # Only hit the cheap / high-value feeds.
-                    results = {
-                        "paste_sites": await scanner.search_paste_sites(),
-                        "breach_databases": await scanner.search_breach_databases(),
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    }
-                else:
-                    results = await scanner.run_scan_cycle()
-                    # run_scan_cycle returns {total_findings, findings, timestamp}
-                    # but _persist_findings wants the raw per-source list.
-                    # Fetch again via aggregate_findings or re-run sources.
-                    # Simplest: use the aggregated 'findings' list the engine
-                    # already deduped in-memory.
-                    findings_list = results.get("findings", [])
+                outcome = await scan_monitor(db, monitor, scan_type=scan_type)
+                await db.commit()
 
-                if scan_type == "quick":
-                    findings_list = []
-                    for source, items in results.items():
-                        if source == "timestamp" or not isinstance(items, list):
-                            continue
-                        for item in items:
-                            item["source"] = source
-                            # Engine's deduplicate_results sets content_hash; the
-                            # quick path skips it so stamp one here.
-                            import hashlib as _h
-                            import json as _j
-                            if "content_hash" not in item:
-                                item["content_hash"] = _h.sha256(
-                                    _j.dumps(item, sort_keys=True, default=str).encode(),
-                                ).hexdigest()
-                            findings_list.append(item)
-
-# ---- Tier 2: per-monitor HIBP account & domain lookups ----
-# Runs when the monitor has emails_watched / domains_watched
-# AND either the API key is set (for per-email) or not (for
-# domain-level breach list which is free).
-                if monitor is not None:
-                    import json as _json
-                    emails = monitor.emails_watched
-                    if isinstance(emails, str):
-                        try:
-                            emails = _json.loads(emails)
-                        except Exception:
-                            emails = []
-                    domains = monitor.domains_watched
-                    if isinstance(domains, str):
-                        try:
-                            domains = _json.loads(domains)
-                        except Exception:
-                            domains = []
-                    emails = list(emails or [])
-                    domains = list(domains or [])
-                    if emails:
-                        findings_list.extend(
-                            await scanner.hibp_lookup_emails(emails),
-                        )
-                    if domains:
-                        findings_list.extend(
-                            await scanner.hibp_lookup_domains(domains),
-                        )
-
-                alert_severity = (monitor.alert_severity if monitor else "medium") or "medium"
-                created, skipped, criticals, cred_leaks_created = await _persist_findings(
-                    db,
-                    organization_id=org_id,
-                    monitor_id=monitor.id if monitor else None,
-                    findings=findings_list,
-                    monitor_alert_severity=alert_severity,
-                )
-
-                # Update monitor health fields — the UI renders "last
-                # scan" from these; previously stayed null because no
-                # real scan ever ran.
-                if monitor is not None:
-                    monitor.last_check = datetime.now(timezone.utc).isoformat()
-                    monitor.findings_count = (monitor.findings_count or 0) + created
-                    await db.commit()
-
-                # Fire the agentic pipeline for critical findings so the
-                # investigator picks them up like it does ITDR / supply-
-                # chain threats today.
                 automation_fired = 0
-                if criticals:
+                automation_errors: list[str] = []
+                if outcome.criticals:
                     from src.services.automation import AutomationService
                     svc = AutomationService(db)
-                    for c in criticals:
+                    for c in outcome.criticals:
                         try:
                             await svc.on_darkweb_finding(
                                 finding_type=c["finding_type"],
@@ -366,24 +109,27 @@ def scheduled_dark_web_scan(
                                 organization_id=org_id,
                             )
                             automation_fired += 1
-                        except Exception as exc:
+                        except Exception as exc:  # noqa: BLE001 - one rule must not undo the scan
+                            automation_errors.append(f"{c['finding_id']}: {exc}"[:300])
                             logger.warning(f"on_darkweb_finding fire failed: {exc}")
-                    # on_darkweb_finding only flushes — without an explicit
-                    # commit here every Alert row would roll back on session
-                    # exit and the dashboard would show 0 dark-web alerts.
+                    # on_darkweb_finding only flushes; commit the alerts.
                     if automation_fired:
                         await db.commit()
 
                 return {
-                    "scan_id": f"scan_{monitor_id or org_id}_{datetime.now(timezone.utc).timestamp()}",
                     "monitor_id": monitor_id,
                     "organization_id": org_id,
-                    "created": created,
-                    "credential_leaks_created": cred_leaks_created,
-                    "skipped_duplicate": skipped,
+                    "status": outcome.status,
+                    "detail": outcome.detail,
+                    "terms_searched": outcome.terms_searched,
+                    "sources": outcome.sources,
+                    "matched": outcome.matched,
+                    "created": outcome.created,
+                    "credential_leaks_created": outcome.credential_leaks_created,
+                    "skipped_duplicate": outcome.skipped_duplicate,
                     "critical_fired": automation_fired,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "status": "completed",
+                    "automation_errors": automation_errors,
+                    "timestamp": outcome.finished_at,
                 }
         finally:
             await engine.dispose()
@@ -436,7 +182,9 @@ def _run_darkweb_cross_org_sweep() -> dict[str, Any]:
     while another loop is running", so the sweep failed at the first
     enabled monitor.)
     """
-    totals: dict[str, Any] = {"orgs_scanned": 0, "monitors_scanned": 0, "findings_created": 0}
+    totals: dict[str, Any] = {
+        "orgs_scanned": 0, "monitors_scanned": 0, "monitors_failed": 0, "findings_created": 0,
+    }
     orgs_seen: set[str] = set()
     cap_hit = False
     last_id: str | None = None
@@ -462,6 +210,8 @@ def _run_darkweb_cross_org_sweep() -> dict[str, Any]:
                 res = _scan_monitor(monitor_id)
                 if isinstance(res, dict):
                     totals["findings_created"] += int(res.get("created") or 0)
+                    if res.get("status") in ("failed", "error"):
+                        totals["monitors_failed"] += 1
 
             if len(monitors) < window:
                 break
@@ -554,10 +304,10 @@ async def _credential_context_async(finding_id: str) -> dict[str, Any]:
                 last_id = monitors[-1].id
                 monitors_read += len(monitors)
                 for m in monitors:
-                    if m.domains_watched:
-                        monitored_domains.update(m.domains_watched or [])
-                    if m.emails_watched:
-                        monitored_emails.update(m.emails_watched or [])
+                    # Older rows hold a JSON-encoded string, not a list;
+                    # set.update() on that string added single characters.
+                    monitored_domains.update(parse_term_list(m.domains_watched))
+                    monitored_emails.update(parse_term_list(m.emails_watched))
                 if len(monitors) < window:
                     break
             else:
@@ -662,138 +412,6 @@ def credential_leak_check(
 
     except Exception as exc:
         logger.error(f"Credential leak check failed: {exc}")
-        raise self.retry(exc=exc, countdown=60 * (2 ** self.request.retries))
-
-
-@shared_task(bind=True, max_retries=3)
-def brand_monitoring_scan(
-    self,
-    monitor_id: str,
-    target_brand: str,
-    monitored_domains: list[str] | None = None,
-) -> dict[str, Any]:
-    """
-    Scan for brand impersonation and domain spoofing threats.
-
-    Detects typosquatting, lookalike sites, phishing kits, and
-    unauthorized use of brand assets.
-
-    Args:
-        monitor_id: ID of the brand monitoring configuration
-        target_brand: Brand name to monitor
-        monitored_domains: List of legitimate domains to monitor
-
-    Returns:
-        Dictionary with brand threat detection results
-    """
-    try:
-        logger.info(
-            f"Starting brand monitoring scan (brand={target_brand}, "
-            f"monitor={monitor_id})",
-        )
-
-        brand_protection = BrandProtection()
-        monitored_domains = monitored_domains or [f"{target_brand.lower()}.com"]
-
-        threats = {
-            "typosquats": [],
-            "lookalikes": [],
-            "phishing_kits": [],
-            "ct_anomalies": [],
-        }
-
-        # Detect typosquatting
-        for domain in monitored_domains:
-            typosquat_detections = brand_protection.detect_typosquatting(domain)
-            threats["typosquats"].extend(typosquat_detections)
-
-        # Monitor certificate transparency logs
-        ct_anomalies = brand_protection.monitor_certificate_transparency_logs(
-            monitored_domains,
-        )
-        threats["ct_anomalies"].extend(ct_anomalies)
-
-        total_threats = sum(len(v) for v in threats.values() if isinstance(v, list))
-        logger.info(f"Brand scan detected {total_threats} potential threats")
-
-        return {
-            "monitor_id": monitor_id,
-            "target_brand": target_brand,
-            "total_threats": total_threats,
-            "threats": threats,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "status": "completed",
-        }
-
-    except Exception as exc:
-        logger.error(f"Brand monitoring scan failed: {exc}")
-        raise self.retry(exc=exc, countdown=60 * (2 ** self.request.retries))
-
-
-@shared_task(bind=True, max_retries=3)
-def takedown_status_check(
-    self,
-    takedown_id: str,
-    threat_id: str,
-) -> dict[str, Any]:
-    """
-    Check status of ongoing takedown requests.
-
-    Queries takedown service providers for status updates on
-    phishing sites, cloned websites, and other brand threats.
-
-    Args:
-        takedown_id: ID of the takedown request
-        threat_id: ID of the associated threat
-
-    Returns:
-        Dictionary with updated takedown status
-    """
-    try:
-        logger.info(f"Checking takedown status (takedown={takedown_id})")
-
-        brand_protection = BrandProtection()
-
-        # Query the DarkWebMonitor/DarkWebFinding for real takedown status
-        import asyncio
-
-        from src.core.database import async_session_factory
-
-        async def _check_status():
-            async with async_session_factory() as db:
-                # Look up the finding associated with this takedown
-                finding_query = select(DarkWebFinding).where(
-                    DarkWebFinding.id == threat_id,
-                )
-                result = await db.execute(finding_query)
-                finding = result.scalar_one_or_none()
-
-                if finding:
-                    return {
-                        "takedown_id": takedown_id,
-                        "status": finding.status if hasattr(finding, 'status') else "in_progress",
-                        "last_updated": finding.updated_at.isoformat() if hasattr(finding, 'updated_at') and finding.updated_at else datetime.now(timezone.utc).isoformat(),
-                        "finding_type": finding.finding_type,
-                        "source_platform": finding.source_platform,
-                    }
-                else:
-                    # Fall back to the brand_protection engine
-                    return await brand_protection.track_takedown_status(takedown_id)
-
-        status = asyncio.run(_check_status())
-
-        logger.info(f"Takedown {takedown_id} status: {status.get('status')}")
-
-        return {
-            "takedown_id": takedown_id,
-            "threat_id": threat_id,
-            "status": status.get("status"),
-            "progress": status.get("progress"),
-            "last_checked": datetime.now(timezone.utc).isoformat(),
-        }
-
-    except Exception as exc:
-        logger.error(f"Takedown status check failed: {exc}")
         raise self.retry(exc=exc, countdown=60 * (2 ** self.request.retries))
 
 
@@ -1037,16 +655,3 @@ def threat_correlation(
     except Exception as exc:
         logger.error(f"Threat correlation failed: {exc}")
         raise self.retry(exc=exc, countdown=60 * (2 ** self.request.retries))
-
-
-def await_sync_wrapper(coro: Any) -> Any:
-    """Helper to run async functions in sync Celery tasks"""
-    import asyncio
-
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    return loop.run_until_complete(coro)

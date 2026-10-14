@@ -1,16 +1,17 @@
 """Dark Web Monitoring Module
 
-Provides comprehensive dark web and deep web monitoring capabilities including:
-- Credential leak detection and alerting
-- Brand impersonation and domain spoofing detection
-- Data sale monitoring on illicit marketplaces
-- Executive targeting and PII exposure detection
-- Code/source code leak detection
-- Infrastructure exposure monitoring
-- Ransomware victim list monitoring
-- Automated threat intelligence correlation
-- Credential remediation workflows
-- Brand protection and takedown management
+What is implemented (see src/darkweb/monitor_scan.py):
+- Monitors with their own search terms, watched domains and watched emails
+- Have I Been Pwned account lookups (HIBP_API_KEY), domain breach lookups and
+  the recent breach catalogue, with credential-leak rows for account hits
+- abuse.ch URLhaus / ThreatFox and AlienVault OTX feed items that mention a
+  monitor term, labelled as threat-intel feed matches (not dark-web posts)
+- Credential remediation tracking (recorded decisions; no identity-provider
+  action is executed) and threat-intel correlation of findings
+
+Not implemented: Tor forum, Telegram, paste-site crawling beyond HIBP's paste
+index, ransomware leak-site monitoring and takedown submission (the takedown
+route answers 501).
 """
 
 from src.darkweb.models import (
