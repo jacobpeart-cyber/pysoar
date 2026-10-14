@@ -16,10 +16,13 @@ from typing import Any
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agents.models import AgentCommand, EndpointAgent
 from src.models.alert import Alert
 from src.models.audit import AuditLog
+from src.models.organization import Organization
+from src.models.user import User
 from src.models.playbook import Playbook, PlaybookExecution
 from src.services.playbook_engine import RUN_PARTIAL, PlaybookEngine
 from tests.helpers.tenancy import assert_tenant_isolated
