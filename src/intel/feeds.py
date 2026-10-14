@@ -43,6 +43,24 @@ FEED_INGEST_BATCH = 1_000          # rows per existence-check + commit window
 FEED_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
 
 
+_URL_USERINFO_RE = re.compile(r"(https?://)[^/\s@]+@")
+_URL_QUERY_RE = re.compile(r"\?[^\s'\"]*")
+_TOKEN_RE = re.compile(r"(?i)\b(api[_-]?key|token|secret|password|authorization)(\s*[:=]\s*)(?:bearer\s+)?[^\s,;&'\"]+")
+
+
+def redact_error_text(text: str) -> str:
+    """Strip credentials from an error before it is stored or shown.
+
+    Feed URLs can carry keys in the query string or userinfo and httpx error
+    messages echo the full URL, so ``feed.last_error`` (visible to every user
+    of the tenant) must never carry them.
+    """
+    cleaned = _URL_USERINFO_RE.sub(r"\1[redacted]@", str(text or ""))
+    cleaned = _URL_QUERY_RE.sub("?[redacted]", cleaned)
+    cleaned = _TOKEN_RE.sub(r"\1\2[redacted]", cleaned)
+    return cleaned[:1000]
+
+
 async def _fetch_guarded(url: str, headers: dict[str, str]) -> tuple[Optional[bytes], Optional[str]]:
     """Download a feed body through the intel outbound guard.
 
@@ -55,12 +73,12 @@ async def _fetch_guarded(url: str, headers: dict[str, str]) -> tuple[Optional[by
             url, headers=headers, max_bytes=MAX_FEED_BYTES, timeout=FEED_TIMEOUT,
         )
     except IntelOutboundRefused as exc:
-        return None, f"URL refused: {exc}"
+        return None, f"URL refused: {redact_error_text(str(exc))}"
     except httpx.TimeoutException:
         return None, "feed fetch timed out"
     except httpx.HTTPError as exc:
-        return None, f"feed fetch failed: {type(exc).__name__}: {exc}"
-    return body, error
+        return None, f"feed fetch failed: {type(exc).__name__}: {redact_error_text(str(exc))}"
+    return body, (redact_error_text(error) if error else error)
 
 
 class FeedParser(ABC):
@@ -904,7 +922,7 @@ class FeedManager:
                         await session.execute(select(ThreatFeed).where(ThreatFeed.id == feed_id))
                     ).scalar_one_or_none()
                     if feed is not None:
-                        feed.last_error = f"poll failed: {type(e).__name__}: {e}"[:1000]
+                        feed.last_error = f"poll failed: {type(e).__name__}: {redact_error_text(str(e))}"[:1000]
                         feed.last_poll_at = datetime.now(timezone.utc)
                         await session.commit()
 

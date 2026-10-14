@@ -1810,6 +1810,17 @@ async def get_dashboard_stats(
     )
 
 
+
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value: Any) -> Any:
+    """Neutralise spreadsheet formula injection: prefix a leading = + - @ tab or
+    CR with a single quote so the cell is read as text."""
+    if isinstance(value, str) and value.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
 @router.get("/export", response_model=None, operation_id="export_indicators")
 async def export_indicators(
     current_user: CurrentUser = None,
@@ -1883,7 +1894,10 @@ async def export_indicators(
             flat = dict(row)
             flat["tags"] = ";".join(str(x) for x in (row.get("tags") or []))
             flat["mitre_techniques"] = ";".join(str(x) for x in (row.get("mitre_techniques") or []))
-            writer.writerow(flat)
+            # Indicator values and tags are attacker-influenced text; a cell
+            # starting with = + - @ or a tab/CR would execute as a formula when
+            # the file is opened in a spreadsheet.
+            writer.writerow({key: _csv_safe(value) for key, value in flat.items()})
         return Response(
             content=buffer.getvalue(),
             media_type="text/csv",

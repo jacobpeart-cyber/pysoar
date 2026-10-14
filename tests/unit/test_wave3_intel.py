@@ -479,3 +479,29 @@ def test_intel_outbound_is_netguard() -> None:
     assert outbound.IntelOutboundRefused is netguard.OutboundTargetRefused
     assert not hasattr(outbound, "refusal_reason")
     assert json.dumps(sorted(outbound.__all__))
+
+
+def test_csv_export_neutralises_spreadsheet_formulas() -> None:
+    """Indicator values and tags are attacker-influenced; a leading = + - @ tab or
+    CR must not execute as a formula when the export is opened in a spreadsheet."""
+    from src.api.v1.endpoints.intel import _csv_safe
+
+    for value in ("=HYPERLINK(1)", "+1", "-1", "@SUM(A1)", chr(9) + "x", chr(13) + "x"):
+        assert _csv_safe(value) == "'" + value
+    assert _csv_safe("8.8.8.8") == "8.8.8.8"
+    assert _csv_safe(7) == 7
+    assert _csv_safe(None) is None
+
+
+def test_feed_error_text_never_carries_credentials() -> None:
+    """``feed.last_error`` is shown to every user of the tenant: userinfo, query
+    strings and key=value secrets from URLs and provider errors are redacted."""
+    from src.intel.feeds import redact_error_text
+
+    text = redact_error_text("ConnectError: https://user:pw@feeds.example/x?api_key=abc123&y=1 (api_key=zzz)")
+    assert "pw" not in text and "abc123" not in text and "zzz" not in text
+    assert text.startswith("ConnectError: https://[redacted]@feeds.example/x?[redacted]")
+    bearer = redact_error_text("Authorization: Bearer abc.def; token=xyz")
+    assert "abc.def" not in bearer and "xyz" not in bearer
+    assert redact_error_text("plain message") == "plain message"
+    assert len(redact_error_text("x" * 5000)) == 1000
