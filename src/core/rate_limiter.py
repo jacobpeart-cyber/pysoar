@@ -24,8 +24,22 @@ class InMemoryRateLimiter:
     This provides defense-in-depth even without Redis.
     """
 
+    #: Upper bound on tracked keys. Unauthenticated callers (phishing tracking
+    #: tokens, canary callbacks) can mint keys at will; past this the oldest
+    #: idle buckets are evicted so memory stays bounded.
+    MAX_KEYS = 50_000
+
     def __init__(self):
         self._buckets: dict[str, dict] = defaultdict(dict)
+
+    def _evict_if_needed(self, now: float) -> None:
+        if len(self._buckets) <= self.MAX_KEYS:
+            return
+        stale = [k for k, b in self._buckets.items() if not b.get("timestamps") or b["timestamps"][-1] < now - 3600]
+        for k in stale:
+            self._buckets.pop(k, None)
+        while len(self._buckets) > self.MAX_KEYS:
+            self._buckets.pop(next(iter(self._buckets)), None)
 
     def _get_key(self, request: Request, key_func: Optional[Callable] = None) -> str:
         """Generate rate limit key from request."""
@@ -48,6 +62,7 @@ class InMemoryRateLimiter:
             (allowed, retry_after_seconds)
         """
         now = time.time()
+        self._evict_if_needed(now)
         bucket = self._buckets[key]
 
         # Clean expired entries

@@ -1227,6 +1227,10 @@ _POSITIVE_EVENTS = {"reported_as_phishing"}
 # cannot flood events. Returning the same response when throttled keeps it
 # from becoming an enumeration oracle.
 _TRACK_RATE_MAX = 30
+# Stored repeats of one event type per recipient from the public endpoints;
+# beyond this nothing is written (the response is unchanged). Counters and
+# awareness only ever move on the first event of a type per recipient.
+_PUBLIC_EVENT_CAP = 5
 _TRACK_RATE_WINDOW = 60
 
 
@@ -1243,14 +1247,35 @@ async def _ingest_campaign_event(
     geo_location: dict[str, Any] | None = None,
     device_type: str | None = None,
     time_to_action_seconds: int | None = None,
-) -> CampaignEvent:
+    public: bool = False,
+) -> CampaignEvent | None:
     """Record one campaign event and roll it into counters + awareness.
+
+    Campaign counters (``emails_opened``, ``links_clicked`` ...) count
+    recipients, so they and the awareness score move only on the first event
+    of a type per recipient; repeats are stored as evidence but never inflate
+    a rate past 100 %. Public (unauthenticated) sources are capped at
+    ``_PUBLIC_EVENT_CAP`` stored repeats per recipient and type, after which
+    nothing is written and ``None`` is returned.
 
     The single code path for both the authenticated analyst route and the
     public tracking endpoints, so a hand-entered event and a real recipient
     open update the same rows the same way. No fake data: every call writes a
     real CampaignEvent and only moves awareness on real failure/report events.
     """
+    prior = (
+        await db.execute(
+            select(func.count(CampaignEvent.id)).where(
+                CampaignEvent.campaign_id == str(campaign.id),
+                CampaignEvent.target_email == target_email,
+                CampaignEvent.event_type == event_type,
+            )
+        )
+    ).scalar_one() or 0
+    if public and prior >= _PUBLIC_EVENT_CAP:
+        return None
+    first_of_type = prior == 0
+
     event = CampaignEvent(
         id=str(uuid_mod.uuid4()),
         campaign_id=str(campaign.id),
@@ -1268,12 +1293,12 @@ async def _ingest_campaign_event(
     db.add(event)
 
     counter_field = _EVENT_COUNTER_MAP.get(event_type)
-    if counter_field:
+    if counter_field and first_of_type:
         setattr(campaign, counter_field, getattr(campaign, counter_field, 0) + 1)
 
     await db.flush()
 
-    if event_type in _FAILURE_EVENTS | _POSITIVE_EVENTS:
+    if first_of_type and event_type in _FAILURE_EVENTS | _POSITIVE_EVENTS:
         try:
             awareness = (
                 await db.execute(
@@ -1419,6 +1444,7 @@ async def track_open_pixel(token: str, request: Request, db: DatabaseSession) ->
             org_id=target.organization_id,
             ip_address=_client_ip(request),
             user_agent=request.headers.get("user-agent"),
+            public=True,
         )
         await db.commit()
     return pixel
@@ -1445,6 +1471,7 @@ async def track_click_redirect(token: str, request: Request, db: DatabaseSession
                 org_id=target.organization_id,
                 ip_address=_client_ip(request),
                 user_agent=request.headers.get("user-agent"),
+                public=True,
             )
             await db.commit()
     return RedirectResponse(url=destination, status_code=status.HTTP_302_FOUND)
@@ -1467,6 +1494,7 @@ async def track_report(token: str, request: Request, db: DatabaseSession) -> Res
                 org_id=target.organization_id,
                 ip_address=_client_ip(request),
                 user_agent=request.headers.get("user-agent"),
+                public=True,
             )
             await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

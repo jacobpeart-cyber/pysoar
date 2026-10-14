@@ -260,3 +260,42 @@ async def test_record_event_viewer_forbidden(
         headers=viewer_headers,
     )
     assert resp.status_code == 403
+
+
+async def test_repeated_events_never_inflate_counters_and_public_repeats_are_capped(
+    client: AsyncClient, db_session, org_a,
+) -> None:
+    """Campaign counters count recipients: the first event of a type per
+    recipient moves them, repeats do not. The public endpoints store at most
+    ``_PUBLIC_EVENT_CAP`` repeats per recipient and type, then write nothing
+    while still answering identically, so a leaked token cannot grow the
+    table or push a rate past 100 %."""
+    from sqlalchemy import func, select
+
+    from src.api.v1.endpoints import phishing_sim as mod
+    from src.phishing_sim.models import CampaignEvent, PhishingCampaign
+
+    org_id = org_a.id
+    campaign_id, token = await _seed_campaign_target(db_session, org_id)
+    cap = mod._PUBLIC_EVENT_CAP
+    for _ in range(cap + 10):
+        resp = await client.get(f"{BASE}/t/{token}.gif")
+        assert resp.status_code == 200
+        mod._limiter._buckets.clear()  # isolate from the per-token rate limit
+    stored = (await db_session.execute(
+        select(func.count(CampaignEvent.id)).where(
+            CampaignEvent.campaign_id == campaign_id, CampaignEvent.event_type == "email_opened",
+        )
+    )).scalar_one()
+    assert stored == cap
+    campaign = await db_session.get(PhishingCampaign, campaign_id)
+    await db_session.refresh(campaign)
+    assert campaign.emails_opened == 1
+
+    # A click repeated through the public endpoint counts one recipient once.
+    for _ in range(3):
+        resp = await client.get(f"{BASE}/c/{token}", follow_redirects=False)
+        assert resp.status_code in (302, 303, 307)
+        mod._limiter._buckets.clear()
+    await db_session.refresh(campaign)
+    assert campaign.links_clicked == 1
