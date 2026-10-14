@@ -1811,15 +1811,7 @@ async def get_dashboard_stats(
 
 
 
-_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
-
-
-def _csv_safe(value: Any) -> Any:
-    """Neutralise spreadsheet formula injection: prefix a leading = + - @ tab or
-    CR with a single quote so the cell is read as text."""
-    if isinstance(value, str) and value.startswith(_CSV_FORMULA_PREFIXES):
-        return "'" + value
-    return value
+from src.core.csvsafe import csv_safe as _csv_safe  # shared with the DFIR timeline export
 
 @router.get("/export", response_model=None, operation_id="export_indicators")
 async def export_indicators(

@@ -28,6 +28,9 @@ celery_app = Celery(
         # registers but the worker never imports the module on boot,
         # so the beat schedule entry fires into the void.
         "src.siem.tasks",
+        # Threat hunting — closes hunt sessions whose executor stopped
+        # (no heartbeat), so they do not stay "active" forever.
+        "src.hunting.tasks",
         # Agentic SOC autonomous investigations — `run_investigation`
         # drives AutonomousInvestigator through the guarded AgentRunner
         # (org-resolved LLM provider + read-only tool allow-list). Missing
@@ -181,12 +184,23 @@ celery_app.conf.task_annotations = {
     "src.ueba.tasks.calculate_entity_risks": dict(_HEAVY_SWEEP_LIMITS),
     "src.ueba.tasks.update_peer_groups": dict(_HEAVY_SWEEP_LIMITS),
     "src.ueba.tasks.cleanup_old_behavior_events": dict(_HEAVY_SWEEP_LIMITS),
+    # Wave 3: per-org cursor over log_entries, 50k rows / 5k buckets per org
+    # per run (src/ueba/siem_bridge.py). Runs every 5 minutes, so a short
+    # wall clock keeps a slow run from overlapping its successors.
+    "src.ueba.tasks.bridge_siem_logs": {"soft_time_limit": 240, "time_limit": 290},
+    # Wave 3 ITDR: auth-event analysis (cursor over log_entries) and the
+    # directory sync (paged identity-provider reads with a per-run cap).
+    "src.itdr.tasks.analyze_identity_auth_events": {"soft_time_limit": 240, "time_limit": 290},
+    "src.itdr.tasks.sync_identity_directories": dict(_NETWORK_SWEEP_LIMITS),
+    "src.itdr.tasks.check_identity_credential_exposures": dict(_HEAVY_SWEEP_LIMITS),
     "automation.periodic_ioc_sweep": dict(_HEAVY_SWEEP_LIMITS),
     "automation.auto_escalate_stale_alerts": dict(_HEAVY_SWEEP_LIMITS),
     "automation.auto_close_resolved_alerts": dict(_HEAVY_SWEEP_LIMITS),
     "automation.hourly_correlation_sweep": dict(_HEAVY_SWEEP_LIMITS),
     "intel.poll_threat_feeds": dict(_HEAVY_SWEEP_LIMITS),
     "siem.poll_cloud_integrations": dict(_HEAVY_SWEEP_LIMITS),
+    # Bounded UPDATE sweep (<= 500 sessions per run).
+    "hunting.reap_stale_sessions": {"soft_time_limit": 120, "time_limit": 150},
     "src.itdr.tasks.scheduled_identity_threat_sweep": dict(_HEAVY_SWEEP_LIMITS),
     "src.supplychain.tasks.supplychain_cross_org_sweep": dict(_HEAVY_SWEEP_LIMITS),
     # Round 2 of the memory bounding: these tasks now page their tables in
@@ -203,6 +217,9 @@ celery_app.conf.task_annotations = {
     "src.darkweb.tasks.credential_leak_check": dict(_HEAVY_SWEEP_LIMITS),
     "src.darkweb.tasks.threat_correlation": dict(_HEAVY_SWEEP_LIMITS),
     "deception.reconcile_honeypot_dispatches": dict(_HEAVY_SWEEP_LIMITS),
+    # Wave 3 DFIR: 50-row windows, 2,000 collections per run; each collected
+    # file (<= 25 MiB) is written and hashed once.
+    "dfir.reconcile_agent_collections": {"soft_time_limit": 240, "time_limit": 290},
     "playbooks.check_scheduled_playbooks": dict(_HEAVY_SWEEP_LIMITS),
     # Runs every minute with windowed reads and per-run caps (see
     # src/tickethub/rules.py); the short wall clock keeps one wedged run
@@ -248,10 +265,17 @@ celery_app.conf.beat_schedule = {
         "schedule": 60.0,  # Every minute
     },
     # --- Honeypot dispatch reconciliation ---
-    # Flips honeypot decoys from "deploying" to active/failed once the
-    # deception agent posts its listener deploy result.
+    # Flips honeypot and agent-planted decoys (deploy_decoy) from
+    # "deploying" to active/failed once the deception agent posts its result.
     "deception-honeypot-reconcile": {
         "task": "deception.reconcile_honeypot_dispatches",
+        "schedule": 60.0,
+    },
+    # --- DFIR agent collections (src.dfir.tasks, wave 3) ---
+    # Moves collect_* evidence from pending to collected / failed once the
+    # endpoint agent reports, storing and hashing the returned bytes.
+    "dfir-collection-reconcile": {
+        "task": "dfir.reconcile_agent_collections",
         "schedule": 60.0,
     },
     # --- Scheduled automation tasks (src.tasks.automation_tasks) ---
@@ -286,6 +310,13 @@ celery_app.conf.beat_schedule = {
     "siem-cloud-poll": {
         "task": "siem.poll_cloud_integrations",
         "schedule": 300.0,  # Every 5 minutes
+    },
+    # --- Threat hunting (src.hunting.tasks.reap_stale_sessions_task) ---
+    # Marks PENDING / RUNNING / PAUSED hunt sessions without an executor
+    # heartbeat for 15 minutes FAILED, with the reason.
+    "hunting-reap-stale-sessions": {
+        "task": "hunting.reap_stale_sessions",
+        "schedule": 600.0,  # Every 10 minutes
     },
     # --- Autonomous SOC triage (src.agentic.tasks.auto_triage_new_alerts) ---
     # Every 60s, scan for new critical/high alerts that don't yet have an
@@ -334,12 +365,12 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(minute="*/30"),  # Every 30 min
     },
     # --- Dark web cross-org sweep ---
-    # Every 30 min, iterate every enabled DarkWebMonitor across every
-    # org and hit URLhaus + HIBP /breaches + ThreatFox + OTX. Persists
-    # new findings (deduped by content_hash) and fires
-    # on_darkweb_finding -> alert -> investigator chain on criticals.
-    # Previous state: no beat entry -> zero dark-web scans ever ran
-    # in production.
+    # Every 30 min, scan every enabled DarkWebMonitor across every org
+    # against its own terms (src/darkweb/monitor_scan.py): HIBP lookups for
+    # the watched emails / domains plus HIBP-catalogue, URLhaus, ThreatFox
+    # and OTX items that mention the monitor's terms. Persists new findings
+    # (deduped by content hash per org) and fires on_darkweb_finding ->
+    # alert -> investigator chain on criticals.
     "darkweb-cross-org-sweep": {
         "task": "src.darkweb.tasks.darkweb_cross_org_sweep",
         "schedule": 1800.0,  # Every 30 min
@@ -394,6 +425,31 @@ celery_app.conf.beat_schedule = {
     "ueba-event-cleanup": {
         "task": "src.ueba.tasks.cleanup_old_behavior_events",
         "schedule": 86400.0,  # Daily — 90-day retention by default
+    },
+    # Wave 3: the feed the tasks above were missing. Walks each org's stored
+    # log_entries from its cursor, creates/updates user and host
+    # EntityProfiles, hourly activity buckets, baselines and UEBARiskAlerts.
+    "ueba-siem-bridge": {
+        "task": "src.ueba.tasks.bridge_siem_logs",
+        "schedule": 300.0,  # Every 5 minutes
+    },
+    # --- ITDR ingestion (src.itdr.tasks, wave 3) ---
+    # Identity rows from every installed Okta / Entra ID integration.
+    "itdr-directory-sync": {
+        "task": "src.itdr.tasks.sync_identity_directories",
+        "schedule": crontab(minute=20),  # Hourly at :20
+    },
+    # Auth events from stored log_entries -> identity auth baselines,
+    # last_authentication, access anomalies and brute-force threats.
+    "itdr-auth-analysis": {
+        "task": "src.itdr.tasks.analyze_identity_auth_events",
+        "schedule": 300.0,  # Every 5 minutes
+    },
+    # Credential monitoring: identities matched against the org's own
+    # dark-web credential leak records.
+    "itdr-credential-exposure-check": {
+        "task": "src.itdr.tasks.check_identity_credential_exposures",
+        "schedule": crontab(minute=40),  # Hourly at :40
     },
     # --- Agentic retention (src.agentic.tasks.purge_agentic_retention) ---
     # Rolls expiring call-log days into llm_usage_daily, then deletes raw
