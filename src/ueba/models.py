@@ -244,3 +244,54 @@ class PeerGroup(BaseModel):
 
     organization_id: Mapped[str] = mapped_column(String(36), ForeignKey("organizations.id"), nullable=False)
     """Organization that owns the peer group"""
+
+
+class LogIngestCursor(BaseModel):
+    """
+    Per-organisation read position of a consumer of stored SIEM log entries.
+
+    The UEBA SIEM bridge (consumer ``ueba_siem``) and the ITDR auth-event
+    analysis (consumer ``itdr_auth``) each walk ``log_entries`` in
+    ``(received_at, id)`` order from this cursor, so every stored log row is
+    folded in once and a run never re-reads the whole table.
+
+    The ITDR identity scan (``itdr_scan``) and directory syncs
+    (``itdr_sync:<integration id>``) use only the run columns, so every
+    background job reports when it last ran and how (src/itdr/runs.py).
+    """
+
+    __tablename__ = "log_ingest_cursors"
+
+    organization_id: Mapped[str] = mapped_column(String(36), ForeignKey("organizations.id"), nullable=False)
+    """Organisation whose log entries this cursor walks"""
+
+    consumer: Mapped[str] = mapped_column(String(50), nullable=False)
+    """Which pipeline owns the row: ueba_siem, itdr_auth, itdr_scan, itdr_sync:<id>"""
+
+    last_received_at: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    """``received_at`` of the last log entry folded in (ISO string, as stored)"""
+
+    last_log_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    """``id`` of the last log entry folded in (tie-break inside one received_at)"""
+
+    rows_processed_total: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    """Log entries folded in since the cursor was created"""
+
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    """When the consumer last ran for this organisation"""
+
+    last_run_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    """Log entries folded in by the last run"""
+
+    last_run_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    """ok, partial (a per-run cap deferred the rest), idle (nothing new), failed"""
+
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Error of the last failed run"""
+
+    last_run_summary: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    """Counters of the last run (entities created, alerts raised, ...)"""
+
+    __table_args__ = (
+        UniqueConstraint("organization_id", "consumer", name="uix_log_ingest_cursor"),
+    )

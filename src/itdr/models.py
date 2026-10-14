@@ -180,6 +180,21 @@ class IdentityProfile(BaseModel):
         default=0.0, nullable=False
     )  # 0.0-100.0
 
+    # Directory state and provenance (wave 3). ``account_status`` is the
+    # provider's own state (Okta ACTIVE / SUSPENDED / ..., Entra enabled /
+    # disabled, or the imported value); ``source`` says where the row came
+    # from (okta, azure_ad, csv_import, manual); ``source_integration_id`` is
+    # the installed integration that synced it.
+    account_status: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    source: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    source_integration_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    last_synced_at: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
+    # Authentication baseline learned from stored auth events (see
+    # src/itdr/analytics.py): hour-of-day and source-address counts of
+    # successful logins plus per-day failure counts.
+    auth_baseline: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
     def __repr__(self) -> str:
         return f"<IdentityProfile {self.username}@{self.organization_id}>"
 

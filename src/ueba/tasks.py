@@ -27,6 +27,7 @@ from src.ueba.engine import (
     PeerGroupAnalyzer,
     RiskScorer,
 )
+from src.ueba.siem_bridge import EVENT_TYPE as BRIDGE_EVENT_TYPE
 
 logger = get_logger(__name__)
 
@@ -243,6 +244,10 @@ async def _update_entity_baselines_async(
                             BehaviorEvent.entity_profile_id == entity.id,
                             BehaviorEvent.organization_id == entity.organization_id,
                             BehaviorEvent.created_at >= cutoff,
+                            # Hourly SIEM-bridge buckets carry their own
+                            # baseline (src/ueba/siem_bridge.py); rebuilding
+                            # it here as a login pattern would overwrite it.
+                            BehaviorEvent.event_type != BRIDGE_EVENT_TYPE,
                         )
                     )
                     .limit(MAX_BASELINE_EVENTS_PER_ENTITY)
@@ -1146,3 +1151,76 @@ def cleanup_old_behavior_events(
     except Exception as exc:
         logger.error(f"Error in cleanup task: {exc}")
         raise self.retry(exc=exc, countdown=300)
+
+
+# ---------------------------------------------------------------------------
+# SIEM bridge (wave 3): EntityProfile / baseline / anomaly rows from log_entries
+# ---------------------------------------------------------------------------
+
+#: Organisations one bridge run walks; the rest wait for the next run.
+MAX_BRIDGE_ORGS_PER_RUN = 1_000
+
+
+async def _bridge_siem_logs_async(organization_id: Optional[str] = None) -> dict[str, Any]:
+    """Run ``src.ueba.siem_bridge.run_bridge_for_org`` for one or every organisation.
+
+    Each organisation gets its own session and transaction (the bridge
+    commits once per organisation), so one organisation's rows never stay in
+    memory while the next is processed and a failure in one does not undo
+    another. A failed organisation is rolled back (its cursor does not move)
+    and its cursor row records ``failed`` with the error.
+    """
+    from src.core.database import async_session_factory
+    from src.models.organization import Organization
+    from src.ueba.siem_bridge import record_failure, run_bridge_for_org
+
+    if organization_id:
+        org_ids = [organization_id]
+    else:
+        async with async_session_factory() as db:
+            org_ids = list(await db.scalars(
+                select(Organization.id).order_by(Organization.id).limit(MAX_BRIDGE_ORGS_PER_RUN),
+            ))
+
+    totals: dict[str, Any] = {
+        "status": "completed",
+        "organizations": 0,
+        "failed_organizations": 0,
+        "log_rows": 0,
+        "entities_created": 0,
+        "alerts_created": 0,
+        "capped_organizations": 0,
+        "errors": [],
+    }
+    for org_id in org_ids:
+        try:
+            async with async_session_factory() as db:
+                result = await run_bridge_for_org(db, org_id)
+        except Exception as exc:  # recorded per organisation; the sweep continues
+            totals["failed_organizations"] += 1
+            totals["errors"].append({"organization_id": org_id, "error": str(exc)[:500]})
+            logger.error("ueba_siem_bridge_failed", organization_id=org_id, error=str(exc))
+            try:
+                await record_failure(org_id, str(exc))
+            except Exception as rec_exc:  # the original failure is already logged
+                logger.error("ueba_siem_bridge_record_failure_failed", organization_id=org_id, error=str(rec_exc))
+            continue
+        totals["organizations"] += 1
+        totals["log_rows"] += result["log_rows"]
+        totals["entities_created"] += result["entities_created"]
+        totals["alerts_created"] += result["alerts_created"]
+        if result.get("capped"):
+            totals["capped_organizations"] += 1
+    if totals["failed_organizations"]:
+        totals["status"] = "partial" if totals["organizations"] else "failed"
+    return totals
+
+
+@shared_task(max_retries=0, name="src.ueba.tasks.bridge_siem_logs")
+def bridge_siem_logs(organization_id: Optional[str] = None) -> dict:
+    """Fold new stored SIEM log entries into UEBA entities, baselines and alerts.
+
+    Beat runs it every five minutes for every organisation; see
+    ``src/ueba/siem_bridge.py`` for the cursor, caps and scoring method.
+    """
+    return run_async(_bridge_siem_logs_async(organization_id))

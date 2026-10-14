@@ -9,7 +9,7 @@ import math
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status, BackgroundTasks
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status, BackgroundTasks
 import json
 
 from sqlalchemy import and_, func, or_, select
@@ -34,6 +34,22 @@ from src.itdr.models import (
     AccessAnomaly,
     PrivilegedAccessEvent,
 )
+from src.itdr.analytics import analyze_auth_events_for_org, check_credential_exposures_for_org
+from src.itdr.directory import (
+    CSV_ALIASES,
+    CSV_MAX_BYTES,
+    CSV_MAX_ROWS,
+    IDP_ACTIONS,
+    SUPPORTED_CONNECTORS,
+    awaiting_integration_detail,
+    connector_name,
+    identity_integrations,
+    parse_identity_csv,
+    provider_for_identity,
+    run_identity_action,
+    upsert_identities,
+)
+from src.itdr.runs import SCAN, SYNC_PREFIX, run_statuses
 from src.itdr.engine import (
     IdentityThreatDetector,
     CredentialMonitor,
@@ -69,6 +85,8 @@ from src.schemas.itdr import (
     AnomalyReviewRequest,
     ITDRDashboardMetrics,
     ITDRRiskOverview,
+    IdentityActionRequest,
+    IdentityImportResult,
 )
 
 logger = get_logger(__name__)
@@ -78,6 +96,21 @@ router = APIRouter(prefix="/itdr", tags=["ITDR"])
 AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
 #: Access decisions and response actions: approve/revoke elevation.
 AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
+
+#: Log rows one on-demand auth analysis may read (the beat run allows more).
+ON_DEMAND_AUTH_ROWS = 10_000
+#: Threat states that count as active on the dashboard.
+ACTIVE_THREAT_STATES = ("detected", "investigating", "confirmed")
+#: Privilege levels counted as privileged.
+PRIVILEGED_LEVELS = ("admin", "privileged_access", "elevated")
+#: ``action_type`` values whose account part goes to the identity provider
+#: when one can act on the identity (see respond_to_threat).
+IDENTITY_PROVIDER_ACTION: dict[str, str] = {
+    "disable_account": "disable_account",
+    "disable_user": "disable_account",
+    "force_password_reset": "force_password_reset",
+    "quarantine": "disable_account",
+}
 
 
 async def get_identity_or_404(
@@ -623,6 +656,18 @@ async def respond_to_threat(
     The threat is only marked ``contained`` once a tool actually executed --
     a proposal leaves the status untouched rather than claiming a response
     that has not happened yet.
+
+    Wave 3: for ``disable_account`` / ``disable_user`` /
+    ``force_password_reset`` / ``quarantine`` the payload carries
+    ``identity_provider``. When an installed Okta / Entra ID integration can
+    act on the threat's identity, the account step runs as the guarded
+    ``identity_provider_action`` tool (in place of ``disable_user``, which
+    only touches a PySOAR login) through the same ``guarded_tool_call`` path:
+    the response is a proposal naming that tool and its parameters, and the
+    provider is only called once an approver executes it
+    (``POST /agentic/actions/{id}/approve``). When no integration can act on
+    the account, ``identity_provider`` reports ``awaiting_integration`` with
+    the missing dependency and ``disable_user`` is proposed as before.
     """
     from src.api.v1.endpoints.agentic import (
         _agent_context,
@@ -656,11 +701,42 @@ async def respond_to_threat(
         identity_row, "username", None
     )
 
+    idp_action = IDENTITY_PROVIDER_ACTION.get(action)
+    idp_integration = None
+    if idp_action and identity_row is not None:
+        idp_integration = await provider_for_identity(db, ctx.org_id, identity_row)
+
     calls = _response_tool_calls(action, threat, details, target_user)
+    if idp_action and idp_integration is not None and identity_row is not None:
+        # The account lives in the directory: act on it there, through the
+        # guarded identity_provider_action tool (policy gate, propose mode,
+        # approval), instead of disabling a PySOAR login with the same email.
+        calls = [
+            (
+                "identity_provider_action",
+                {"identity_id": identity_row.id, "action": idp_action, "reason": params["reason"]},
+            )
+            if tool_name == "disable_user" else (tool_name, params)
+            for tool_name, params in calls
+        ]
 
     results: list[dict[str, Any]] = []
     proposals: list[dict[str, Any]] = []
     executed = 0
+    identity_provider: Optional[dict[str, Any]] = None
+    if idp_action and idp_integration is None:
+        identity_provider = {
+            "status": "awaiting_integration",
+            "missing_dependency": (
+                awaiting_integration_detail(identity_row) if identity_row is not None
+                else "an identity profile linked to this threat"
+            ),
+            "detail": (
+                "No identity-provider integration can act on this account, so it was not changed in any "
+                "directory. The disable_user tool below acts on a PySOAR login account with the same email, "
+                "if one exists."
+            ),
+        }
     for tool_name, params in calls:
         outcome = await guarded_tool_call(
             db,
@@ -682,6 +758,32 @@ async def respond_to_threat(
             proposals.append(outcome["proposal"])
         else:
             executed += 1
+        if tool_name == "identity_provider_action" and idp_integration is not None:
+            provider = connector_name(idp_integration)
+            if outcome.get("proposed"):
+                identity_provider = {
+                    "status": "proposed",
+                    "tool": tool_name,
+                    "provider": provider,
+                    "integration_id": idp_integration.id,
+                    "action": idp_action,
+                    "proposal_id": outcome["proposal"].get("id"),
+                    "detail": (
+                        f"Nothing has been sent to {provider} yet: the {idp_action} call runs against the "
+                        "directory account once an approver executes this proposal."
+                    ),
+                }
+            else:
+                tool_result = outcome.get("result") if isinstance(outcome.get("result"), dict) else {}
+                identity_provider = {
+                    "status": tool_result.get("status"),
+                    "tool": tool_name,
+                    "provider": tool_result.get("provider") or provider,
+                    "integration_id": tool_result.get("integration_id") or idp_integration.id,
+                    "action": idp_action,
+                    "audit_log_id": tool_result.get("audit_log_id"),
+                    "detail": tool_result.get("detail") or tool_result.get("error"),
+                }
 
     if executed and not proposals:
         threat.status = "contained"
@@ -714,6 +816,8 @@ async def respond_to_threat(
         "threat_status": threat.status,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if identity_provider is not None:
+        payload["identity_provider"] = identity_provider
     if proposals:
         payload["proposal"] = proposals[0]
         payload["proposals"] = proposals
@@ -912,6 +1016,13 @@ async def run_threat_scan(
     logger.info(
         f"Identity threat scan complete: scanned={scanned} created={created}"
     )
+    from src.itdr.runs import record_run
+
+    await record_run(
+        db, org_id, SCAN, status="ok", rows=scanned,
+        summary={"identities_scanned": scanned, "threats_created": created},
+    )
+    await db.commit()
     return {
         "status": "completed",
         "organization_id": org_id,
@@ -1491,15 +1602,17 @@ async def get_dashboard_metrics(
     )
     at_risk = at_risk_result.scalar() or 0
 
+    active_threat_base = threat_base.where(IdentityThreat.status.in_(ACTIVE_THREAT_STATES))
     critical_threats_result = await db.execute(
-        threat_base.where(IdentityThreat.severity == "critical")
+        active_threat_base.where(IdentityThreat.severity == "critical")
     )
     critical_threats = critical_threats_result.scalar() or 0
 
     high_threats_result = await db.execute(
-        threat_base.where(IdentityThreat.severity == "high")
+        active_threat_base.where(IdentityThreat.severity == "high")
     )
     high_threats = high_threats_result.scalar() or 0
+    active_threats = (await db.execute(active_threat_base)).scalar() or 0
 
     exposures_result = await db.execute(
         exposure_base.where(CredentialExposure.is_remediated == False)
@@ -1511,22 +1624,54 @@ async def get_dashboard_metrics(
     )
     anomalies = anomalies_result.scalar() or 0
 
+    # Service accounts holding an admin / privileged / elevated level.
     service_accounts_result = await db.execute(
-        identity_base.where(IdentityProfile.is_service_account == True)
+        identity_base.where(
+            IdentityProfile.is_service_account.is_(True),
+            IdentityProfile.privilege_level.in_(PRIVILEGED_LEVELS),
+        ),
     )
-    service_accounts = service_accounts_result.scalar() or 0
+    service_accounts_privileged = service_accounts_result.scalar() or 0
+    privileged = (await db.execute(
+        identity_base.where(IdentityProfile.privilege_level.in_(PRIVILEGED_LEVELS)),
+    )).scalar() or 0
+    with_mfa = (await db.execute(identity_base.where(IdentityProfile.mfa_enabled.is_(True)))).scalar() or 0
+    by_source = dict((await db.execute(
+        select(IdentityProfile.source, func.count(IdentityProfile.id))
+        .where(IdentityProfile.organization_id == org_id)
+        .group_by(IdentityProfile.source),
+    )).all())
 
     dormant_result = await db.execute(
         identity_base.where(IdentityProfile.is_dormant == True)
     )
     dormant = dormant_result.scalar() or 0
 
+    # Just-in-time grants not revoked and not past their expiry.
+    now_iso = datetime.now(timezone.utc).isoformat()
     jit_result = await db.execute(
-        priv_base.where(PrivilegedAccessEvent.event_type == "just_in_time_access")
+        priv_base.where(
+            PrivilegedAccessEvent.event_type == "just_in_time_access",
+            PrivilegedAccessEvent.was_revoked.is_(False),
+            or_(
+                PrivilegedAccessEvent.expiry_timestamp.is_(None),
+                PrivilegedAccessEvent.expiry_timestamp > now_iso,
+            ),
+        ),
     )
     jit_active = jit_result.scalar() or 0
 
     overall_risk = min(100.0, critical_threats * 20 + high_threats * 10 + exposures * 5)
+    jobs = await run_statuses(db, org_id)
+    scan_runs = [j["last_run_at"] for j in jobs if j["job"] == SCAN and j["last_run_at"]]
+    sync_runs = [
+        j["last_run_at"] for j in jobs
+        if j["job"].startswith(SYNC_PREFIX) and j["last_run_at"] and j["status"] in ("ok", "partial")
+    ]
+    integrations = [
+        {"integration_id": i.id, "provider": connector_name(i), "display_name": i.display_name}
+        for i in await identity_integrations(db, org_id)
+    ]
 
     return ITDRDashboardMetrics(
         total_identities=total_identities,
@@ -1535,11 +1680,19 @@ async def get_dashboard_metrics(
         high_threats_active=high_threats,
         credential_exposures_active=exposures,
         anomalies_pending_review=anomalies,
-        service_accounts_over_privileged=max(0, service_accounts - 5),
+        service_accounts_over_privileged=service_accounts_privileged,
         dormant_accounts=dormant,
         jit_access_active=jit_active,
-        last_scan_timestamp=datetime.now(timezone.utc),
+        last_scan_timestamp=max(scan_runs) if scan_runs else None,
         overall_risk_score=overall_risk,
+        active_threats_total=active_threats,
+        privileged_identities=privileged,
+        identities_with_mfa=with_mfa,
+        mfa_coverage_percent=round(100.0 * with_mfa / total_identities, 1) if total_identities else None,
+        identities_by_source={(k or "manual"): int(v) for k, v in by_source.items()},
+        last_directory_sync_at=max(sync_runs) if sync_runs else None,
+        identity_integrations=integrations,
+        jobs=jobs,
     )
 
 
@@ -1760,3 +1913,185 @@ async def update_privileged_access_event(
     await db.refresh(event)
     logger.info(f"Privileged access event updated: {event_id}")
     return PrivilegedAccessEventResponse.model_validate(event)
+
+
+# ============================================================================
+# Identity sources (wave 3): directory sync, CSV import, provider actions
+# ============================================================================
+
+
+@router.get("/identity-sources")
+async def get_identity_sources(
+    org_id: OrganizationId = None,
+    db: DatabaseSession = None,
+):
+    """Where identities come from: installed Okta / Entra ID integrations, job runs, CSV format.
+
+    ``integrations`` lists the organisation's active identity-provider
+    integrations PySOAR can sync and act on; ``jobs`` the last run of the
+    directory syncs, the auth-event analysis and the identity scan;
+    ``csv_import`` the accepted columns of ``POST /itdr/identities/import``
+    (Active Directory exports use it: PySOAR has no LDAP connector).
+    """
+    integrations = [
+        {"integration_id": i.id, "provider": connector_name(i), "display_name": i.display_name,
+         "health_status": i.health_status}
+        for i in await identity_integrations(db, org_id)
+    ]
+    counts = dict((await db.execute(
+        select(IdentityProfile.source, func.count(IdentityProfile.id))
+        .where(IdentityProfile.organization_id == org_id)
+        .group_by(IdentityProfile.source)
+    )).all())
+    return {
+        "integrations": integrations,
+        "supported_providers": list(SUPPORTED_CONNECTORS),
+        "identities_by_source": {(k or "manual"): int(v) for k, v in counts.items()},
+        "jobs": await run_statuses(db, org_id),
+        "csv_import": {
+            "required": ["username", "email"],
+            "columns": {k: list(v) for k, v in CSV_ALIASES.items()},
+            "max_rows": CSV_MAX_ROWS,
+            "max_bytes": CSV_MAX_BYTES,
+            "list_separator": "; or |",
+        },
+    }
+
+
+@router.post("/identities/sync")
+async def sync_identities(
+    integration_id: Optional[str] = Query(None, description="Sync only this installed integration"),
+    _caller: AdminRoleUser = None,
+    org_id: OrganizationId = None,
+    db: DatabaseSession = None,
+):
+    """Sync identities now from the organisation's Okta / Entra ID integrations (admin).
+
+    409 ``no_identity_integration`` when none is installed and active (use
+    ``POST /itdr/identities/import`` for Active Directory or other exports).
+    Each integration reports ``ok`` / ``partial`` (the per-run user cap was
+    reached) / ``failed`` with the provider's error.
+    """
+    from src.itdr.tasks import sync_org_directories
+
+    result = await sync_org_directories(db, org_id, integration_id)
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "no_identity_integration",
+                "detail": (
+                    "No active Okta or Entra ID integration is installed for this organisation"
+                    + (f" with id {integration_id}" if integration_id else "")
+                    + ". Install one under Integrations, or import a CSV export with POST /itdr/identities/import."
+                ),
+            },
+        )
+    return result
+
+
+@router.post("/identities/import", response_model=IdentityImportResult)
+async def import_identities(
+    file: UploadFile = File(..., description="CSV export (UTF-8) with a header row"),
+    dry_run: bool = Query(False, description="Validate only; write nothing"),
+    _caller: AdminRoleUser = None,
+    org_id: OrganizationId = None,
+    db: DatabaseSession = None,
+):
+    """Create or update identities from a CSV export (admin).
+
+    Required columns: ``username`` and ``email`` (``SamAccountName`` /
+    ``UserPrincipalName`` / ``mail`` from ``Get-ADUser`` are accepted). Every
+    row is validated; valid rows are imported and invalid ones reported with
+    their line number. A file with no valid row is a 422.
+    """
+    content = await file.read(CSV_MAX_BYTES + 1)
+    try:
+        parsed = parse_identity_csv(content)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "invalid_csv", "detail": str(exc)},
+        ) from exc
+    if not parsed.records:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "no_valid_rows", "rows_read": parsed.rows_read, "errors": parsed.errors},
+        )
+    counts = {"created": 0, "updated": 0}
+    if not dry_run:
+        counts = await upsert_identities(db, org_id, parsed.records, source="csv_import")
+        await db.commit()
+    logger.info(
+        "itdr_identity_import", organization_id=org_id, rows=parsed.rows_read, valid=len(parsed.records),
+        invalid=parsed.error_count, dry_run=dry_run, **counts,
+    )
+    return IdentityImportResult(
+        dry_run=dry_run, rows_read=parsed.rows_read, valid_rows=len(parsed.records),
+        invalid_rows=parsed.error_count, created=counts["created"], updated=counts["updated"],
+        columns=parsed.columns, errors=parsed.errors,
+    )
+
+
+@router.post("/identities/{identity_id}/actions/{action}")
+async def identity_provider_action(
+    identity_id: str,
+    action: str,
+    data: Optional[IdentityActionRequest] = None,
+    current_user: AdminRoleUser = None,
+    org_id: OrganizationId = None,
+    db: DatabaseSession = None,
+):
+    """Act on the account in its identity provider (admin).
+
+    ``action``: ``disable_account``, ``enable_account``,
+    ``force_password_reset`` or ``revoke_sessions``. The result ``status`` is
+    ``executed`` (the provider accepted every call) or
+    ``awaiting_integration`` (no installed Okta / Entra ID integration can act
+    on this identity; ``missing_dependency`` names it and nothing changed). A
+    provider failure is a 502 carrying the same result. Every call writes an
+    audit log row.
+    """
+    if action not in IDP_ACTIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "unknown_action", "supported": list(IDP_ACTIONS)},
+        )
+    identity = await get_identity_or_404(db, identity_id, org_id)
+    reason = (data.reason if data else "") or f"ITDR {action} by {current_user.email}"
+    result = await run_identity_action(db, org_id, identity, action, actor_user_id=current_user.id, reason=reason)
+    await db.commit()
+    if result["status"] == "failed":
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"error": "identity_provider_failed", "result": result},
+        )
+    return result
+
+
+@router.post("/auth-analysis/run")
+async def run_auth_analysis(
+    _caller: AdminRoleUser = None,
+    org_id: OrganizationId = None,
+    db: DatabaseSession = None,
+):
+    """Analyse this organisation's new authentication log entries now (admin).
+
+    Same job as the 5-minute beat run (src/itdr/analytics.py) with a smaller
+    per-call cap; the remainder is read by the next run.
+    """
+    return await analyze_auth_events_for_org(db, org_id, max_rows=ON_DEMAND_AUTH_ROWS)
+
+
+@router.post("/credential-exposures/check-all")
+async def check_all_credential_exposures(
+    _caller: AnalystUser = None,
+    org_id: OrganizationId = None,
+    db: DatabaseSession = None,
+):
+    """Match every identity of the organisation against its dark-web credential leak rows.
+
+    One call instead of one ``/credential-exposures/check`` per identity; the
+    hourly beat runs the same check.
+    """
+    return await check_credential_exposures_for_org(db, org_id)

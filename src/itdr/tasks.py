@@ -1,13 +1,17 @@
 """
 Celery Tasks for ITDR (Identity Threat Detection & Response)
 
-Background tasks for identity threat scanning, credential exposure
-monitoring, baseline updates, privileged access auditing, and
-dormant account detection. Every task queries real database rows.
+Background tasks for identity threat scanning, directory sync (Okta / Entra
+ID, src/itdr/directory.py), authentication-event analysis and credential
+monitoring (src/itdr/analytics.py), privileged access auditing and dormant
+account detection. Every task reads and writes ``IdentityProfile`` and its
+child rows of one organisation at a time; the beat sweeps loop over
+organisations with a fresh session per organisation.
 """
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
 
 from celery import shared_task
 from sqlalchemy import select, func, and_
@@ -192,15 +196,19 @@ async def _run_identity_scan_for_org(session, organization_id: str) -> dict:
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"AutomationService setup failed in identity scan: {exc}")
 
-    await session.commit()
-    # Release this org's ORM rows so a cross-org sweep does not accumulate
-    # every org's identities in one session.
-    session.expunge_all()
-    return {
+    from src.itdr.runs import SCAN, record_run
+
+    result = {
         "organization_id": organization_id,
         "identities_scanned": identities_scanned,
         "threats_created": created,
     }
+    await record_run(session, organization_id, SCAN, status="ok", summary=result, rows=identities_scanned)
+    await session.commit()
+    # Release this org's ORM rows so a cross-org sweep does not accumulate
+    # every org's identities in one session.
+    session.expunge_all()
+    return result
 
 
 @shared_task(bind=True, max_retries=0)
@@ -276,208 +284,278 @@ def scheduled_identity_threat_sweep(self):
         return {"error": str(exc)[:200]}
 
 
-@shared_task(bind=True, max_retries=3)
+#: Organisations one sweep walks; the rest wait for the next run.
+MAX_ORGS_PER_SWEEP = 1_000
+
+
+async def _org_ids(session_factory, organization_id: Optional[str]) -> list[str]:
+    if organization_id:
+        return [organization_id]
+    from src.models.organization import Organization
+
+    async with session_factory() as session:
+        return list(await session.scalars(
+            select(Organization.id).order_by(Organization.id).limit(MAX_ORGS_PER_SWEEP)
+        ))
+
+
+async def _per_org(session_factory, organization_id: Optional[str], job, label: str) -> dict[str, Any]:
+    """Run ``job(session, org_id)`` per organisation, each in its own session."""
+    totals: dict[str, Any] = {"status": "completed", "organizations": 0, "failed_organizations": 0,
+                              "results": [], "errors": []}
+    for org_id in await _org_ids(session_factory, organization_id):
+        try:
+            async with session_factory() as session:
+                result = await job(session, org_id)
+        except Exception as exc:  # noqa: BLE001 - recorded per organisation, the sweep continues
+            totals["failed_organizations"] += 1
+            totals["errors"].append({"organization_id": org_id, "error": str(exc)[:500]})
+            logger.error(f"{label} failed for org {org_id}: {exc}")
+            continue
+        totals["organizations"] += 1
+        if result:
+            totals["results"].append(result)
+    if totals["failed_organizations"]:
+        totals["status"] = "partial" if totals["organizations"] else "failed"
+    totals["results"] = totals["results"][:200]
+    return totals
+
+
+async def sync_org_directories(session, org_id: str, integration_id: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Sync the active Okta / Entra ID integrations of one organisation (or just ``integration_id``).
+
+    Each integration is its own transaction; its run row
+    (``itdr_sync:<integration id>``) records ok / partial / failed.
+    Returns None when the organisation has no such integration.
+    """
+    from src.integrations.netguard import OutboundTargetRefused
+    from src.itdr.directory import DirectoryError, identity_integrations, sync_integration
+    from src.itdr.runs import record_run, sync_consumer
+
+    integration_ids = [i.id for i in await identity_integrations(session, org_id)]
+    if integration_id is not None:
+        integration_ids = [i for i in integration_ids if i == integration_id]
+    if not integration_ids:
+        return None
+    out: dict[str, Any] = {"organization_id": org_id, "integrations": []}
+    for iid in integration_ids:
+        integration = next((i for i in await identity_integrations(session, org_id) if i.id == iid), None)
+        if integration is None:
+            continue
+        try:
+            summary = await sync_integration(session, org_id, integration)
+        except (DirectoryError, OutboundTargetRefused, ValueError) as exc:
+            # ValueError: a provider answered with a body that is not JSON.
+            await session.rollback()
+            await record_run(session, org_id, sync_consumer(iid), status="failed", error=str(exc))
+            await session.commit()
+            out["integrations"].append({"integration_id": iid, "status": "failed", "error": str(exc)[:500]})
+            continue
+        status = "partial" if summary.get("capped") else "ok"
+        await record_run(session, org_id, sync_consumer(iid), status=status, summary=summary,
+                         rows=int(summary.get("fetched") or 0))
+        await session.commit()
+        session.expunge_all()
+        out["integrations"].append({"status": status, **summary})
+    return out
+
+
+async def _sync_identity_directories_async(organization_id: Optional[str] = None, session_factory=None) -> dict[str, Any]:
+    engine = None
+    if session_factory is None:
+        engine, session_factory = _fresh_itdr_session_factory()
+    try:
+        return await _per_org(session_factory, organization_id, sync_org_directories, "directory sync")
+    finally:
+        if engine is not None:
+            await engine.dispose()
+
+
+async def _analyze_identity_auth_events_async(organization_id: Optional[str] = None, session_factory=None) -> dict[str, Any]:
+    from src.itdr.analytics import analyze_auth_events_for_org
+    from src.itdr.runs import AUTH, record_run
+
+    engine = None
+    if session_factory is None:
+        engine, session_factory = _fresh_itdr_session_factory()
+    try:
+        totals = await _per_org(session_factory, organization_id, analyze_auth_events_for_org, "auth analysis")
+        # A failed organisation's transaction was rolled back (its cursor did
+        # not move); record the failure on the cursor row in a new session.
+        for err in totals["errors"]:
+            async with session_factory() as session:
+                await record_run(session, err["organization_id"], AUTH, status="failed", error=err["error"])
+                await session.commit()
+        return totals
+    finally:
+        if engine is not None:
+            await engine.dispose()
+
+
+async def _check_identity_credential_exposures_async(organization_id: Optional[str] = None,
+                                                     session_factory=None) -> dict[str, Any]:
+    from src.itdr.analytics import check_credential_exposures_for_org
+
+    engine = None
+    if session_factory is None:
+        engine, session_factory = _fresh_itdr_session_factory()
+    try:
+        return await _per_org(session_factory, organization_id, check_credential_exposures_for_org,
+                              "credential exposure check")
+    finally:
+        if engine is not None:
+            await engine.dispose()
+
+
+@shared_task(bind=True, max_retries=0, name="src.itdr.tasks.sync_identity_directories")
+def sync_identity_directories(self, organization_id: Optional[str] = None):
+    """Sync identities from every installed Okta / Entra ID integration (hourly)."""
+    return _run_async(_sync_identity_directories_async(organization_id))
+
+
+@shared_task(bind=True, max_retries=0, name="src.itdr.tasks.analyze_identity_auth_events")
+def analyze_identity_auth_events(self, organization_id: Optional[str] = None):
+    """Auth baselines, access anomalies and brute-force / spray threats from stored logs (every 5 min)."""
+    return _run_async(_analyze_identity_auth_events_async(organization_id))
+
+
+@shared_task(bind=True, max_retries=0, name="src.itdr.tasks.check_identity_credential_exposures")
+def check_identity_credential_exposures(self, organization_id: Optional[str] = None):
+    """Match identities against the organisation's dark-web credential leak rows (hourly)."""
+    return _run_async(_check_identity_credential_exposures_async(organization_id))
+
+
+@shared_task(bind=True, max_retries=0)
 def credential_exposure_check(
     self,
     organization_id: str,
     check_type: str = "comprehensive",
     include_dark_web: bool = True,
 ):
-    """Check credentials against real CredentialLeak and User tables."""
-    from src.core.database import async_session_factory
-    from src.models.user import User
-    from src.darkweb.models import CredentialLeak
+    """One organisation's credential monitoring run (on demand).
 
-    async def _run():
-        async with async_session_factory() as session:
-            user_count = (await session.execute(
-                select(func.count(User.id)).where(
-                    User.organization_id == organization_id,
-                    User.is_active == True,
-                )
-            )).scalar() or 0
-
-            org_emails_result = await session.execute(
-                select(User.email).where(
-                    User.organization_id == organization_id,
-                    User.is_active == True,
-                )
-            )
-            org_emails = {r[0].lower() for r in org_emails_result.all() if r[0]}
-
-            # Only this organisation's leak records: matching against every
-            # tenant's leaks disclosed whether another tenant's monitoring
-            # had seen an address.
-            leaked_result = await session.execute(
-                select(CredentialLeak.email).where(
-                    CredentialLeak.organization_id == organization_id,
-                    CredentialLeak.is_remediated == False,
-                )
-            )
-            leaked_emails = {r[0].lower() for r in leaked_result.all() if r[0]}
-
-            exposed = org_emails & leaked_emails
-
-            return {
-                "status": "success",
-                "organization_id": organization_id,
-                "check_type": check_type,
-                "total_credentials_checked": user_count,
-                "exposures_found": len(exposed),
-                "exposed_emails": list(exposed)[:50],
-                "critical_exposures": len(exposed),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-
-    try:
-        return _run_async(_run())
-    except Exception as e:
-        logger.error(f"Credential exposure check failed: {e}")
-        raise self.retry(exc=e, countdown=60 * (2 ** self.request.retries))
+    Formerly compared PySOAR login accounts with leak rows and persisted
+    nothing; it now runs the same identity check as the hourly sweep.
+    ``check_type`` / ``include_dark_web`` are kept for callers; the only
+    source is the organisation's own dark-web leak records.
+    """
+    return _run_async(_check_identity_credential_exposures_async(organization_id))
 
 
-@shared_task(bind=True, max_retries=2)
+@shared_task(bind=True, max_retries=0)
 def update_identity_baseline(
     self,
     organization_id: str,
     baseline_type: str = "comprehensive",
 ):
-    """Build identity access baseline from real AccessAnomaly + User data."""
-    from src.core.database import async_session_factory
-    from src.models.user import User
-    from src.itdr.models import AccessAnomaly
+    """One organisation's auth-event analysis run (on demand).
 
-    async def _run():
-        async with async_session_factory() as session:
-            user_count = (await session.execute(
-                select(func.count(User.id)).where(
-                    User.organization_id == organization_id,
-                    User.is_active == True,
-                )
-            )).scalar() or 0
-
-            anomaly_count = (await session.execute(
-                select(func.count(AccessAnomaly.id)).where(
-                    AccessAnomaly.organization_id == organization_id,
-                )
-            )).scalar() or 0
-
-            return {
-                "status": "success",
-                "organization_id": organization_id,
-                "baseline_type": baseline_type,
-                "identities_profiled": user_count,
-                "anomalies_in_baseline": anomaly_count,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-
-    try:
-        return _run_async(_run())
-    except Exception as e:
-        logger.error(f"Identity baseline update failed: {e}")
-        raise self.retry(exc=e, countdown=120)
+    Formerly counted rows and built nothing; the identity auth baseline is
+    the ``auth_baseline`` the analysis maintains (src/itdr/analytics.py).
+    """
+    return _run_async(_analyze_identity_auth_events_async(organization_id))
 
 
-@shared_task(bind=True, max_retries=2)
+async def _privileged_access_audit_async(organization_id: str, session_factory) -> dict[str, Any]:
+    from src.itdr.models import IdentityProfile, PrivilegeLevel
+
+    privileged = [PrivilegeLevel.ADMIN.value, PrivilegeLevel.PRIVILEGED_ACCESS.value, PrivilegeLevel.ELEVATED.value]
+    async with session_factory() as session:
+        base = select(func.count(IdentityProfile.id)).where(IdentityProfile.organization_id == organization_id)
+        total = (await session.execute(base)).scalar() or 0
+        priv = (await session.execute(base.where(IdentityProfile.privilege_level.in_(privileged)))).scalar() or 0
+        priv_no_mfa = (await session.execute(
+            base.where(IdentityProfile.privilege_level.in_(privileged), IdentityProfile.mfa_enabled.is_(False))
+        )).scalar() or 0
+        svc_priv = (await session.execute(
+            base.where(IdentityProfile.privilege_level.in_(privileged), IdentityProfile.is_service_account.is_(True))
+        )).scalar() or 0
+    return {
+        "status": "success",
+        "organization_id": organization_id,
+        "total_identities": total,
+        "privileged_identities": priv,
+        "privileged_without_mfa": priv_no_mfa,
+        "privileged_service_accounts": svc_priv,
+        "privilege_ratio": round(priv / total * 100, 1) if total else None,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@shared_task(bind=True, max_retries=0)
 def privileged_access_audit(
     self,
     organization_id: str,
     include_service_accounts: bool = True,
 ):
-    """Audit privileged access by counting real admin/superuser accounts."""
-    from src.core.database import async_session_factory
-    from src.models.user import User
-
+    """Count the organisation's privileged identities (directory rows, not PySOAR logins)."""
     async def _run():
-        async with async_session_factory() as session:
-            priv_query = select(func.count(User.id)).where(
-                and_(
-                    User.organization_id == organization_id,
-                    User.is_active == True,
-                    User.role.in_(["admin"]),
-                )
+        engine, factory = _fresh_itdr_session_factory()
+        try:
+            return await _privileged_access_audit_async(organization_id, factory)
+        finally:
+            await engine.dispose()
+
+    return _run_async(_run())
+
+
+async def _dormant_account_detection_async(organization_id: str, inactive_days: int, session_factory) -> dict[str, Any]:
+    """Set ``is_dormant`` from ``last_authentication`` (ISO UTC strings compare in time order)."""
+    from sqlalchemy import update
+
+    from src.itdr.models import IdentityProfile
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=inactive_days)).isoformat()
+    async with session_factory() as session:
+        marked = (await session.execute(
+            update(IdentityProfile)
+            .where(
+                IdentityProfile.organization_id == organization_id,
+                IdentityProfile.last_authentication.is_not(None),
+                IdentityProfile.last_authentication < cutoff,
+                IdentityProfile.is_dormant.is_(False),
             )
-            privileged_accounts = (await session.execute(priv_query)).scalar() or 0
-
-            super_query = select(func.count(User.id)).where(
-                and_(
-                    User.organization_id == organization_id,
-                    User.is_superuser == True,
-                )
+            .values(is_dormant=True)
+        )).rowcount or 0
+        cleared = (await session.execute(
+            update(IdentityProfile)
+            .where(
+                IdentityProfile.organization_id == organization_id,
+                IdentityProfile.last_authentication >= cutoff,
+                IdentityProfile.is_dormant.is_(True),
             )
-            superusers = (await session.execute(super_query)).scalar() or 0
-
-            total_query = select(func.count(User.id)).where(
-                User.organization_id == organization_id,
-                User.is_active == True,
+            .values(is_dormant=False)
+        )).rowcount or 0
+        unknown = (await session.execute(
+            select(func.count(IdentityProfile.id)).where(
+                IdentityProfile.organization_id == organization_id,
+                IdentityProfile.last_authentication.is_(None),
             )
-            total_users = (await session.execute(total_query)).scalar() or 0
-
-            return {
-                "status": "success",
-                "organization_id": organization_id,
-                "total_users": total_users,
-                "privileged_accounts": privileged_accounts,
-                "superuser_accounts": superusers,
-                "privilege_ratio": round(
-                    (privileged_accounts + superusers) / max(total_users, 1) * 100, 1
-                ),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-
-    try:
-        return _run_async(_run())
-    except Exception as e:
-        logger.error(f"Privileged access audit failed: {e}")
-        raise self.retry(exc=e, countdown=120)
+        )).scalar() or 0
+        await session.commit()
+    return {
+        "status": "success",
+        "organization_id": organization_id,
+        "marked_dormant": marked,
+        "cleared_dormant": cleared,
+        "identities_without_sign_in_data": unknown,
+        "inactive_threshold_days": inactive_days,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
-@shared_task(bind=True, max_retries=2)
+@shared_task(bind=True, max_retries=0)
 def dormant_account_detection(
     self,
     organization_id: str,
     inactive_days: int = 90,
 ):
-    """Detect dormant accounts by checking last_login against real User rows."""
-    from src.core.database import async_session_factory
-    from src.models.user import User
-
+    """Mark identities dormant when their last sign-in is older than ``inactive_days``."""
     async def _run():
-        async with async_session_factory() as session:
-            cutoff = datetime.now(timezone.utc) - timedelta(days=inactive_days)
+        engine, factory = _fresh_itdr_session_factory()
+        try:
+            return await _dormant_account_detection_async(organization_id, inactive_days, factory)
+        finally:
+            await engine.dispose()
 
-            total = (await session.execute(
-                select(func.count(User.id)).where(
-                    User.organization_id == organization_id,
-                    User.is_active == True,
-                )
-            )).scalar() or 0
-
-            # A failing query used to be swallowed into "0 dormant accounts"
-            # (and comparing the string column to a datetime always failed);
-            # errors now fail the task and its retry instead.
-            dormant_count = (await session.execute(
-                select(func.count(User.id)).where(
-                    and_(
-                        User.organization_id == organization_id,
-                        User.is_active == True,
-                        # last_login is an ISO-8601 UTC string column
-                        User.last_login < cutoff.isoformat(),
-                    )
-                )
-            )).scalar() or 0
-
-            return {
-                "status": "success",
-                "organization_id": organization_id,
-                "total_active_accounts": total,
-                "dormant_accounts": dormant_count,
-                "inactive_threshold_days": inactive_days,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-
-    try:
-        return _run_async(_run())
-    except Exception as e:
-        logger.error(f"Dormant account detection failed: {e}")
-        raise self.retry(exc=e, countdown=60)
+    return _run_async(_run())

@@ -346,6 +346,8 @@ class AlertDistribution(BaseModel):
     """Schema for alert type distribution."""
 
     alert_type: str = ""
+    #: The dashboard groups alerts by severity; ``severity`` carries the key.
+    severity: str = ""
     count: int = 0
     percentage: float = 0.0
 
@@ -360,6 +362,23 @@ class HighRiskEntity(BaseModel):
     risk_level: str = ""
     latest_alert: Optional[str] = None
     last_anomaly_at: Optional[datetime] = None
+    display_name: Optional[str] = None
+    anomaly_count_30d: int = 0
+    last_activity_at: Optional[datetime] = None
+
+
+class SiemBridgeStatus(BaseModel):
+    """Run state of the UEBA SIEM bridge for one organisation (``log_ingest_cursors``)."""
+
+    consumer: str = "ueba_siem"
+    #: never_run, ok, partial (a per-run cap deferred rows), idle, failed
+    status: str = "never_run"
+    last_run_at: Optional[datetime] = None
+    last_received_at: Optional[str] = None
+    rows_processed_total: int = 0
+    last_run_rows: int = 0
+    last_error: Optional[str] = None
+    last_run_summary: dict = Field(default_factory=dict)
 
 
 class UEBADashboardStats(BaseModel):
@@ -375,6 +394,10 @@ class UEBADashboardStats(BaseModel):
     anomalies_last_7d: int = 0
     anomalies_last_30d: int = 0
     updated_at: datetime
+    #: Every entity with risk_score >= 70 (``high_risk_entities`` is the top 10).
+    high_risk_entity_count: int = 0
+    #: Where the entity data comes from: the SIEM bridge's last run.
+    siem_bridge: Optional[SiemBridgeStatus] = None
 
 
 # ============================================================================

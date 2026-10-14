@@ -24,6 +24,7 @@ from src.api.deps import (
 )
 from src.models.user import User, UserRole
 from src.ueba.engine import PeerGroupAnalyzer, RiskScorer
+from src.ueba import siem_bridge
 from src.ueba.models import (
     EntityProfile,
     BehaviorBaseline,
@@ -49,6 +50,7 @@ from src.schemas.ueba import (
     RiskHeatmapResponse,
     BatchIngestionResponse,
     BehaviorBaselineResponse,
+    SiemBridgeStatus,
     EntityListFilter,
     AlertListFilter,
     EventListFilter,
@@ -1281,6 +1283,8 @@ async def rebuild_baselines(
                     BehaviorEvent.entity_profile_id == entity.id,
                     BehaviorEvent.organization_id == org_id,
                     BehaviorEvent.created_at >= cutoff,
+                    # SIEM-bridge hourly buckets keep their own baseline.
+                    BehaviorEvent.event_type != siem_bridge.EVENT_TYPE,
                 )
             )
         )
@@ -1298,7 +1302,8 @@ async def rebuild_baselines(
         # Wipe this entity's existing baselines so the rebuild is clean
         await db.execute(
             sql_delete(BehaviorBaseline).where(
-                BehaviorBaseline.entity_profile_id == entity.id
+                BehaviorBaseline.entity_profile_id == entity.id,
+                BehaviorBaseline.behavior_type != siem_bridge.EVENT_TYPE,
             )
         )
 
@@ -1409,6 +1414,12 @@ async def get_dashboard_stats(
         ).order_by(desc(EntityProfile.risk_score)).limit(10)
     )
     high_risk_entities = list(high_risk_result.scalars().all())
+    high_risk_count = (await db.execute(
+        select(func.count(EntityProfile.id)).where(
+            EntityProfile.organization_id == org_id,
+            EntityProfile.risk_score >= 70.0,
+        )
+    )).scalar() or 0
 
     # Risk distribution
     risk_dist_result = await db.execute(
@@ -1424,7 +1435,9 @@ async def get_dashboard_stats(
         .where(UEBARiskAlert.organization_id == org_id)
         .group_by(UEBARiskAlert.severity)
     )
-    alert_distribution = [{"severity": sev, "count": count} for sev, count in alert_dist_result.all()]
+    alert_distribution = [
+        {"severity": sev, "alert_type": sev, "count": count} for sev, count in alert_dist_result.all()
+    ]
 
     # Alerts in last 7 and 30 days
     now = datetime.now(timezone.utc)
@@ -1482,7 +1495,49 @@ async def get_dashboard_stats(
         "anomalies_last_7d": anomalies_7d,
         "anomalies_last_30d": anomalies_30d,
         "updated_at": now,
+        "high_risk_entity_count": high_risk_count,
+        "siem_bridge": await siem_bridge.cursor_status(db, org_id),
     }
+
+
+# ============================================================================
+# SIEM bridge (stored log entries -> entities, baselines, anomaly alerts)
+# ============================================================================
+
+#: Log rows one on-demand run may fold in (the 5-minute beat run allows more).
+ON_DEMAND_BRIDGE_ROWS = 10_000
+
+
+@router.get(
+    "/siem-bridge/status",
+    response_model=SiemBridgeStatus,
+    summary="UEBA SIEM bridge status",
+    description="Last run of the job that builds UEBA entities and anomaly alerts from stored SIEM logs",
+)
+async def get_siem_bridge_status(
+    org_id: OrganizationId = None,
+    db: DatabaseSession = None,
+) -> dict:
+    return await siem_bridge.cursor_status(db, org_id)
+
+
+@router.post(
+    "/siem-bridge/run",
+    summary="Run the UEBA SIEM bridge now",
+    description=(
+        "Fold this organisation's new stored SIEM log entries into UEBA entities, "
+        "hourly baselines and anomaly alerts now (admin). At most "
+        f"{ON_DEMAND_BRIDGE_ROWS} log rows per call; the rest is read by the next run."
+    ),
+)
+async def run_siem_bridge(
+    _caller: AdminRoleUser = None,
+    org_id: OrganizationId = None,
+    db: DatabaseSession = None,
+) -> dict:
+    result = await siem_bridge.run_bridge_for_org(db, org_id, max_rows=ON_DEMAND_BRIDGE_ROWS)
+    logger.info("ueba_siem_bridge_on_demand", organization_id=org_id, rows=result["log_rows"])
+    return result
 
 
 @router.get(

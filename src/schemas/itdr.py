@@ -66,9 +66,39 @@ class IdentityProfileResponse(IdentityProfileBase, DBModel):
     authentication_methods: Optional[list[str]] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # Wave 3: directory provenance and the learned sign-in baseline.
+    account_status: Optional[str] = None
+    source: Optional[str] = None
+    source_integration_id: Optional[str] = None
+    last_synced_at: Optional[str] = None
+    auth_baseline: Optional[dict[str, Any]] = None
 
     class Config:
         from_attributes = True
+
+
+# ============================================================================
+# Identity sources (wave 3)
+# ============================================================================
+
+
+class IdentityActionRequest(BaseModel):
+    """Reason recorded with an identity-provider action."""
+
+    reason: str = Field("", max_length=1000)
+
+
+class IdentityImportResult(BaseModel):
+    """Outcome of a CSV identity import."""
+
+    dry_run: bool = False
+    rows_read: int = 0
+    valid_rows: int = 0
+    invalid_rows: int = 0
+    created: int = 0
+    updated: int = 0
+    columns: dict[str, str] = Field(default_factory=dict)
+    errors: list[dict[str, Any]] = Field(default_factory=list)
 
 
 # ============================================================================
@@ -374,8 +404,19 @@ class ITDRDashboardMetrics(BaseModel):
     service_accounts_over_privileged: int = 0
     dormant_accounts: int = 0
     jit_access_active: int = 0
-    last_scan_timestamp: datetime
+    #: When the identity scan last ran for this organisation (None = never).
+    last_scan_timestamp: Optional[datetime] = None
     overall_risk_score: float = Field(0.0, ge=0.0, le=100.0)
+    # Wave 3 additions (all computed from rows).
+    active_threats_total: int = 0
+    privileged_identities: int = 0
+    identities_with_mfa: int = 0
+    #: None when there are no identities (coverage is undefined, not 0%).
+    mfa_coverage_percent: Optional[float] = None
+    identities_by_source: dict[str, int] = Field(default_factory=dict)
+    last_directory_sync_at: Optional[datetime] = None
+    identity_integrations: list[dict[str, Any]] = Field(default_factory=list)
+    jobs: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ITDRRiskOverview(BaseModel):

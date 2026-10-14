@@ -55,6 +55,8 @@ from src.exposure.models import RemediationTicket
 from src.hunting.models import HuntFinding, HuntHypothesis, HuntSession
 from src.integrations.models import InstalledIntegration
 from src.intel.models import ThreatActor, ThreatCampaign, ThreatIndicator
+from src.itdr.directory import IDP_ACTIONS
+from src.itdr.models import IdentityProfile
 from src.llm.base import ToolSpecForLLM
 from src.models.alert import Alert
 from src.models.asset import Asset
@@ -132,6 +134,8 @@ MODEL_REGISTRY: dict[str, type] = {
     "CaseNote": CaseNote,
     "CaseTimeline": CaseTimeline,
     "SimulationTest": SimulationTest,
+    #: ITDR identity (a directory account: Okta / Entra ID / AD), not a PySOAR login.
+    "Identity": IdentityProfile,
 }
 
 
@@ -643,6 +647,15 @@ class AgentToolRegistry:
 
     async def _targets_disable_user(self, args: dict[str, Any], registry: Any = None) -> list[Target]:
         return [await self._user_target(args.get("user_email") or "")]
+
+    async def _targets_identity_provider_action(self, args: dict[str, Any], registry: Any = None) -> list[Target]:  # noqa: ARG002
+        """The directory account (never a PySOAR login), labelled with its username."""
+        identity_id = str(args.get("identity_id") or "")
+        identity = await self._scoped_get("Identity", identity_id) if identity_id else None
+        if identity is None:
+            return [Target(kind="other", value=identity_id, resolved_id=None, provenance="unknown")]
+        label = f"{identity.identity_provider or 'directory'}:{identity.username or identity.email or identity.id}"
+        return [Target(kind="other", value=label, resolved_id=identity.id, provenance="structured")]
 
     async def _targets_execute_playbook(self, args: dict[str, Any], registry: Any = None) -> list[Target]:
         targets = [await self._row_target("playbook", "Playbook", args.get("playbook_id"))]
@@ -1256,6 +1269,23 @@ class AgentToolRegistry:
             effects=WRITE, tier=Tier.DESTRUCTIVE, min_role=UserRole.ANALYST, models=("User",),
             handler=self._disable_user, category="action",
             effective_targets=self._targets_disable_user,
+        ))
+        self._register(ToolSpec(
+            name="identity_provider_action",
+            description=(
+                "Act on an ITDR identity's account in its identity provider (Okta / Entra ID) through the installed "
+                "integration: disable_account, enable_account, force_password_reset or revoke_sessions. Reports "
+                "status=awaiting_integration when no integration can act on the account (nothing is changed)."
+            ),
+            params={
+                "identity_id": _s("ITDR identity UUID", required=True, ref="Identity"),
+                "action": _s("Identity-provider action", required=True, enum=IDP_ACTIONS),
+                "reason": _s("Reason", required=True, max_length=2000),
+            },
+            effects=Effects(writes_org=True, external=True), tier=Tier.DESTRUCTIVE, min_role=UserRole.ANALYST,
+            models=("Identity",),
+            handler=self._identity_provider_action, category="action", returns_sensitive=True,
+            effective_targets=self._targets_identity_provider_action,
         ))
         self._register(ToolSpec(
             name="create_remediation_ticket",
@@ -2399,6 +2429,60 @@ class AgentToolRegistry:
         user.is_active = False
         await self.db.flush()
         return {"user_email": user.email, "user_id": user.id, "status": "disabled", "reason": reason}
+
+    async def _identity_provider_action(self, identity_id: str, action: str, reason: str) -> dict[str, Any]:
+        """Run ``action`` on the identity's directory account (Okta / Entra ID).
+
+        Delegates to :func:`src.itdr.directory.run_identity_action`, which picks
+        the installed integration, makes the provider calls and writes the audit
+        row. Only the directory result shape is returned (status, provider,
+        integration id, per-call path + HTTP status, audit row id): never a raw
+        provider response body or a credential. Unattended contexts (no human
+        actor) are refused; another tenant's identity reads as not found.
+        """
+        from src.itdr.directory import run_identity_action
+
+        identity = await self._scoped_get("Identity", identity_id)
+        if identity is None:
+            return {"error": "Identity not found in this organization", "status": "not_found", "identity_id": identity_id}
+        if action not in IDP_ACTIONS:
+            return {
+                "error": f"Unsupported identity action; supported: {', '.join(IDP_ACTIONS)}",
+                "status": "invalid_action", "identity_id": identity.id,
+            }
+        refused = {
+            "error": "Identity-provider actions require a human actor (an interactive user or an approver)",
+            "status": "refused", "identity_id": identity.id, "action": action,
+        }
+        if not self.ctx.actor_user_id:
+            return refused
+        audit_q = self._scoped(select(AuditLog.id), AuditLog).where(
+            AuditLog.resource_type == "identity_profile",
+            AuditLog.resource_id == identity.id,
+            AuditLog.action == f"itdr_identity_{action}",
+        )
+        audits_before = set((await self.db.execute(audit_q)).scalars().all())
+        try:
+            result = await run_identity_action(
+                self.db, self.ctx.org_id, identity, action, actor_user_id=self.ctx.actor_user_id, reason=reason,
+            )
+        except PermissionError:
+            return refused
+        new_audits = sorted(set((await self.db.execute(audit_q)).scalars().all()) - audits_before)
+        out: dict[str, Any] = {
+            key: result.get(key)
+            for key in (
+                "action", "identity_id", "username", "status", "provider", "integration_id",
+                "detail", "missing_dependency", "error",
+            )
+        }
+        out["steps"] = [
+            {"call": step.get("call"), "http_status": step.get("http_status")}
+            for step in (result.get("steps") or []) if isinstance(step, dict)
+        ]
+        out["audit_log_id"] = new_audits[0] if len(new_audits) == 1 else None
+        out["reason"] = reason
+        return out
 
     async def _create_remediation_ticket(
         self, title: str, priority: str = "medium", description: str = "", incident_id: Optional[str] = None,

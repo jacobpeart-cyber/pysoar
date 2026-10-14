@@ -38,6 +38,7 @@ from src.exposure.models import RemediationTicket
 from src.hunting.models import HuntFinding, HuntHypothesis, HuntSession
 from src.integrations.models import InstalledIntegration
 from src.intel.models import ThreatActor, ThreatCampaign, ThreatIndicator
+from src.itdr.models import IdentityProfile
 from src.models.alert import Alert
 from src.models.asset import Asset
 from src.models.audit import AuditLog
@@ -351,6 +352,12 @@ async def _seed_case_timeline(db, org, tag, rows):
     return t
 
 
+async def _seed_identity(db, org, tag, rows):  # noqa: ARG001
+    i = IdentityProfile(organization_id=org, user_id=f"{tag}-idp-uid", username=f"{tag}-identity", email=f"{tag}@idp.example.test", identity_provider="okta")
+    db.add(i)
+    return i
+
+
 #: Dependency-ordered seeders, one per registry model.
 SEEDERS: dict[str, Seeder] = {
     "User": _seed_user,
@@ -395,6 +402,7 @@ SEEDERS: dict[str, Seeder] = {
     "AuditLog": _seed_audit_log,
     "CaseNote": _seed_case_note,
     "CaseTimeline": _seed_case_timeline,
+    "Identity": _seed_identity,
 }
 
 
