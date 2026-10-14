@@ -322,6 +322,22 @@ class DashboardStatsResponse(BaseModel):
     security_trends: Dict[str, List[float]]  # Score trend over time
 
 
+class TacticPostureItem(BaseModel):
+    """Detection posture for a single MITRE tactic, computed from runs."""
+    tactic: str = ""
+    status: str = "not_assessed"  # "assessed" | "not_assessed"
+    tests_total: int = 0
+    tests_detected: int = 0
+    detection_rate: Optional[float] = None  # None when not_assessed
+
+
+class TacticPostureResponse(BaseModel):
+    """Per-tactic posture across the organisation's completed simulations."""
+    tactics: List[TacticPostureItem]
+    assessed_tactics: int = 0
+    not_assessed_tactics: int = 0
+
+
 class SimulationApprovalRequest(BaseModel):
     """Request to approve a production simulation."""
 

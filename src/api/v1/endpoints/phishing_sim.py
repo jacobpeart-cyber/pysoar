@@ -11,14 +11,22 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import RedirectResponse, Response
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, get_current_active_user, require_role
 from src.core.database import get_db
 from src.core.logging import get_logger
+from src.core.rate_limiter import _limiter
 from src.models.user import User, UserRole
+from src.phishing_sim.tracking import (
+    TRANSPARENT_GIF,
+    generate_tracking_token,
+    public_base_url,
+    tracking_urls,
+)
 from src.phishing_sim.models import (
     CampaignEvent,
     PhishingCampaign,
@@ -624,7 +632,10 @@ async def list_campaigns(
     if campaign_type:
         query = query.where(PhishingCampaign.campaign_type == campaign_type)
 
-    query = query.offset(skip).limit(limit)
+    # Newest first so "latest campaign" views are deterministic (the query
+    # previously had no ORDER BY, so the funnel's "latest" was whatever row
+    # Postgres returned first).
+    query = query.order_by(PhishingCampaign.created_at.desc()).offset(skip).limit(limit)
     result = await db.execute(query)
     campaigns = result.scalars().all()
 
@@ -870,6 +881,7 @@ async def launch_campaign(
             recipient_department=m.get("department") or target_group.department,
             status=target_status,
             tracking_id=str(uuid_mod.uuid4()),
+            tracking_token=generate_tracking_token(),
             organization_id=org_id,
         )
         db.add(pt)
@@ -1197,88 +1209,86 @@ async def get_campaign_results(
 # CAMPAIGN EVENT ENDPOINTS
 # ============================================================================
 
+# Counter field each event type increments on the campaign row.
+_EVENT_COUNTER_MAP = {
+    "email_sent": "emails_sent",
+    "email_delivered": "emails_sent",
+    "email_opened": "emails_opened",
+    "link_clicked": "links_clicked",
+    "credential_submitted": "credentials_submitted",
+    "attachment_opened": "attachments_opened",
+    "reported_as_phishing": "reported_count",
+}
+_FAILURE_EVENTS = {"link_clicked", "credential_submitted", "attachment_opened"}
+_POSITIVE_EVENTS = {"reported_as_phishing"}
 
-@router.post(
-    "/campaigns/{campaign_id}/events",
-    response_model=CampaignEventResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-async def record_event(
-    campaign_id: UUID,
-    request: CampaignEventCreateRequest,
-    db: DatabaseSession,
-    current_user: AnalystUser,
-    org_id: OrganizationId,
-):
-    """Record a campaign event (email open, link click, credential submission, etc.)."""
-    # Verify campaign exists
-    campaign_result = await db.execute(
-        select(PhishingCampaign).where(
-            PhishingCampaign.id == str(campaign_id),
-            PhishingCampaign.organization_id == org_id,
-        )
-    )
-    campaign = campaign_result.scalar_one_or_none()
+# Public tracking rate limit: a recipient's mail client may fetch the pixel a
+# few times, but a burst per (token, IP) is throttled so a scanned token
+# cannot flood events. Returning the same response when throttled keeps it
+# from becoming an enumeration oracle.
+_TRACK_RATE_MAX = 30
+_TRACK_RATE_WINDOW = 60
 
-    if not campaign:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Campaign not found",
-        )
 
+async def _ingest_campaign_event(
+    db: AsyncSession,
+    campaign: PhishingCampaign,
+    *,
+    target_email: str,
+    target_name: str | None,
+    event_type: str,
+    org_id: str,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+    geo_location: dict[str, Any] | None = None,
+    device_type: str | None = None,
+    time_to_action_seconds: int | None = None,
+) -> CampaignEvent:
+    """Record one campaign event and roll it into counters + awareness.
+
+    The single code path for both the authenticated analyst route and the
+    public tracking endpoints, so a hand-entered event and a real recipient
+    open update the same rows the same way. No fake data: every call writes a
+    real CampaignEvent and only moves awareness on real failure/report events.
+    """
     event = CampaignEvent(
         id=str(uuid_mod.uuid4()),
-        campaign_id=str(campaign_id),
-        target_email=request.target_email,
-        target_name=request.target_name,
-        event_type=request.event_type,
+        campaign_id=str(campaign.id),
+        target_email=target_email,
+        target_name=target_name,
+        event_type=event_type,
         event_timestamp=datetime.now(timezone.utc),
-        ip_address=request.ip_address,
-        user_agent=request.user_agent,
-        geo_location=request.geo_location,
-        device_type=request.device_type,
-        time_to_action_seconds=request.time_to_action_seconds,
+        ip_address=ip_address,
+        user_agent=user_agent,
+        geo_location=geo_location,
+        device_type=device_type,
+        time_to_action_seconds=time_to_action_seconds,
         organization_id=org_id,
     )
-
     db.add(event)
 
-    # Update campaign counters based on event type
-    event_counter_map = {
-        "email_sent": "emails_sent",
-        "email_delivered": "emails_sent",
-        "email_opened": "emails_opened",
-        "link_clicked": "links_clicked",
-        "credential_submitted": "credentials_submitted",
-        "attachment_opened": "attachments_opened",
-        "reported_as_phishing": "reported_count",
-    }
-    counter_field = event_counter_map.get(request.event_type)
+    counter_field = _EVENT_COUNTER_MAP.get(event_type)
     if counter_field:
-        current_val = getattr(campaign, counter_field, 0)
-        setattr(campaign, counter_field, current_val + 1)
+        setattr(campaign, counter_field, getattr(campaign, counter_field, 0) + 1)
 
     await db.flush()
 
-    # --- Auto-update Security Awareness Score on failure/report events ---
-    _failure_events = {"link_clicked", "credential_submitted", "attachment_opened"}
-    _positive_events = {"reported_as_phishing"}
-
-    if request.event_type in _failure_events | _positive_events:
+    if event_type in _FAILURE_EVENTS | _POSITIVE_EVENTS:
         try:
-            score_result = await db.execute(
-                select(SecurityAwarenessScore).where(
-                    SecurityAwarenessScore.user_email == request.target_email,
+            awareness = (
+                await db.execute(
+                    select(SecurityAwarenessScore).where(
+                        SecurityAwarenessScore.user_email == target_email,
+                        SecurityAwarenessScore.organization_id == org_id,
+                    )
                 )
-            )
-            awareness = score_result.scalar_one_or_none()
+            ).scalar_one_or_none()
 
             if awareness is None:
-                # Create a new score record for this user
                 awareness = SecurityAwarenessScore(
                     id=str(uuid_mod.uuid4()),
-                    user_email=request.target_email,
-                    user_name=request.target_name or request.target_email,
+                    user_email=target_email,
+                    user_name=target_name or target_email,
                     overall_score=50,
                     phishing_score=50,
                     training_completion_rate=0.0,
@@ -1293,28 +1303,27 @@ async def record_event(
                 )
                 db.add(awareness)
 
-            if request.event_type == "link_clicked":
+            if event_type == "link_clicked":
                 awareness.times_clicked = (awareness.times_clicked or 0) + 1
                 awareness.overall_score = max(0, (awareness.overall_score or 50) - 10)
                 awareness.phishing_score = max(0, (awareness.phishing_score or 50) - 10)
                 awareness.last_failed_campaign = datetime.now(timezone.utc)
-            elif request.event_type == "credential_submitted":
+            elif event_type == "credential_submitted":
                 awareness.times_submitted_credentials = (awareness.times_submitted_credentials or 0) + 1
                 awareness.times_clicked = (awareness.times_clicked or 0) + 1
                 awareness.overall_score = max(0, (awareness.overall_score or 50) - 20)
                 awareness.phishing_score = max(0, (awareness.phishing_score or 50) - 20)
                 awareness.last_failed_campaign = datetime.now(timezone.utc)
-            elif request.event_type == "attachment_opened":
+            elif event_type == "attachment_opened":
                 awareness.times_clicked = (awareness.times_clicked or 0) + 1
                 awareness.overall_score = max(0, (awareness.overall_score or 50) - 15)
                 awareness.phishing_score = max(0, (awareness.phishing_score or 50) - 15)
                 awareness.last_failed_campaign = datetime.now(timezone.utc)
-            elif request.event_type == "reported_as_phishing":
+            elif event_type == "reported_as_phishing":
                 awareness.times_reported = (awareness.times_reported or 0) + 1
                 awareness.overall_score = min(100, (awareness.overall_score or 50) + 5)
                 awareness.phishing_score = min(100, (awareness.phishing_score or 50) + 5)
 
-            # Recalculate risk category based on overall score
             score = awareness.overall_score or 0
             if score >= 80:
                 awareness.risk_category = "champion"
@@ -1327,44 +1336,186 @@ async def record_event(
             else:
                 awareness.risk_category = "critical_risk"
 
-            # Auto-assign training when score drops below 50
-            if score < 50 and request.event_type in _failure_events:
+            if score < 50 and event_type in _FAILURE_EVENTS:
                 existing_assignments = awareness.training_assignments or []
-                # Avoid duplicate pending assignments
                 has_pending = any(
                     a.get("status") == "pending" for a in existing_assignments
                 )
                 if not has_pending:
-                    new_assignment = {
+                    awareness.training_assignments = existing_assignments + [{
                         "module": "phishing_awareness_remedial",
                         "status": "pending",
                         "assigned_at": datetime.now(timezone.utc).isoformat(),
-                        "reason": f"Score dropped to {score} after {request.event_type}",
-                    }
-                    awareness.training_assignments = existing_assignments + [new_assignment]
+                        "reason": f"Score dropped to {score} after {event_type}",
+                    }]
                     logger.info(
-                        f"Auto-assigned remedial training to {request.target_email} "
-                        f"(score={score})"
+                        f"Auto-assigned remedial training to {target_email} (score={score})"
                     )
 
             await db.flush()
+        except Exception as exc:  # noqa: BLE001 — awareness update must not fail the event write
+            logger.error(f"Failed to update awareness score for {target_email}: {exc}")
 
-            logger.info(
-                f"Updated awareness score for {request.target_email}: "
-                f"overall_score={awareness.overall_score}, "
-                f"risk_category={awareness.risk_category}"
+    return event
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+async def _resolve_target_by_token(
+    db: AsyncSession, token: str,
+) -> tuple[PhishingTarget | None, PhishingCampaign | None]:
+    """Resolve a tracking token to its target + campaign, or (None, None).
+
+    Never raises for an unknown token: the public endpoints must behave
+    identically for a valid and an invalid token so the token space cannot be
+    probed.
+    """
+    target = (
+        await db.execute(
+            select(PhishingTarget).where(PhishingTarget.tracking_token == token)
+        )
+    ).scalar_one_or_none()
+    if target is None:
+        return None, None
+    campaign = (
+        await db.execute(
+            select(PhishingCampaign).where(PhishingCampaign.id == target.campaign_id)
+        )
+    ).scalar_one_or_none()
+    return target, campaign
+
+
+def _track_allowed(token: str, request: Request) -> bool:
+    key = f"phish-track:{token}:{_client_ip(request)}"
+    allowed, _ = _limiter.check_rate_limit(key, _TRACK_RATE_MAX, _TRACK_RATE_WINDOW)
+    return allowed
+
+
+# ---------------------------------------------------------------------------
+# Public tracking endpoints (no authentication; keyed by unguessable token)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/t/{token}.gif")
+async def track_open_pixel(token: str, request: Request, db: DatabaseSession) -> Response:
+    """1x1 tracking pixel. Records an ``email_opened`` event for the token.
+
+    Always returns the transparent GIF — for a valid token, an invalid token,
+    or a throttled request — so it is not an enumeration oracle.
+    """
+    pixel = Response(content=TRANSPARENT_GIF, media_type="image/gif")
+    pixel.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    if not _track_allowed(token, request):
+        return pixel
+    target, campaign = await _resolve_target_by_token(db, token)
+    if target and campaign:
+        await _ingest_campaign_event(
+            db, campaign,
+            target_email=target.recipient_email,
+            target_name=target.recipient_name,
+            event_type="email_opened",
+            org_id=target.organization_id,
+            ip_address=_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+        )
+        await db.commit()
+    return pixel
+
+
+@router.get("/c/{token}")
+async def track_click_redirect(token: str, request: Request, db: DatabaseSession) -> RedirectResponse:
+    """Record a ``link_clicked`` event, then redirect the recipient.
+
+    Campaign templates store only ``landing_page_html`` (no external landing
+    URL), so the redirect always goes to ``{PYSOAR_PUBLIC_URL}/phishing-awareness``;
+    valid, unknown and throttled tokens receive the same response.
+    """
+    safe_default = f"{public_base_url()}/phishing-awareness"
+    destination = safe_default
+    if _track_allowed(token, request):
+        target, campaign = await _resolve_target_by_token(db, token)
+        if target and campaign:
+            await _ingest_campaign_event(
+                db, campaign,
+                target_email=target.recipient_email,
+                target_name=target.recipient_name,
+                event_type="link_clicked",
+                org_id=target.organization_id,
+                ip_address=_client_ip(request),
+                user_agent=request.headers.get("user-agent"),
             )
-        except Exception as exc:
-            logger.error(
-                f"Failed to update awareness score for {request.target_email}: {exc}"
+            await db.commit()
+    return RedirectResponse(url=destination, status_code=status.HTTP_302_FOUND)
+
+
+@router.post("/r/{token}", status_code=status.HTTP_204_NO_CONTENT)
+async def track_report(token: str, request: Request, db: DatabaseSession) -> Response:
+    """Record a ``reported_as_phishing`` event (recipient used the report button).
+
+    Returns 204 for valid, invalid and throttled tokens alike (no oracle).
+    """
+    if _track_allowed(token, request):
+        target, campaign = await _resolve_target_by_token(db, token)
+        if target and campaign:
+            await _ingest_campaign_event(
+                db, campaign,
+                target_email=target.recipient_email,
+                target_name=target.recipient_name,
+                event_type="reported_as_phishing",
+                org_id=target.organization_id,
+                ip_address=_client_ip(request),
+                user_agent=request.headers.get("user-agent"),
             )
+            await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post(
+    "/campaigns/{campaign_id}/events",
+    response_model=CampaignEventResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def record_event(
+    campaign_id: UUID,
+    request: CampaignEventCreateRequest,
+    db: DatabaseSession,
+    current_user: AnalystUser,
+    org_id: OrganizationId,
+):
+    """Record a campaign event (email open, link click, credential submission, etc.)."""
+    campaign = (
+        await db.execute(
+            select(PhishingCampaign).where(
+                PhishingCampaign.id == str(campaign_id),
+                PhishingCampaign.organization_id == org_id,
+            )
+        )
+    ).scalar_one_or_none()
+
+    if not campaign:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Campaign not found",
+        )
+
+    event = await _ingest_campaign_event(
+        db, campaign,
+        target_email=request.target_email,
+        target_name=request.target_name,
+        event_type=request.event_type,
+        org_id=org_id,
+        ip_address=request.ip_address,
+        user_agent=request.user_agent,
+        geo_location=request.geo_location,
+        device_type=request.device_type,
+        time_to_action_seconds=request.time_to_action_seconds,
+    )
 
     logger.info(
         f"Recorded event: {request.event_type}",
-        extra={
-            "campaign_id": str(campaign_id),
-            "email": request.target_email,
-        },
+        extra={"campaign_id": str(campaign_id), "email": request.target_email},
     )
 
     return event
@@ -1468,6 +1619,31 @@ async def list_awareness_scores(
 
 
 @router.get(
+    "/awareness-scores/high-risk",
+    response_model=list[SecurityAwarenessScoreResponse],
+)
+async def get_high_risk_users(
+    db: DatabaseSession,
+    org_id: OrganizationId,
+    threshold: int = Query(40, ge=0, le=100),
+):
+    """Identify users with awareness scores below threshold.
+
+    Registered before ``/awareness-scores/{user_email}`` so the literal
+    "high-risk" segment is not captured as an email address (which 404'd).
+    """
+    result = await db.execute(
+        select(SecurityAwarenessScore)
+        .where(
+            SecurityAwarenessScore.overall_score < threshold,
+            SecurityAwarenessScore.organization_id == org_id,
+        )
+        .order_by(SecurityAwarenessScore.overall_score)
+    )
+    return result.scalars().all()
+
+
+@router.get(
     "/awareness-scores/{user_email}",
     response_model=SecurityAwarenessScoreResponse,
 )
@@ -1500,24 +1676,105 @@ async def get_user_awareness_score(
 )
 async def calculate_user_score(
     user_email: str,
-    request: UserScoreCalculationRequest,
     db: DatabaseSession,
     current_user: AnalystUser,
     org_id: OrganizationId,
+    request: UserScoreCalculationRequest | None = None,
     user_name: str = Query(...),
     department: str | None = Query(None),
 ):
-    """Calculate or recalculate user awareness score.
+    """Recalculate a user's awareness score from their recorded event history.
 
-    Not implemented: the previous version "calculated" the score from counts
-    supplied in the request body (falling back to an invented 50) rather than
-    from the user's recorded CampaignEvent history, so it let a caller write
-    any score they liked.
+    ``request`` is accepted but ignored: the score is derived from the user's
+    recorded ``CampaignEvent`` rows, not from caller-supplied counts.
+
+    The score is derived from this user's own ``CampaignEvent`` rows in the
+    organisation — not from counts supplied by the caller. Starting from 100,
+    the clicked / credential-submitted rates subtract and the reported rate
+    adds, so the number always reflects real recorded behaviour. A user with
+    no recorded events yet 404s rather than inventing a baseline.
     """
-    raise _not_implemented(
-        "awareness scores are not recalculated from campaign event history; "
-        "this route only echoed caller-supplied counts",
+    counts = dict(
+        (
+            await db.execute(
+                select(CampaignEvent.event_type, func.count(CampaignEvent.id))
+                .where(
+                    CampaignEvent.target_email == user_email,
+                    CampaignEvent.organization_id == org_id,
+                )
+                .group_by(CampaignEvent.event_type)
+            )
+        ).all()
     )
+    if not counts:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No recorded events for this user; cannot derive a score",
+        )
+
+    sent = int(counts.get("email_sent", 0) or counts.get("email_delivered", 0) or 0)
+    clicked = int(counts.get("link_clicked", 0))
+    submitted = int(counts.get("credential_submitted", 0))
+    reported = int(counts.get("reported_as_phishing", 0))
+
+    score = 100
+    if sent > 0:
+        score -= int((clicked / sent) * 40)
+        score -= int((submitted / sent) * 30)
+        score += int((reported / sent) * 20)
+    else:
+        # No delivery recorded but interactions exist: penalise per interaction.
+        score -= clicked * 10 + submitted * 20
+        score += reported * 5
+    score = max(0, min(100, score))
+
+    if score >= 80:
+        risk = "champion"
+    elif score >= 60:
+        risk = "low_risk"
+    elif score >= 40:
+        risk = "moderate_risk"
+    elif score >= 20:
+        risk = "high_risk"
+    else:
+        risk = "critical_risk"
+
+    awareness = (
+        await db.execute(
+            select(SecurityAwarenessScore).where(
+                SecurityAwarenessScore.user_email == user_email,
+                SecurityAwarenessScore.organization_id == org_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if awareness is None:
+        awareness = SecurityAwarenessScore(
+            id=str(uuid_mod.uuid4()),
+            user_email=user_email,
+            user_name=user_name,
+            department=department,
+            training_completion_rate=0.0,
+            campaigns_participated=0,
+            training_assignments=[],
+            certifications=[],
+            organization_id=org_id,
+        )
+        db.add(awareness)
+    awareness.overall_score = score
+    awareness.phishing_score = score
+    awareness.times_clicked = clicked
+    awareness.times_submitted_credentials = submitted
+    awareness.times_reported = reported
+    awareness.risk_category = risk
+    if department:
+        awareness.department = department
+    await db.flush()
+
+    logger.info(
+        f"Recalculated awareness score for {user_email} from events",
+        extra={"score": score, "risk": risk, "user_id": current_user.id},
+    )
+    return awareness
 
 
 @router.get(
@@ -1567,29 +1824,6 @@ async def get_department_scores(
         "max_score": float(max_score),
         "risk_distribution": risk_dist,
     }
-
-
-@router.get(
-    "/awareness-scores/high-risk",
-    response_model=list[SecurityAwarenessScoreResponse],
-)
-async def get_high_risk_users(
-    db: DatabaseSession,
-    org_id: OrganizationId,
-    threshold: int = Query(40, ge=0, le=100),
-):
-    """Identify users with awareness scores below threshold."""
-    result = await db.execute(
-        select(SecurityAwarenessScore)
-        .where(
-            SecurityAwarenessScore.overall_score < threshold,
-            SecurityAwarenessScore.organization_id == org_id,
-        )
-        .order_by(SecurityAwarenessScore.overall_score)
-    )
-    high_risk = result.scalars().all()
-
-    return high_risk
 
 
 # ============================================================================
@@ -1646,19 +1880,20 @@ async def list_training_modules(
     db: DatabaseSession,
     org_id: OrganizationId,
 ):
-    """Get available training modules."""
-    modules = [
-        TrainingModuleResponse(
-            id=key,
-            title=mod["title"],
-            description=mod["description"],
-            duration_minutes=mod["duration_minutes"],
-            modules=mod["modules"],
-        )
-        for key, mod in TRAINING_MODULES.items()
-    ]
+    """Training catalogue — not implemented (honest 501).
 
-    return modules
+    Previously this returned a hardcoded dict of slug titles with no stored
+    content, no per-tenant backing and no completion data, served without
+    authentication. There is no training-content table to back a real
+    catalogue, so the listing is an honest 501 rather than fake rows. Named
+    module assignment / completion / certification still operate on the real
+    SecurityAwarenessScore rows (admins assign a module name, users complete
+    it, and a certificate is only issued for a completed module).
+    """
+    raise _not_implemented(
+        "training catalogue is not backed by stored content; assign/track/"
+        "certify operate on named modules recorded against the user instead",
+    )
 
 
 @router.post("/training/{user_email}/assign", response_model=dict[str, Any])

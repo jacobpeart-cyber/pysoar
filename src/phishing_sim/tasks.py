@@ -172,14 +172,25 @@ def send_phishing_email(self, target_id: str, organization_id: str):
                     template_text = tmpl.text_body or tmpl.html_body or template_text
                     template_subject = tmpl.subject_line or template_subject
 
-            def _render(body: str | None) -> str | None:
+            from src.phishing_sim.tracking import render_body
+
+            # Each recipient has an unguessable token; the tracking URLs
+            # (open pixel, click redirect, report) are rendered into the body
+            # so opens/clicks/reports are attributed to this recipient.
+            token = target.tracking_token
+            if not token:
+                from src.phishing_sim.tracking import generate_tracking_token
+                token = generate_tracking_token()
+                target.tracking_token = token
+
+            def _render(body: str | None, is_html: bool = False) -> str | None:
                 if body is None:
                     return None
-                return (
+                personalised = (
                     body.replace("{{name}}", target.recipient_name or "")
                         .replace("{{email}}", target.recipient_email)
-                        .replace("{{tracking_id}}", target.tracking_id)
                 )
+                return render_body(personalised, token, is_html=is_html)
 
             # Tenant SMTP: the campaign's organisation settings, falling back
             # to the platform relay (EmailService.for_organization).
@@ -195,7 +206,7 @@ def send_phishing_email(self, target_id: str, organization_id: str):
                     to=[target.recipient_email],
                     subject=_render(template_subject) or template_subject,
                     body=_render(template_text) or "",
-                    html_body=_render(template_html),
+                    html_body=_render(template_html, is_html=True),
                 )
             except Exception as exc:  # noqa: BLE001
                 target.status = "failed"

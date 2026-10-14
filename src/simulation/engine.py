@@ -340,11 +340,18 @@ class SimulationOrchestrator:
                 executor=test_cmd.get("executor", "sh"),
             )
 
+            agent_errored = False
             if agent_result is not None:
                 test.output = agent_result.stdout or ""
                 if agent_result.stderr:
                     test.error_output = agent_result.stderr
-                test.status = "passed" if agent_result.status == "success" else "error"
+                # The agent's reported status drives the test status: a
+                # failed command is an errored test, never silently a pass.
+                if agent_result.status == "success":
+                    test.status = "passed"
+                else:
+                    test.status = "error"
+                    agent_errored = True
                 # Real-execution stamps for audit + UI.
                 test.detection_details = {
                     **(test.detection_details or {}),
@@ -369,16 +376,23 @@ class SimulationOrchestrator:
                     "execution_mode": "coverage_only",
                 }
 
-            # Deterministic detection lookup against active detection rules
-            detected = await self._check_detection(test, technique)
-            test.was_detected = detected
+            if agent_errored:
+                # The command result drives the status: the atomic test did
+                # not run on the endpoint, so we neither score detection
+                # against a technique that never executed nor overwrite the
+                # error with passed/blocked.
+                test.was_detected = None
+            else:
+                # Deterministic detection lookup against active detection rules
+                detected = await self._check_detection(test, technique)
+                test.was_detected = detected
 
-            # Run cleanup if test passed and cleanup command exists
-            if cleanup:
-                cleanup_success = await self._run_cleanup(test, cleanup)
-                test.cleanup_status = "completed" if cleanup_success else "failed"
+                # Run cleanup if test passed and cleanup command exists
+                if cleanup:
+                    cleanup_success = await self._run_cleanup(test, cleanup)
+                    test.cleanup_status = "completed" if cleanup_success else "failed"
 
-            test.status = "passed" if detected else "blocked"
+                test.status = "passed" if detected else "blocked"
 
         except Exception as e:
             test.status = "error"
@@ -531,12 +545,43 @@ class SimulationOrchestrator:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
 
+    @staticmethod
+    def _host_token(value: Optional[str]) -> Optional[str]:
+        """Normalise a hostname for comparison (lowercase, short name)."""
+        if not value:
+            return None
+        return str(value).strip().lower().split(".")[0] or None
+
+    @classmethod
+    def _log_matches_host(cls, log, hostname: str) -> bool:
+        """True if an ingested log entry belongs to ``hostname``."""
+        want = cls._host_token(hostname)
+        if want is None:
+            return True
+        for candidate in (getattr(log, "hostname", None), getattr(log, "source_name", None)):
+            if cls._host_token(candidate) == want:
+                return True
+        return False
+
+    @classmethod
+    def _correlation_matches_host(cls, event, hostname: str) -> bool:
+        """True if a correlation event references ``hostname``."""
+        want = cls._host_token(hostname)
+        if want is None:
+            return True
+        try:
+            hosts = json.loads(event.hostnames or "[]")
+        except (ValueError, TypeError):
+            return False
+        return any(cls._host_token(h) == want for h in hosts)
+
     async def _find_fired_evidence(
         self,
         mitre_id: str,
         rule_ids: list[str],
         window_start: datetime,
         organization_id: str,
+        hostname: Optional[str] = None,
     ) -> Optional[dict]:
         """Find the earliest evidence that detection actually FIRED in the
         execution window: a rule match recorded on an ingested log entry,
@@ -568,6 +613,11 @@ class SimulationOrchestrator:
                 .limit(500)
             )
             for log in (await self.session.execute(stmt)).scalars().all():
+                # Host correlation: when the run targeted a known host, only
+                # evidence recorded on that host counts, so a rule firing on a
+                # different endpoint cannot credit this test.
+                if hostname and not self._log_matches_host(log, hostname):
+                    continue
                 fired_at = self._parse_ts(log.received_at) or self._parse_ts(log.timestamp)
                 if fired_at and fired_at >= search_start:
                     hits.append((fired_at, "log_rule_match", log.id))
@@ -589,6 +639,8 @@ class SimulationOrchestrator:
             except (ValueError, TypeError):
                 continue
             if mitre_id not in techniques:
+                continue
+            if hostname and not self._correlation_matches_host(event, hostname):
                 continue
             fired_at = self._parse_ts(event.created_at)
             if fired_at and fired_at >= search_start:
@@ -663,8 +715,13 @@ class SimulationOrchestrator:
 
         if execution_mode == "real":
             window_start = self._parse_ts(test.started_at) or utc_now()
+            # The host the technique actually ran on (if known): detection
+            # evidence must correlate to that host, not merely the tenant.
+            scope = simulation.scope if isinstance(simulation.scope, dict) else {}
+            run_host = scope.get("actual_target_host") or scope.get("target_host")
             evidence = await self._find_fired_evidence(
                 mitre_id, [r.id for r in matching_rules], window_start, org_id,
+                hostname=run_host,
             )
             if evidence:
                 latency = max(0, int((evidence["fired_at"] - window_start).total_seconds()))

@@ -52,6 +52,8 @@ from src.schemas.simulation import (
     AdversaryEmulationPlanResponse,
     AttackChainItem,
     DashboardStatsResponse,
+    TacticPostureItem,
+    TacticPostureResponse,
 )
 from src.simulation.tasks import (
     execute_simulation,
@@ -911,6 +913,85 @@ async def get_current_posture(
     except Exception as e:
         logger.error(f"Error getting posture: {str(e)}")
         raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
+
+
+@router.get("/posture/by-tactic", response_model=TacticPostureResponse)
+async def get_posture_by_tactic(
+    org_id: OrganizationId,
+    session: DatabaseSession = None,
+) -> TacticPostureResponse:
+    """Per-tactic detection posture computed from this org's completed runs.
+
+    Every MITRE tactic present in the technique library is listed. For each,
+    the detection rate is the share of this organisation's executed
+    simulation tests (completed runs) for techniques in that tactic that the
+    detection pipeline caught. Tactics with no executed test are reported
+    ``not_assessed`` with ``detection_rate=None`` — never an invented 0%.
+    """
+    from sqlalchemy import func, select
+
+    from src.simulation.models import SimulationTest
+
+    # Universe of tactics = every tactic in the technique catalogue.
+    tactics_stmt = select(AttackTechnique.tactic).distinct()
+    all_tactics = [t for (t,) in (await session.execute(tactics_stmt)).all() if t]
+
+    # Executed tests per tactic for this org's completed simulations.
+    detected_count = func.count(SimulationTest.id).filter(
+        SimulationTest.was_detected.is_(True),
+    )
+    rows_stmt = (
+        select(
+            AttackTechnique.tactic,
+            func.count(SimulationTest.id).label("total"),
+            detected_count.label("detected"),
+        )
+        .select_from(SimulationTest)
+        .join(AttackTechnique, SimulationTest.technique_id == AttackTechnique.id)
+        .join(AttackSimulation, SimulationTest.simulation_id == AttackSimulation.id)
+        .where(
+            AttackSimulation.status == "completed",
+            AttackSimulation.organization_id == org_id,
+        )
+        .group_by(AttackTechnique.tactic)
+    )
+    rows = (await session.execute(rows_stmt)).all()
+    counts = {
+        tactic: (int(total or 0), int(detected or 0))
+        for tactic, total, detected in rows
+    }
+
+    items: list[TacticPostureItem] = []
+    assessed = 0
+    for tactic in sorted(all_tactics):
+        total, detected = counts.get(tactic, (0, 0))
+        if total > 0:
+            assessed += 1
+            items.append(
+                TacticPostureItem(
+                    tactic=tactic,
+                    status="assessed",
+                    tests_total=total,
+                    tests_detected=detected,
+                    detection_rate=round((detected / total) * 100.0, 1),
+                ),
+            )
+        else:
+            items.append(
+                TacticPostureItem(
+                    tactic=tactic,
+                    status="not_assessed",
+                    tests_total=0,
+                    tests_detected=0,
+                    detection_rate=None,
+                ),
+            )
+
+    return TacticPostureResponse(
+        tactics=items,
+        assessed_tactics=assessed,
+        not_assessed_tactics=len(items) - assessed,
+    )
 
 
 @router.get("/posture/gaps", response_model=GapAnalysisResponse)

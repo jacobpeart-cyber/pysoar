@@ -135,6 +135,13 @@ class PhishingTarget(BaseModel):
     tracking_id: Mapped[str] = mapped_column(
         String(36), nullable=False, unique=True, index=True
     )
+    # Unguessable per-recipient token (secrets.token_urlsafe) behind the
+    # public open/click/report endpoints. Distinct from tracking_id (a UUID
+    # kept for backward compatibility); events are keyed on this token so a
+    # recipient id space can never be scanned. See src/phishing_sim/tracking.py.
+    tracking_token: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, unique=True, index=True,
+    )
     sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     celery_task_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
