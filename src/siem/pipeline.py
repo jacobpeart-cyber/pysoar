@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-from sqlalchemy import or_, update
+from sqlalchemy import case, func, or_, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,7 +19,13 @@ from src.siem.correlation import CorrelationResult
 from src.siem.parser import LogParserManager
 from src.siem.normalizer import LogNormalizer
 from src.siem.engine_manager import get_rule_engine, get_correlation_engine, ensure_rules_loaded
-from src.siem.models import CorrelationEvent, CorrelationStatus, DetectionRule, LogEntry
+from src.siem.models import (
+    CorrelationEvent,
+    CorrelationStatus,
+    DetectionRule,
+    LogEntry,
+    SIEMDataSource,
+)
 from src.models.alert import Alert
 
 logger = get_logger(__name__)
@@ -34,6 +40,70 @@ _VALID_SEVERITIES = {"critical", "high", "medium", "low", "informational", "info
 
 def _distinct_values(events: List[dict], field_name: str) -> List[str]:
     return sorted({str(e[field_name]) for e in events if e.get(field_name)})
+
+
+def _iso_event_time(timestamp: Optional[str], fallback: str) -> str:
+    """The log's event time as ISO 8601, or ``fallback`` (receive time) when unparseable."""
+    if timestamp:
+        try:
+            parsed = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+        except ValueError:
+            return fallback
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.isoformat()
+    return fallback
+
+
+async def record_data_source_event(
+    db: AsyncSession,
+    organization_id: Optional[str],
+    source_name: Optional[str],
+    received_at: datetime,
+) -> None:
+    """Bump the counters of the organisation's data source named ``source_name``.
+
+    A configured data source (``SIEMDataSource``) is matched to ingested logs
+    by name: a log whose ``source_name`` equals the data source's ``name`` in
+    the same organisation increments ``events_received`` (lifetime) and
+    ``events_today`` (reset on the first event of a new UTC day) and sets
+    ``last_event_at``. Logs that match no data source change nothing. Runs in
+    its own SAVEPOINT so a counter failure never loses the log.
+    """
+    if not organization_id or not source_name:
+        return
+    today = received_at.date().isoformat()
+    stmt = (
+        update(SIEMDataSource)
+        .where(
+            SIEMDataSource.organization_id == organization_id,
+            SIEMDataSource.name == source_name,
+        )
+        .values(
+            events_received=func.coalesce(SIEMDataSource.events_received, 0) + 1,
+            events_today=case(
+                (
+                    func.substr(SIEMDataSource.last_event_at, 1, 10) == today,
+                    func.coalesce(SIEMDataSource.events_today, 0) + 1,
+                ),
+                else_=1,
+            ),
+            last_event_at=received_at.isoformat(),
+            # Counter traffic is not a configuration change.
+            updated_at=SIEMDataSource.updated_at,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    try:
+        async with db.begin_nested():
+            await db.execute(stmt)
+    except SQLAlchemyError as exc:
+        logger.warning(
+            "Data source counter update failed",
+            organization_id=organization_id,
+            source_name=source_name,
+            error=str(exc),
+        )
 
 
 def build_correlation_event(
@@ -234,6 +304,9 @@ async def _persist_and_detect(
     """Steps 3-7 of ``process_log``; runs inside the caller's SAVEPOINT."""
     db.add(log_entry)
     await db.flush()
+    await record_data_source_event(
+        db, organization_id, log_entry.source_name, datetime.now(timezone.utc),
+    )
 
     # --- Step 4: Evaluate detection rules (this organisation's engine) ---
     await ensure_rules_loaded(db, organization_id)
@@ -322,6 +395,9 @@ async def _persist_and_detect(
                         .values(
                             match_count=DetectionRule.match_count + 1,
                             last_matched_at=datetime.now(timezone.utc).isoformat(),
+                            # A hit is not a definition change: keep updated_at
+                            # (engines reload when it moves).
+                            updated_at=DetectionRule.updated_at,
                         )
                         .execution_options(synchronize_session=False)
                     )
@@ -372,7 +448,7 @@ async def _persist_and_detect(
     # --- Step 6: Correlation (this organisation's buffers only) ---
     event_dict = {
         "event_id": log_entry.id,
-        "timestamp": log_entry.timestamp,
+        "timestamp": _iso_event_time(log_entry.timestamp, log_entry.received_at),
         "source_address": norm_dict.get("source_address", source_ip),
         "destination_address": norm_dict.get("destination_address"),
         "username": norm_dict.get("username"),

@@ -7,6 +7,40 @@ from typing import Any, Optional
 from src.schemas.base import DBModel
 from pydantic import BaseModel, Field, field_validator
 
+#: Hunt priority levels: 1 (most urgent) .. 5 and their labels.
+HUNT_PRIORITY_LABELS: dict[int, str] = {1: "critical", 2: "high", 3: "medium", 4: "low", 5: "info"}
+_PRIORITY_BY_LABEL = {label: level for level, label in HUNT_PRIORITY_LABELS.items()}
+_PRIORITY_BY_LABEL["informational"] = 5
+
+
+def normalize_hunt_priority(value: Any) -> int:
+    """A priority as its level 1..5 (int, numeric text or label); ValueError otherwise."""
+    if isinstance(value, bool):
+        raise ValueError("priority must be 1-5 or critical / high / medium / low / info")
+    if isinstance(value, int):
+        level = value
+    elif isinstance(value, str) and value.strip():
+        text = value.strip().lower()
+        if text in _PRIORITY_BY_LABEL:
+            return _PRIORITY_BY_LABEL[text]
+        try:
+            level = int(text)
+        except ValueError:
+            level = 0
+    else:
+        level = 0
+    if level not in HUNT_PRIORITY_LABELS:
+        raise ValueError(
+            f"invalid priority {value!r}: use 1-5 or critical / high / medium / low / info",
+        )
+    return level
+
+
+def hunt_priority_spellings(level: int) -> list[str]:
+    """Every stored spelling of a priority level (numeric text and label)."""
+    label = HUNT_PRIORITY_LABELS[level]
+    return [str(level), label, label.upper()]
+
 
 def _parse_json_list(v):
     """Parse JSON string to list, or return as-is if already a list"""
@@ -39,17 +73,11 @@ class HuntHypothesisBase(BaseModel):
     @field_validator("priority", mode="before")
     @classmethod
     def parse_priority(cls, v):
-        if isinstance(v, int):
-            return v
-        if isinstance(v, str):
-            mapping = {"CRITICAL": 1, "HIGH": 2, "MEDIUM": 3, "LOW": 4, "INFO": 5}
-            if v.upper() in mapping:
-                return mapping[v.upper()]
-            try:
-                return int(v)
-            except ValueError:
-                return 3
-        return 3
+        # Lenient for stored rows (responses): unknown values read as 3.
+        try:
+            return normalize_hunt_priority(v)
+        except ValueError:
+            return 3
 
     @field_validator("mitre_tactics", "mitre_techniques", "data_sources", "expected_evidence", "tags", mode="before")
     @classmethod
@@ -58,9 +86,14 @@ class HuntHypothesisBase(BaseModel):
 
 
 class HuntHypothesisCreate(HuntHypothesisBase):
-    """Schema for creating a hunt hypothesis"""
+    """Schema for creating a hunt hypothesis (priority typed: 1-5 or a label, else 422)"""
 
-    pass
+    @field_validator("priority", mode="before")
+    @classmethod
+    def parse_priority(cls, v):
+        if v is None:
+            return 3
+        return normalize_hunt_priority(v)
 
 
 class HuntHypothesisUpdate(BaseModel):
@@ -86,21 +119,10 @@ class HuntHypothesisUpdate(BaseModel):
     @field_validator("priority", mode="before")
     @classmethod
     def parse_priority(cls, v):
+        # Typed: 1-5 or a label; anything else is a 422, not a silent 3.
         if v is None:
             return None
-        if isinstance(v, int):
-            if 1 <= v <= 5:
-                return v
-            return 3
-        if isinstance(v, str):
-            mapping = {"CRITICAL": 1, "HIGH": 2, "MEDIUM": 3, "LOW": 4, "INFO": 5}
-            if v.upper() in mapping:
-                return mapping[v.upper()]
-            try:
-                return int(v)
-            except ValueError:
-                return 3
-        return 3
+        return normalize_hunt_priority(v)
 
 
 class HuntHypothesisResponse(HuntHypothesisBase, DBModel):

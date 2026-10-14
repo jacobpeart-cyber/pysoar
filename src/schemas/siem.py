@@ -1,11 +1,11 @@
 """SIEM schemas for API request/response validation"""
 
 import json as _json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from src.schemas.base import DBModel
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def _parse_json_list(v):
@@ -78,6 +78,10 @@ class LogEntryResponse(LogEntryBase, DBModel):
     log_type: str = ""
     severity: str = ""
     message: Optional[str] = None
+    # address the log was received from / the stored raw line (wave 3: the
+    # log table's Source IP column and the detail modal's raw section)
+    source_ip: Optional[str] = None
+    raw_log: Optional[str] = None
     source_address: Optional[str] = None
     destination_address: Optional[str] = None
     source_port: Optional[int] = None
@@ -149,6 +153,10 @@ class LogSearchResponse(BaseModel):
     pages: int = 0
     query_time_ms: int = 0
     aggregations: Optional[dict[str, Any]] = None
+    # The ingest-time window the search ran over (bounded; see
+    # src/api/v1/endpoints/siem.py MAX_LOG_WINDOW).
+    window_start: Optional[str] = None
+    window_end: Optional[str] = None
 
 
 class AggregationRequest(BaseModel):
@@ -230,6 +238,10 @@ class DetectionRuleResponse(DetectionRuleBase, DBModel):
     organization_id: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # Set on create / update responses only: whether the engine of the
+    # process that answered now evaluates this rule, and validator warnings.
+    engine_loaded: Optional[bool] = None
+    validation_warnings: list[str] = []
 
     @field_validator("detection_logic", mode="before")
     @classmethod
@@ -311,6 +323,19 @@ class SIEMStatsResponse(BaseModel):
     active_correlations: int = 0
     ingestion_rate_per_hour: float = 0.0
     storage_stats: Optional[dict[str, Any]] = None
+    # Wave 3: everything below is computed from stored rows and live
+    # collector / queue state for the caller's organisation.
+    window_hours: int = 24
+    logs_24h: int = 0
+    # enabled data sources whose last event arrived in the last hour
+    receiving_data_sources: int = 0
+    events_per_second_window_seconds: int = 300
+    ingestion_timeline: list[dict[str, Any]] = []
+    logs_by_source_type: list[dict[str, Any]] = []
+    top_rules: list[dict[str, Any]] = []
+    correlations_24h: int = 0
+    last_ingest_at: Optional[str] = None
+    pipeline_status: Optional[dict[str, Any]] = None
 
 
 class DataSourceCreate(BaseModel):
@@ -348,6 +373,38 @@ class DataSourceResponse(DBModel):
     error_count: int = 0
     last_error: Optional[str] = None
     created_at: Optional[datetime] = None
+    # Lifetime count of ingested logs whose source_name equals ``name``.
+    events_received: int = 0
+    # disabled | no_events | receiving (event in the last hour) | idle
+    ingest_status: str = ""
+    # How ingested logs are attributed to this data source.
+    match_field: str = "source_name"
 
     class Config:
         from_attributes = True
+
+    @model_validator(mode="after")
+    def _derive_ingest_state(self) -> "DataSourceResponse":
+        now = datetime.now(timezone.utc)
+        last = None
+        if self.last_event_at:
+            try:
+                last = datetime.fromisoformat(self.last_event_at.replace("Z", "+00:00"))
+            except ValueError:
+                last = None
+            if last is not None and last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+        # events_today is reset by the first event of a new UTC day, so a
+        # source that has been quiet since an earlier day has 0 today.
+        if last is None or last.date() != now.date():
+            self.events_today = 0
+        self.events_received = self.events_received or 0
+        if not self.enabled:
+            self.ingest_status = "disabled"
+        elif last is None:
+            self.ingest_status = "no_events"
+        elif now - last <= timedelta(hours=1):
+            self.ingest_status = "receiving"
+        else:
+            self.ingest_status = "idle"
+        return self

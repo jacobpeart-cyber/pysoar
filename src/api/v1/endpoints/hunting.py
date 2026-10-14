@@ -44,6 +44,8 @@ from src.schemas.hunting import (
     HuntSessionResponse,
     HuntStatsResponse,
     HuntTemplateResponse,
+    hunt_priority_spellings,
+    normalize_hunt_priority,
 )
 
 router = APIRouter(prefix="/hunting", tags=["hunting"])
@@ -145,27 +147,46 @@ _TERMINAL_SESSION_STATES = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
 #: never leave a RUNNING session with no executor behind it).
 HUNT_PAUSE_POLL_SECONDS = 2.0
 HUNT_PAUSE_MAX_SECONDS = 3600.0
+#: The executor stamps ``updated_at`` (its heartbeat) at every query
+#: boundary and on every poll while paused. A PAUSED session whose heartbeat
+#: is older than this has no executor behind it any more, so resume refuses
+#: it instead of leaving a RUNNING session nobody runs.
+HUNT_HEARTBEAT_STALE_SECONDS = 60.0
 
 
 class _HuntStopped(Exception):
     """The session was cancelled (or deleted) while the hunt ran."""
 
 
+async def _hunt_heartbeat(db: AsyncSession, session_id: str) -> None:
+    """Stamp the executor's heartbeat (``updated_at``) on a live session."""
+    await db.execute(
+        update(HuntSession)
+        .where(HuntSession.id == session_id, HuntSession.status.in_(("RUNNING", "PAUSED")))
+        .values(updated_at=datetime.now(timezone.utc))
+        .execution_options(synchronize_session=False),
+    )
+
+
 async def _hunt_checkpoint(db: AsyncSession, session_id: str) -> None:
-    """Commit progress so far, then honour pause / cancel.
+    """Query boundary: commit progress so far, then honour pause / cancel.
 
     * CANCELLED / FAILED / COMPLETED / deleted: raise ``_HuntStopped``.
     * PAUSED: wait (without holding a transaction) until the analyst resumes
       or cancels; after ``HUNT_PAUSE_MAX_SECONDS`` the hunt is cancelled.
     * RUNNING: return and keep hunting.
+
+    Every pass stamps the executor heartbeat (see
+    ``HUNT_HEARTBEAT_STALE_SECONDS``).
     """
     await db.commit()
     waited = 0.0
     while True:
+        await _hunt_heartbeat(db, session_id)
         current = (
             await db.execute(select(HuntSession.status).where(HuntSession.id == session_id))
         ).scalar_one_or_none()
-        await db.commit()  # end the read transaction before sleeping
+        await db.commit()  # end the transaction before sleeping
         if current is None or current in _TERMINAL_SESSION_STATES:
             raise _HuntStopped(current or "DELETED")
         if current != "PAUSED":
@@ -335,6 +356,8 @@ async def execute_hunt_session(session_id: str) -> None:  # noqa: C901
                         )
                         matches = ioc_result.scalars().all()
                         iocs_checked += 1
+                        # every IOC lookup is a query boundary
+                        await _hunt_checkpoint(db, session_id)
                         for ioc in matches:
                             db.add(HuntFinding(
                                 organization_id=org_id,
@@ -516,7 +539,9 @@ async def list_hypotheses(
     size: int = Query(20, ge=1, le=100),
     search: Optional[str] = None,
     status: Optional[str] = None,
-    priority: Optional[int] = None,
+    priority: Optional[str] = Query(
+        None, description="1-5 or critical / high / medium / low / info",
+    ),
     hunt_type: Optional[str] = None,
     sort_by: str = "created_at",
     sort_order: str = "desc",
@@ -535,9 +560,18 @@ async def list_hypotheses(
     if status:
         query = query.where(HuntHypothesis.status == status)
 
-    if priority:
-        # priority is a VARCHAR column; binding the int failed on Postgres
-        query = query.where(HuntHypothesis.priority == str(priority))
+    if priority is not None and priority != "":
+        # Typed: 1-5 or a label, else 422. The VARCHAR column holds the
+        # number as text (API-created rows) or a label (model default), so
+        # both spellings of the level match.
+        try:
+            level = normalize_hunt_priority(priority)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,  # `status` is the filter parameter here
+                detail={"error": "invalid_priority", "detail": str(exc)},
+            ) from exc
+        query = query.where(HuntHypothesis.priority.in_(hunt_priority_spellings(level)))
 
     if hunt_type:
         query = query.where(HuntHypothesis.hunt_type == hunt_type)
@@ -822,6 +856,72 @@ async def get_session(
     return HuntSessionResponse.model_validate(session)
 
 
+#: Allowed hunt-session transitions: action -> (from states, to state).
+_SESSION_TRANSITIONS: dict[str, tuple[frozenset[str], str]] = {
+    "pause": (frozenset({"RUNNING"}), "PAUSED"),
+    "resume": (frozenset({"PAUSED"}), "RUNNING"),
+    "cancel": (frozenset({"PENDING", "RUNNING", "PAUSED"}), "CANCELLED"),
+}
+
+
+def _invalid_transition(action: str, current: Optional[str]) -> HTTPException:
+    allowed_from, _ = _SESSION_TRANSITIONS[action]
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "error": "invalid_transition",
+            "detail": (
+                f"cannot {action} a session in {current or 'unknown'} status; "
+                f"allowed from {', '.join(sorted(allowed_from))}"
+            ),
+            "status": current,
+        },
+    )
+
+
+async def _transition_session(db: AsyncSession, session: HuntSession, action: str) -> HuntSession:
+    """Compare-and-set the session status; 409 ``invalid_transition`` otherwise.
+
+    The UPDATE only matches while the session is still in an allowed state,
+    so a pause racing the executor's completion (or a resume racing the
+    pause timeout) cannot overwrite the state the other side wrote.
+    """
+    allowed_from, target = _SESSION_TRANSITIONS[action]
+    values: dict[str, Any] = {"status": target, "updated_at": datetime.now(timezone.utc)}
+    if target == "CANCELLED":
+        values["completed_at"] = datetime.now(timezone.utc)
+    result = await db.execute(
+        update(HuntSession)
+        .where(
+            HuntSession.id == session.id,
+            HuntSession.organization_id == session.organization_id,
+            HuntSession.status.in_(allowed_from),
+        )
+        .values(**values)
+        .execution_options(synchronize_session=False),
+    )
+    await db.refresh(session)
+    if result.rowcount != 1:
+        raise _invalid_transition(action, session.status)
+    logger.info(
+        "hunt_session_transition",
+        session_id=session.id,
+        organization_id=session.organization_id,
+        action=action,
+        status=session.status,
+    )
+    return session
+
+
+def _heartbeat_age_seconds(session: HuntSession) -> Optional[float]:
+    stamp = session.updated_at
+    if stamp is None:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - stamp).total_seconds()
+
+
 @router.post("/sessions/{session_id}/pause", response_model=HuntSessionResponse)
 async def pause_session(
     session_id: str,
@@ -829,21 +929,12 @@ async def pause_session(
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Pause a hunt session"""
-    session = await get_session_or_404(
-        db, session_id, org_id
-    )
+    """Pause a RUNNING hunt; the executor waits at its next query boundary.
 
-    if session.status != "RUNNING":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Can only pause RUNNING sessions",
-        )
-
-    session.status = "PAUSED"
-    await db.flush()
-    await db.refresh(session)
-
+    409 ``invalid_transition`` from any other state.
+    """
+    session = await get_session_or_404(db, session_id, org_id)
+    session = await _transition_session(db, session, "pause")
     return HuntSessionResponse.model_validate(session)
 
 
@@ -854,21 +945,37 @@ async def resume_session(
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Resume a paused hunt session"""
-    session = await get_session_or_404(
-        db, session_id, org_id
-    )
+    """Resume a PAUSED hunt; its waiting executor continues with the next query.
 
+    409 ``invalid_transition`` from any other state. When the paused
+    session's executor heartbeat is older than ``HUNT_HEARTBEAT_STALE_SECONDS``
+    (the process running it stopped) the session is marked FAILED and the
+    answer is 409 ``executor_not_running``: start a new session instead.
+    """
+    session = await get_session_or_404(db, session_id, org_id)
     if session.status != "PAUSED":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Can only resume PAUSED sessions",
+        raise _invalid_transition("resume", session.status)
+    age = _heartbeat_age_seconds(session)
+    if age is not None and age > HUNT_HEARTBEAT_STALE_SECONDS:
+        message = (
+            f"no executor heartbeat for {int(age)}s; the hunt is no longer running. "
+            "Start a new session to hunt again."
         )
-
-    session.status = "RUNNING"
-    await db.flush()
-    await db.refresh(session)
-
+        result = await db.execute(
+            update(HuntSession)
+            .where(HuntSession.id == session.id, HuntSession.status == "PAUSED")
+            .values(status="FAILED", completed_at=datetime.now(timezone.utc), error_message=message)
+            .execution_options(synchronize_session=False),
+        )
+        await db.commit()
+        if result.rowcount == 1:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"error": "executor_not_running", "detail": message, "status": "FAILED"},
+            )
+        await db.refresh(session)
+        raise _invalid_transition("resume", session.status)
+    session = await _transition_session(db, session, "resume")
     return HuntSessionResponse.model_validate(session)
 
 
@@ -879,22 +986,14 @@ async def cancel_session(
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Cancel a hunt session"""
-    session = await get_session_or_404(
-        db, session_id, org_id
-    )
+    """Cancel a PENDING, RUNNING or PAUSED hunt.
 
-    if session.status in ["COMPLETED", "FAILED", "CANCELLED"]:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot cancel session in {session.status} status",
-        )
-
-    session.status = "CANCELLED"
-    session.completed_at = datetime.now(timezone.utc)
-    await db.flush()
-    await db.refresh(session)
-
+    The executor stops at its next query boundary and keeps the findings and
+    counts gathered so far; the session stays CANCELLED. 409
+    ``invalid_transition`` for a finished session.
+    """
+    session = await get_session_or_404(db, session_id, org_id)
+    session = await _transition_session(db, session, "cancel")
     return HuntSessionResponse.model_validate(session)
 
 
@@ -1237,13 +1336,21 @@ async def instantiate_template(
             detail="Template not found",
         )
 
+    try:
+        priority_level = normalize_hunt_priority(parameters.get("priority", 3))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "invalid_priority", "detail": str(exc)},
+        ) from exc
+
     # Create hypothesis from template
     hypothesis = HuntHypothesis(
         organization_id=org_id,
         title=parameters.get("title", template.name),
         description=template.hypothesis_template,
         hunt_type=template.hunt_type,
-        priority=str(parameters.get("priority", 3)),
+        priority=str(priority_level),
         mitre_tactics=template.mitre_tactics,
         mitre_techniques=template.mitre_techniques,
         tags=json.dumps(template.tags) if template.tags else None,

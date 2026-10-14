@@ -394,7 +394,7 @@ def _insert_derived_alert(connection, audit: AuditLog, match) -> Optional[str]:
                 UPDATE detection_rules
                 SET match_count = COALESCE(match_count, 0) + 1,
                     last_matched_at = :ts
-                WHERE name = :name
+                WHERE (id = :name OR name = :name) AND organization_id IS NULL
                 """
             ),
             {"ts": now.isoformat(), "name": match.rule_id},

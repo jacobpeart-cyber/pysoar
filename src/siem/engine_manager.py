@@ -20,17 +20,25 @@ Engines live in-process and are rebuilt lazily after rule CRUD through
 has seen many organisations does not grow without limit; an evicted engine
 is simply rebuilt from the database on next use (correlation state for that
 organisation starts afresh).
+
+Rule CRUD happens in one API process while logs are evaluated in others
+(other API workers, the ingest-queue consumers, Celery pollers). Each
+process therefore re-checks an organisation's rule fingerprint (count and
+latest ``updated_at`` of the rules that apply to it) at most every
+``RULE_REFRESH_SECONDS`` and rebuilds the engine when it changed, so a rule
+created, edited, disabled or deleted anywhere takes effect everywhere within
+that interval.
 """
 
 from __future__ import annotations
 
-import json
 import threading
+import time
 from collections import OrderedDict
 from typing import Any, Optional
 
 import yaml
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 
 from src.core.logging import get_logger
 from src.siem.correlation import CorrelationEngine
@@ -40,11 +48,15 @@ logger = get_logger(__name__)
 
 #: Maximum number of organisations whose engines are kept in memory.
 MAX_CACHED_ORGANIZATIONS = 1024
+#: How often a process re-checks whether an organisation's rules changed.
+RULE_REFRESH_SECONDS = 30.0
 
 _lock = threading.RLock()
 _rule_engines: "OrderedDict[Optional[str], RuleEngine]" = OrderedDict()
 _loaded_orgs: set[Optional[str]] = set()
 _correlation_engines: "OrderedDict[Optional[str], CorrelationEngine]" = OrderedDict()
+#: organisation -> (fingerprint at load, monotonic time of the last check)
+_fingerprints: dict[Optional[str], tuple[tuple, float]] = {}
 
 
 def _touch(cache: "OrderedDict[Optional[str], Any]", key: Optional[str]) -> None:
@@ -53,6 +65,7 @@ def _touch(cache: "OrderedDict[Optional[str], Any]", key: Optional[str]) -> None
         evicted, _ = cache.popitem(last=False)
         if cache is _rule_engines:
             _loaded_orgs.discard(evicted)
+            _fingerprints.pop(evicted, None)
 
 
 def get_rule_engine(organization_id: Optional[str] = None) -> RuleEngine:
@@ -91,15 +104,30 @@ def _rule_scope(organization_id: Optional[str]):
     )
 
 
-async def load_rules_from_db(db, organization_id: Optional[str] = None) -> int:
-    """Load the enabled rules that apply to ``organization_id`` into its engine.
-
-    ``organization_id=None`` loads the platform (built-in) rules only.
-    """
+async def _rules_fingerprint(db, organization_id: Optional[str]) -> tuple:
+    """(count, latest updated_at) of every rule that applies to the organisation."""
     from src.siem.models import DetectionRule
 
-    engine = get_rule_engine(organization_id)
+    row = (
+        await db.execute(
+            select(func.count(DetectionRule.id), func.max(DetectionRule.updated_at)).where(
+                _rule_scope(organization_id),
+            ),
+        )
+    ).one()
+    return (int(row[0] or 0), str(row[1]) if row[1] is not None else None)
 
+
+async def load_rules_from_db(db, organization_id: Optional[str] = None) -> int:
+    """Load the enabled rules that apply to ``organization_id`` into a fresh engine.
+
+    ``organization_id=None`` loads the platform (built-in) rules only. The
+    engine is rebuilt from scratch, so a disabled or deleted rule is gone.
+    """
+    from src.siem.models import DetectionRule
+    from src.siem.rule_validation import engine_yaml_for_rule
+
+    fingerprint = await _rules_fingerprint(db, organization_id)
     result = await db.execute(
         select(DetectionRule).where(
             DetectionRule.enabled == True,  # noqa: E712
@@ -108,28 +136,23 @@ async def load_rules_from_db(db, organization_id: Optional[str] = None) -> int:
     )
     rules = result.scalars().all()
 
+    engine = RuleEngine()
     loaded = 0
     for rule in rules:
         try:
-            if rule.rule_yaml:
-                instance = engine.load_rule_from_yaml(rule.rule_yaml)
-                if instance:
-                    loaded += 1
-            elif rule.detection_logic:
-                logic = (
-                    json.loads(rule.detection_logic)
-                    if isinstance(rule.detection_logic, str)
-                    else rule.detection_logic
-                )
-                yaml_content = _build_yaml_from_logic(rule, logic)
-                instance = engine.load_rule_from_yaml(yaml_content)
-                if instance:
-                    loaded += 1
+            yaml_content = engine_yaml_for_rule(rule)
+            if yaml_content and engine.load_rule_from_yaml(yaml_content):
+                loaded += 1
+            else:
+                logger.warning("Detection rule has nothing the engine can evaluate", rule_id=rule.id)
         except (ValueError, TypeError, KeyError, yaml.YAMLError) as e:
             logger.warning("Failed to load detection rule", rule_id=rule.id, error=str(e))
 
     with _lock:
+        _rule_engines[organization_id] = engine
+        _touch(_rule_engines, organization_id)
         _loaded_orgs.add(organization_id)
+        _fingerprints[organization_id] = (fingerprint, time.monotonic())
     logger.info(
         "Loaded detection rules",
         organization_id=organization_id,
@@ -140,11 +163,27 @@ async def load_rules_from_db(db, organization_id: Optional[str] = None) -> int:
 
 
 async def ensure_rules_loaded(db, organization_id: Optional[str] = None) -> None:
-    """Load ``organization_id``'s rules on first use (lazy initialisation)."""
+    """Load ``organization_id``'s rules on first use; reload when they changed.
+
+    The change check (one aggregate query) runs at most every
+    ``RULE_REFRESH_SECONDS`` per organisation and process.
+    """
     with _lock:
         loaded = organization_id in _loaded_orgs and organization_id in _rule_engines
-    if not loaded:
+        known = _fingerprints.get(organization_id)
+    if not loaded or known is None:
         await load_rules_from_db(db, organization_id)
+        return
+    fingerprint, checked_at = known
+    if time.monotonic() - checked_at < RULE_REFRESH_SECONDS:
+        return
+    current = await _rules_fingerprint(db, organization_id)
+    if current != fingerprint:
+        logger.info("Detection rules changed; reloading", organization_id=organization_id)
+        await load_rules_from_db(db, organization_id)
+        return
+    with _lock:
+        _fingerprints[organization_id] = (fingerprint, time.monotonic())
 
 
 async def reload_rules(db, organization_id: Optional[str] = None) -> int:
@@ -159,9 +198,11 @@ async def reload_rules(db, organization_id: Optional[str] = None) -> int:
         if organization_id is None:
             _rule_engines.clear()
             _loaded_orgs.clear()
+            _fingerprints.clear()
         else:
             _rule_engines.pop(organization_id, None)
             _loaded_orgs.discard(organization_id)
+            _fingerprints.pop(organization_id, None)
     return await load_rules_from_db(db, organization_id)
 
 
@@ -171,26 +212,24 @@ def reset_engines() -> None:
         _rule_engines.clear()
         _loaded_orgs.clear()
         _correlation_engines.clear()
+        _fingerprints.clear()
 
 
 def _build_yaml_from_logic(rule, logic: dict) -> str:
-    """Build YAML rule definition from detection_logic JSON."""
-    condition = getattr(rule, "condition", None) or "selection"
+    """Build the engine YAML for a rule from its detection_logic JSON.
 
-    yaml_dict = {
+    Kept for callers that pass the logic explicitly; the mapping itself lives
+    in ``src.siem.rule_validation`` so the validator, the dry-run test route
+    and the engine agree on what ``detection_logic`` means.
+    """
+    from src.siem.rule_validation import detection_block_from_logic
+
+    yaml_dict: dict[str, Any] = {
         "title": rule.title or rule.name,
         "id": str(rule.id),
         "status": "active",
         "description": rule.description or "",
         "level": rule.severity or "medium",
-        "detection": {
-            "selection": logic,
-            "condition": condition,
-        },
+        "detection": detection_block_from_logic(logic, getattr(rule, "condition", None)),
     }
-
-    if rule.mitre_tactics:
-        tactics = json.loads(rule.mitre_tactics) if isinstance(rule.mitre_tactics, str) else rule.mitre_tactics
-        yaml_dict["tags"] = tactics
-
     return yaml.dump(yaml_dict, default_flow_style=False)

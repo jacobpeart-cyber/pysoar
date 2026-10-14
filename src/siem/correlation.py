@@ -7,7 +7,7 @@ time windows to identify attack patterns, lateral movement, and complex security
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Set, Tuple
 from collections import defaultdict
 import threading
@@ -219,7 +219,7 @@ class SessionCorrelation(CorrelationStrategy):
         )
 
         return CorrelationResult(
-            correlation_id=f"session_{uuid.uuid4().hex[:8]}",
+            correlation_id=f"session_{uuid.uuid4().hex}",
             strategy_name="SessionCorrelation",
             events=sorted_events,
             severity=severity,
@@ -313,7 +313,7 @@ class HostCorrelation(CorrelationStrategy):
         )
 
         return CorrelationResult(
-            correlation_id=f"host_{uuid.uuid4().hex[:8]}",
+            correlation_id=f"host_{uuid.uuid4().hex}",
             strategy_name="HostCorrelation",
             events=sorted_events,
             severity=severity,
@@ -453,7 +453,7 @@ class AttackChainCorrelation(CorrelationStrategy):
         )
 
         return CorrelationResult(
-            correlation_id=f"chain_{uuid.uuid4().hex[:8]}",
+            correlation_id=f"chain_{uuid.uuid4().hex}",
             strategy_name="AttackChainCorrelation",
             events=sorted_events,
             severity=severity,
@@ -618,6 +618,18 @@ class EventAggregator:
 MAX_EVENTS_PER_GROUP = 500
 
 
+def _event_time(value) -> Optional[datetime]:
+    """Parse an event timestamp (ISO 8601) as an aware datetime, or None."""
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
 class CorrelationEngine:
     """
     Main SIEM correlation engine.
@@ -631,8 +643,10 @@ class CorrelationEngine:
 
     Buffers are bounded: each group keeps at most ``MAX_EVENTS_PER_GROUP``
     events, each strategy keeps at most ``max_buffer_size`` groups (oldest
-    evicted first), and a group is cleared once it produces a correlation so
-    one pattern is reported once instead of on every later event.
+    evicted first), events older than ``time_window`` before the newest event
+    of a group leave the group, and a group is cleared once it produces a
+    correlation so one pattern is reported once instead of on every later
+    event.
     """
 
     def __init__(
@@ -700,6 +714,15 @@ class CorrelationEngine:
 
                 # Get correlation key
                 corr_key = strategy.get_correlation_key(event)
+                # Only events inside the time window correlate together.
+                new_time = _event_time(event.get("timestamp"))
+                if new_time is not None and buffer.get(corr_key):
+                    kept = []
+                    for old in buffer[corr_key]:
+                        old_time = _event_time(old.get("timestamp"))
+                        if old_time is None or new_time - old_time <= self.time_window:
+                            kept.append(old)
+                    buffer[corr_key] = kept
                 buffer[corr_key].append(event)
                 if len(buffer[corr_key]) > MAX_EVENTS_PER_GROUP:
                     del buffer[corr_key][: len(buffer[corr_key]) - MAX_EVENTS_PER_GROUP]

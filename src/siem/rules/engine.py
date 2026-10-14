@@ -41,6 +41,27 @@ class RuleMatch:
         }
 
 
+#: Sigma field modifiers (``Field|modifier``) the engine evaluates, mapped to
+#: the engine operator. Any other modifier is rejected when the rule loads
+#: (``UnsupportedModifierError``) instead of silently never matching.
+SIGMA_MODIFIER_OPERATORS = {
+    "contains": "contains",
+    "startswith": "startswith",
+    "endswith": "endswith",
+    "re": "regex",
+    "cidr": "cidr",
+    "gt": ">",
+    "lt": "<",
+    "gte": ">=",
+    "lte": "<=",
+    "exists": "exists",
+}
+
+
+class UnsupportedModifierError(ValueError):
+    """A Sigma field modifier the engine cannot evaluate."""
+
+
 class FieldMatcher:
     """Evaluates a single field condition against log fields."""
 
@@ -48,12 +69,68 @@ class FieldMatcher:
         """Initialize a field matcher.
 
         Args:
-            field_name: The name of the field to match
+            field_name: The name of the field to match; Sigma modifiers
+                (``CommandLine|contains``, ``|all``, ``|re``...) are honoured
             condition: The condition value (string, list, dict with operators)
         """
         self.field_name = field_name
         self.condition = condition
+        # Sigma modifier form: ``field|op`` or ``field|op|all``.
+        self.modifier_operator: Optional[str] = None
+        self.require_all = False
+        if isinstance(field_name, str) and "|" in field_name:
+            base, *modifiers = field_name.split("|")
+            self.field_name = base
+            for modifier in modifiers:
+                modifier = modifier.strip().lower()
+                if modifier == "all":
+                    self.require_all = True
+                elif modifier in SIGMA_MODIFIER_OPERATORS:
+                    if self.modifier_operator is not None:
+                        raise UnsupportedModifierError(
+                            f"field '{field_name}': only one value modifier is supported",
+                        )
+                    self.modifier_operator = SIGMA_MODIFIER_OPERATORS[modifier]
+                else:
+                    raise UnsupportedModifierError(
+                        f"field '{field_name}': modifier '{modifier}' is not supported",
+                    )
+        if self.modifier_operator is not None or self.require_all:
+            self.operator = self.modifier_operator or "exact"
+            self.value = condition
+            return
         self._parse_condition()
+
+    def _match_with_modifier(self, field_value: Any) -> bool:
+        """Evaluate a Sigma ``field|modifier`` condition (list = any-of, ``|all`` = all-of)."""
+        values = self.value if isinstance(self.value, list) else [self.value]
+        if self.operator == "cidr":
+            return self._match_cidr(field_value)
+        results = []
+        for candidate in values:
+            saved = self.value
+            self.value = candidate
+            try:
+                results.append(self._dispatch(field_value))
+            finally:
+                self.value = saved
+        return all(results) if self.require_all else any(results)
+
+    def _dispatch(self, field_value: Any) -> bool:
+        """Apply the single-value operator to ``field_value``."""
+        handlers = {
+            "exact": self._match_exact,
+            "contains": self._match_contains,
+            "startswith": self._match_startswith,
+            "endswith": self._match_endswith,
+            "regex": self._match_regex,
+            ">": self._match_numeric_gt,
+            "<": self._match_numeric_lt,
+            ">=": self._match_numeric_gte,
+            "<=": self._match_numeric_lte,
+        }
+        handler = handlers.get(self.operator)
+        return handler(field_value) if handler else False
 
     def _parse_condition(self):
         """Parse the condition into operator and value(s)."""
@@ -118,6 +195,9 @@ class FieldMatcher:
 
         if self.field_name not in log_fields:
             return False
+
+        if self.modifier_operator is not None or self.require_all:
+            return self._match_with_modifier(field_value)
 
         if self.operator == 'exact':
             return self._match_exact(field_value)
@@ -235,6 +315,22 @@ class SelectionBlock:
         """
         self.name = name
         self.matchers: List[FieldMatcher] = []
+        # Sigma alternatives: a list of maps is OR over the maps; a list of
+        # plain values is a keyword search over message / raw_log.
+        self.alternatives: List["SelectionBlock"] = []
+        self.keywords: List[str] = []
+
+        if isinstance(conditions, list):
+            for index, item in enumerate(conditions):
+                if isinstance(item, dict):
+                    self.alternatives.append(SelectionBlock(f"{name}[{index}]", item))
+                elif isinstance(item, (str, int, float)):
+                    self.keywords.append(str(item).lower())
+                else:
+                    raise ValueError(f"selection '{name}': unsupported list item {item!r}")
+            return
+        if not isinstance(conditions, dict):
+            raise ValueError(f"selection '{name}' must be a mapping of field -> value or a list")
 
         for field_name, condition in conditions.items():
             if field_name not in ('timewindow', 'threshold', 'group_by'):
@@ -247,8 +343,21 @@ class SelectionBlock:
             log_fields: Dictionary of log field values
 
         Returns:
-            True if all matchers match (AND logic)
+            True if all matchers match (AND logic); for list selections, True
+            when any alternative map or any keyword matches
         """
+        if self.alternatives or self.keywords:
+            if any(alt.evaluate(log_fields) for alt in self.alternatives):
+                return True
+            if self.keywords:
+                haystack = " ".join(
+                    str(log_fields.get(key) or "") for key in ("message", "raw_log")
+                ).lower()
+                return any(
+                    fnmatch.fnmatch(haystack, f"*{kw}*") if ("*" in kw or "?" in kw) else kw in haystack
+                    for kw in self.keywords
+                )
+            return False
         return all(matcher.matches(log_fields) for matcher in self.matchers)
 
 

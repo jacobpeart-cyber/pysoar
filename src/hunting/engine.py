@@ -4,12 +4,13 @@ Provides query building, execution, result analysis, and finding generation
 for structured security investigations with MITRE ATT&CK framework integration.
 """
 
+import asyncio
 import json
 import statistics
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from src.core.logging import get_logger
 from src.hunting.models import (
@@ -26,6 +27,11 @@ from src.hunting.models import (
 from src.siem.search import SearchQuery, LogSearchService
 
 logger = get_logger(__name__)
+
+#: How often a paused hunt re-checks its status at a query boundary, and how
+#: long it may stay paused before the executor cancels it.
+EXECUTOR_PAUSE_POLL_SECONDS = 2.0
+EXECUTOR_PAUSE_MAX_SECONDS = 3600.0
 
 
 class HuntQueryBuilder:
@@ -287,6 +293,42 @@ class HuntExecutor:
         )
         return result.scalar_one_or_none()
 
+    async def _at_query_boundary(self, session_id: str) -> bool:
+        """Honour pause / cancel before the next query; False = stop hunting.
+
+        CANCELLED / FAILED / COMPLETED / deleted: stop. PAUSED: wait until
+        resumed (True) or cancelled (False); a pause longer than
+        ``EXECUTOR_PAUSE_MAX_SECONDS`` cancels the session. Status case is
+        ignored (the hunting router stores upper case, this class lower).
+        """
+        waited = 0.0
+        while True:
+            current = await self._current_status(session_id)
+            if current is None or current.lower() in self._TERMINAL:
+                return False
+            if current.lower() != SessionStatus.PAUSED.value:
+                return True
+            if waited >= EXECUTOR_PAUSE_MAX_SECONDS:
+                cancelled = SessionStatus.CANCELLED.value
+                await self.db.execute(
+                    update(HuntSession)
+                    .where(
+                        HuntSession.id == session_id,
+                        HuntSession.organization_id == self.organization_id,
+                        HuntSession.status == current,
+                    )
+                    .values(
+                        status=cancelled.upper() if current.isupper() else cancelled,
+                        completed_at=datetime.now(timezone.utc),
+                        error_message="paused too long; hunt stopped",
+                    )
+                    .execution_options(synchronize_session=False),
+                )
+                logger.warning("hunt_pause_timeout", session_id=session_id)
+                return False
+            await asyncio.sleep(EXECUTOR_PAUSE_POLL_SECONDS)
+            waited += EXECUTOR_PAUSE_POLL_SECONDS
+
     async def execute_hunt(
         self, hypothesis_id: str, parameters: dict, hypothesis_data: dict,
     ) -> str:
@@ -364,7 +406,7 @@ class HuntExecutor:
             session.events_analyzed = sum(
                 r.get("event_count", 1) for r in results
             )
-            session.query_count = 1
+            session.query_count = len(results)
 
             # Honour a cancel issued while the hunt ran: keep CANCELLED.
             if await self._current_status(session_id) not in self._TERMINAL:
@@ -408,6 +450,16 @@ class HuntExecutor:
         results = []
 
         for query_dict in queries:
+            # Query boundary: a paused session waits, a cancelled one stops
+            # (the results gathered so far are kept).
+            if not await self._at_query_boundary(session.id):
+                logger.info(
+                    "hunt_stopped_at_query_boundary",
+                    session_id=session.id,
+                    organization_id=self.organization_id,
+                    queries_run=len(results),
+                )
+                break
             start_time = datetime.now(timezone.utc)
 
             if isinstance(query_dict, SearchQuery):

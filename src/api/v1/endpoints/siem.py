@@ -22,10 +22,10 @@ Tenancy and roles (wave 1, docs/audit/2026-10-08/PLAN.md):
 import json
 import math
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -68,6 +68,8 @@ from src.siem.models import (
 from src.models.alert import Alert
 from src.services.automation import AutomationService
 from src.core.utils import safe_json_loads
+from src.siem.rule_validation import engine_yaml_for_rule
+from src.siem.rule_validation import validate_rule as validate_rule_definition
 
 logger = get_logger(__name__)
 
@@ -128,6 +130,26 @@ async def get_rule_or_404(db: AsyncSession, rule_id: str, org_id: str) -> Detect
             detail="Detection rule not found",
         )
     return rule
+
+
+def _invalid_rule(check) -> HTTPException:
+    """422 carrying the validator's per-field errors."""
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail={
+            "error": "invalid_rule",
+            "detail": "; ".join(check.messages()),
+            "field_errors": list(check.field_errors),
+            "warnings": list(check.warnings),
+        },
+    )
+
+
+def _engine_loaded(rule: DetectionRule, organization_id: Optional[str]) -> bool:
+    """Whether the organisation's engine (this process) now evaluates ``rule``."""
+    from src.siem.engine_manager import get_rule_engine
+
+    return get_rule_engine(organization_id).get_rule(str(rule.id)) is not None
 
 
 def _ensure_rule_writable(rule: DetectionRule, current_user: User) -> None:
@@ -484,6 +506,86 @@ _LOG_SEARCHABLE_FIELDS = {
     "process_name", "action", "outcome", "created_at",
 }
 
+#: Widest time window a log search / aggregation may cover. Without an
+#: explicit ``time_start`` the query is bounded to logs ingested within it.
+MAX_LOG_WINDOW = timedelta(days=90)
+#: Deepest result a paginated search may reach (page * size).
+MAX_LOG_RESULT_OFFSET = 10_000
+
+
+def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _log_window(
+    time_start: Optional[datetime], time_end: Optional[datetime],
+) -> tuple[datetime, datetime, bool]:
+    """Effective (start, end, explicit) window of a log query; 422 when unbounded.
+
+    ``explicit`` is True when the caller gave ``time_start`` (the event
+    ``timestamp`` is filtered); otherwise the query is bounded to logs
+    ingested (``created_at``) within ``MAX_LOG_WINDOW`` before ``end``.
+    """
+    end = _as_utc(time_end) or datetime.now(timezone.utc)
+    start = _as_utc(time_start)
+    if start is None:
+        return end - MAX_LOG_WINDOW, end, False
+    if start > end:
+        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_window", "time_start is after time_end")
+    if end - start > MAX_LOG_WINDOW:
+        raise _error(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "window_too_large",
+            f"a log query may cover at most {MAX_LOG_WINDOW.days} days",
+        )
+    return start, end, True
+
+
+def _apply_log_filters(query, search_data: LogSearchRequest):
+    """Apply the LogSearchRequest filters (except the time window) to ``query``."""
+    if search_data.query:
+        search_filter = f"%{search_data.query}%"
+        query = query.where(
+            (LogEntry.message.ilike(search_filter))
+            | (LogEntry.raw_log.ilike(search_filter))
+            | (LogEntry.hostname.ilike(search_filter))
+        )
+    if search_data.source_types:
+        query = query.where(LogEntry.source_type.in_(search_data.source_types))
+    if search_data.log_types:
+        query = query.where(LogEntry.log_type.in_(search_data.log_types))
+    if search_data.severities:
+        query = query.where(LogEntry.severity.in_(search_data.severities))
+    if search_data.source_addresses:
+        query = query.where(LogEntry.source_address.in_(search_data.source_addresses))
+    if search_data.destination_addresses:
+        query = query.where(LogEntry.destination_address.in_(search_data.destination_addresses))
+    if search_data.usernames:
+        query = query.where(LogEntry.username.in_(search_data.usernames))
+    if search_data.hostnames:
+        query = query.where(LogEntry.hostname.in_(search_data.hostnames))
+    for field_name, value in (search_data.field_filters or {}).items():
+        if field_name not in _LOG_SEARCHABLE_FIELDS or field_name in ("timestamp", "created_at", "received_at"):
+            raise _error(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "invalid_field_filter",
+                f"cannot filter on '{field_name}'; allowed: "
+                + ", ".join(sorted(_LOG_SEARCHABLE_FIELDS - {"timestamp", "created_at", "received_at"})),
+            )
+        column = getattr(LogEntry, field_name)
+        if isinstance(value, list):
+            query = query.where(column.in_(value))
+        elif value is None:
+            query = query.where(column.is_(None))
+        else:
+            query = query.where(column == value)
+    for tag in search_data.tags or []:
+        # tags are stored as a JSON list of strings
+        query = query.where(LogEntry.tags.like(f"%{json.dumps(str(tag))}%"))
+    return query
+
 
 @router.post("/logs/search", response_model=LogSearchResponse)
 async def search_logs(
@@ -492,47 +594,33 @@ async def search_logs(
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Search the organisation's logs with complex filtering (a read; viewers allowed)."""
+    """Search the organisation's logs with complex filtering (a read; viewers allowed).
+
+    The window is bounded (at most ``MAX_LOG_WINDOW``; without ``time_start``
+    only logs ingested within it are searched) and pagination stops at
+    ``MAX_LOG_RESULT_OFFSET`` results. ``field_filters`` (whitelisted
+    columns, value or list of values) and ``tags`` are applied.
+    """
     import time as _time
     started = _time.monotonic()
 
-    query = select(LogEntry).where(LogEntry.organization_id == org_id)
-
-    # Apply filters
-    if search_data.query:
-        search_filter = f"%{search_data.query}%"
-        query = query.where(
-            (LogEntry.message.ilike(search_filter))
-            | (LogEntry.raw_log.ilike(search_filter))
-            | (LogEntry.hostname.ilike(search_filter))
+    if search_data.page * search_data.size > MAX_LOG_RESULT_OFFSET:
+        raise _error(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "page_out_of_range",
+            f"results beyond {MAX_LOG_RESULT_OFFSET} are not paginated; narrow the search",
         )
+    window_start, window_end, explicit = _log_window(search_data.time_start, search_data.time_end)
 
-    if search_data.source_types:
-        query = query.where(LogEntry.source_type.in_(search_data.source_types))
+    query = select(LogEntry).where(LogEntry.organization_id == org_id)
+    if not explicit:
+        query = query.where(LogEntry.created_at >= window_start)
+    query = _apply_log_filters(query, search_data)
 
-    if search_data.log_types:
-        query = query.where(LogEntry.log_type.in_(search_data.log_types))
-
-    if search_data.severities:
-        query = query.where(LogEntry.severity.in_(search_data.severities))
-
-    if search_data.source_addresses:
-        query = query.where(LogEntry.source_address.in_(search_data.source_addresses))
-
-    if search_data.destination_addresses:
-        query = query.where(LogEntry.destination_address.in_(search_data.destination_addresses))
-
-    if search_data.usernames:
-        query = query.where(LogEntry.username.in_(search_data.usernames))
-
-    if search_data.hostnames:
-        query = query.where(LogEntry.hostname.in_(search_data.hostnames))
-
-    if search_data.time_start:
-        query = query.where(LogEntry.timestamp >= search_data.time_start.isoformat())
-
+    if explicit:
+        query = query.where(LogEntry.timestamp >= window_start.isoformat())
     if search_data.time_end:
-        query = query.where(LogEntry.timestamp <= search_data.time_end.isoformat())
+        query = query.where(LogEntry.timestamp <= window_end.isoformat())
 
     # Get total count
     count_result = await db.execute(
@@ -564,6 +652,8 @@ async def search_logs(
         size=search_data.size,
         pages=math.ceil(total / search_data.size) if total > 0 else 0,
         query_time_ms=query_time_ms,
+        window_start=window_start.isoformat(),
+        window_end=window_end.isoformat(),
     )
 
 
@@ -574,11 +664,14 @@ async def aggregate_logs(
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Run aggregation query on logs.
+    """Run an aggregation over the organisation's logs (a read; viewers allowed).
 
     The `field` parameter is whitelisted against
     `_LOG_SEARCHABLE_FIELDS` so clients can't GROUP BY arbitrary
     columns (would otherwise allow leaking JSON blob columns or hashes).
+    The window is bounded like ``/logs/search`` (at most ``MAX_LOG_WINDOW``;
+    without ``time_start`` only logs ingested within it are counted) and at
+    most ``top_n`` (<= 100) buckets are returned.
     """
     if agg_data.field not in _LOG_SEARCHABLE_FIELDS:
         raise HTTPException(
@@ -589,19 +682,23 @@ async def aggregate_logs(
             ),
         )
 
+    window_start, window_end, explicit = _log_window(agg_data.time_start, agg_data.time_end)
     field_column = getattr(LogEntry, agg_data.field)
     query = select(field_column, func.count(LogEntry.id)).where(LogEntry.organization_id == org_id)
 
-    if agg_data.time_start:
-        query = query.where(LogEntry.timestamp >= agg_data.time_start.isoformat())
-
+    if explicit:
+        query = query.where(LogEntry.timestamp >= window_start.isoformat())
+    else:
+        query = query.where(LogEntry.created_at >= window_start)
     if agg_data.time_end:
-        query = query.where(LogEntry.timestamp <= agg_data.time_end.isoformat())
+        query = query.where(LogEntry.timestamp <= window_end.isoformat())
+
+    total_in_window = (
+        await db.execute(select(func.count()).select_from(query.group_by(field_column).subquery()))
+    ).scalar() or 0
 
     query = query.group_by(field_column).order_by(func.count(LogEntry.id).desc())
-
-    if agg_data.top_n:
-        query = query.limit(min(agg_data.top_n, 1000))
+    query = query.limit(agg_data.top_n)
 
     result = await db.execute(query)
     rows = result.all()
@@ -612,7 +709,123 @@ async def aggregate_logs(
         "field": agg_data.field,
         "agg_type": agg_data.agg_type,
         "aggregations": aggregations,
+        "null_count": next((row[1] for row in rows if row[0] is None), 0),
+        "buckets_total": total_in_window,
+        "truncated": total_in_window > len(rows),
+        "window_start": window_start.isoformat(),
+        "window_end": window_end.isoformat(),
     }
+
+
+#: Window of the overview breakdowns, timeline and alert counts.
+STATS_WINDOW = timedelta(hours=24)
+#: Window over which events per second is measured.
+EPS_WINDOW = timedelta(minutes=5)
+#: A stage that saw data within this long is "receiving"; otherwise "idle".
+INGEST_FRESH_WINDOW = timedelta(minutes=15)
+#: Queue depth above which the queue stage reports "backlogged".
+QUEUE_BACKLOG_THRESHOLD = 1000
+
+
+def _queue_consumers() -> tuple[bool, int]:
+    """(initialised, running consumer tasks) of this process's ingest queue."""
+    from src.siem import ingest_queue
+
+    tasks = getattr(ingest_queue, "_worker_tasks", None) or []
+    return ingest_queue.is_initialized(), sum(1 for t in tasks if not t.done())
+
+
+async def _pipeline_status(
+    *,
+    now: datetime,
+    last_ingest_at: Optional[datetime],
+    events_last_window: int,
+    active_rules: int,
+    rule_alerts_24h: int,
+    correlations_24h: int,
+) -> dict[str, Any]:
+    """Per-stage pipeline state from stored rows and live collector / queue state.
+
+    Nothing here is a constant: ``ingestion`` is derived from the
+    organisation's newest stored log, ``collector`` from the syslog listener
+    of the API process that answered, ``queue`` from the host ingest queue
+    (depth is host-wide, not per organisation), ``detection`` from the
+    enabled rules and the rule alerts they raised, ``correlation`` from
+    stored correlation rows.
+    """
+    from src.siem.ingest_queue import get_status as queue_status
+
+    if last_ingest_at is None:
+        ingestion_state = "no_data"
+    elif now - last_ingest_at <= INGEST_FRESH_WINDOW:
+        ingestion_state = "receiving"
+    else:
+        ingestion_state = "idle"
+
+    collector = _collector_instance
+    collector_running = bool(collector is not None and getattr(collector, "_running", False))
+    collector_stats = collector.get_stats() if collector is not None else {}
+
+    initialised, consumers = _queue_consumers()
+    try:
+        q = await queue_status()
+    except Exception as exc:  # noqa: BLE001 - reported as the queue's state, not hidden
+        q = {"mode": "unknown", "queue_length": -1, "redis_connected": False, "error": str(exc)}
+    depth = q.get("queue_length", 0)
+    if q.get("mode") == "none" or not initialised:
+        queue_state = "not_started"
+    elif depth < 0 or (q.get("mode") == "redis" and not q.get("redis_connected")):
+        queue_state = "unavailable"
+    elif consumers == 0:
+        queue_state = "no_consumers"
+    elif depth > QUEUE_BACKLOG_THRESHOLD:
+        queue_state = "backlogged"
+    else:
+        queue_state = "running"
+
+    stages = {
+        "ingestion": {
+            "state": ingestion_state,
+            "last_ingest_at": last_ingest_at.isoformat() if last_ingest_at else None,
+            "events_last_5m": events_last_window,
+        },
+        "collector": {
+            "state": "running" if collector_running else "stopped",
+            "scope": "syslog listener of the API process that answered",
+            "port": getattr(collector, "udp_port", None) if collector_running else None,
+            "messages_received": int(collector_stats.get("messages_received", 0) or 0),
+        },
+        "queue": {
+            "state": queue_state,
+            "mode": q.get("mode"),
+            "depth": depth,
+            "consumers_running": consumers,
+            "scope": "host-wide endpoint-event queue",
+        },
+        "detection": {
+            "state": "active" if active_rules else "no_rules",
+            "rules_enabled": active_rules,
+            "rule_alerts_24h": rule_alerts_24h,
+        },
+        "correlation": {
+            "state": "active" if ingestion_state == "receiving" else "idle",
+            "correlations_24h": correlations_24h,
+        },
+    }
+    if ingestion_state == "no_data":
+        overall = "no_data"
+    elif queue_state in ("unavailable", "backlogged", "no_consumers"):
+        overall = "degraded"
+    else:
+        overall = ingestion_state
+    return {"overall": overall, "checked_at": now.isoformat(), "stages": stages}
+
+
+def _hour_buckets(now: datetime) -> list[tuple[datetime, datetime]]:
+    """Hourly [start, end) buckets covering ``STATS_WINDOW``, oldest first."""
+    end = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    hours = int(STATS_WINDOW.total_seconds() // 3600)
+    return [(end - timedelta(hours=h + 1), end - timedelta(hours=h)) for h in range(hours - 1, -1, -1)]
 
 
 @router.get("/logs/stats", response_model=SIEMStatsResponse)
@@ -621,118 +834,239 @@ async def get_siem_stats(
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Get the organisation's SIEM statistics"""
-    own_logs = LogEntry.organization_id == org_id
-    total_result = await db.execute(select(func.count(LogEntry.id)).where(own_logs))
-    total_logs = total_result.scalar() or 0
+    """The organisation's SIEM overview, computed from stored rows.
 
-    # Filter logs_today by today's date
+    ``total_logs`` is all time; the breakdowns (``logs_by_*``), the hourly
+    ``ingestion_timeline`` and the alert / correlation counts cover the last
+    ``window_hours`` (24) by ingest time; ``events_per_second`` is measured
+    over the last ``events_per_second_window_seconds`` (300).
+    ``pipeline_status`` reports each stage from stored data and the live
+    collector / queue state.
+    """
     now = datetime.now(timezone.utc)
+    since = now - STATS_WINDOW
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    logs_today_result = await db.execute(
-        select(func.count(LogEntry.id)).where(own_logs, LogEntry.timestamp >= today_start.isoformat())
-    )
-    logs_today = logs_today_result.scalar() or 0
+    own_logs = LogEntry.organization_id == org_id
+    recent_logs = (own_logs, LogEntry.created_at >= since)
 
-    # Events per second based on total logs over 24 hours
-    events_per_second = total_logs / (24 * 3600) if total_logs > 0 else 0.0
-
-    type_result = await db.execute(
-        select(LogEntry.log_type, func.count(LogEntry.id))
-        .where(own_logs)
-        .group_by(LogEntry.log_type)
+    total_logs = int((await db.execute(select(func.count(LogEntry.id)).where(own_logs))).scalar() or 0)
+    logs_today = int(
+        (await db.execute(select(func.count(LogEntry.id)).where(own_logs, LogEntry.created_at >= today_start))).scalar()
+        or 0,
     )
-    logs_by_type = [{"name": row[0] or "unknown", "value": row[1]} for row in type_result.all()]
-
-    severity_result = await db.execute(
-        select(LogEntry.severity, func.count(LogEntry.id))
-        .where(own_logs)
-        .group_by(LogEntry.severity)
+    logs_24h = int((await db.execute(select(func.count(LogEntry.id)).where(*recent_logs))).scalar() or 0)
+    events_last_window = int(
+        (
+            await db.execute(
+                select(func.count(LogEntry.id)).where(own_logs, LogEntry.created_at >= now - EPS_WINDOW),
+            )
+        ).scalar()
+        or 0,
     )
-    logs_by_severity = [{"name": row[0] or "unknown", "value": row[1]} for row in severity_result.all()]
-
-    source_result = await db.execute(
-        select(LogEntry.source_name, func.count(LogEntry.id))
-        .where(own_logs)
-        .group_by(LogEntry.source_name)
+    events_per_second = events_last_window / EPS_WINDOW.total_seconds()
+    last_ingest_at = _as_utc(
+        (await db.execute(select(func.max(LogEntry.created_at)).where(own_logs))).scalar(),
     )
-    logs_by_source = [{"name": row[0] or "unknown", "value": row[1]} for row in source_result.all()]
+
+    async def _breakdown(column) -> list[dict[str, Any]]:
+        rows = (
+            await db.execute(
+                select(column, func.count(LogEntry.id))
+                .where(*recent_logs)
+                .group_by(column)
+                .order_by(func.count(LogEntry.id).desc())
+                .limit(20),
+            )
+        ).all()
+        return [{"name": row[0] or "unknown", "value": row[1]} for row in rows]
+
+    logs_by_type = await _breakdown(LogEntry.log_type)
+    logs_by_severity = await _breakdown(LogEntry.severity)
+    logs_by_source = await _breakdown(LogEntry.source_name)
+    logs_by_source_type = await _breakdown(LogEntry.source_type)
+
+    # Hourly ingest counts over the window: one scan, portable SUM(CASE).
+    buckets = _hour_buckets(now)
+    sums = (
+        await db.execute(
+            select(
+                *[
+                    func.sum(case((and_(LogEntry.created_at >= b0, LogEntry.created_at < b1), 1), else_=0))
+                    for b0, b1 in buckets
+                ],
+            ).where(own_logs, LogEntry.created_at >= buckets[0][0]),
+        )
+    ).one()
+    ingestion_timeline = [
+        {"hour": b0.isoformat(), "count": int(sums[i] or 0)} for i, (b0, _b1) in enumerate(buckets)
+    ]
 
     # Enabled rules that apply to this organisation (its own + platform).
-    rules_result = await db.execute(
-        select(func.count(DetectionRule.id)).where(
-            DetectionRule.enabled == True,  # noqa: E712
-            _visible_rules(org_id),
-        )
+    active_rules = int(
+        (
+            await db.execute(
+                select(func.count(DetectionRule.id)).where(
+                    DetectionRule.enabled == True,  # noqa: E712
+                    _visible_rules(org_id),
+                ),
+            )
+        ).scalar()
+        or 0,
     )
-    active_rules = rules_result.scalar() or 0
 
     # Rule matches today and SIEM alerts in the last 24 hours, both counted
     # from this organisation's SIEM alerts. Rule match_count columns are not
     # used: platform rules are shared, so their counters are not per tenant.
     siem_alerts = (Alert.organization_id == org_id, Alert.source == "siem")
-    matches_result = await db.execute(
-        select(func.count(Alert.id)).where(
-            *siem_alerts,
-            Alert.alert_type == "detection_rule",
-            Alert.created_at >= today_start,
-        )
+    rule_alerts = (*siem_alerts, Alert.alert_type == "detection_rule")
+    rule_matches_today = int(
+        (await db.execute(select(func.count(Alert.id)).where(*rule_alerts, Alert.created_at >= today_start))).scalar()
+        or 0,
     )
-    rule_matches_today = matches_result.scalar() or 0
+    alerts_triggered_24h = int(
+        (await db.execute(select(func.count(Alert.id)).where(*siem_alerts, Alert.created_at >= since))).scalar() or 0,
+    )
+    rule_alerts_24h = int(
+        (await db.execute(select(func.count(Alert.id)).where(*rule_alerts, Alert.created_at >= since))).scalar() or 0,
+    )
 
-    alerts_result = await db.execute(
-        select(func.count(Alert.id)).where(*siem_alerts, Alert.created_at >= now - timedelta(hours=24))
-    )
-    alerts_triggered_24h = alerts_result.scalar() or 0
-
-    # Active data sources count
-    sources_result = await db.execute(
-        select(func.count(SIEMDataSource.id)).where(
-            SIEMDataSource.enabled == True,  # noqa: E712
-            SIEMDataSource.organization_id == org_id,
+    # Top alerting rules: this organisation's rule alerts in the window,
+    # grouped by the rule title the pipeline wrote ("Detection: <title>").
+    top_rows = (
+        await db.execute(
+            select(Alert.title, func.count(Alert.id), func.max(Alert.severity))
+            .where(*rule_alerts, Alert.created_at >= since)
+            .group_by(Alert.title)
+            .order_by(func.count(Alert.id).desc())
+            .limit(10),
         )
+    ).all()
+    top_rules = [
+        {
+            "name": (row[0] or "").removeprefix("Detection: ") or "unknown",
+            "count": row[1],
+            "severity": row[2],
+        }
+        for row in top_rows
+    ]
+
+    own_sources = SIEMDataSource.organization_id == org_id
+    active_data_sources = int(
+        (
+            await db.execute(
+                select(func.count(SIEMDataSource.id)).where(
+                    own_sources, SIEMDataSource.enabled == True,  # noqa: E712
+                ),
+            )
+        ).scalar()
+        or 0,
     )
-    active_data_sources = sources_result.scalar() or 0
+    receiving_data_sources = int(
+        (
+            await db.execute(
+                select(func.count(SIEMDataSource.id)).where(
+                    own_sources,
+                    SIEMDataSource.enabled == True,  # noqa: E712
+                    SIEMDataSource.last_event_at >= (now - timedelta(hours=1)).isoformat(),
+                ),
+            )
+        ).scalar()
+        or 0,
+    )
 
     own_correlations = CorrelationEvent.organization_id == org_id
-    corr_result = await db.execute(select(func.count(CorrelationEvent.id)).where(own_correlations))
-    active_correlations = corr_result.scalar() or 0
-
-    # Recent detections - last 5 correlation events
-    recent_corr_result = await db.execute(
-        select(CorrelationEvent)
-        .where(own_correlations)
-        .order_by(CorrelationEvent.created_at.desc())
-        .limit(5)
+    active_correlations = int(
+        (
+            await db.execute(
+                select(func.count(CorrelationEvent.id)).where(
+                    own_correlations,
+                    CorrelationEvent.status.in_(
+                        [CorrelationStatus.NEW.value, CorrelationStatus.INVESTIGATING.value],
+                    ),
+                ),
+            )
+        ).scalar()
+        or 0,
     )
-    recent_corr = list(recent_corr_result.scalars().all())
-    recent_detections = [
+    correlations_24h = int(
+        (
+            await db.execute(
+                select(func.count(CorrelationEvent.id)).where(
+                    own_correlations, CorrelationEvent.created_at >= since,
+                ),
+            )
+        ).scalar()
+        or 0,
+    )
+
+    # Recent detections: the newest correlations and rule alerts, merged.
+    recent_corr = (
+        await db.execute(
+            select(CorrelationEvent)
+            .where(own_correlations)
+            .order_by(CorrelationEvent.created_at.desc())
+            .limit(5),
+        )
+    ).scalars().all()
+    recent_alerts = (
+        await db.execute(select(Alert).where(*rule_alerts).order_by(Alert.created_at.desc()).limit(5))
+    ).scalars().all()
+    recent = [
         {
+            "id": c.id,
+            "kind": "correlation",
             "rule_name": c.name,
             "severity": c.severity,
-            "timestamp": c.created_at.isoformat() if c.created_at else "",
+            "timestamp": _as_utc(c.created_at).isoformat() if c.created_at else "",
             "status": c.status,
         }
         for c in recent_corr
+    ] + [
+        {
+            "id": a.id,
+            "kind": "rule_alert",
+            "rule_name": (a.title or "").removeprefix("Detection: "),
+            "severity": a.severity,
+            "timestamp": _as_utc(a.created_at).isoformat() if a.created_at else "",
+            "status": a.status,
+        }
+        for a in recent_alerts
     ]
+    recent_detections = sorted(recent, key=lambda d: d["timestamp"], reverse=True)[:5]
 
-    # Ingestion rate per hour
-    ingestion_rate = logs_today / max(datetime.now(timezone.utc).hour, 1)
+    pipeline_status = await _pipeline_status(
+        now=now,
+        last_ingest_at=last_ingest_at,
+        events_last_window=events_last_window,
+        active_rules=active_rules,
+        rule_alerts_24h=rule_alerts_24h,
+        correlations_24h=correlations_24h,
+    )
 
     return SIEMStatsResponse(
         total_logs=total_logs,
         logs_today=logs_today,
-        events_per_second=round(events_per_second, 2),
+        events_per_second=round(events_per_second, 3),
         active_rules=active_rules,
         alerts_triggered_24h=alerts_triggered_24h,
         active_data_sources=active_data_sources,
+        receiving_data_sources=receiving_data_sources,
         logs_by_type=logs_by_type,
         logs_by_severity=logs_by_severity,
         logs_by_source=logs_by_source,
+        logs_by_source_type=logs_by_source_type,
         recent_detections=recent_detections,
-        rule_matches_today=int(rule_matches_today) if rule_matches_today else 0,
+        rule_matches_today=rule_matches_today,
         active_correlations=active_correlations,
-        ingestion_rate_per_hour=round(ingestion_rate, 2),
+        ingestion_rate_per_hour=round(logs_24h / (STATS_WINDOW.total_seconds() / 3600), 2),
+        window_hours=int(STATS_WINDOW.total_seconds() // 3600),
+        logs_24h=logs_24h,
+        events_per_second_window_seconds=int(EPS_WINDOW.total_seconds()),
+        ingestion_timeline=ingestion_timeline,
+        top_rules=top_rules,
+        correlations_24h=correlations_24h,
+        last_ingest_at=last_ingest_at.isoformat() if last_ingest_at else None,
+        pipeline_status=pipeline_status,
     )
 
 
@@ -819,7 +1153,27 @@ async def create_rule(
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Create a new detection rule owned by the organisation"""
+    """Create a detection rule owned by the organisation.
+
+    The definition is validated the way the engine loads it
+    (``src.siem.rule_validation``): ``rule_yaml`` (Sigma-like) or
+    ``detection_logic`` (field -> value conditions, optionally named
+    selections combined by ``condition``) is required, and any problem is a
+    422 ``invalid_rule`` with ``field_errors``. The stored logic is what the
+    engine evaluates; the response's ``engine_loaded`` says whether this
+    process's engine picked it up.
+    """
+    check = validate_rule_definition(
+        name=rule_data.name,
+        title=rule_data.title,
+        severity=rule_data.severity,
+        rule_yaml=rule_data.rule_yaml,
+        detection_logic=rule_data.detection_logic,
+        condition=rule_data.condition,
+    )
+    if not check.valid:
+        raise _invalid_rule(check)
+
     rule = DetectionRule(
         name=rule_data.name,
         title=rule_data.title,
@@ -855,7 +1209,10 @@ async def create_rule(
     from src.siem.engine_manager import reload_rules
     await reload_rules(db, org_id)
 
-    return DetectionRuleResponse.model_validate(rule)
+    response = DetectionRuleResponse.model_validate(rule)
+    response.engine_loaded = _engine_loaded(rule, org_id)
+    response.validation_warnings = list(check.warnings)
+    return response
 
 
 @router.get("/rules/{rule_id}", response_model=DetectionRuleResponse)
@@ -884,6 +1241,31 @@ async def update_rule(
 
     update_data = rule_data.model_dump(exclude_unset=True, exclude_none=True)
 
+    # A change to the definition is validated against the merged rule the
+    # engine will load (422 invalid_rule with field_errors otherwise).
+    warnings: list[str] = []
+    definition_keys = {"rule_yaml", "detection_logic", "condition", "severity"}
+    if definition_keys & update_data.keys():
+        detection_changed = bool({"rule_yaml", "detection_logic", "condition"} & update_data.keys())
+        if detection_changed:
+            stored_logic = safe_json_loads(rule.detection_logic, None) if rule.detection_logic else None
+            check = validate_rule_definition(
+                title=update_data.get("title", rule.title),
+                severity=update_data.get("severity"),
+                rule_yaml=update_data.get("rule_yaml", rule.rule_yaml),
+                detection_logic=update_data.get("detection_logic", stored_logic),
+                condition=update_data.get("condition", rule.condition),
+                require_identity=False,
+            )
+        else:
+            # severity only: the stored detection is not re-judged
+            check = validate_rule_definition(
+                severity=update_data.get("severity"), require_identity=False, require_detection=False,
+            )
+        if not check.valid:
+            raise _invalid_rule(check)
+        warnings = list(check.warnings)
+
     # Handle JSON serialization for list fields
     json_fields = ["log_types", "mitre_tactics", "mitre_techniques", "tags", "references", "group_by", "detection_logic"]
     for field in json_fields:
@@ -899,7 +1281,10 @@ async def update_rule(
     from src.siem.engine_manager import reload_rules
     await reload_rules(db, rule.organization_id)
 
-    return DetectionRuleResponse.model_validate(rule)
+    response = DetectionRuleResponse.model_validate(rule)
+    response.engine_loaded = _engine_loaded(rule, rule.organization_id) if rule.enabled else False
+    response.validation_warnings = warnings
+    return response
 
 
 @router.delete("/rules/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -941,30 +1326,20 @@ async def test_rule(
       * a list of dicts with parsed fields (recommended for testing
         field-aware Sigma rules)
     """
+    import yaml
+
     from src.siem.rules.engine import RuleEngine
-    from src.siem.engine_manager import _build_yaml_from_logic
-    from src.core.utils import safe_json_loads
 
     rule = await get_rule_or_404(db, rule_id, org_id)
     sample_logs = test_data.get("sample_logs", []) or []
 
-    # Build a one-rule engine instance loaded with this specific rule.
-    # Prefer rule_yaml; fall back to detection_logic JSON (same path
-    # used by load_rules_from_db at runtime).
-    yaml_content = getattr(rule, "rule_yaml", None)
-    if not yaml_content:
-        detection_logic = getattr(rule, "detection_logic", None)
-        if detection_logic:
-            try:
-                logic = (
-                    json.loads(detection_logic)
-                    if isinstance(detection_logic, str)
-                    else detection_logic
-                )
-                yaml_content = _build_yaml_from_logic(rule, logic)
-            except (ValueError, TypeError) as exc:
-                logger.warning("detection_logic could not be converted", rule_id=rule.id, error=str(exc))
-                yaml_content = None
+    # Build a one-rule engine loaded with exactly the YAML the runtime
+    # engine loads for this row (src.siem.rule_validation.engine_yaml_for_rule).
+    try:
+        yaml_content = engine_yaml_for_rule(rule)
+    except (ValueError, TypeError, yaml.YAMLError) as exc:
+        logger.warning("Stored rule definition could not be read", rule_id=rule.id, error=str(exc))
+        yaml_content = None
 
     if not yaml_content:
         raise HTTPException(
@@ -1022,22 +1397,23 @@ async def validate_rule(
     rule_data: DetectionRuleCreate,
     current_user: CurrentUser = None,
 ):
-    """Validate rule YAML without saving"""
-    errors = []
+    """Validate a rule definition without saving (a read; viewers allowed).
 
-    if not rule_data.name or len(rule_data.name) == 0:
-        errors.append("Rule name is required")
-
-    if not rule_data.title or len(rule_data.title) == 0:
-        errors.append("Rule title is required")
-
-    if rule_data.severity and rule_data.severity not in ["critical", "high", "medium", "low", "informational"]:
-        errors.append("Invalid severity level")
-
-    return {
-        "valid": len(errors) == 0,
-        "errors": errors,
-    }
+    Parses ``rule_yaml`` (Sigma-like YAML) or ``detection_logic`` with the
+    same checks Create Rule applies and the engine relies on. Returns
+    ``valid``, ``errors`` (``"<field>: <message>"`` strings),
+    ``field_errors`` (``[{field, message}]``), ``warnings`` and, when valid,
+    ``detection`` (the block the engine will evaluate).
+    """
+    check = validate_rule_definition(
+        name=rule_data.name,
+        title=rule_data.title,
+        severity=rule_data.severity,
+        rule_yaml=rule_data.rule_yaml,
+        detection_logic=rule_data.detection_logic,
+        condition=rule_data.condition,
+    )
+    return check.to_dict()
 
 
 # ============================================================================
@@ -1384,6 +1760,13 @@ async def import_rule_yaml(
         )
     title = title.strip()
 
+    # The engine must be able to evaluate what is imported: unsupported
+    # Sigma constructs (aggregation pipes, "1 of" quantifiers, unknown
+    # modifiers) are field errors, not an inert rule shown as enabled.
+    check = validate_rule_definition(title=title, rule_yaml=yaml_content, require_identity=False)
+    if not check.valid:
+        raise _invalid_rule(check)
+
     sigma_id = parsed.get("id")  # UUID identifier — NOT the name
     if sigma_id is not None and not isinstance(sigma_id, str):
         sigma_id = str(sigma_id)
@@ -1477,6 +1860,8 @@ async def import_rule_yaml(
         "title": rule.title,
         "sigma_id": sigma_id,
         "status": "imported",
+        "engine_loaded": _engine_loaded(rule, org_id),
+        "warnings": list(check.warnings),
     }
 
 
@@ -1493,17 +1878,22 @@ async def export_rule_yaml(
     if rule.rule_yaml:
         return {"yaml": rule.rule_yaml, "title": rule.title}
 
-    # Build YAML from fields
+    # No stored YAML: export exactly what the engine evaluates for this row.
     import yaml
-    rule_dict = {
-        "title": rule.title,
-        "id": rule.name,
-        "description": rule.description or "",
-        "level": rule.severity,
-        "status": "active" if rule.enabled else "disabled",
-        "detection": safe_json_loads(rule.detection_logic, {}) if rule.detection_logic else {},
-    }
-    return {"yaml": yaml.dump(rule_dict, default_flow_style=False), "title": rule.title}
+
+    try:
+        engine_yaml = engine_yaml_for_rule(rule)
+    except (ValueError, TypeError, yaml.YAMLError) as exc:
+        raise _error(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "unreadable_rule", f"stored detection logic is unreadable: {exc}",
+        ) from exc
+    if engine_yaml is None:
+        raise _error(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "no_detection_logic",
+            "this rule has no rule_yaml or detection_logic to export",
+        )
+    return {"yaml": engine_yaml, "title": rule.title}
 
 
 # ============================================================================
@@ -1668,14 +2058,23 @@ async def _syslog_batch_handler(messages: list):
 
 @router.get("/collector/status", response_model=None)
 async def get_collector_status(current_user: CurrentUser = None):
-    """Get syslog collector status"""
+    """Syslog collector status of the API process that answered.
+
+    ``status`` ("running" / "stopped") and ``port`` mirror ``running`` and
+    ``listen_port`` (the dashboard reads the former). The listener lives in
+    one API process; ``scope`` says so.
+    """
     global _collector_instance
     if _collector_instance:
         # get_stats() carries the processed/errors/uptime/rate counters;
         # get_health() does not, so those always read 0 before.
         stats = _collector_instance.get_stats()
+        running = bool(_collector_instance._running)
         return {
-            "running": _collector_instance._running,
+            "status": "running" if running else "stopped",
+            "port": _collector_instance.udp_port,
+            "scope": "api_process",
+            "running": running,
             "listen_port": _collector_instance.udp_port,
             "protocol": "udp+tcp",
             "messages_received": stats.get("messages_received", 0),
@@ -1685,6 +2084,9 @@ async def get_collector_status(current_user: CurrentUser = None):
             "messages_per_second": stats.get("messages_per_second", 0),
         }
     return {
+        "status": "stopped",
+        "port": None,
+        "scope": "api_process",
         "running": False,
         "listen_port": 5514,
         "protocol": "udp+tcp",

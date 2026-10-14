@@ -321,6 +321,11 @@ class SIEMDataSource(BaseModel):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     last_event_at: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     events_today: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    # Lifetime count of ingested logs whose source_name equals this name
+    # (written by src.siem.pipeline.record_data_source_event).
+    events_received: Mapped[int] = mapped_column(
+        BigInteger, default=0, server_default="0", nullable=False,
+    )
 
     # Error tracking
     error_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
