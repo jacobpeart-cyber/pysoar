@@ -18,9 +18,8 @@ Features:
 """
 
 import asyncio
-import json
 import os
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 from ipaddress import ip_network, ip_address
 
@@ -1110,40 +1109,6 @@ class SafetyManager:
         except Exception as e:
             logger.error(f"Safety system monitoring failed: {str(e)}")
             return monitoring
-
-    async def generate_safety_incident_report(
-        self, incident: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """
-        Generate safety-focused incident report.
-
-        Documents physical impact, safe response actions, SIS status,
-        and post-incident validation of safety systems.
-        """
-        report = {
-            "incident_id": incident.get("id"),
-            "incident_type": incident.get("incident_type"),
-            "physical_impact_risk": incident.get("physical_impact_risk", "unknown"),
-            "operational_impact": incident.get("operational_impact", "unknown"),
-            "safe_shutdown_initiated": incident.get("safe_shutdown_initiated", False),
-            "actions_taken": [],
-            "safety_systems_status": {},
-            "validation_required": True,
-        }
-
-        try:
-            report["actions_taken"] = [
-                "Physical impact assessment completed",
-                "Safe response strategy recommended",
-                "Safety systems verified",
-            ]
-
-            return report
-
-        except Exception as e:
-            logger.error(f"Safety incident report generation failed: {str(e)}")
-            return report
-
 
 class OTVulnerabilityAssessor:
     """

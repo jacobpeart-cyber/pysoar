@@ -40,7 +40,6 @@ from src.ot_security.engine import (
     MAX_DISCOVERY_PREFIX,
     OTMonitor,
     PurdueModelEnforcer,
-    SafetyManager,
     OTVulnerabilityAssessor,
     ICSComplianceEngine,
 )
@@ -658,25 +657,6 @@ async def investigate_alert(
     return OTAlertResponse.model_validate(alert)
 
 
-@router.post("/alerts/{alert_id}/respond")
-async def respond_to_alert(
-    alert_id: str,
-    org_id: OrganizationId,
-    _user: AnalystUser = None,
-    db: DatabaseSession = None,
-    response_action: str = Query(...),
-):
-    """Record response action to alert"""
-    alert = await get_alert_or_404(db, alert_id, org_id)
-    alert.response_action = response_action
-    alert.status = "contained"
-
-    await db.commit()
-    await db.refresh(alert)
-
-    return OTAlertResponse.model_validate(alert)
-
-
 @router.post("/alerts/bulk_action")
 async def bulk_alert_action(
     org_id: OrganizationId,
@@ -1061,17 +1041,6 @@ async def get_safe_shutdown_status(incident_id: str, org_id: OrganizationId, db:
         await db.commit()
         await db.refresh(incident)
     return actuation.safe_shutdown_view(incident)
-
-
-@router.get("/incidents/{incident_id}/post_incident")
-async def get_post_incident_report(incident_id: str, org_id: OrganizationId, db: DatabaseSession = None):
-    """Generate post-incident report"""
-    incident = await get_incident_or_404(db, incident_id, org_id)
-
-    safety_mgr = SafetyManager(org_id)
-    report = await safety_mgr.generate_safety_incident_report(incident.to_dict())
-
-    return report
 
 
 # ===== OT POLICIES =====

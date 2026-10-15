@@ -108,7 +108,6 @@ async def test_by_id_routes_isolated_and_work_for_owner(
         f"{API}/zones/{ids['zone']}",
         f"{API}/zones/{ids['zone']}/communication_matrix",
         f"{API}/incidents/{ids['incident']}",
-        f"{API}/incidents/{ids['incident']}/post_incident",
         f"{API}/policies/{ids['policy']}",
         f"{API}/policies/{ids['policy']}/violation_history",
     ]
@@ -219,7 +218,6 @@ WRITE_ROUTES = [
     ("POST", "/alerts", {"asset_id": "x", "alert_type": "network_scan", "severity": "high"}),
     ("PUT", "/alerts/{alert}", {"status": "resolved"}),
     ("POST", "/alerts/{alert}/investigate", None),
-    ("POST", "/alerts/{alert}/respond?response_action=isolate", None),
     ("POST", "/zones", ZONE_BODY),
     ("PUT", "/zones/{zone}", {"description": "x"}),
     ("DELETE", "/zones/{zone}", None),
@@ -452,10 +450,9 @@ async def test_export_is_scoped(
     org_b_headers: dict[str, str],
 ) -> None:
     await _seed(db_session, org_a.id)
-    # Wave 4: moved from the dash alias, which now answers 410 with the new path.
+    # Wave 4 moved it from the dash alias; wave 5 retired the 410 tombstone.
     gone = await client.get("/api/v1/ot-security/export", headers=org_a_headers)
-    assert gone.status_code == 410, gone.text
-    assert gone.json()["detail"]["new_path"] == "/api/v1/ot_security/export"
+    assert gone.status_code == 404, gone.text
     own = await client.get(f"{API}/export", headers=org_a_headers)
     assert own.status_code == 200, own.text
     assert own.json()["summary"]["total_assets"] == 1

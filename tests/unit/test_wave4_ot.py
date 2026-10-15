@@ -359,13 +359,13 @@ async def test_dash_list_duplicates_are_gone(client: AsyncClient, org_a_headers:
     assert (await client.get(path, headers=org_a_headers)).status_code == 404
 
 
-async def test_moved_dash_routes_answer_410_with_the_new_path(
+async def test_dash_prefixed_discover_is_gone(
     client: AsyncClient, org_a_admin_headers: dict[str, str],
 ) -> None:
+    """Wave 5 retired the 410 tombstone: the dash-prefixed path is simply not served."""
     discover = await client.post("/api/v1/ot-security/discover", json={"cidr": "10.0.0.0/24"},
                                  headers=org_a_admin_headers)
-    assert discover.status_code == 410
-    assert discover.json()["detail"]["new_path"] == "/api/v1/ot_security/discover"
+    assert discover.status_code == 404
 
 
 async def test_discovered_unknown_asset_type_lists_cleanly(

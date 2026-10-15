@@ -1,6 +1,6 @@
 # API-only routes
 
-Every route under `/api/v1` is either called by the frontend or listed in this file. `scripts/contract_diff.py` reads it: KEEP-API routes and routes called through a runtime-built path are reported separately, so its "never called" list holds only the EXPOSE, pending-retirement and unclassified routes. `tests/unit/test_route_inventory.py` fails when a served route is in neither place, when a row names a route the app no longer serves, or when a KEEP-API row is a route the frontend now calls.
+Every route under `/api/v1` is either called by the frontend or listed in this file. `scripts/contract_diff.py` reads it: KEEP-API routes and routes called through a runtime-built path are reported separately, so its "never called" list holds only the EXPOSE and unclassified routes. `tests/unit/test_route_inventory.py` fails when a served route is in neither place, when a row names a route the app no longer serves, or when a KEEP-API row is a route the frontend now calls.
 
 Roles: `viewer` < `analyst` < `admin` inside an organisation; `platform superuser` is the org-less operator. "any authenticated user" means any role of the organisation (read routes); "analyst, admin" excludes viewers. Tenancy "org-scoped" means the route takes the caller's organisation (`OrganizationId`) and filters every query and lookup by it (403 `organization_required` for an org-less caller); "(in handler)" means the filter is applied in the handler body rather than through the dependency.
 
@@ -575,14 +575,3 @@ Real routes the UI should call. They stay in the contract diff's "never called" 
 | GET | `/api/v1/stig/rules/{rule_id}` | STIG rule detail (check and fix text). | any authenticated user | org-scoped |
 | POST | `/api/v1/threat-modeling/{model_id}/threats/{threat_id}/mitigations` | ThreatModel mitigations panel is always empty without a create control. | analyst, admin | org-scoped |
 | POST | `/api/v1/vulnmgmt/instances` | Vulnerability instance create: the only creator besides scanner import. | analyst, admin | org-scoped |
-
-## Pending retirement (4 routes)
-
-To be deleted, but they live in files another wave-5 package is editing; listed so the inventory test passes until they go.
-
-| Method | Route | Why | Roles | Tenancy |
-|---|---|---|---|---|
-| POST | `/api/v1/ot-security/discover` | 410 tombstone left by wave 4 (moved to /ot_security/discover). Delete together with the assertion at test_wave4_ot.py:365 once W5-C's OT work lands. | any authenticated user | no tenant data |
-| GET | `/api/v1/ot-security/export` | 410 tombstone left by wave 4 (moved to /ot_security/export). Delete together with the assertion at test_tenancy_ot_security.py:456. | any authenticated user | no tenant data |
-| POST | `/api/v1/ot_security/alerts/{alert_id}/respond` | FAKE label: stores free text and sets status 'contained' with no action taken. Lives in ot_security.py (W5-C): delete; PUT /alerts/{id} already sets the status. | analyst, admin | org-scoped |
-| GET | `/api/v1/ot_security/incidents/{incident_id}/post_incident` | FAKE: SafetyManager.generate_safety_incident_report returns fixed strings ('Safety systems verified'). Lives in ot_security.py, which W5-C is editing: delete with the engine method. | any authenticated user | org-scoped |

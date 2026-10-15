@@ -14,7 +14,7 @@ empty list — no hardcoded data.
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Query
 from sqlalchemy import and_, desc, func, or_, select
 
 from src.api.deps import (
@@ -315,22 +315,3 @@ async def integrations_webhooks_flat(
 # nothing else.
 # --------------------------------------------------------------------------
 
-
-def _ot_moved(new_path: str) -> HTTPException:
-    return HTTPException(
-        status_code=410,
-        detail={"error": "moved", "new_path": new_path,
-                "detail": f"This route moved to {new_path}."},
-    )
-
-
-@router.post("/ot-security/discover", status_code=410)
-async def ot_security_bulk_discover_moved(_user: CurrentUser = None):
-    """Gone: use ``POST /api/v1/ot_security/discover``."""
-    raise _ot_moved("/api/v1/ot_security/discover")
-
-
-@router.get("/ot-security/export", status_code=410)
-async def ot_security_export_moved(_user: CurrentUser = None):
-    """Gone: use ``GET /api/v1/ot_security/export``."""
-    raise _ot_moved("/api/v1/ot_security/export")
