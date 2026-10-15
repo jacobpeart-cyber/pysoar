@@ -148,6 +148,13 @@ ORG_RUN_BUDGET_SECONDS = 60.0
 #: edited; built-in detectors keep running) and the other policies are
 #: unaffected. Policies run cheapest-first within a run.
 POLICY_RUN_BUDGET_SECONDS = 20.0
+#: A record whose chunks stall the child is a poison pill: it alone is flagged
+#: and scanning resumes after it. A policy is degraded only after this many
+#: poison records in one run, so one planted record cannot blind it.
+MAX_POISON_RECORDS_PER_RUN = 3
+#: Text handed to the child per policy and window; records beyond it are
+#: recorded as unscanned rather than silently skipped.
+MAX_WINDOW_CHARS_PER_POLICY = 5_000_000
 _RUN_BUDGET: contextvars.ContextVar[dict[str, float] | None] = contextvars.ContextVar("_dlp_run_budget", default=None)
 _NESTED_QUANTIFIER_RE = re.compile(r"(?:\([^()]*[+*][^()]*\)|\[[^\]]*\][+*]|[+*])\s*[+*{]")
 _BACKREF_RE = re.compile(r"\\[1-9]|\(\?P=")
@@ -728,48 +735,73 @@ async def _evaluate_window(
             custom_hits[plan.policy.id] = {}
             unscanned[plan.policy.id] = {cid.split("\x1f", 1)[0] for cid, _ in todo}
             continue
-        policy_remaining = per_policy.get(plan.policy.id, POLICY_RUN_BUDGET_SECONDS)
-        org_remaining = state["remaining"] if state is not None else POLICY_WINDOW_BUDGET_SECONDS
-        budget = min(POLICY_WINDOW_BUDGET_SECONDS, policy_remaining, org_remaining)
-        if budget <= 0:
-            found, missing, timed_out = {}, [cid for cid, _ in todo], True
-        else:
+        # Bound the text volume handed to the child per policy and window; the
+        # records that do not fit are recorded as unscanned (fail closed).
+        kept: list[tuple[str, str]] = []
+        dropped: set[str] = set()
+        total = 0
+        for cid, chunk in todo:
+            rid = cid.split("\x1f", 1)[0]
+            if rid in dropped:
+                continue
+            if total + len(chunk) > MAX_WINDOW_CHARS_PER_POLICY:
+                dropped.add(rid)
+                continue
+            kept.append((cid, chunk))
+            total += len(chunk)
+        kept = [(cid, chunk) for cid, chunk in kept if cid.split("\x1f", 1)[0] not in dropped]
+        merged: dict[str, list[tuple[str, int, int]]] = {}
+        unscanned_ids: set[str] = set(dropped)
+        poison = 0
+        pending = kept
+        while pending:
+            policy_remaining = per_policy.get(plan.policy.id, POLICY_RUN_BUDGET_SECONDS)
+            org_remaining = state["remaining"] if state is not None else POLICY_WINDOW_BUDGET_SECONDS
+            budget = min(POLICY_WINDOW_BUDGET_SECONDS, policy_remaining, org_remaining)
+            if budget <= 0:
+                unscanned_ids |= {cid.split("\x1f", 1)[0] for cid, _ in pending}
+                break
             started = time.perf_counter()
             # The child-process call is synchronous: run it in a worker thread so
             # the event loop (and the other tenants' work) keeps moving.
-            found, missing, timed_out = await asyncio.to_thread(match_custom_patterns, custom, todo, budget)
+            found, missing, timed_out = await asyncio.to_thread(match_custom_patterns, custom, pending, budget)
             spent = time.perf_counter() - started
             per_policy[plan.policy.id] = max(0.0, policy_remaining - spent)
             if state is not None:
                 state["remaining"] = max(0.0, state["remaining"] - spent)
-        if timed_out and per_policy.get(plan.policy.id, POLICY_RUN_BUDGET_SECONDS) <= 0:
-            # This policy exhausted its own run budget: suspend its custom matching
-            # (visible on the policy) instead of letting it eat the other policies'.
-            plan.policy.evaluation_status = "degraded"
-            plan.policy.evaluation_reason = (
-                f"custom patterns exceeded {POLICY_RUN_BUDGET_SECONDS:.0f}s of matching in one run; "
-                "custom matching is suspended until the policy is edited (built-in detectors still run)"
-            )
-            plan.status = "degraded"
-            plan.reason = plan.policy.evaluation_reason
-        # Map chunk results back to records: offsets added, overlap duplicates dropped,
-        # and a record with any unscanned chunk counts as unscanned.
-        merged: dict[str, list[tuple[str, int, int]]] = {}
-        for cid, chunk_hits in found.items():
-            rid, offset = cid.split("\x1f", 1)
-            base = int(offset)
-            bucket = merged.setdefault(rid, [])
-            for name, start, end in chunk_hits:
-                hit = (name, start + base, end + base)
-                if hit not in bucket:
-                    bucket.append(hit)
+            for cid, chunk_hits in found.items():
+                rid, offset = cid.split("\x1f", 1)
+                base = int(offset)
+                bucket = merged.setdefault(rid, [])
+                for name, start, end in chunk_hits:
+                    hit = (name, start + base, end + base)
+                    if hit not in bucket:
+                        bucket.append(hit)
+            if not timed_out or not missing:
+                break
+            # The first unreported chunk belongs to the record that stalled the
+            # child (the poison pill): flag that record alone and resume with the
+            # records after it in a fresh child, charging this policy's budget.
+            poison_rid = missing[0].split("\x1f", 1)[0]
+            unscanned_ids.add(poison_rid)
+            poison += 1
+            done = {cid for cid in found}
+            pending = [
+                (cid, chunk) for cid, chunk in pending
+                if cid not in done and cid.split("\x1f", 1)[0] != poison_rid
+            ]
+            if poison >= MAX_POISON_RECORDS_PER_RUN:
+                unscanned_ids |= {cid.split("\x1f", 1)[0] for cid, _ in pending}
+                plan.policy.evaluation_status = "degraded"
+                plan.policy.evaluation_reason = (
+                    f"custom patterns timed out on {poison} records in one run; custom matching is "
+                    "suspended until the policy is edited (built-in detectors still run)"
+                )
+                plan.status = "degraded"
+                plan.reason = plan.policy.evaluation_reason
+                break
         custom_hits[plan.policy.id] = merged
-        unscanned[plan.policy.id] = {cid.split("\x1f", 1)[0] for cid in missing}
-        if timed_out:
-            logger.warning(
-                "dlp_custom_scan_incomplete", organization_id=org_id, policy_id=plan.policy.id,
-                unscanned=len(missing), budget=POLICY_WINDOW_BUDGET_SECONDS,
-            )
+        unscanned[plan.policy.id] = unscanned_ids
     for record in records:
         text = texts.get(record.id, "")
         if not text:

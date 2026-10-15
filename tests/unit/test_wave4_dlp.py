@@ -341,8 +341,8 @@ async def test_slow_policy_only_exhausts_itself_and_is_marked_degraded(
     assert by_policy[fast["id"]].violation_type != "scan_incomplete"
     assert by_policy[slow["id"]].violation_type == "scan_incomplete"
     slow_status = (await client.get(f"{BASE}/policies/{slow['id']}", headers=org_a_admin_headers)).json()
-    assert slow_status["evaluation_status"] == "degraded"
-    assert "suspended" in (slow_status.get("evaluation_reason") or "")
+    # one poison record does not blind the policy: it stays active and only that record is flagged
+    assert slow_status["evaluation_status"] == "active"
     fast_status = (await client.get(f"{BASE}/policies/{fast['id']}", headers=org_a_admin_headers)).json()
     assert fast_status["evaluation_status"] == "active"
 
@@ -376,3 +376,39 @@ async def test_matches_past_the_chunk_size_are_found_and_over_cap_records_are_fl
     assert by_source[huge_id].violation_type != "scan_incomplete"  # match inside the cap
     overflow = by_source[f"{huge_id}#overflow"]
     assert overflow.violation_type == "scan_incomplete" and overflow.action_taken == "scan_truncated"
+
+
+async def test_poison_records_are_isolated_and_scanning_resumes_after_them(
+    client: AsyncClient, db_session: AsyncSession, org_a, org_a_admin_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A planted slow record is flagged alone; the clean records before and after
+    it are still scanned by the same policy, and the policy is degraded only after
+    several poison records in one run."""
+    from src.dlp import scanner as mod
+    from src.dlp.models import DLPViolation
+
+    org_id = org_a.id
+    monkeypatch.setattr(mod, "POLICY_WINDOW_BUDGET_SECONDS", 1.0)
+    monkeypatch.setattr(mod, "POLICY_RUN_BUDGET_SECONDS", 30.0)
+    monkeypatch.setattr(mod, "ORG_RUN_BUDGET_SECONDS", 60.0)
+    monkeypatch.setattr(mod, "MAX_POISON_RECORDS_PER_RUN", 3)
+    pol = await _policy(client, org_a_admin_headers, name="mixed", data_patterns=[r"(a|aa)+$", r"PROJ-\d{4}"],
+                        channels_monitored=["logs"])
+    before = _log(org_id, "clean PROJ-1111 first")
+    poison = _log(org_id, "a" * 48 + "b")
+    after = _log(org_id, "clean PROJ-2222 after the poison")
+    db_session.add_all([before, poison, after])
+    await db_session.commit()
+    before_id, poison_id, after_id = before.id, poison.id, after.id
+
+    run = await client.post(f"{BASE}/scan/run", headers=org_a_admin_headers)
+    assert run.status_code == 200, run.text
+    rows = (await db_session.execute(
+        select(DLPViolation).where(DLPViolation.organization_id == org_id, DLPViolation.policy_id == pol["id"])
+    )).scalars().all()
+    by_source = {r.source_id: r for r in rows}
+    assert by_source[poison_id].violation_type == "scan_incomplete"
+    assert by_source[before_id].violation_type != "scan_incomplete"
+    assert by_source[after_id].violation_type != "scan_incomplete"
+    status = (await client.get(f"{BASE}/policies/{pol['id']}", headers=org_a_admin_headers)).json()
+    assert status["evaluation_status"] == "active"
