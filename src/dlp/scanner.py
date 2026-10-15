@@ -45,6 +45,11 @@ logger = get_logger(__name__)
 WINDOW_ROWS = 200
 MAX_ROWS_PER_SOURCE = 2_000
 MAX_TEXT_CHARS = 20_000
+#: Hard cap per record. Text up to it is scanned in overlapping chunks of
+#: ``MAX_TEXT_CHARS`` (so nothing inside the cap is skipped); a record longer
+#: than the cap gets a scan_incomplete finding for the unscanned remainder.
+MAX_RECORD_CHARS = 1_000_000
+CHUNK_OVERLAP = 256
 MAX_CUSTOM_PATTERN_LENGTH = 500
 INITIAL_LOOKBACK_DAYS = 30
 EXCERPT_RADIUS = 120
@@ -654,6 +659,22 @@ async def scan_organization(
     return summary
 
 
+def _chunks(text: str) -> list[tuple[int, str]]:
+    """``(offset, chunk)`` windows covering ``text`` with overlap, inside the hard cap."""
+    body = text[:MAX_RECORD_CHARS]
+    if len(body) <= MAX_TEXT_CHARS:
+        return [(0, body)] if body else []
+    out: list[tuple[int, str]] = []
+    step = MAX_TEXT_CHARS - CHUNK_OVERLAP
+    start = 0
+    while start < len(body):
+        out.append((start, body[start:start + MAX_TEXT_CHARS]))
+        if start + MAX_TEXT_CHARS >= len(body):
+            break
+        start += step
+    return out
+
+
 async def _evaluate_window(
     db: AsyncSession,
     org_id: str,
@@ -676,7 +697,8 @@ async def _evaluate_window(
         ).all()
     )
     created = 0
-    texts = {r.id: (r.text or "")[:MAX_TEXT_CHARS] for r in records}
+    texts = {r.id: (r.text or "")[:MAX_RECORD_CHARS] for r in records}
+    overflow = {r.id for r in records if len(r.text or "") > MAX_RECORD_CHARS}
     # Custom (tenant-authored) patterns run per policy in a killable child
     # process over the whole window; records it did not finish are recorded
     # as scan_incomplete findings rather than silently passed.
@@ -693,20 +715,24 @@ async def _evaluate_window(
         custom = {name: p.pattern for name, p in plan.patterns.items() if name.startswith("custom:")}
         if not custom:
             continue
-        todo = [(rid, text) for rid, text in texts.items() if text and (plan.policy.id, rid) not in existing]
+        todo = [
+            (f"{rid}\x1f{offset}", chunk)
+            for rid, text in texts.items() if text and (plan.policy.id, rid) not in existing
+            for offset, chunk in _chunks(text)
+        ]
         if not todo:
             continue
         if plan.policy.evaluation_status == "degraded":
             # Suspended custom matching is never silent: every record it would
             # have scanned is recorded as scan_incomplete for review.
             custom_hits[plan.policy.id] = {}
-            unscanned[plan.policy.id] = {rid for rid, _ in todo}
+            unscanned[plan.policy.id] = {cid.split("\x1f", 1)[0] for cid, _ in todo}
             continue
         policy_remaining = per_policy.get(plan.policy.id, POLICY_RUN_BUDGET_SECONDS)
         org_remaining = state["remaining"] if state is not None else POLICY_WINDOW_BUDGET_SECONDS
         budget = min(POLICY_WINDOW_BUDGET_SECONDS, policy_remaining, org_remaining)
         if budget <= 0:
-            found, missing, timed_out = {}, [rid for rid, _ in todo], True
+            found, missing, timed_out = {}, [cid for cid, _ in todo], True
         else:
             started = time.perf_counter()
             # The child-process call is synchronous: run it in a worker thread so
@@ -726,8 +752,19 @@ async def _evaluate_window(
             )
             plan.status = "degraded"
             plan.reason = plan.policy.evaluation_reason
-        custom_hits[plan.policy.id] = found
-        unscanned[plan.policy.id] = set(missing)
+        # Map chunk results back to records: offsets added, overlap duplicates dropped,
+        # and a record with any unscanned chunk counts as unscanned.
+        merged: dict[str, list[tuple[str, int, int]]] = {}
+        for cid, chunk_hits in found.items():
+            rid, offset = cid.split("\x1f", 1)
+            base = int(offset)
+            bucket = merged.setdefault(rid, [])
+            for name, start, end in chunk_hits:
+                hit = (name, start + base, end + base)
+                if hit not in bucket:
+                    bucket.append(hit)
+        custom_hits[plan.policy.id] = merged
+        unscanned[plan.policy.id] = {cid.split("\x1f", 1)[0] for cid in missing}
         if timed_out:
             logger.warning(
                 "dlp_custom_scan_incomplete", organization_id=org_id, policy_id=plan.policy.id,
@@ -763,6 +800,27 @@ async def _evaluate_window(
                 existing.add((plan.policy.id, record.id))
                 created += 1
                 continue
+            if record.id in overflow:
+                db.add(DLPViolation(
+                    organization_id=org_id,
+                    policy_id=plan.policy.id,
+                    violation_type="scan_incomplete",
+                    severity=plan.policy.severity or "medium",
+                    source_user=(record.user or None) and str(record.user)[:255],
+                    source_application=source_label,
+                    sensitive_data_types=json.dumps(["record_over_cap"]),
+                    action_taken="scan_truncated",
+                    status="new",
+                    source_type=source_key,
+                    source_id=f"{record.id}#overflow",
+                    location=record.location[:2000],
+                    redacted_excerpt=(
+                        f"the record is longer than {MAX_RECORD_CHARS} characters; only the first "
+                        f"{MAX_RECORD_CHARS} were scanned. Review the remainder manually."
+                    ),
+                    detected_by="content_scan",
+                ))
+                created += 1
             hits = _builtin_matches(plan, text)
             hits.extend(_filter_hits(plan, text, custom_hits.get(plan.policy.id, {}).get(record.id, [])))
             if not hits:

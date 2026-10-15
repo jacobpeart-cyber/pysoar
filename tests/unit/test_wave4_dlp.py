@@ -345,3 +345,34 @@ async def test_slow_policy_only_exhausts_itself_and_is_marked_degraded(
     assert "suspended" in (slow_status.get("evaluation_reason") or "")
     fast_status = (await client.get(f"{BASE}/policies/{fast['id']}", headers=org_a_admin_headers)).json()
     assert fast_status["evaluation_status"] == "active"
+
+
+async def test_matches_past_the_chunk_size_are_found_and_over_cap_records_are_flagged(
+    client: AsyncClient, db_session: AsyncSession, org_a, org_a_admin_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Records are scanned in overlapping chunks: a match after the first chunk is
+    found; a record past the hard cap gets a scan_incomplete finding for the
+    unscanned remainder instead of being silently truncated."""
+    from src.dlp import scanner as mod
+    from src.dlp.models import DLPViolation
+
+    org_id = org_a.id
+    monkeypatch.setattr(mod, "MAX_TEXT_CHARS", 2_000)
+    monkeypatch.setattr(mod, "MAX_RECORD_CHARS", 10_000)
+    pol = await _policy(client, org_a_admin_headers, name="proj", data_patterns=[r"PROJ-\d{4}"], channels_monitored=["logs"])
+    deep = _log(org_id, "x" * 5_000 + " PROJ-7777 " + "y" * 1_000)
+    huge = _log(org_id, "z" * 9_000 + " PROJ-8888 " + "w" * 5_000)
+    db_session.add_all([deep, huge])
+    await db_session.commit()
+    deep_id, huge_id = deep.id, huge.id
+
+    run = await client.post(f"{BASE}/scan/run", headers=org_a_admin_headers)
+    assert run.status_code == 200, run.text
+    rows = (await db_session.execute(
+        select(DLPViolation).where(DLPViolation.organization_id == org_id, DLPViolation.policy_id == pol["id"])
+    )).scalars().all()
+    by_source = {r.source_id: r for r in rows}
+    assert by_source[deep_id].violation_type != "scan_incomplete"  # found past the first chunk
+    assert by_source[huge_id].violation_type != "scan_incomplete"  # match inside the cap
+    overflow = by_source[f"{huge_id}#overflow"]
+    assert overflow.violation_type == "scan_incomplete" and overflow.action_taken == "scan_truncated"
