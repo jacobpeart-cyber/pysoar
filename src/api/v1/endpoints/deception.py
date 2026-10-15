@@ -986,7 +986,8 @@ def _presented_values(request: Request, body_json: Any) -> list[str]:
     return [v[:8192] for v in found]
 
 
-@router.api_route("/canary/{token_id}", methods=["POST", "GET"])
+@router.post("/canary/{token_id}", operation_id="canary_callback_post")
+@router.get("/canary/{token_id}", operation_id="canary_callback_get")
 async def canary_callback(
     token_id: str,
     request: Request,
