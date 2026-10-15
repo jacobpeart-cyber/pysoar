@@ -456,6 +456,7 @@ class AutomationService:
             source="siem",
             status="new",
             category="detection",
+            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
@@ -479,6 +480,7 @@ class AutomationService:
             status="new",
             category="intrusion",
             source_ip=attacker_ip,
+            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
@@ -501,6 +503,7 @@ class AutomationService:
             severity="high" if data_classification in ("secret", "top_secret", "confidential") else "medium",
             status="open",
             incident_type="data_breach",
+            organization_id=organization_id,
         )
         self.db.add(incident)
         await self.db.flush()
@@ -525,6 +528,7 @@ class AutomationService:
             source="ueba",
             status="new",
             category="insider_threat",
+            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
@@ -547,6 +551,7 @@ class AutomationService:
             source="dark_web",
             status="new",
             category="data_leak",
+            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
@@ -670,6 +675,7 @@ class AutomationService:
             source="attack_simulation",
             status="new",
             category="defense_gap",
+            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
@@ -724,6 +730,7 @@ class AutomationService:
             source="threat_hunting",
             status="new",
             category="hunt_finding",
+            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
@@ -772,6 +779,7 @@ class AutomationService:
             severity="high" if loss_expectancy_usd >= 1000000 else "medium",
             status="open",
             incident_type="risk_review",
+            organization_id=organization_id,
         )
         self.db.add(incident)
         await self.db.flush()
@@ -794,6 +802,7 @@ class AutomationService:
             source="privacy",
             status="new",
             category="privacy_request",
+            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
@@ -815,6 +824,7 @@ class AutomationService:
             source="zero_trust",
             status="new",
             category="policy_violation",
+            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
@@ -837,6 +847,7 @@ class AutomationService:
             source="supply_chain",
             status="new",
             category="vulnerability",
+            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
@@ -861,6 +872,7 @@ class AutomationService:
             source="api_security",
             status="new",
             category="api_attack",
+            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
@@ -891,6 +903,7 @@ class AutomationService:
             source="stig",
             status="new",
             category="compliance",
+            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
@@ -912,6 +925,7 @@ class AutomationService:
             source="data_lake",
             status="new",
             category="data_anomaly",
+            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()

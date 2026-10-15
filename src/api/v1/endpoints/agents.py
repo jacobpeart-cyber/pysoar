@@ -572,8 +572,6 @@ async def agent_heartbeat(
                     "encryption_enabled": bool(posture.get("encryption_enabled")),
                     "av_active": bool(posture.get("av_active")),
                     "firewall_on": bool(posture.get("firewall_on")),
-                    "certificate_valid": True,
-                    "jailbroken": False,
                     "last_posture_at": posture.get("hostname") and str(agent.last_heartbeat_at or ""),
                 },
             )
