@@ -175,6 +175,14 @@ async def create_dsr(
     - objection: Right to object to processing (GDPR Article 21)
     - automated_decision: Right to human review (GDPR Article 22)
     """
+    try:
+        dsr_flow.validate_subject_email(dsr.subject_email)
+        dsr_flow.validate_subject_identifier(dsr.subject_identifier)
+    except dsr_flow.InvalidSubjectIdentifier as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "invalid_subject_identifier", "detail": str(exc)},
+        ) from None
     processor = DSRProcessor(db, org_id)
     request = await processor.receive_request(
         request_type=dsr.request_type.value,
@@ -545,6 +553,28 @@ async def execute_dsr_erasure(
         )
     if _user is not None and (_user.email or "").strip().lower() == (request.subject_email or "").strip().lower():
         raise _conflict("an administrator cannot run erasure of their own account", "self_erasure")
+    if _user is not None and request.identity_verified_by and str(_user.id) == str(request.identity_verified_by):
+        raise _conflict(
+            "the administrator who verified the subject's identity cannot also run the erasure",
+            "separation_of_duties",
+        )
+    try:
+        counts = await dsr_flow.preflight_erasure(db, org_id, request, force=confirmation.force)
+    except dsr_flow.InvalidSubjectIdentifier as exc:
+        raise HTTPException(status_code=422, detail={"error": "invalid_subject_identifier", "detail": str(exc)}) from None
+    except dsr_flow.ErasureTooBroad as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "erasure_too_broad",
+                "detail": "a source matches more rows than the per-source limit; review the counts and resend with force=true to proceed",
+                "counts": exc.counts,
+                "max_rows_per_source": exc.limit,
+            },
+        ) from None
+    if confirmation.force:
+        await _audit(db, _user, org_id, "privacy.dsr_erasure.forced", request.id,
+                     "DSR erasure forced past the per-source breadth limit", {"counts": counts})
 
     log = await dsr_flow.execute_erasure(db, org_id, request)
     for key, entry in log["sources"].items():

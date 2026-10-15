@@ -271,6 +271,9 @@ class DSRErasureRequest(BaseModel):
     """Explicit confirmation for an erasure run."""
 
     confirm: bool = False
+    #: Run even when a source matches more rows than the per-source limit (409
+    #: ``erasure_too_broad`` otherwise). Audited.
+    force: bool = False
 
 
 class DataSubjectRequestListResponse(BaseModel):

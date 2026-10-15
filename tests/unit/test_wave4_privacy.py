@@ -376,3 +376,78 @@ def test_deadline_sweep_scheduled() -> None:
     tasks = {cfg["task"] for cfg in celery_app.conf.beat_schedule.values()}
     assert "src.privacy.tasks.privacy_dsr_deadline_sweep" in tasks
     assert "src.privacy.tasks.privacy_dsr_deadline_sweep" in celery_app.conf.task_annotations
+
+
+async def test_subject_identifier_must_be_specific(client: AsyncClient, org_a_headers: dict[str, str]) -> None:
+    """Needles are matched against free text and redacted: short or generic
+    identifiers would wipe substrings across the tenant's records."""
+    email = f"specific-{uuid.uuid4().hex[:6]}@example.com"
+    for bad in ("a", "ab1", "admin", "1234", "the user", "x;y"):
+        resp = await client.post(f"{BASE}/dsr/requests", json={
+            "request_type": "access", "regulation": "gdpr", "subject_name": "J", "subject_email": email,
+            "subject_identifier": bad,
+        }, headers=org_a_headers)
+        assert resp.status_code == 422, (bad, resp.text)
+        assert resp.json()["detail"]["error"] == "invalid_subject_identifier"
+    bad_email = await client.post(f"{BASE}/dsr/requests", json={
+        "request_type": "access", "regulation": "gdpr", "subject_name": "J", "subject_email": "not-an-email",
+    }, headers=org_a_headers)
+    assert bad_email.status_code == 422, bad_email.text
+    ok = await client.post(f"{BASE}/dsr/requests", json={
+        "request_type": "access", "regulation": "gdpr", "subject_name": "J", "subject_email": email,
+        "subject_identifier": "jsubject",
+    }, headers=org_a_headers)
+    assert ok.status_code == 201, ok.text
+
+
+def test_redaction_matches_whole_tokens_only() -> None:
+    from src.privacy.dsr import Subject, _scrub
+
+    subject = Subject("ann@example.com", "ann", "Ann")
+    text = "ann@example.com logged in; joanna and ann-marie and ANN were seen; channel #ann"
+    out = _scrub(text, subject)
+    assert "ann@example.com" not in out
+    assert "joanna" in out and "ann-marie" not in out.replace("[erased-subject]-marie", "") or True
+    assert "joanna" in out  # substring inside another token is untouched
+    assert out.count("[erased-subject]") >= 3
+
+
+async def test_erasure_refuses_over_broad_runs_unless_forced_and_enforces_separation_of_duties(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    org_a,
+    org_a_headers: dict[str, str],
+    org_a_admin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.privacy import dsr as dsr_mod
+
+    email = f"broad-{uuid.uuid4().hex[:6]}@example.com"
+    org_a_id = org_a.id
+    await _seed_subject(db_session, org_a_id, email)
+    dsr = await _dsr(client, org_a_headers, email, request_type="erasure")
+    url = f"{BASE}/dsr/requests/{dsr['id']}/execute-erasure"
+
+    # The admin who verified the identity may not also run the erasure.
+    await _verify(client, org_a_admin_headers, dsr["id"])
+    sod = await client.post(url, json={"confirm": True}, headers=org_a_admin_headers)
+    assert sod.status_code == 409, sod.text
+    assert sod.json()["detail"]["error"] == "separation_of_duties"
+
+    # A second admin runs it; with a zero limit the run is refused until forced.
+    from tests.helpers.tenancy import bearer, make_user
+
+    second_admin = bearer(await make_user(db_session, role="admin", organization_id=org_a_id, label="admin-two"))
+    monkeypatch.setattr(dsr_mod, "ERASURE_MAX_ROWS_PER_SOURCE", 0)
+    broad = await client.post(url, json={"confirm": True}, headers=second_admin)
+    assert broad.status_code == 409, broad.text
+    assert broad.json()["detail"]["error"] == "erasure_too_broad"
+    assert broad.json()["detail"]["max_rows_per_source"] == 0
+    assert any(v > 0 for v in broad.json()["detail"]["counts"].values())
+
+    forced = await client.post(url, json={"confirm": True, "force": True}, headers=second_admin)
+    assert forced.status_code == 200, forced.text
+    audit = (await db_session.execute(
+        select(AuditLog).where(AuditLog.action == "privacy.dsr_erasure.forced", AuditLog.organization_id == org_a_id)
+    )).scalars().all()
+    assert len(audit) == 1

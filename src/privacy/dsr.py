@@ -80,6 +80,60 @@ def check_transition(current: str, new: str) -> None:
             f"cannot move a DSR from {current!r} to {new!r}; allowed: {allowed or 'none (final)'}"
         )
 
+# A DSR's needles are matched against free text (alert titles, descriptions,
+# raw data, incident fields) and then redacted. A short or common identifier
+# ("a", "admin", "1") would redact substrings across the tenant's records, so
+# identifiers are validated when the request is created and again before any
+# search or erasure, free-text matches are token-bounded, and an erasure that
+# would touch more rows per source than ``ERASURE_MAX_ROWS_PER_SOURCE`` is
+# refused unless an administrator explicitly forces it.
+MIN_IDENTIFIER_LEN = 4
+ERASURE_MAX_ROWS_PER_SOURCE = 200
+_EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}\.[A-Za-z0-9-]{2,}$")
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+/\\-]{3,254}$")
+_COMMON_TOKENS = frozenset({
+    "admin", "administrator", "user", "users", "test", "root", "null", "none", "true", "false",
+    "guest", "system", "service", "unknown", "anonymous", "default", "local", "localhost", "nobody",
+})
+
+
+class InvalidSubjectIdentifier(ValueError):
+    """The subject e-mail or identifier is not safe to match against free text."""
+
+
+class ErasureTooBroad(ValueError):
+    """An erasure would touch more rows in a source than the configured limit."""
+
+    def __init__(self, counts: dict[str, int], limit: int) -> None:
+        super().__init__("erasure too broad")
+        self.counts = counts
+        self.limit = limit
+
+
+def validate_subject_email(email: str) -> str:
+    text = (email or "").strip().lower()
+    if not _EMAIL_RE.fullmatch(text):
+        raise InvalidSubjectIdentifier("subject_email must be a valid e-mail address")
+    return text
+
+
+def validate_subject_identifier(identifier: str | None) -> str | None:
+    text = (identifier or "").strip()
+    if not text:
+        return None
+    if len(text) < MIN_IDENTIFIER_LEN or not _IDENTIFIER_RE.fullmatch(text):
+        raise InvalidSubjectIdentifier(
+            f"subject_identifier must be at least {MIN_IDENTIFIER_LEN} characters of letters, digits and . _ @ + - /",
+        )
+    if text.isdigit() or text.lower() in _COMMON_TOKENS:
+        raise InvalidSubjectIdentifier("subject_identifier is too generic to identify one person")
+    return text
+
+
+def _bounded(needle: str) -> re.Pattern[str]:
+    """Match ``needle`` only where it is not glued to other identifier characters."""
+    return re.compile(r"(?<![A-Za-z0-9])" + re.escape(needle) + r"(?![A-Za-z0-9])", re.IGNORECASE)
+
 
 @dataclass
 class Subject:
@@ -96,8 +150,12 @@ class Subject:
 
 
 def subject_of(dsr: DataSubjectRequest) -> Subject:
-    ident = (dsr.subject_identifier or "").strip() or None
-    return Subject((dsr.subject_email or "").strip().lower(), ident, dsr.subject_name)
+    """Build the search subject; raises InvalidSubjectIdentifier for unsafe values."""
+    return Subject(
+        validate_subject_email(dsr.subject_email or ""),
+        validate_subject_identifier(dsr.subject_identifier),
+        dsr.subject_name,
+    )
 
 
 def _like(value: str) -> str:
@@ -110,7 +168,7 @@ def _scrub(text: Optional[str], subject: Subject) -> Optional[str]:
         return text
     out = text
     for needle in subject.needles:
-        out = re.sub(re.escape(needle), ERASED_TOKEN, out, flags=re.IGNORECASE)
+        out = _bounded(needle).sub(ERASED_TOKEN, out)
     return out
 
 
@@ -650,6 +708,26 @@ def package_to_csv(package: dict[str, Any]) -> str:
                 cell = json.dumps(value, default=str) if isinstance(value, (dict, list)) else value
                 writer.writerow([csv_safe(key), csv_safe(rid), csv_safe(field_name), csv_safe(cell)])
     return buf.getvalue()
+
+
+async def preflight_erasure(
+    db: AsyncSession, org_id: str, dsr: DataSubjectRequest, *, force: bool = False,
+) -> dict[str, int]:
+    """Count what an erasure would touch per source; refuse an over-broad run.
+
+    Raises ErasureTooBroad when any erasable source matches more than
+    ``ERASURE_MAX_ROWS_PER_SOURCE`` rows and ``force`` is not set.
+    """
+    subject = subject_of(dsr)
+    counts: dict[str, int] = {}
+    for src in SUBJECT_SOURCES:
+        if src.erasure == "retained":
+            continue
+        counts[src.key] = int(await src.count(db, org_id, subject))
+    too_many = {k: v for k, v in counts.items() if v > ERASURE_MAX_ROWS_PER_SOURCE}
+    if too_many and not force:
+        raise ErasureTooBroad(too_many, ERASURE_MAX_ROWS_PER_SOURCE)
+    return counts
 
 
 async def execute_erasure(
