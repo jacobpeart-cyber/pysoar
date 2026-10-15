@@ -1,10 +1,16 @@
 """Celery tasks for Risk Quantification module
 
-Asynchronous tasks for FAIR analysis, risk reviews, control audits, and BIA updates.
+Asynchronous tasks for FAIR analysis, risk reviews, control ROI and BIA updates.
+
+Every task works on stored rows only. A row whose inputs are missing or
+inconsistent is reported (``missing_inputs`` / ``invalid_fair_input`` with the
+field) instead of being filled with invented numbers; the earlier versions
+replaced falsy FAIR inputs with hard-coded estimates, assumed a $150,000 /
+$45,000 / $25,000 control case, a $300,000 risk appetite and default BIA
+impacts.
 """
 
-import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from celery import shared_task
 from sqlalchemy import create_engine, select
@@ -15,15 +21,15 @@ from src.core.logging import get_logger
 from src.risk_quant.engine import (
     BIAEngine,
     ControlEffectivenessAnalyzer,
-    FAIREngine,
-    RiskAggregator,
+    FAIRInputError,
+    simulate_analysis,
+    store_result,
 )
 from src.risk_quant.models import (
     BusinessImpactAssessment,
     FAIRAnalysis,
     RiskControl,
     RiskRegister,
-    RiskScenario,
 )
 
 logger = get_logger(__name__)
@@ -38,11 +44,13 @@ def _get_sync_session():
 
 @shared_task(bind=True, max_retries=3)
 def run_fair_simulation(self, analysis_id: str, organization_id: str):
-    """Run FAIR Monte Carlo simulation for a risk analysis."""
-    try:
-        logger.info("Starting FAIR simulation", extra={"analysis_id": analysis_id})
+    """Run the FAIR Monte Carlo simulation of one stored analysis.
 
-        engine = FAIREngine()
+    Same model, inputs and per-analysis seed as
+    ``POST /risk-quantification/fair-analyses/{id}/run-simulation``.
+    """
+    try:
+        logger.info("Starting FAIR simulation", analysis_id=analysis_id)
 
         with _get_sync_session() as db:
             analysis = db.execute(
@@ -55,36 +63,18 @@ def run_fair_simulation(self, analysis_id: str, organization_id: str):
             if not analysis:
                 return {"status": "error", "message": "Analysis not found"}
 
-            analysis_data = {
-                "tef_min": analysis.tef_min or 1,
-                "tef_mode": analysis.tef_mode or 5,
-                "tef_max": analysis.tef_max or 20,
-                "tcap_min": analysis.tcap_min or 0.3,
-                "tcap_mode": analysis.tcap_mode or 0.6,
-                "tcap_max": analysis.tcap_max or 0.9,
-                "rs_min": analysis.rs_min or 0.2,
-                "rs_mode": analysis.rs_mode or 0.5,
-                "rs_max": analysis.rs_max or 0.8,
-                "primary_loss_min": analysis.primary_loss_min or 10000,
-                "primary_loss_mode": analysis.primary_loss_mode or 50000,
-                "primary_loss_max": analysis.primary_loss_max or 200000,
-                "secondary_loss_min": analysis.secondary_loss_min or 5000,
-                "secondary_loss_mode": analysis.secondary_loss_mode or 25000,
-                "secondary_loss_max": analysis.secondary_loss_max or 100000,
-                "secondary_loss_event_frequency": getattr(analysis, "secondary_loss_event_frequency", 0.3) or 0.3,
-            }
+            try:
+                result = simulate_analysis(analysis)
+            except FAIRInputError as exc:
+                logger.warning("FAIR simulation refused: invalid stored input",
+                               analysis_id=analysis_id, field=exc.field)
+                return {"status": "invalid_fair_input", "analysis_id": analysis_id,
+                        "field": exc.field, "detail": exc.detail}
 
-            result = engine.run_simulation(analysis_data, iterations=10000)
-
-            analysis.ale_mean = result.ale_mean
-            analysis.ale_p10 = getattr(result, "ale_p10", None)
-            analysis.ale_p50 = result.ale_p50
-            analysis.ale_p90 = getattr(result, "ale_p90", None)
-            analysis.ale_p99 = getattr(result, "ale_p99", None)
-            analysis.completed_at = datetime.now(timezone.utc)
+            store_result(analysis, result, datetime.now(timezone.utc))
             db.commit()
 
-        logger.info("FAIR simulation completed", extra={"analysis_id": analysis_id, "ale_mean": result.ale_mean})
+        logger.info("FAIR simulation completed", analysis_id=analysis_id, ale_mean=result.ale_mean)
         return {"status": "success", "analysis_id": analysis_id, "ale_mean": result.ale_mean}
 
     except Exception as exc:
@@ -94,9 +84,9 @@ def run_fair_simulation(self, analysis_id: str, organization_id: str):
 
 @shared_task(bind=True, max_retries=3)
 def periodic_risk_review(self, organization_id: str):
-    """Perform periodic risk register review."""
+    """Count register entries whose stored ``next_review`` date has passed."""
     try:
-        logger.info("Starting periodic risk review", extra={"organization_id": organization_id})
+        logger.info("Starting periodic risk review", organization_id=organization_id)
 
         now = datetime.now(timezone.utc)
         overdue_count = 0
@@ -109,13 +99,13 @@ def periodic_risk_review(self, organization_id: str):
 
             for risk in risks:
                 reviewed_count += 1
-                next_review = getattr(risk, "next_review_date", None) or getattr(risk, "next_review", None)
+                next_review = risk.next_review
+                if next_review is not None and next_review.tzinfo is None:
+                    next_review = next_review.replace(tzinfo=timezone.utc)
                 if next_review and next_review < now:
-                    risk.status = "review_due"
                     overdue_count += 1
-            db.commit()
 
-        logger.info("Periodic risk review completed", extra={"overdue_count": overdue_count})
+        logger.info("Periodic risk review completed", overdue_count=overdue_count)
         return {"status": "success", "overdue_count": overdue_count, "reviewed_count": reviewed_count}
 
     except Exception as exc:
@@ -125,9 +115,13 @@ def periodic_risk_review(self, organization_id: str):
 
 @shared_task(bind=True, max_retries=3)
 def control_effectiveness_audit(self, control_id: str, organization_id: str):
-    """Audit control effectiveness and calculate updated ROI."""
+    """Recalculate a control's ROI from its register's ALE, effectiveness and cost.
+
+    A financial calculation, not a control test: ``last_tested`` /
+    ``test_result`` are not touched.
+    """
     try:
-        logger.info("Starting control audit", extra={"control_id": control_id})
+        logger.info("Starting control ROI calculation", control_id=control_id)
 
         analyzer = ControlEffectivenessAnalyzer()
 
@@ -142,19 +136,25 @@ def control_effectiveness_audit(self, control_id: str, organization_id: str):
             if not control:
                 return {"status": "error", "message": "Control not found"}
 
-            unmitigated_ale = getattr(control, "unmitigated_ale", 150000) or 150000
-            mitigated_ale = getattr(control, "mitigated_ale", 45000) or 45000
-            annual_cost = getattr(control, "annual_cost", 25000) or 25000
+            register = db.execute(
+                select(RiskRegister).where(
+                    RiskRegister.id == control.risk_register_id,
+                    RiskRegister.organization_id == organization_id,
+                )
+            ).scalars().first()
+            if register is None:
+                return {"status": "missing_inputs", "control_id": control_id,
+                        "missing": "risk_register (the control's register is not in this organisation)"}
 
-            roi_data = analyzer.assess_control_roi(unmitigated_ale, mitigated_ale, annual_cost)
+            unmitigated_ale = float(register.ale_annual_usd)
+            mitigated_ale = unmitigated_ale * (1 - float(control.effectiveness_score or 0) / 100.0)
+            roi_data = analyzer.assess_control_roi(unmitigated_ale, mitigated_ale, float(control.cost_annual_usd))
 
-            control.effectiveness_score = roi_data.get("annual_benefit", 0) / max(unmitigated_ale, 1) * 100
-            control.last_tested = datetime.now(timezone.utc)
-            control.test_result = "passed"
+            control.roi_percentage = roi_data["roi_5yr_percent"]
             db.commit()
 
-        logger.info("Control audit completed", extra={"control_id": control_id})
-        return {"status": "success", "control_id": control_id, "roi_5yr_percent": roi_data.get("roi_5yr_percent", 0)}
+        logger.info("Control ROI calculation completed", control_id=control_id)
+        return {"status": "success", "control_id": control_id, "roi_5yr_percent": roi_data["roi_5yr_percent"]}
 
     except Exception as exc:
         logger.error(f"Control audit failed: {exc}")
@@ -163,13 +163,13 @@ def control_effectiveness_audit(self, control_id: str, organization_id: str):
 
 @shared_task(bind=True, max_retries=3)
 def bia_refresh(self, organization_id: str):
-    """Refresh Business Impact Assessment for all critical assets."""
+    """Recompute the impact figures of every stored BIA (stored values only)."""
     try:
-        logger.info("Starting BIA refresh", extra={"organization_id": organization_id})
+        logger.info("Starting BIA refresh", organization_id=organization_id)
 
         bia_engine = BIAEngine()
         bia_count = 0
-        total_downtime_cost = 0
+        total_downtime_cost = 0.0
 
         with _get_sync_session() as db:
             bias = db.execute(
@@ -180,17 +180,16 @@ def bia_refresh(self, organization_id: str):
 
             for bia in bias:
                 impact = bia_engine.assess_business_impact({
-                    "financial_impact_per_hour_usd": getattr(bia, "financial_impact_per_hour_usd", 10000) or 10000,
-                    "rto_hours": getattr(bia, "rto_hours", 4) or 4,
-                    "reputational_impact_score": getattr(bia, "reputational_impact_score", 5) or 5,
-                    "regulatory_impact_score": getattr(bia, "regulatory_impact_score", 5) or 5,
-                    "criticality": getattr(bia, "criticality", "high") or "high",
+                    "financial_impact_per_hour_usd": bia.financial_impact_per_hour_usd,
+                    "rto_hours": bia.rto_hours,
+                    "reputational_impact_score": bia.reputational_impact_score,
+                    "regulatory_impact_score": bia.regulatory_impact_score,
+                    "criticality": bia.criticality,
                 })
                 total_downtime_cost += impact.get("maximum_downtime_cost_usd", 0)
                 bia_count += 1
-            db.commit()
 
-        logger.info("BIA refresh completed", extra={"bia_count": bia_count})
+        logger.info("BIA refresh completed", bia_count=bia_count)
         return {"status": "success", "bia_count": bia_count, "total_downtime_cost": total_downtime_cost}
 
     except Exception as exc:
@@ -200,41 +199,36 @@ def bia_refresh(self, organization_id: str):
 
 @shared_task(bind=True, max_retries=3)
 def risk_appetite_check(self, organization_id: str):
-    """Check if organizational risks are within risk appetite."""
+    """Compare each register entry's stored ALE with its own stored appetite threshold."""
     try:
-        logger.info("Starting risk appetite check", extra={"organization_id": organization_id})
+        logger.info("Starting risk appetite check", organization_id=organization_id)
 
-        aggregator = RiskAggregator()
-
+        exceeding: list[dict] = []
+        checked = 0
         with _get_sync_session() as db:
             registers = db.execute(
                 select(RiskRegister).where(RiskRegister.organization_id == organization_id)
             ).scalars().all()
 
-            risks = []
             for r in registers:
-                risks.append({
-                    "ale_mean": getattr(r, "ale_mean", 0) or 0,
-                    "category": getattr(r, "category", "cyber") or "cyber",
-                })
+                checked += 1
+                within = float(r.ale_annual_usd) <= float(r.risk_appetite_threshold_usd)
+                if r.is_within_appetite != within:
+                    r.is_within_appetite = within
+                if not within:
+                    exceeding.append({
+                        "register_id": r.id,
+                        "ale_annual_usd": r.ale_annual_usd,
+                        "risk_appetite_threshold_usd": r.risk_appetite_threshold_usd,
+                    })
+            db.commit()
 
-            risk_appetite_threshold = 300000
-            if risks:
-                agg_result = aggregator.aggregate_organizational_risk(risks)
-                total_ale = agg_result.get("total_ale", 0)
-            else:
-                total_ale = 0
-
-        within_appetite = total_ale <= risk_appetite_threshold
-        over_by = total_ale - risk_appetite_threshold if not within_appetite else 0
-
-        logger.info("Risk appetite check completed", extra={"total_ale": total_ale, "within_appetite": within_appetite})
+        logger.info("Risk appetite check completed", checked=checked, exceeding=len(exceeding))
         return {
             "status": "success",
-            "total_ale": total_ale,
-            "risk_appetite_threshold": risk_appetite_threshold,
-            "within_appetite": within_appetite,
-            "over_by": over_by,
+            "checked": checked,
+            "within_appetite": checked - len(exceeding),
+            "exceeding_appetite": exceeding,
         }
 
     except Exception as exc:

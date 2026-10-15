@@ -15,12 +15,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import DatabaseSession, OrganizationId, require_role
 from src.models.user import User, UserRole
 from src.core.logging import get_logger
-from src.services.automation import AutomationService
 from src.core.utils import safe_json_loads
 from src.risk_quant.engine import (
+    FAIR_MODEL_DESCRIPTION,
     ControlEffectivenessAnalyzer,
     FAIREngine,
+    FAIRInputError,
     RiskAggregator,
+    simulate_analysis,
+    simulate_portfolio,
+    store_result,
 )
 from src.risk_quant.models import (
     BusinessImpactAssessment,
@@ -69,6 +73,35 @@ AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
 
 
 # Helper Functions
+def _fair_input_422(exc: FAIRInputError) -> HTTPException:
+    """422 naming the stored FAIR input that is missing or inconsistent."""
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail={"error": "invalid_fair_input", "field": exc.field, "detail": exc.detail},
+    )
+
+
+async def _latest_completed_analyses(db: AsyncSession, org_id: str) -> list[FAIRAnalysis]:
+    """The most recent completed FAIRAnalysis of each scenario in the tenant.
+
+    Portfolio figures use one analysis per scenario; several analyses of the
+    same scenario are revisions, not separate risks, and summing them would
+    count the scenario twice.
+    """
+    rows = (await db.execute(
+        select(FAIRAnalysis)
+        .where(
+            FAIRAnalysis.organization_id == org_id,
+            FAIRAnalysis.completed_at.is_not(None),
+        )
+        .order_by(FAIRAnalysis.scenario_id, FAIRAnalysis.completed_at.desc(), FAIRAnalysis.created_at.desc())
+    )).scalars().all()
+    latest: dict[str, FAIRAnalysis] = {}
+    for row in rows:
+        latest.setdefault(row.scenario_id, row)
+    return list(latest.values())
+
+
 async def get_risk_scenario_or_404(
     db: AsyncSession, scenario_id: str, org_id: str
 ) -> RiskScenario:
@@ -238,16 +271,10 @@ async def create_risk_scenario(
     await db.flush()
     await db.refresh(scenario)
 
-    try:
-        automation = AutomationService(db)
-        await automation.on_risk_scenario_high_loss(
-            scenario_name=scenario.name,
-            loss_expectancy_usd=scenario.asset_value_usd or 0,
-            organization_id=org_id,
-        )
-    except Exception as automation_exc:
-        logger.warning(f"Automation on_risk_scenario_high_loss failed: {automation_exc}")
-
+    # No "high loss" incident here: the asset value is not a loss expectancy,
+    # and the automation hook opened an Incident claiming the asset value as
+    # the scenario's loss (without an organisation). Loss figures exist only
+    # once a FAIR analysis with analyst inputs has been simulated.
     return RiskScenarioResponse.model_validate(scenario)
 
 
@@ -389,11 +416,15 @@ async def create_fair_analysis(
     db.add(analysis)
     await db.flush()
     await db.refresh(analysis)
+    response = FAIRAnalysisResponse.model_validate(analysis)
+    # Commit before queueing so the worker can see the row it is asked to
+    # simulate (it used to be queued before the commit and race it).
+    await db.commit()
 
-    # Queue simulation task
-    run_fair_simulation.delay(analysis.id, org_id)
+    # Queue simulation task (same stored inputs and seed as run-simulation)
+    run_fair_simulation.delay(response.id, org_id)
 
-    return FAIRAnalysisResponse.model_validate(analysis)
+    return response
 
 
 @router.get("/fair-analyses/{analysis_id}", response_model=FAIRAnalysisResponse)
@@ -419,49 +450,26 @@ async def run_fair_simulation_endpoint(
     _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
-    """Run FAIR Monte Carlo simulation"""
+    """Run the FAIR Monte Carlo simulation over the analysis's stored inputs.
+
+    Nothing is defaulted: a missing or inconsistent stored estimate is a 422
+    naming it (``detail.field``). The run is seeded per analysis, so repeating
+    it reproduces the stored figures.
+    """
     analysis = await get_fair_analysis_or_404(
         db, analysis_id, org_id
     )
 
-    # Prepare analysis data
-    analysis_data = {
-        "tef_min": analysis.tef_min,
-        "tef_mode": analysis.tef_mode,
-        "tef_max": analysis.tef_max,
-        "tcap_min": analysis.tcap_min,
-        "tcap_mode": analysis.tcap_mode,
-        "tcap_max": analysis.tcap_max,
-        "rs_min": analysis.rs_min,
-        "rs_mode": analysis.rs_mode,
-        "rs_max": analysis.rs_max,
-        "primary_loss_min": analysis.primary_loss_min,
-        "primary_loss_mode": analysis.primary_loss_mode,
-        "primary_loss_max": analysis.primary_loss_max,
-        "secondary_loss_min": analysis.secondary_loss_min,
-        "secondary_loss_mode": analysis.secondary_loss_mode,
-        "secondary_loss_max": analysis.secondary_loss_max,
-        "secondary_loss_event_frequency": analysis.secondary_loss_event_frequency,
-    }
+    try:
+        result = simulate_analysis(analysis)
+    except FAIRInputError as exc:
+        raise _fair_input_422(exc) from None
 
-    # Run simulation
-    engine = FAIREngine()
-    result = engine.run_simulation(analysis_data, analysis.simulation_iterations)
-
-    # Store results
-    analysis.ale_mean = result.ale_mean
-    analysis.ale_p10 = result.ale_p10
-    analysis.ale_p50 = result.ale_p50
-    analysis.ale_p90 = result.ale_p90
-    analysis.ale_p99 = result.ale_p99
-    analysis.loss_exceedance_curve = json.dumps(result.loss_exceedance_curve)
-    analysis.completed_at = datetime.now(timezone.utc)
-
+    store_result(analysis, result, datetime.now(timezone.utc))
     await db.flush()
     await db.refresh(analysis)
 
-    # Generate report
-    report = engine.generate_risk_report(result)
+    report = FAIREngine().generate_risk_report(result)
 
     return FAIRResultsResponse(
         ale_mean=result.ale_mean,
@@ -469,7 +477,10 @@ async def run_fair_simulation_endpoint(
         ale_p50=result.ale_p50,
         ale_p90=result.ale_p90,
         ale_p99=result.ale_p99,
-        loss_exceedance_curve=result.loss_exceedance_curve,
+        derived_vulnerability=result.derived_vulnerability,
+        iterations=result.iterations,
+        approximation=result.approximation,
+        model=result.model,
         **report,
     )
 
@@ -788,7 +799,11 @@ async def audit_control_effectiveness(
     _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
-    """Audit control effectiveness and calculate ROI"""
+    """Calculate the control's ROI from its stored register ALE, effectiveness and cost.
+
+    This is a financial calculation, not a control test: ``last_tested`` and
+    ``test_result`` are left alone (they used to be stamped "passed" here).
+    """
     control = await get_risk_control_or_404(db, control_id, org_id)
     register = await get_risk_register_or_404(db, control.risk_register_id, org_id)
 
@@ -804,8 +819,6 @@ async def audit_control_effectiveness(
 
     # Update control
     control.roi_percentage = roi_data["roi_5yr_percent"]
-    control.last_tested = datetime.now(timezone.utc)
-    control.test_result = "passed" if roi_data["effective"] else "needs_improvement"
 
     await db.flush()
     await db.refresh(control)
@@ -958,13 +971,39 @@ async def get_risk_dashboard(
     org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
-    """Get organizational risk dashboard"""
+    """Organizational risk dashboard from stored rows only.
+
+    Register figures come from the risk register; ``fair_*`` figures from the
+    latest completed FAIR analysis of each scenario (None when there is none).
+    """
     # Query all risks for organization
     query = select(RiskRegister).where(
         RiskRegister.organization_id == org_id
     )
     result = await db.execute(query)
     registers = list(result.scalars().all())
+
+    number_of_controls = (await db.execute(
+        select(func.count(RiskControl.id)).where(RiskControl.organization_id == org_id)
+    )).scalar() or 0
+    number_of_scenarios = (await db.execute(
+        select(func.count(RiskScenario.id)).where(RiskScenario.organization_id == org_id)
+    )).scalar() or 0
+    scenarios_with_inputs = (await db.execute(
+        select(func.count(func.distinct(FAIRAnalysis.scenario_id))).where(
+            FAIRAnalysis.organization_id == org_id
+        )
+    )).scalar() or 0
+    completed = await _latest_completed_analyses(db, org_id)
+    fair_fields = {
+        "number_of_controls": number_of_controls,
+        "number_of_scenarios": number_of_scenarios,
+        "fair_analyses_completed": len(completed),
+        "fair_scenarios_without_inputs": max(number_of_scenarios - scenarios_with_inputs, 0),
+        "fair_total_ale_mean": (
+            round(sum(a.ale_mean or 0.0 for a in completed), 2) if completed else None
+        ),
+    }
 
     if not registers:
         return RiskDashboardResponse(
@@ -976,6 +1015,7 @@ async def get_risk_dashboard(
             top_risks_by_ale=[],
             ale_by_category={},
             control_effectiveness_avg=0,
+            **fair_fields,
         )
 
     # Calculate metrics
@@ -1013,6 +1053,7 @@ async def get_risk_dashboard(
         ],
         ale_by_category=by_category,
         control_effectiveness_avg=avg_effectiveness * 100,
+        **fair_fields,
     )
 
 
@@ -1075,7 +1116,14 @@ async def analyze_scenarios(
     invent PERT inputs from the asset value and save them as an ordinary
     analysis, so every ALE on the page came from made-up defaults. Such
     scenarios are now listed under ``skipped`` with ``reason`` =
-    ``no_fair_inputs``.
+    ``no_fair_inputs``. An analysis whose stored inputs are inconsistent is
+    listed under ``failed`` with ``error`` = ``invalid_fair_input`` and the
+    ``field`` at fault.
+
+    Each analysis runs with its own stored ``simulation_iterations`` and seed.
+    The portfolio figures (``portfolio_var_95``, ``portfolio_p90`` /
+    ``portfolio_p99``) re-simulate the analysed scenarios with a common
+    ``iterations`` count and sum the draws (independent scenarios).
     """
     scenario_ids = request.get("scenario_ids") or []
     if not isinstance(scenario_ids, list) or not all(isinstance(x, str) for x in scenario_ids):
@@ -1104,49 +1152,25 @@ async def analyze_scenarios(
     skipped: list[dict] = []
     failed: list[dict] = []
 
-    engine = FAIREngine()
-    ale_samples: list[list[float]] = []
     per_scenario: list[dict] = []
+    analysed: list[FAIRAnalysis] = []
 
     # Helper: run sim + persist for a given FAIRAnalysis row
     async def _simulate_and_record(analysis: FAIRAnalysis) -> None:
-        payload = {
-            "tef_min": analysis.tef_min,
-            "tef_mode": analysis.tef_mode,
-            "tef_max": analysis.tef_max,
-            "tcap_min": analysis.tcap_min,
-            "tcap_mode": analysis.tcap_mode,
-            "tcap_max": analysis.tcap_max,
-            "rs_min": analysis.rs_min,
-            "rs_mode": analysis.rs_mode,
-            "rs_max": analysis.rs_max,
-            "primary_loss_min": analysis.primary_loss_min,
-            "primary_loss_mode": analysis.primary_loss_mode,
-            "primary_loss_max": analysis.primary_loss_max,
-            "secondary_loss_min": analysis.secondary_loss_min,
-            "secondary_loss_mode": analysis.secondary_loss_mode,
-            "secondary_loss_max": analysis.secondary_loss_max,
-            "secondary_loss_event_frequency": analysis.secondary_loss_event_frequency,
-        }
-        result = engine.run_simulation(
-            payload, analysis.simulation_iterations or iterations
-        )
-        ale_samples.append(result.ale_distribution)
+        result = simulate_analysis(analysis)
+        analysed.append(analysis)
         per_scenario.append({
             "analysis_id": analysis.id,
             "scenario_id": analysis.scenario_id,
             "ale_mean": result.ale_mean,
+            "ale_p10": result.ale_p10,
             "ale_p50": result.ale_p50,
             "ale_p90": result.ale_p90,
             "ale_p99": result.ale_p99,
+            "iterations": result.iterations,
+            "derived_vulnerability": result.derived_vulnerability,
         })
-        analysis.ale_mean = result.ale_mean
-        analysis.ale_p10 = result.ale_p10
-        analysis.ale_p50 = result.ale_p50
-        analysis.ale_p90 = result.ale_p90
-        analysis.ale_p99 = result.ale_p99
-        analysis.loss_exceedance_curve = json.dumps(result.loss_exceedance_curve)
-        analysis.completed_at = datetime.now(timezone.utc)
+        store_result(analysis, result, datetime.now(timezone.utc))
 
     # Determine target scenario set. If scenario_ids given, simulate each
     # scenario's latest FAIRAnalysis (several may exist; the most recent
@@ -1181,14 +1205,24 @@ async def analyze_scenarios(
             reason = "no_fair_inputs" if scen_res.scalar_one_or_none() else "scenario_not_found"
             skipped.append({"scenario_id": sid, "reason": reason})
     else:
-        fa_query = select(FAIRAnalysis).where(
-            FAIRAnalysis.organization_id == org_id
+        # Every scenario's latest analysis (several analyses of one scenario
+        # are revisions; simulating all of them double-counted the scenario).
+        fa_query = (
+            select(FAIRAnalysis)
+            .where(FAIRAnalysis.organization_id == org_id)
+            .order_by(FAIRAnalysis.scenario_id, FAIRAnalysis.created_at.desc())
         )
-        targets = list((await db.execute(fa_query)).scalars().all())
+        latest: dict[str, FAIRAnalysis] = {}
+        for row in (await db.execute(fa_query)).scalars().all():
+            latest.setdefault(row.scenario_id, row)
+        targets = list(latest.values())
 
     for analysis in targets:
         try:
             await _simulate_and_record(analysis)
+        except FAIRInputError as exc:
+            failed.append({"analysis_id": analysis.id, "scenario_id": analysis.scenario_id,
+                           "error": "invalid_fair_input", "field": exc.field, "detail": exc.detail})
         except Exception as exc:  # noqa: BLE001
             logger.error("fair_analyze_failed", analysis_id=analysis.id, error=str(exc))
             failed.append({"analysis_id": analysis.id, "scenario_id": analysis.scenario_id,
@@ -1196,10 +1230,8 @@ async def analyze_scenarios(
 
     await db.flush()
 
-    # Aggregate across the run
-    aggregator = RiskAggregator()
-    portfolio_var_95 = aggregator.calculate_portfolio_var(ale_samples, confidence=0.95)
-
+    # Portfolio of the analysed scenarios: summed draws, not summed percentiles.
+    portfolio = simulate_portfolio(analysed, iterations) if analysed else None
     total_mean = sum(s["ale_mean"] for s in per_scenario)
 
     return {
@@ -1208,7 +1240,11 @@ async def analyze_scenarios(
         "skipped": skipped,
         "failed": failed,
         "total_ale_mean": round(total_mean, 2),
-        "portfolio_var_95": round(portfolio_var_95, 2),
+        "portfolio_var_95": round(portfolio["p95"], 2) if portfolio else 0.0,
+        "portfolio_p90": round(portfolio["p90"], 2) if portfolio else None,
+        "portfolio_p99": round(portfolio["p99"], 2) if portfolio else None,
+        "portfolio_iterations": portfolio["iterations"] if portfolio else 0,
+        "model": dict(FAIR_MODEL_DESCRIPTION),
         "per_scenario": per_scenario,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -1218,131 +1254,60 @@ async def analyze_scenarios(
 async def get_loss_exceedance_portfolio(
     org_id: OrganizationId,
     db: DatabaseSession = None,
+    iterations: int = Query(10000, ge=100, le=100000),
 ):
-    """Return the aggregate loss exceedance curve for the organization.
+    """Portfolio loss-exceedance curve from stored FAIR analyses only.
 
-    The frontend's Risk Quantification page calls this endpoint on the
-    initial data load; previously it 404'd and the entire page spun on
-    the loading state forever. Now aggregates the ``loss_exceedance_
-    curve`` fields of every completed FAIRAnalysis in the org,
-    merges them into a single portfolio curve by interpolating each
-    analysis's curve onto a shared probability grid, and returns the
-    result.
+    Uses the latest completed analysis of each scenario, re-simulates each
+    from its stored inputs (its own seed, a common ``iterations`` count) and
+    sums the draws, i.e. the scenarios are treated as independent. ``curve``
+    is ``[{probability, loss}]`` with ``loss`` the annual portfolio loss that
+    is exceeded with that probability. ``total_ale_p90`` / ``total_ale_p99``
+    are percentiles of the summed distribution; they used to be sums of the
+    per-scenario percentiles (which assumes perfectly correlated scenarios)
+    across every analysis row, so a re-analysed scenario counted twice.
+    An analysis whose stored inputs became inconsistent is listed under
+    ``excluded`` with the field at fault.
     """
-
-    fa_query = select(FAIRAnalysis).where(
-        and_(
-            FAIRAnalysis.organization_id == org_id,
-            FAIRAnalysis.loss_exceedance_curve.is_not(None),
-        )
-    )
-    analyses = list((await db.execute(fa_query)).scalars().all())
+    analyses = await _latest_completed_analyses(db, org_id)
 
     if not analyses:
         return {
             "analyses_count": 0,
             "curve": [],
+            "excluded": [],
             "note": "No completed FAIR analyses for this organization",
         }
 
-    # Merge per-analysis loss-exceedance curves into a portfolio curve.
-    #
-    # The FAIR engine writes loss_exceedance_curve as
-    #   {"x_values": [thresholds...], "y_values": [exceedance_probs...]}
-    # where y_values[i] = P(loss > x_values[i]). The original aggregator
-    # iterated the dict expecting list-of-{probability,loss} entries and
-    # silently produced an empty curve every call.
-    #
-    # The right portfolio aggregation: at each grid probability P, sum
-    # across analyses of "the loss threshold where THIS analysis hits
-    # exceedance probability P". That's a real per-scenario interpolation
-    # (linear) over the analysis's own (x,y) curve — naively bucketing
-    # would over-count when many threshold points fall in one bucket.
-    #
-    # We accept both the engine's {x_values,y_values} and any legacy
-    # list-of-{probability,loss} shape so older runs still aggregate.
-    import bisect
-
-    GRID = [round(i * 0.05, 2) for i in range(21)]  # 0.00 .. 1.00 step 0.05
-
-    def _interp_loss_at_prob(xs: list[float], ys: list[float], target_p: float) -> float:
-        """Given a per-analysis (loss thresholds, exceedance probs) curve,
-        return the loss threshold X such that P(loss > X) ~= target_p, by
-        linear interpolation. Engine emits ys monotonically decreasing
-        (higher loss -> lower exceedance prob), so we walk in reverse.
-        """
-        if not xs or not ys or len(xs) != len(ys):
-            return 0.0
-        # Sort by exceedance probability ascending so we can interpolate.
-        pairs = sorted(zip(ys, xs))  # [(prob_lo, loss_hi), ..., (prob_hi, loss_lo)]
-        ps_sorted = [p for p, _ in pairs]
-        ls_sorted = [l for _, l in pairs]
-        # Clamp out of range to nearest endpoint.
-        if target_p <= ps_sorted[0]:
-            return float(ls_sorted[0])
-        if target_p >= ps_sorted[-1]:
-            return float(ls_sorted[-1])
-        idx = bisect.bisect_left(ps_sorted, target_p)
-        if idx == 0:
-            return float(ls_sorted[0])
-        p_lo, p_hi = ps_sorted[idx - 1], ps_sorted[idx]
-        l_lo, l_hi = ls_sorted[idx - 1], ls_sorted[idx]
-        if p_hi == p_lo:
-            return float(l_lo)
-        # Linear interp between the two surrounding points.
-        t = (target_p - p_lo) / (p_hi - p_lo)
-        return float(l_lo + t * (l_hi - l_lo))
-
-    portfolio_loss_at_p: dict[float, float] = {p: 0.0 for p in GRID}
-    contributing = 0
+    usable: list[FAIRAnalysis] = []
+    excluded: list[dict] = []
     for analysis in analyses:
         try:
-            curve_data = json.loads(analysis.loss_exceedance_curve or "null")
-        except (ValueError, TypeError):
+            simulate_analysis(analysis, iterations=1)
+        except FAIRInputError as exc:
+            excluded.append({"analysis_id": analysis.id, "scenario_id": analysis.scenario_id,
+                             "error": "invalid_fair_input", "field": exc.field})
             continue
-        if curve_data is None:
-            continue
-        xs: list[float] = []
-        ys: list[float] = []
-        if (
-            isinstance(curve_data, dict)
-            and isinstance(curve_data.get("x_values"), list)
-            and isinstance(curve_data.get("y_values"), list)
-        ):
-            try:
-                xs = [float(x) for x in curve_data["x_values"]]
-                ys = [float(y) for y in curve_data["y_values"]]
-            except (TypeError, ValueError):
-                continue
-        elif isinstance(curve_data, list):
-            for point in curve_data:
-                if not isinstance(point, dict):
-                    continue
-                try:
-                    xs.append(float(point.get("loss") or 0))
-                    ys.append(float(point.get("probability") or 0))
-                except (TypeError, ValueError):
-                    continue
-        if not xs:
-            continue
-        contributing += 1
-        for p in GRID:
-            portfolio_loss_at_p[p] += _interp_loss_at_prob(xs, ys, p)
+        usable.append(analysis)
 
-    curve = [
-        {"probability": p, "loss": round(l, 2)}
-        for p, l in sorted(portfolio_loss_at_p.items())
-        if l > 0 or p == 0.0  # always keep p=0 to anchor the chart
-    ]
+    if not usable:
+        return {
+            "analyses_count": 0,
+            "curve": [],
+            "excluded": excluded,
+            "note": "No completed FAIR analysis has consistent stored inputs",
+        }
 
-    total_mean = sum(a.ale_mean or 0 for a in analyses)
-    total_p90 = sum(a.ale_p90 or 0 for a in analyses)
-    total_p99 = sum(a.ale_p99 or 0 for a in analyses)
-
+    portfolio = simulate_portfolio(usable, iterations)
     return {
-        "analyses_count": len(analyses),
-        "total_ale_mean": round(total_mean, 2),
-        "total_ale_p90": round(total_p90, 2),
-        "total_ale_p99": round(total_p99, 2),
-        "curve": curve,
+        "analyses_count": len(usable),
+        "total_ale_mean": round(portfolio["mean"], 2),
+        "total_ale_p50": round(portfolio["p50"], 2),
+        "total_ale_p90": round(portfolio["p90"], 2),
+        "total_ale_p95": round(portfolio["p95"], 2),
+        "total_ale_p99": round(portfolio["p99"], 2),
+        "iterations": portfolio["iterations"],
+        "method": "sum of independent per-scenario simulations (latest completed analysis per scenario)",
+        "curve": portfolio["curve"],
+        "excluded": excluded,
     }

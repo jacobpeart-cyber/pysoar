@@ -214,13 +214,27 @@ async def test_devices_and_segments_are_isolated(
     a_policy = await _allow_policy(db_session, org_a_id)
     await assert_tenant_isolated(client, "PUT", f"{API}/policies/{a_policy}", b_admin, json={"name": "x"})
     await assert_tenant_isolated(client, "DELETE", f"{API}/policies/{a_policy}", b_admin)
-    # Device compliance for org A's device: org B's admin gets 404 and creates nothing.
+    # Device compliance for org A's device id: since migration 032 device ids
+    # are unique per organisation and the override is an upsert within the
+    # caller's tenant, so org B's admin creates org B's own profile and org A's
+    # row is untouched (wave 4; previously a 404 because the id was global).
+    a_before = (await db_session.execute(
+        select(DeviceTrustProfile.compliance_status).where(
+            DeviceTrustProfile.device_id == device_id, DeviceTrustProfile.organization_id == org_a_id,
+        ),
+    )).scalar_one()
     foreign = await client.put(f"{API}/devices/{device_id}/compliance", json={"av_active": True}, headers=b_admin)
-    assert foreign.status_code == 404, foreign.text
-    a_row = (await db_session.execute(
+    assert foreign.status_code == 200, foreign.text
+    rows = (await db_session.execute(
         select(DeviceTrustProfile).where(DeviceTrustProfile.device_id == device_id),
     )).scalars().all()
-    assert [r.organization_id for r in a_row] == [org_a_id]
+    assert sorted(r.organization_id for r in rows) == sorted([org_a_id, org_b_id])
+    a_after = (await db_session.execute(
+        select(DeviceTrustProfile.compliance_status).where(
+            DeviceTrustProfile.device_id == device_id, DeviceTrustProfile.organization_id == org_a_id,
+        ),
+    )).scalar_one()
+    assert a_after == a_before
     _ = org_a_admin_headers
 
 

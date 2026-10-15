@@ -7,9 +7,12 @@ without declaring it no longer raise NameError), lookups by id 404 outside
 the tenant, an alert cannot reference another tenant's asset, operational
 writes need analyst or admin, and policy configuration, OT bulk actions,
 safe shutdown, segmentation audit and live-network discovery need admin.
-Safe shutdown and segmentation audit return an honest 501 instead of
-claiming work that never happened. The dash-prefixed mirrors in
-``aliases.py`` are scoped too.
+Safe shutdown and segmentation audit never claim work that did not happen:
+since wave 4 they command an endpoint agent (approval queue, result-driven
+status, see tests/unit/test_wave4_ot.py) and are refused with a 409 that
+changes nothing when no capable agent / target exists. The dash-prefixed
+list mirrors in ``aliases.py`` were deleted in wave 4 and the dash discover /
+export routes moved under ``/ot_security`` (the old paths answer 410).
 """
 
 from __future__ import annotations
@@ -290,9 +293,9 @@ async def test_viewer_can_read_and_run_readonly_checks(
         f"{API}/dashboard",
         f"{API}/purdue-map",
         f"{API}/risk_assessment",
-        "/api/v1/ot-security/assets",
-        "/api/v1/ot-security/purdue-map",
-        "/api/v1/ot-security/export",
+        f"{API}/export",
+        f"{API}/advisories",
+        f"{API}/advisories/status",
     ],
 )
 async def test_orgless_superuser_gets_organization_required(
@@ -326,31 +329,43 @@ async def test_bulk_action_rejects_unknown_action(
     assert resp.json()["detail"]["field"] == "action"
 
 
-async def test_safe_shutdown_is_honest_501_and_changes_nothing(
+async def test_safe_shutdown_without_capable_agent_is_refused_and_changes_nothing(
     client: AsyncClient,
     db_session: AsyncSession,
     org_a: Organization,
     org_a_admin_headers: dict[str, str],
 ) -> None:
+    # Wave 4: was an honest 501; now commanded through an ot_safe_shutdown
+    # agent, and refused (409) when the incident has no target or no agent.
     ids = await _seed(db_session, org_a.id)
     resp = await client.post(f"{API}/incidents/{ids['incident']}/safe_shutdown", headers=org_a_admin_headers)
-    assert resp.status_code == 501, resp.text
-    assert resp.json()["detail"]["error"] == "not_implemented"
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["error"] == "no_target_assets"
+    db_session.expire_all()
+    incident = (await db_session.execute(select(OTIncident).where(OTIncident.id == ids["incident"]))).scalar_one()
+    incident.affected_assets = [ids["asset"]]
+    await db_session.commit()
+    resp = await client.post(f"{API}/incidents/{ids['incident']}/safe_shutdown", headers=org_a_admin_headers)
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["error"] == "no_capable_agent"
     db_session.expire_all()
     incident = (await db_session.execute(select(OTIncident).where(OTIncident.id == ids["incident"]))).scalar_one()
     assert not incident.safe_shutdown_initiated
+    assert incident.safe_shutdown_status is None
 
 
-async def test_segmentation_audit_is_honest_501_and_changes_nothing(
+async def test_segmentation_audit_without_targets_is_refused_and_changes_nothing(
     client: AsyncClient,
     db_session: AsyncSession,
     org_a: Organization,
     org_a_admin_headers: dict[str, str],
 ) -> None:
+    # Wave 4: was an honest 501; now an agent-run probe, refused (409) when
+    # there is nothing to probe (a single zone) and nothing is changed.
     ids = await _seed(db_session, org_a.id)
     resp = await client.post(f"{API}/zones/{ids['zone']}/segmentation_audit", headers=org_a_admin_headers)
-    assert resp.status_code == 501, resp.text
-    assert resp.json()["detail"]["error"] == "not_implemented"
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["error"] == "no_probe_targets"
     db_session.expire_all()
     zone = (await db_session.execute(select(OTZone).where(OTZone.id == ids["zone"]))).scalar_one()
     assert not zone.segmentation_verified
@@ -429,7 +444,7 @@ async def test_asset_discover_validates_ranges(
     assert override.status_code == 422, override.text
 
 
-async def test_dash_export_is_scoped(
+async def test_export_is_scoped(
     client: AsyncClient,
     db_session: AsyncSession,
     org_a: Organization,
@@ -437,11 +452,15 @@ async def test_dash_export_is_scoped(
     org_b_headers: dict[str, str],
 ) -> None:
     await _seed(db_session, org_a.id)
-    own = await client.get("/api/v1/ot-security/export", headers=org_a_headers)
+    # Wave 4: moved from the dash alias, which now answers 410 with the new path.
+    gone = await client.get("/api/v1/ot-security/export", headers=org_a_headers)
+    assert gone.status_code == 410, gone.text
+    assert gone.json()["detail"]["new_path"] == "/api/v1/ot_security/export"
+    own = await client.get(f"{API}/export", headers=org_a_headers)
     assert own.status_code == 200, own.text
     assert own.json()["summary"]["total_assets"] == 1
 
-    other = await client.get("/api/v1/ot-security/export", headers=org_b_headers)
+    other = await client.get(f"{API}/export", headers=org_b_headers)
     assert other.status_code == 200, other.text
     assert other.json()["summary"]["total_assets"] == 0
 
@@ -468,7 +487,7 @@ async def test_discovery_fails_closed_without_platform_allowlist(
     assert asset_route.status_code == 403, asset_route.text
     assert asset_route.json()["detail"]["error"] == "ot_discovery_disabled"
 
-    alias = await client.post("/api/v1/ot-security/discover", json={"cidr": "10.10.5.0/24"}, headers=org_a_admin_headers)
+    alias = await client.post("/api/v1/ot_security/discover", json={"cidr": "10.10.5.0/24"}, headers=org_a_admin_headers)
     assert alias.status_code == 403, alias.text
     assert alias.json()["detail"]["error"] == "ot_discovery_disabled"
 
@@ -502,7 +521,7 @@ async def test_discovery_requires_zone_and_refuses_internal_ranges(
         assert refused.status_code == 403, refused.text
         assert refused.json()["detail"]["error"] == "target_network_refused", refused.text
 
-    alias = await client.post("/api/v1/ot-security/discover", json={"cidr": "127.0.0.0/24"}, headers=org_a_admin_headers)
+    alias = await client.post("/api/v1/ot_security/discover", json={"cidr": "127.0.0.0/24"}, headers=org_a_admin_headers)
     assert alias.status_code == 403, alias.text
     assert alias.json()["detail"]["error"] == "target_network_refused"
 

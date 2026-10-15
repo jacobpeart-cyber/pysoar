@@ -162,15 +162,17 @@ def firmware_audit(self, organization_id: str):
     try:
         logger.info(f"Starting firmware audit for org {organization_id}")
 
-        assessor = OTVulnerabilityAssessor(organization_id)
-
         from src.core.database import async_session_factory
+        from src.ot_security.advisories import load_advisories
         from src.ot_security.models import OTAsset
         from sqlalchemy import select
         import asyncio
 
         async def _audit():
             async with async_session_factory() as db:
+                # Matches against the cached CISA ICS advisories (vendor + model);
+                # there is no built-in CVE catalogue any more.
+                assessor = OTVulnerabilityAssessor(organization_id, await load_advisories(db))
                 result = await db.execute(select(OTAsset).where(OTAsset.organization_id == organization_id).limit(500))
                 assets = list(result.scalars().all())
                 vulnerabilities = await assessor.scan_firmware_versions(assets)
@@ -273,3 +275,95 @@ def safety_system_check(self, organization_id: str):
     except Exception as exc:
         logger.error(f"Safety system check failed: {str(exc)}")
         raise self.retry(exc=exc, countdown=180)
+
+
+# ---------------------------------------------------------------------------
+# Wave 4: CISA ICS advisory sync and agent-command reconciliation
+# ---------------------------------------------------------------------------
+
+#: Bounds of the advisory rescoring sweep.
+ADVISORY_SWEEP_MAX_ORGS = 500
+ADVISORY_SWEEP_ASSETS_PER_ORG = 2000
+ADVISORY_SWEEP_BATCH = 200
+
+
+async def _sync_ics_advisories_async(force: bool = False) -> Dict[str, Any]:
+    """Refresh the advisory cache, then write each asset's matched-advisory
+    count and risk score (per org, 200-asset keyset batches, capped)."""
+    from src.core.database import async_session_factory
+    from src.ot_security.advisories import load_advisories, refresh_ics_advisories
+    from src.ot_security.models import OTAsset
+
+    async with async_session_factory() as db:
+        feed = await refresh_ics_advisories(db, force=force)
+        await db.commit()
+        advisories = await load_advisories(db)
+        org_ids = [row[0] for row in (await db.execute(
+            select(OTAsset.organization_id).group_by(OTAsset.organization_id)
+            .order_by(OTAsset.organization_id).limit(ADVISORY_SWEEP_MAX_ORGS),
+        )).all()]
+
+    rescored = 0
+    with_advisories = 0
+    for org_id in org_ids:
+        assessor = OTVulnerabilityAssessor(org_id, advisories)
+        last_id = ""
+        seen = 0
+        while seen < ADVISORY_SWEEP_ASSETS_PER_ORG:
+            async with async_session_factory() as db:
+                batch = list((await db.execute(
+                    select(OTAsset).where(OTAsset.organization_id == org_id, OTAsset.id > last_id)
+                    .order_by(OTAsset.id).limit(ADVISORY_SWEEP_BATCH),
+                )).scalars().all())
+                if not batch:
+                    break
+                for asset in batch:
+                    data = asset.to_dict()
+                    matches = await assessor.check_known_vulnerabilities(data)
+                    asset.known_vulnerabilities_count = len(matches)
+                    asset.risk_score = await assessor.calculate_ot_risk_score(data, matches)
+                    rescored += 1
+                    with_advisories += 1 if matches else 0
+                await db.commit()
+                last_id = batch[-1].id
+                seen += len(batch)
+    return {"feed": feed, "organizations": len(org_ids), "assets_rescored": rescored,
+            "assets_with_advisories": with_advisories, "advisories_cached": len(advisories)}
+
+
+@shared_task(bind=True, max_retries=2, name="src.ot_security.tasks.sync_ics_advisories")
+def sync_ics_advisories(self, force: bool = False):
+    """Daily: CISA ICS advisories (pinned fetch, cached) matched to stored OT assets."""
+    try:
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(_sync_ics_advisories_async(force))
+        finally:
+            loop.close()
+        logger.info("ICS advisory sync complete", assets_rescored=result["assets_rescored"],
+                    feed_status=result["feed"].get("status"))
+        return result
+    except Exception as exc:
+        logger.error(f"ICS advisory sync failed: {exc}")
+        raise self.retry(exc=exc, countdown=1800)
+
+
+async def _reconcile_ot_agent_commands_async() -> Dict[str, int]:
+    from src.core.database import async_session_factory
+    from src.ot_security.actuation import reconcile_pending
+
+    async with async_session_factory() as db:
+        changed = await reconcile_pending(db, limit=200)
+        await db.commit()
+    return changed
+
+
+@shared_task(bind=True, max_retries=0, name="src.ot_security.tasks.reconcile_ot_agent_commands")
+def reconcile_ot_agent_commands(self):
+    """Every 2 minutes: apply agent results to pending safe shutdowns and
+    segmentation audits (200 of each per run)."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_reconcile_ot_agent_commands_async())
+    finally:
+        loop.close()

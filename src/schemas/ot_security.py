@@ -53,6 +53,9 @@ class AssetType(str, Enum):
     ACTUATOR = "actuator"
     ROBOT = "robot"
     CNC_MACHINE = "cnc_machine"
+    # Wave 4: discovery inserts assets whose type a port probe cannot tell;
+    # without this value one discovery turned GET /ot_security/assets into a 500.
+    UNKNOWN = "unknown"
 
 
 class Protocol(str, Enum):
@@ -331,6 +334,10 @@ class OTZoneResponse(DBModel):
     last_audit: Optional[datetime] = None
     firewall_rules: Dict[str, Any] = {}
     segmentation_verified: bool = False
+    # Wave 4: agent-run segmentation audit (status follows the agent command).
+    segmentation_audit_status: Optional[str] = None
+    segmentation_audit_command_id: Optional[str] = None
+    segmentation_audited_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -385,6 +392,12 @@ class OTIncidentResponse(DBModel):
     status: IncidentStatus
     containment_strategy: Optional[ContainmentStrategy] = None
     safe_shutdown_initiated: bool = False
+    # Wave 4: agent-commanded safe shutdown (status follows the agent command;
+    # safe_shutdown_initiated is True only after the agent reports success).
+    safe_shutdown_status: Optional[str] = None
+    safe_shutdown_command_id: Optional[str] = None
+    safe_shutdown_requested_at: Optional[datetime] = None
+    safe_shutdown_detail: Optional[str] = None
     detected_at: Optional[datetime] = None
     contained_at: Optional[datetime] = None
     resolved_at: Optional[datetime] = None
@@ -558,3 +571,7 @@ class OTRiskAssessmentResponse(BaseModel):
     asset_risks: List[AssetRisk] = []
     network_risks: List[Dict[str, Any]] = []
     compliance_risks: List[Dict[str, Any]] = []
+    # Wave 4: low band, and the advisory feed the vulnerabilities came from
+    # (status not_fetched / current / stale; vulnerabilities = advisory ids).
+    low_risk_assets: int = 0
+    advisory_feed: Dict[str, Any] = {}

@@ -20,6 +20,8 @@ __all__ = [
     "OTZone",
     "OTIncident",
     "OTPolicyRule",
+    "OTICSAdvisory",
+    "OTAdvisoryFeedStatus",
 ]
 
 
@@ -169,6 +171,16 @@ class OTZone(BaseModel):
     firewall_rules: Mapped[Dict[str, Any]] = mapped_column(JSON, default={})
     segmentation_verified: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # Wave 4: segmentation audit run by an endpoint agent inside the zone
+    # (``ot_segmentation_probe``). Status follows the agent command:
+    # awaiting_approval / queued / in_progress / verified / violations_found /
+    # failed. ``segmentation_verified`` is set only from a completed probe
+    # with no violation.
+    segmentation_audit_command_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    segmentation_audit_status: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    segmentation_audited_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    segmentation_findings: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+
     __table_args__ = (
         Index("ix_ot_zones_org_level", "organization_id", "purdue_level"),
         UniqueConstraint("organization_id", "name", name="uq_org_zone_name"),
@@ -226,6 +238,15 @@ class OTIncident(BaseModel):
     contained_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
+    # Wave 4: safe shutdown commanded through an endpoint agent
+    # (``ot_safe_shutdown``, approval required). Status follows the agent
+    # command: awaiting_approval / queued / in_progress / completed / failed.
+    # ``safe_shutdown_initiated`` is set only when the agent reports success.
+    safe_shutdown_command_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    safe_shutdown_status: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    safe_shutdown_requested_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    safe_shutdown_detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     __table_args__ = (
         Index("ix_ot_incidents_org_severity", "organization_id", "severity"),
         Index("ix_ot_incidents_org_status", "organization_id", "status"),
@@ -270,3 +291,38 @@ class OTPolicyRule(BaseModel):
         Index("ix_ot_policies_org_type", "organization_id", "rule_type"),
         UniqueConstraint("organization_id", "name", name="uq_org_policy_name"),
     )
+
+
+class OTICSAdvisory(BaseModel):
+    """CISA ICS advisory cached from the public advisories feed (platform-wide).
+
+    Not tenant data: one row per advisory, shared by every organisation and
+    matched against each tenant's own assets by vendor and product at read
+    time. Filled only by ``src.ot_security.advisories.refresh_ics_advisories``
+    (pinned outbound fetch); nothing here is authored by PySOAR.
+    """
+
+    __tablename__ = "ot_ics_advisories"
+
+    advisory_id: Mapped[str] = mapped_column(String(40), nullable=False, unique=True, index=True)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    vendor: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    products: Mapped[List[str]] = mapped_column(JSON, default=list)
+    cve_ids: Mapped[List[str]] = mapped_column(JSON, default=list)
+    cvss_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class OTAdvisoryFeedStatus(BaseModel):
+    """Outcome of the last advisory feed fetch (one row per feed key)."""
+
+    __tablename__ = "ot_advisory_feed_status"
+
+    feed: Mapped[str] = mapped_column(String(50), nullable=False, unique=True)
+    url: Mapped[str] = mapped_column(String(500), nullable=False)
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_success_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    entries: Mapped[int] = mapped_column(Integer, default=0)

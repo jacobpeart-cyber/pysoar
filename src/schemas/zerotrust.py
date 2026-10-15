@@ -110,6 +110,14 @@ class DeviceTrustProfileResponse(DeviceTrustProfileBase, DBModel):
     enrolled_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # Wave 4: posture derived from the stored compliance status only. Each
+    # check is True / False as reported or "not_reported"; is_compliant is
+    # None until the agent-measured checks are all reported.
+    compliance_checks: dict[str, Any] = Field(default_factory=dict)
+    is_compliant: Optional[bool] = None
+    posture_status: str = "not_reported"  # reported | partial | not_reported
+    posture_source: Optional[str] = None  # agent | admin_override | api
+    posture_reported_at: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -258,6 +266,8 @@ class ZeroTrustMaturityResponse(BaseModel):
     pillars: dict[str, dict[str, Any]]
     recommendations: list[dict[str, Any]] = Field(default_factory=list)
     assessed_at: Optional[datetime] = None
+    # Wave 4: pillars with at least one configured criterion (0 = nothing set up).
+    configured_pillars: int = 0
 
 
 class PillarAssessmentResponse(BaseModel):
@@ -297,6 +307,12 @@ class ZeroTrustDashboardStats(BaseModel):
     maturity_score: float = 0.0
     maturity_level: str = ""
     pillars: dict = Field(default_factory=dict)
+    # Wave 4 additions: devices that never reported posture (counted neither
+    # compliant nor non-compliant), decisions in the last 24 hours, and the
+    # number of pillars with any configuration.
+    not_reported_devices: int = 0
+    access_decisions_24h: int = 0
+    configured_pillars: int = 0
     last_updated: datetime
 
 

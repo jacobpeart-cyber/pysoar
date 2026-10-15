@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from src.schemas.base import DBModel
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # Risk Scenario Schemas
@@ -103,9 +103,24 @@ class FAIRAnalysisBase(BaseModel):
 
 
 class FAIRAnalysisCreate(FAIRAnalysisBase):
-    """Schema for creating FAIR analysis"""
+    """Schema for creating FAIR analysis.
 
-    pass
+    Every estimate is required (no defaults are invented) and each
+    min / mode / max triple must be ordered; a violation is a 422 that names
+    the offending input.
+    """
+
+    scenario_id: str = Field(..., min_length=1)
+
+    @model_validator(mode="after")
+    def _ordered_estimates(self) -> "FAIRAnalysisCreate":
+        from src.risk_quant.engine import FAIRInputError, validate_fair_inputs
+
+        try:
+            validate_fair_inputs(self.model_dump())
+        except FAIRInputError as exc:
+            raise ValueError(f"{exc.field}: {exc.detail}") from None
+        return self
 
 
 class FAIRAnalysisUpdate(BaseModel):
@@ -166,6 +181,13 @@ class FAIRResultsResponse(BaseModel):
     loss_exceedance_curve: dict
     ale_statistics: dict
     risk_distribution: dict
+    # Wave 4: share of draws with TCap > RS (cross-check of the vuln estimate),
+    # iterations run, compound-sampling approximation (None = exact) and the
+    # model description (which stored inputs were sampled).
+    derived_vulnerability: Optional[float] = None
+    iterations: int = 0
+    approximation: Optional[str] = None
+    model: dict = Field(default_factory=dict)
 
 
 # Risk Register Schemas
@@ -363,6 +385,13 @@ class RiskDashboardResponse(BaseModel):
     top_risks_by_ale: list[dict]
     ale_by_category: dict
     control_effectiveness_avg: float = 0.0
+    # Wave 4: counts and FAIR figures from stored rows only. ``fair_*`` use the
+    # latest completed analysis per scenario; None when none is completed.
+    number_of_controls: int = 0
+    number_of_scenarios: int = 0
+    fair_analyses_completed: int = 0
+    fair_scenarios_without_inputs: int = 0
+    fair_total_ale_mean: Optional[float] = None
 
 
 class RiskHeatmapResponse(BaseModel):
@@ -391,7 +420,8 @@ class ControlROIResponse(BaseModel):
     annual_cost_usd: float = 0.0
     net_annual_benefit_usd: float = 0.0
     roi_5_year_percent: float = 0.0
-    payback_period_months: float = 0.0
+    # None when the control yields no annual benefit (it never pays back).
+    payback_period_months: Optional[float] = None
     effective: bool = False
 
 

@@ -1,7 +1,7 @@
 """Zero Trust Architecture REST API endpoints (NIST 800-207)"""
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
@@ -36,6 +36,7 @@ from src.zerotrust.engine import (
     MicroSegmentationEngine,
     PolicyDecisionPoint,
     ZeroTrustScorer,
+    device_posture,
 )
 from src.zerotrust.models import (
     AccessDecision,
@@ -52,6 +53,36 @@ router = APIRouter(prefix="/zerotrust", tags=["Zero Trust"])
 # admins for configuration and actions against live systems.
 AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
 AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
+
+
+def _device_response(device: DeviceTrustProfile) -> DeviceTrustProfileResponse:
+    """Device profile plus the posture fields derived from its stored checks."""
+    posture = device_posture(device)
+    response = DeviceTrustProfileResponse.model_validate(device)
+    return response.model_copy(update=posture)
+
+
+def _device_summary(d: DeviceTrustProfile) -> dict[str, Any]:
+    """List-row shape: stored fields plus derived posture (never a fabricated verdict)."""
+    posture = device_posture(d)
+    return {
+        "id": d.id,
+        "device_id": d.device_id,
+        "hostname": d.hostname,
+        "device_type": d.device_type,
+        "os_type": d.os_type,
+        "os_version": d.os_version,
+        "trust_score": d.trust_score,
+        "trust_level": d.trust_level,
+        "last_seen": d.last_seen_at,
+        "last_seen_at": d.last_seen_at,
+        "last_assessment_at": d.last_assessment_at,
+        "compliance_checks": posture["compliance_checks"],
+        "is_compliant": posture["is_compliant"],
+        "posture_status": posture["posture_status"],
+        "posture_source": posture["posture_source"],
+        "posture_reported_at": posture["posture_reported_at"],
+    }
 
 
 async def _get_segment_or_404(db: DatabaseSession, segment_id: str, org_id: str) -> MicroSegment:
@@ -577,12 +608,24 @@ async def get_device_stats(
     )
     blocked = blocked_result.scalar_one() or 0
 
+    unknown_result = await db.execute(
+        select(func.count(DeviceTrustProfile.id)).where(
+            and_(
+                DeviceTrustProfile.organization_id == org_id,
+                DeviceTrustProfile.trust_level == "unknown",
+            ),
+        ),
+    )
+    unknown = unknown_result.scalar_one() or 0
+
     return {
         "total": total,
         "trusted": trusted,
         "conditional": conditional,
         "untrusted": untrusted,
         "blocked": blocked,
+        # Profiles that never reported posture: neither trusted nor blocked.
+        "not_reported": unknown,
     }
 
 
@@ -648,17 +691,16 @@ async def list_devices(
     if trust_level:
         query = query.where(DeviceTrustProfile.trust_level == trust_level)
 
-    # Get total count
+    # Get total count (of the filtered set)
     count_result = await db.execute(
-        select(func.count(DeviceTrustProfile.id)).where(
-            DeviceTrustProfile.organization_id == org_id,
-        ),
+        select(func.count()).select_from(query.subquery()),
     )
     total = count_result.scalar_one()
 
     # Get paginated results
     result = await db.execute(
-        query.order_by(desc(DeviceTrustProfile.trust_score)).offset(skip).limit(limit),
+        query.order_by(desc(DeviceTrustProfile.trust_score), DeviceTrustProfile.device_id)
+        .offset(skip).limit(limit),
     )
     devices = result.scalars().all()
 
@@ -666,18 +708,7 @@ async def list_devices(
         "total": total,
         "skip": skip,
         "limit": limit,
-        "devices": [
-            {
-                "id": d.id,
-                "device_id": d.device_id,
-                "hostname": d.hostname,
-                "device_type": d.device_type,
-                "trust_score": d.trust_score,
-                "trust_level": d.trust_level,
-                "last_seen": d.last_seen_at,
-            }
-            for d in devices
-        ],
+        "devices": [_device_summary(d) for d in devices],
     }
 
 
@@ -692,16 +723,7 @@ async def list_non_compliant_devices(
 
     return {
         "count": len(non_compliant),
-        "devices": [
-            {
-                "id": d.id,
-                "device_id": d.device_id,
-                "hostname": d.hostname,
-                "trust_score": d.trust_score,
-                "trust_level": d.trust_level,
-            }
-            for d in non_compliant
-        ],
+        "devices": [_device_summary(d) for d in non_compliant],
     }
 
 
@@ -727,7 +749,7 @@ async def get_device(
             status_code=status.HTTP_404_NOT_FOUND, detail="Device not found",
         )
 
-    return DeviceTrustProfileResponse.model_validate(device)
+    return _device_response(device)
 
 
 @router.post("/devices/{device_id}/assess", response_model=DeviceTrustProfileResponse)
@@ -747,7 +769,7 @@ async def assess_device(
             status_code=status.HTTP_404_NOT_FOUND, detail="Device not found",
         ) from None
 
-    return DeviceTrustProfileResponse.model_validate(device)
+    return _device_response(device)
 
 
 @router.put("/devices/{device_id}/compliance", response_model=DeviceTrustProfileResponse)
@@ -758,18 +780,36 @@ async def update_device_compliance(
     db: DatabaseSession = None,
     _user: AdminRoleUser = None,
 ) -> DeviceTrustProfileResponse:
-    """Override device compliance data (admin only: it feeds the PDP device check)"""
+    """Override device compliance data (admin only: it feeds the PDP device check).
+
+    Upsert within the caller's organisation: an unknown ``device_id`` creates
+    this tenant's profile (device ids are unique per organisation, so the
+    same id in another tenant is a separate row and is never touched). The
+    stored posture is marked ``posture_source="admin_override"`` and the
+    change is written to the audit log.
+    """
+    from src.models.audit import AuditLog
+
     assessor = DeviceTrustAssessor(db, org_id)
 
-    compliance_data = compliance.dict(exclude_unset=True, exclude_none=True)
-    try:
-        device = await assessor.update_device_compliance(device_id, compliance_data)
-    except LookupError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Device not found",
-        ) from None
+    compliance_data = compliance.model_dump(exclude_unset=True, exclude_none=True)
+    device = await assessor.update_device_compliance(
+        device_id, compliance_data, source="admin_override",
+    )
+    db.add(AuditLog(
+        user_id=str(_user.id) if _user is not None else None,
+        organization_id=org_id,
+        action="zerotrust_device_compliance_override",
+        resource_type="device_trust_profile",
+        resource_id=device.id,
+        description=f"Device {device_id} posture overridden by an administrator",
+        new_value=json.dumps(compliance_data),
+        success=True,
+    ))
+    await db.commit()
+    await db.refresh(device)
 
-    return DeviceTrustProfileResponse.model_validate(device)
+    return _device_response(device)
 
 
 # ============================================================================
@@ -1092,6 +1132,7 @@ async def get_maturity_score(
         pillars=maturity["pillars"],
         recommendations=maturity["recommendations"],
         assessed_at=datetime.now(timezone.utc),
+        configured_pillars=maturity["configured_pillars"],
     )
 
 
@@ -1173,7 +1214,17 @@ async def get_dashboard_stats(
         ),
     )
     compliant_devices = compliant_result.scalar_one() or 0
-    non_compliant = total_devices - compliant_devices
+    not_reported_result = await db.execute(
+        select(func.count(DeviceTrustProfile.id)).where(
+            and_(
+                DeviceTrustProfile.organization_id == org_id,
+                DeviceTrustProfile.trust_level == "unknown",
+            ),
+        ),
+    )
+    not_reported_devices = not_reported_result.scalar_one() or 0
+    # A device that never reported posture is not "non-compliant".
+    non_compliant = max(total_devices - compliant_devices - not_reported_devices, 0)
 
     # Get average device trust
     avg_trust_result = await db.execute(
@@ -1190,6 +1241,16 @@ async def get_dashboard_stats(
         ),
     )
     total_decisions = decision_result.scalar_one() or 0
+
+    decisions_24h_result = await db.execute(
+        select(func.count(AccessDecision.id)).where(
+            and_(
+                AccessDecision.organization_id == org_id,
+                AccessDecision.created_at >= datetime.now(timezone.utc) - timedelta(hours=24),
+            ),
+        ),
+    )
+    decisions_24h = decisions_24h_result.scalar_one() or 0
 
     allowed_result = await db.execute(
         select(func.count(AccessDecision.id)).where(
@@ -1268,4 +1329,7 @@ async def get_dashboard_stats(
         maturity_level=maturity["maturity_level"],
         pillars=maturity["pillars"],
         last_updated=datetime.now(timezone.utc),
+        not_reported_devices=not_reported_devices,
+        access_decisions_24h=decisions_24h,
+        configured_pillars=maturity["configured_pillars"],
     )

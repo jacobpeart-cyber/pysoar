@@ -666,6 +666,75 @@ class PolicyDecisionPoint:
         return True
 
 
+#: Posture checks an endpoint agent measures and reports on its heartbeat.
+AGENT_POSTURE_CHECKS: tuple[str, ...] = ("os_patched", "av_active", "encryption_enabled", "firewall_on")
+#: Every posture check a profile can carry (the last two only from an explicit
+#: admin override: the agent does not measure them).
+POSTURE_CHECKS: tuple[str, ...] = AGENT_POSTURE_CHECKS + ("certificate_valid", "jailbroken")
+NOT_REPORTED = "not_reported"
+
+
+def _load_status(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return dict(raw)
+    try:
+        value = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def device_posture(device: DeviceTrustProfile) -> dict[str, Any]:
+    """Posture fields derived from the stored compliance status only.
+
+    ``compliance_checks`` maps each check to the stored boolean or
+    ``"not_reported"``; ``is_compliant`` is None until every agent-measured
+    check has been reported (unknown posture is never shown as failing),
+    otherwise True when all of them pass and the device is not reported as
+    jailbroken / rooted.
+    """
+    status = _load_status(device.compliance_status)
+    checks: dict[str, Any] = {}
+    for key in POSTURE_CHECKS:
+        value = status.get(key)
+        if key == "jailbroken" and value is None and "rooted" in status:
+            value = status.get("rooted")
+        checks[key] = bool(value) if isinstance(value, bool) else NOT_REPORTED
+    reported = [k for k in AGENT_POSTURE_CHECKS if checks[k] != NOT_REPORTED]
+    if not any(checks[k] != NOT_REPORTED for k in POSTURE_CHECKS):
+        posture_status = NOT_REPORTED
+    elif len(reported) < len(AGENT_POSTURE_CHECKS):
+        posture_status = "partial"
+    else:
+        posture_status = "reported"
+    if posture_status == "reported":
+        is_compliant: Optional[bool] = all(checks[k] is True for k in AGENT_POSTURE_CHECKS) and checks[
+            "jailbroken"
+        ] is not True
+    else:
+        is_compliant = None
+    return {
+        "compliance_checks": checks,
+        "is_compliant": is_compliant,
+        "posture_status": posture_status,
+        "posture_source": status.get("_source"),
+        "posture_reported_at": status.get("_reported_at"),
+        "compliance_status": {k: v for k, v in status.items() if not str(k).startswith("_")},
+    }
+
+
+def _trust_level(trust_score: float, posture_status: str) -> str:
+    if posture_status == NOT_REPORTED:
+        return "unknown"
+    if trust_score >= 80:
+        return "trusted"
+    if trust_score >= 60:
+        return "conditional"
+    if trust_score >= 40:
+        return "untrusted"
+    return "blocked"
+
+
 class DeviceTrustAssessor:
     """Device trust assessment and compliance checking"""
 
@@ -673,20 +742,7 @@ class DeviceTrustAssessor:
         self.db = db
         self.organization_id = organization_id
 
-    async def assess_device(self, device_id: str) -> DeviceTrustProfile:
-        """Assess device compliance and calculate trust score
-
-        Checks:
-        - OS patch level
-        - Antivirus status
-        - Encryption status
-        - Firewall status
-        - Certificate validity
-        - Jailbreak/root detection
-        """
-        logger.info("assessing_device", device_id=device_id)
-
-        # Get or create device profile
+    async def _get(self, device_id: str) -> Optional[DeviceTrustProfile]:
         result = await self.db.execute(
             select(DeviceTrustProfile)
             .where(
@@ -697,48 +753,57 @@ class DeviceTrustAssessor:
             )
             .limit(1),
         )
-        device = result.scalar_one_or_none()
+        return result.scalar_one_or_none()
 
+    def _rescore(self, device: DeviceTrustProfile) -> None:
+        status = _load_status(device.compliance_status)
+        posture = device_posture(device)
+        device.trust_score = self._calculate_trust_score(status)
+        device.trust_level = _trust_level(device.trust_score, posture["posture_status"])
+        checks = posture["compliance_checks"]
+        # Mirror the stored checks onto the boolean columns (False only when
+        # actually reported False or not reported; the API returns the
+        # ``compliance_checks`` map, which keeps the difference).
+        device.encryption_enabled = checks["encryption_enabled"] is True
+        device.antivirus_active = checks["av_active"] is True
+        device.firewall_enabled = checks["firewall_on"] is True
+        device.certificate_valid = checks["certificate_valid"] is True
+        device.jailbroken = checks["jailbroken"] is True
+        device.last_assessment_at = datetime.now(timezone.utc)
+
+    async def assess_device(self, device_id: str) -> DeviceTrustProfile:
+        """Recompute a device's trust score from its stored posture.
+
+        Unknown ids are a LookupError (no phantom profile is created). A device
+        with no reported posture is ``trust_level="unknown"``, not "blocked".
+        """
+        logger.info("assessing_device", device_id=device_id)
+
+        device = await self._get(device_id)
         if not device:
             # Assessing an unknown id used to create a phantom "blocked"
             # device in this tenant. Profiles are created by agent telemetry
-            # (update_device_compliance); an assessment never invents one.
+            # or an admin override (update_device_compliance).
             logger.warning("device_not_found", device_id=device_id)
             raise LookupError(f"device {device_id} not found")
 
-        # Calculate trust score based on compliance
-        compliance_status = json.loads(device.compliance_status or "{}")
-        trust_score = self._calculate_trust_score(compliance_status)
-
-        device.trust_score = trust_score
-        device.last_assessment_at = datetime.now(timezone.utc)
-
-        # Determine trust level
-        if trust_score >= 80:
-            device.trust_level = "trusted"
-        elif trust_score >= 60:
-            device.trust_level = "conditional"
-        elif trust_score >= 40:
-            device.trust_level = "untrusted"
-        else:
-            device.trust_level = "blocked"
-
+        self._rescore(device)
         self.db.add(device)
         await self.db.commit()
 
         logger.info(
             "device_assessment_complete",
             device_id=device_id,
-            trust_score=trust_score,
+            trust_score=device.trust_score,
             trust_level=device.trust_level,
         )
 
         return device
 
     def _calculate_trust_score(self, compliance_status: dict[str, Any]) -> float:
-        """Calculate composite trust score from compliance factors
+        """Calculate composite trust score from reported compliance factors
 
-        Factors:
+        Factors (only checks reported True earn points):
         - OS patched (25%)
         - AV active (25%)
         - Encryption (25%)
@@ -747,56 +812,91 @@ class DeviceTrustAssessor:
         """
         score = 0.0
 
-        if compliance_status.get("os_patched"):
+        if compliance_status.get("os_patched") is True:
             score += 25
-        if compliance_status.get("av_active"):
+        if compliance_status.get("av_active") is True:
             score += 25
-        if compliance_status.get("encryption_enabled"):
+        if compliance_status.get("encryption_enabled") is True:
             score += 25
-        if compliance_status.get("firewall_on"):
+        if compliance_status.get("firewall_on") is True:
             score += 15
-        if compliance_status.get("certificate_valid"):
+        if compliance_status.get("certificate_valid") is True:
             score += 10
 
         # Penalize jailbreak/root
-        if compliance_status.get("jailbroken") or compliance_status.get("rooted"):
+        if compliance_status.get("jailbroken") is True or compliance_status.get("rooted") is True:
             score = max(0, score - 50)
 
         return min(score, 100.0)
 
     async def update_device_compliance(
-        self, device_id: str, compliance_data: dict[str, Any],
+        self,
+        device_id: str,
+        compliance_data: dict[str, Any],
+        *,
+        source: Optional[str] = None,
+        device_type: str = "unknown",
+        hostname: Optional[str] = None,
     ) -> DeviceTrustProfile:
-        """Update device compliance data and recalculate trust score"""
-        result = await self.db.execute(
-            select(DeviceTrustProfile)
-            .where(
-                and_(
-                    DeviceTrustProfile.device_id == device_id,
-                    DeviceTrustProfile.organization_id == self.organization_id,
+        """Record reported posture for a device, creating its profile in this tenant.
+
+        Upsert within the organisation (device ids are unique per tenant since
+        migration 032, so the same id in another tenant is a different row).
+
+        ``source``: ``"admin_override"`` from the API; None means the agent
+        heartbeat path when ``device_id`` is an enrolled agent of this tenant.
+        Agent posture keeps only the checks the agent measures
+        (``AGENT_POSTURE_CHECKS``): the heartbeat also sends constant
+        ``certificate_valid=True`` / ``jailbroken=False`` values it never
+        measured, and those must not earn trust points.
+        """
+        agent = None
+        if source is None or source == "agent":
+            from src.agents.models import EndpointAgent
+
+            agent = (await self.db.execute(
+                select(EndpointAgent).where(
+                    EndpointAgent.id == device_id,
+                    EndpointAgent.organization_id == self.organization_id,
                 ),
-            )
-            .limit(1),
-        )
-        device = result.scalar_one_or_none()
+            )).scalar_one_or_none()
+            source = "agent" if agent is not None else (source or "api")
 
+        allowed = AGENT_POSTURE_CHECKS if source == "agent" else POSTURE_CHECKS + ("rooted",)
+        data = {k: v for k, v in compliance_data.items() if k in allowed and isinstance(v, bool)}
+        now = datetime.now(timezone.utc)
+
+        device = await self._get(device_id)
         if not device:
-            # Compliance is an override of an existing profile. Creating one
-            # here let a caller register a device_id that another tenant
-            # already owns (the column is globally unique) and surfaced as a
-            # 500; unknown devices are a 404 for this tenant instead.
-            logger.warning("device_not_found", device_id=device_id)
-            raise LookupError(f"device {device_id} not found")
+            device = DeviceTrustProfile(
+                organization_id=self.organization_id,
+                device_id=device_id,
+                device_type=device_type or "unknown",
+                hostname=hostname or (agent.hostname if agent is not None else None),
+                os_type=agent.os_type if agent is not None else None,
+                os_version=agent.os_version if agent is not None else None,
+                compliance_status="{}",
+                trust_score=0.0,
+                trust_level="unknown",
+                enrolled_at=now,
+            )
+            self.db.add(device)
+            logger.info("device_profile_created", device_id=device_id, source=source)
+        elif agent is not None:
+            device.hostname = device.hostname or agent.hostname
+            device.os_type = agent.os_type or device.os_type
+            device.os_version = agent.os_version or device.os_version
 
-        # Update compliance status
-        current_status = json.loads(device.compliance_status or "{}")
-        current_status.update(compliance_data)
+        current_status = _load_status(device.compliance_status)
+        current_status.update(data)
+        if data:
+            current_status["_source"] = source
+            current_status["_reported_at"] = now.isoformat()
         device.compliance_status = json.dumps(current_status)
+        if source == "agent":
+            device.last_seen_at = now
 
-        # Recalculate trust score
-        device.trust_score = self._calculate_trust_score(current_status)
-        device.last_assessment_at = datetime.now(timezone.utc)
-
+        self._rescore(device)
         self.db.add(device)
         await self.db.commit()
 
@@ -804,17 +904,23 @@ class DeviceTrustAssessor:
             "device_compliance_updated",
             device_id=device_id,
             trust_score=device.trust_score,
+            source=source,
         )
 
         return device
 
     async def get_non_compliant_devices(self) -> list[DeviceTrustProfile]:
-        """Get devices below compliance threshold"""
+        """Devices with reported posture whose trust score is below 70.
+
+        Devices that never reported posture are not "non-compliant": their
+        posture is unknown (``trust_level="unknown"``).
+        """
         result = await self.db.execute(
             select(DeviceTrustProfile).where(
                 and_(
                     DeviceTrustProfile.organization_id == self.organization_id,
                     DeviceTrustProfile.trust_score < 70,
+                    DeviceTrustProfile.trust_level != "unknown",
                 ),
             ),
         )
@@ -1271,7 +1377,19 @@ class ContinuousAuthEngine:
 
 
 class ZeroTrustScorer:
-    """Zero Trust maturity assessment using CISA model"""
+    """Zero Trust maturity assessment (CISA ZTMM pillars), from stored configuration.
+
+    Each pillar is a set of weighted criteria (weights sum to 100). A
+    criterion's value is a share in [0, 1] measured on this tenant's rows:
+    policies, device profiles and their reported posture, micro-segments,
+    sessions the policy decision point evaluated, detection rules, log
+    ingestion, playbooks, remediation policies and enrolled agents. There are
+    no baseline points: a tenant with nothing configured scores 0 in every
+    pillar, and a pillar with nothing configured is ``status="not_configured"``.
+    """
+
+    #: Window for "recent" activity criteria (sessions, decisions, logs).
+    ACTIVITY_WINDOW_DAYS = 30
 
     def __init__(self, db: AsyncSession, organization_id: str):
         self.db = db
@@ -1281,265 +1399,264 @@ class ZeroTrustScorer:
         """Calculate overall Zero Trust maturity score
 
         Returns:
-            {overall_score, pillars, maturity_level, recommendations}
+            {overall_score, pillars, maturity_level, recommendations,
+             configured_pillars}
         """
         logger.info("calculating_zero_trust_maturity")
 
-        # NIST SP 800-207 defines 7 zero-trust pillars; the previous
-        # calculation only scored 5 and hid "visibility & analytics"
-        # and "automation & orchestration" from the maturity dashboard.
         pillars = {
-            "identity": await self.assess_pillar("identity"),
-            "devices": await self.assess_pillar("devices"),
-            "networks": await self.assess_pillar("networks"),
-            "applications": await self.assess_pillar("applications"),
-            "data": await self.assess_pillar("data"),
-            "visibility": await self.assess_pillar("visibility"),
-            "automation": await self.assess_pillar("automation"),
+            name: await self.assess_pillar(name)
+            for name in ("identity", "devices", "networks", "applications", "data", "visibility", "automation")
         }
 
-        # Calculate overall score (average of pillars)
         overall_score = sum(p["score"] for p in pillars.values()) / len(pillars)
 
         maturity_level = self.get_maturity_level_from_score(overall_score)
         recommendations = await self.generate_recommendations(pillars)
 
         return {
-            "overall_score": overall_score,
+            "overall_score": round(overall_score, 1),
             "maturity_level": maturity_level,
             "pillars": pillars,
             "recommendations": recommendations,
+            "configured_pillars": sum(1 for p in pillars.values() if p["status"] != "not_configured"),
         }
 
-    async def assess_pillar(self, pillar: str) -> dict[str, Any]:
-        """Assess specific Zero Trust pillar
+    async def _count(self, stmt: Any) -> int:
+        return int((await self.db.execute(stmt)).scalar() or 0)
 
-        Args:
-            pillar: Pillar name (identity, devices, networks, applications, data)
+    async def _enabled_policies(self, types: Optional[list[str]] = None) -> list[ZeroTrustPolicy]:
+        stmt = select(ZeroTrustPolicy).where(
+            and_(
+                ZeroTrustPolicy.organization_id == self.organization_id,
+                ZeroTrustPolicy.is_enabled == True,  # noqa: E712
+            ),
+        )
+        if types:
+            stmt = stmt.where(ZeroTrustPolicy.policy_type.in_(types))
+        return list((await self.db.execute(stmt)).scalars().all())
+
+    @staticmethod
+    def _criterion(key: str, weight: float, value: float, evidence: Any) -> dict[str, Any]:
+        value = max(0.0, min(1.0, float(value)))
+        return {"key": key, "weight": weight, "value": round(value, 3), "points": round(weight * value, 1),
+                "evidence": evidence}
+
+    async def assess_pillar(self, pillar: str) -> dict[str, Any]:
+        """Assess one pillar from this tenant's stored configuration.
 
         Returns:
-            {pillar, score, maturity_level, details}
+            {pillar, score, maturity_level, status, criteria, details}
         """
-        score = 0.0
         details: dict[str, Any] = {}
+        criteria: list[dict[str, Any]] = []
+        since = datetime.now(timezone.utc) - timedelta(days=self.ACTIVITY_WINDOW_DAYS)
 
         if pillar == "identity":
-            # Assess identity pillar: check MFA policies and verification success rates
-            policy_result = await self.db.execute(
-                select(ZeroTrustPolicy).where(
+            identity_policies = await self._enabled_policies(["identity"])
+            all_policies = await self._enabled_policies()
+            mfa = [p for p in all_policies if p.requires_mfa]
+            sessions = await self._count(
+                select(func.count(func.distinct(AccessDecision.session_id))).where(
                     and_(
-                        ZeroTrustPolicy.organization_id == self.organization_id,
-                        ZeroTrustPolicy.is_enabled == True,
-                        ZeroTrustPolicy.policy_type == "identity",
+                        AccessDecision.organization_id == self.organization_id,
+                        AccessDecision.session_id.is_not(None),
+                        AccessDecision.created_at >= since,
                     ),
                 ),
             )
-            identity_policies = policy_result.scalars().all()
-            mfa_policies = [p for p in identity_policies if p.requires_mfa]
-            details["total_identity_policies"] = len(identity_policies)
-            details["mfa_enforced_policies"] = len(mfa_policies)
-            # Score: base 20 + up to 40 for policies + 40 for MFA coverage
-            score = 20.0
-            score += min(len(identity_policies) * 10.0, 40.0)
-            if identity_policies:
-                mfa_ratio = len(mfa_policies) / len(identity_policies)
-                score += mfa_ratio * 40.0
+            details.update({
+                "total_identity_policies": len(identity_policies),
+                "enabled_policies": len(all_policies),
+                "mfa_enforced_policies": len(mfa),
+                "sessions_evaluated_30d": sessions,
+            })
+            criteria = [
+                self._criterion("identity_policies_enabled", 30, 1.0 if identity_policies else 0.0,
+                                len(identity_policies)),
+                self._criterion("mfa_coverage", 40, len(mfa) / len(all_policies) if all_policies else 0.0,
+                                f"{len(mfa)}/{len(all_policies)} enabled policies require MFA"),
+                self._criterion("sessions_continuously_evaluated", 30, 1.0 if sessions else 0.0, sessions),
+            ]
 
         elif pillar == "devices":
-            # Assess device pillar: check device trust scores
-            device_result = await self.db.execute(
-                select(DeviceTrustProfile).where(
-                    DeviceTrustProfile.organization_id == self.organization_id,
-                ),
-            )
-            devices = device_result.scalars().all()
-            details["total_devices"] = len(devices)
+            devices = list((await self.db.execute(
+                select(DeviceTrustProfile).where(DeviceTrustProfile.organization_id == self.organization_id),
+            )).scalars().all())
+            postures = [device_posture(d) for d in devices]
+            reported = [p for p in postures if p["posture_status"] == "reported"]
+            compliant = [p for p in reported if p["is_compliant"]]
+            details.update({
+                "total_devices": len(devices),
+                "posture_reported_devices": len(reported),
+                "not_reported_devices": sum(1 for p in postures if p["posture_status"] == NOT_REPORTED),
+                "compliant_devices": len(compliant),
+            })
             if devices:
-                avg_trust = sum(d.trust_score for d in devices) / len(devices)
-                compliant = sum(1 for d in devices if d.trust_score >= 70)
-                details["average_trust_score"] = round(avg_trust, 1)
-                details["compliant_devices"] = compliant
-                score = avg_trust  # Device maturity tracks average trust score
-            else:
-                score = 0.0
+                details["average_trust_score"] = round(sum(d.trust_score for d in devices) / len(devices), 1)
+            criteria = [
+                self._criterion("devices_enrolled", 20, 1.0 if devices else 0.0, len(devices)),
+                self._criterion("posture_reported", 30, len(reported) / len(devices) if devices else 0.0,
+                                f"{len(reported)}/{len(devices)} devices report full posture"),
+                self._criterion("devices_compliant", 50, len(compliant) / len(devices) if devices else 0.0,
+                                f"{len(compliant)}/{len(devices)} devices compliant"),
+            ]
 
         elif pillar == "networks":
-            # Assess network pillar: check micro-segmentation coverage
-            segment_result = await self.db.execute(
+            segments = list((await self.db.execute(
                 select(MicroSegment).where(
                     and_(
                         MicroSegment.organization_id == self.organization_id,
-                        MicroSegment.is_active == True,
+                        MicroSegment.is_active == True,  # noqa: E712
                     ),
                 ),
-            )
-            segments = segment_result.scalars().all()
-            details["total_segments"] = len(segments)
-            details["segment_types"] = list({s.segment_type for s in segments})
-            # Score: base 10 + up to 90 based on segment count and type diversity
-            score = 10.0
-            score += min(len(segments) * 8.0, 50.0)
-            type_diversity = len(details["segment_types"])
-            score += min(type_diversity * 10.0, 40.0)
+            )).scalars().all())
+            bound_ids = {p.microsegment_id for p in await self._enabled_policies() if p.microsegment_id}
+            with_cidr = [s for s in segments if MicroSegmentationEngine._safe_json_list(s.cidr_ranges)]
+            bound = [s for s in segments if s.id in bound_ids]
+            details.update({
+                "total_segments": len(segments),
+                "segment_types": sorted({s.segment_type for s in segments}),
+                "segments_with_cidr": len(with_cidr),
+                "segments_with_policy": len(bound),
+            })
+            criteria = [
+                self._criterion("segments_active", 30, 1.0 if segments else 0.0, len(segments)),
+                self._criterion("segments_with_cidr", 30, len(with_cidr) / len(segments) if segments else 0.0,
+                                f"{len(with_cidr)}/{len(segments)} segments define CIDR ranges"),
+                self._criterion("segments_policy_bound", 40, len(bound) / len(segments) if segments else 0.0,
+                                f"{len(bound)}/{len(segments)} segments referenced by an enabled policy"),
+            ]
 
         elif pillar == "applications":
-            # Assess applications pillar: check application-related policies
-            app_policy_result = await self.db.execute(
-                select(ZeroTrustPolicy).where(
-                    and_(
-                        ZeroTrustPolicy.organization_id == self.organization_id,
-                        ZeroTrustPolicy.is_enabled == True,
-                        ZeroTrustPolicy.policy_type.in_(["access", "workload"]),
-                    ),
-                ),
-            )
-            app_policies = app_policy_result.scalars().all()
-            details["total_app_policies"] = len(app_policies)
-            trust_required = sum(1 for p in app_policies if p.requires_device_trust)
-            details["device_trust_required_count"] = trust_required
-            score = 15.0
-            score += min(len(app_policies) * 8.0, 45.0)
-            if app_policies:
-                score += (trust_required / len(app_policies)) * 40.0
+            app_policies = await self._enabled_policies(["access", "workload"])
+            trust_required = [p for p in app_policies if p.requires_device_trust]
+            with_conditions = [p for p in app_policies if MicroSegmentationEngine._safe_json_list(p.conditions)]
+            details.update({
+                "total_app_policies": len(app_policies),
+                "device_trust_required_count": len(trust_required),
+                "policies_with_conditions": len(with_conditions),
+            })
+            criteria = [
+                self._criterion("access_policies_enabled", 30, 1.0 if app_policies else 0.0, len(app_policies)),
+                self._criterion("device_trust_required", 35,
+                                len(trust_required) / len(app_policies) if app_policies else 0.0,
+                                f"{len(trust_required)}/{len(app_policies)} require device trust"),
+                self._criterion("conditions_defined", 35,
+                                len(with_conditions) / len(app_policies) if app_policies else 0.0,
+                                f"{len(with_conditions)}/{len(app_policies)} define match conditions"),
+            ]
 
         elif pillar == "data":
-            # Assess data pillar: check data classification policies
-            data_policy_result = await self.db.execute(
-                select(ZeroTrustPolicy).where(
+            data_policies = await self._enabled_policies(["data"])
+            classified = [p for p in data_policies if p.data_classification_required]
+            details.update({
+                "total_data_policies": len(data_policies),
+                "classified_policies": len(classified),
+            })
+            criteria = [
+                self._criterion("data_policies_enabled", 40, 1.0 if data_policies else 0.0, len(data_policies)),
+                self._criterion("classification_required", 60,
+                                len(classified) / len(data_policies) if data_policies else 0.0,
+                                f"{len(classified)}/{len(data_policies)} require a data classification"),
+            ]
+
+        elif pillar == "visibility":
+            from src.siem.models import DetectionRule, LogEntry, RuleStatus
+            from src.ueba.models import EntityProfile
+
+            active_rules = await self._count(
+                select(func.count(DetectionRule.id)).where(
                     and_(
-                        ZeroTrustPolicy.organization_id == self.organization_id,
-                        ZeroTrustPolicy.is_enabled == True,
-                        ZeroTrustPolicy.policy_type == "data",
+                        DetectionRule.status == RuleStatus.ACTIVE.value,
+                        DetectionRule.organization_id == self.organization_id,
                     ),
                 ),
             )
-            data_policies = data_policy_result.scalars().all()
-            classified = [p for p in data_policies if p.data_classification_required]
-            details["total_data_policies"] = len(data_policies)
-            details["classified_policies"] = len(classified)
-            score = 10.0
-            score += min(len(data_policies) * 10.0, 40.0)
-            if data_policies:
-                score += (len(classified) / len(data_policies)) * 50.0
-
-        elif pillar == "visibility":
-            # NIST 800-207 "Visibility & Analytics": measured by the
-            # presence of active SIEM detection rules, recent log
-            # ingestion, and UEBA entity coverage. The idea is that
-            # zero trust requires continuous monitoring, so we give
-            # credit for each of those signals existing.
-            from datetime import datetime as _dt
-            from datetime import timedelta as _td
-
-            active_rules = 0
-            log_count_24h = 0
-            entity_count = 0
-            try:
-                from src.siem.models import DetectionRule, LogEntry, RuleStatus
-                rules_q = await self.db.execute(
-                    select(func.count(DetectionRule.id)).where(
-                        and_(
-                            DetectionRule.status == RuleStatus.ACTIVE.value,
-                            DetectionRule.organization_id == self.organization_id,
-                        ),
+            logs_24h = await self._count(
+                select(func.count(LogEntry.id)).where(
+                    and_(
+                        LogEntry.created_at >= datetime.now(timezone.utc) - timedelta(hours=24),
+                        LogEntry.organization_id == self.organization_id,
                     ),
-                )
-                active_rules = rules_q.scalar() or 0
-                logs_q = await self.db.execute(
-                    select(func.count(LogEntry.id)).where(
-                        and_(
-                            LogEntry.created_at >= _dt.utcnow() - _td(hours=24),
-                            LogEntry.organization_id == self.organization_id,
-                        ),
+                ),
+            )
+            entity_count = await self._count(
+                select(func.count(EntityProfile.id)).where(EntityProfile.organization_id == self.organization_id),
+            )
+            decisions = await self._count(
+                select(func.count(AccessDecision.id)).where(
+                    and_(
+                        AccessDecision.organization_id == self.organization_id,
+                        AccessDecision.created_at >= since,
                     ),
-                )
-                log_count_24h = logs_q.scalar() or 0
-            except Exception:
-                pass
-            try:
-                from src.ueba.models import EntityProfile
-                entities_q = await self.db.execute(
-                    select(func.count(EntityProfile.id)).where(
-                        EntityProfile.organization_id == self.organization_id,
-                    ),
-                )
-                entity_count = entities_q.scalar() or 0
-            except Exception:
-                pass
-
-            details["active_detection_rules"] = active_rules
-            details["logs_last_24h"] = log_count_24h
-            details["ueba_entities"] = entity_count
-            # Scoring: 10 baseline + up to 40 for rules + 30 for log
-            # ingestion + 20 for UEBA entities.
-            score = 10.0
-            score += min(active_rules * 2.0, 40.0)
-            if log_count_24h > 0:
-                score += min((log_count_24h / 1000.0) * 30.0, 30.0)
-            score += min(entity_count * 2.0, 20.0)
+                ),
+            )
+            details.update({
+                "active_detection_rules": active_rules,
+                "logs_last_24h": logs_24h,
+                "ueba_entities": entity_count,
+                "access_decisions_30d": decisions,
+            })
+            criteria = [
+                self._criterion("active_detection_rules", 30, 1.0 if active_rules else 0.0, active_rules),
+                self._criterion("logs_ingested_24h", 30, 1.0 if logs_24h else 0.0, logs_24h),
+                self._criterion("ueba_entities_profiled", 20, 1.0 if entity_count else 0.0, entity_count),
+                self._criterion("access_decisions_recorded", 20, 1.0 if decisions else 0.0, decisions),
+            ]
 
         elif pillar == "automation":
-            # NIST 800-207 "Automation & Orchestration": enabled
-            # playbooks, enabled remediation policies, and enrolled
-            # endpoint agents. A mature ZT posture automates response
-            # rather than relying on humans clicking buttons.
-            enabled_playbooks = 0
-            enabled_policies = 0
-            agent_count = 0
-            try:
-                from src.models.playbook import Playbook
-                pb_q = await self.db.execute(
-                    select(func.count(Playbook.id)).where(
-                        and_(
-                            Playbook.is_enabled == True,  # noqa: E712
-                            Playbook.organization_id == self.organization_id,
-                        ),
+            from src.agents.models import EndpointAgent
+            from src.models.playbook import Playbook
+            from src.remediation.models import RemediationPolicy
+
+            enabled_playbooks = await self._count(
+                select(func.count(Playbook.id)).where(
+                    and_(
+                        Playbook.is_enabled == True,  # noqa: E712
+                        Playbook.organization_id == self.organization_id,
                     ),
-                )
-                enabled_playbooks = pb_q.scalar() or 0
-            except Exception:
-                pass
-            try:
-                from src.remediation.models import RemediationPolicy
-                rp_q = await self.db.execute(
-                    select(func.count(RemediationPolicy.id)).where(
-                        and_(
-                            RemediationPolicy.is_enabled == True,  # noqa: E712
-                            RemediationPolicy.organization_id == self.organization_id,
-                        ),
+                ),
+            )
+            enabled_policies = await self._count(
+                select(func.count(RemediationPolicy.id)).where(
+                    and_(
+                        RemediationPolicy.is_enabled == True,  # noqa: E712
+                        RemediationPolicy.organization_id == self.organization_id,
                     ),
-                )
-                enabled_policies = rp_q.scalar() or 0
-            except Exception:
-                pass
-            try:
-                from src.agents.models import EndpointAgent
-                ag_q = await self.db.execute(
-                    select(func.count(EndpointAgent.id)).where(
+                ),
+            )
+            agent_count = await self._count(
+                select(func.count(EndpointAgent.id)).where(
+                    and_(
                         EndpointAgent.organization_id == self.organization_id,
+                        EndpointAgent.status == "active",
                     ),
-                )
-                agent_count = ag_q.scalar() or 0
-            except Exception:
-                pass
+                ),
+            )
+            details.update({
+                "enabled_playbooks": enabled_playbooks,
+                "enabled_remediation_policies": enabled_policies,
+                "enrolled_agents": agent_count,
+            })
+            criteria = [
+                self._criterion("playbooks_enabled", 35, 1.0 if enabled_playbooks else 0.0, enabled_playbooks),
+                self._criterion("remediation_policies_enabled", 30, 1.0 if enabled_policies else 0.0,
+                                enabled_policies),
+                self._criterion("active_endpoint_agents", 35, 1.0 if agent_count else 0.0, agent_count),
+            ]
 
-            details["enabled_playbooks"] = enabled_playbooks
-            details["enabled_remediation_policies"] = enabled_policies
-            details["enrolled_agents"] = agent_count
-            # Scoring: 10 baseline + up to 30 for playbooks + 30 for
-            # remediation policies + 30 for enrolled agents.
-            score = 10.0
-            score += min(enabled_playbooks * 5.0, 30.0)
-            score += min(enabled_policies * 5.0, 30.0)
-            score += min(agent_count * 5.0, 30.0)
+        else:
+            raise ValueError(f"unknown Zero Trust pillar: {pillar}")
 
-        score = min(score, 100.0)
-        maturity_level = self.get_maturity_level_from_score(score)
-
+        score = min(sum(c["points"] for c in criteria), 100.0)
+        configured = any(c["value"] > 0 for c in criteria)
         return {
             "pillar": pillar,
             "score": round(score, 1),
-            "maturity_level": maturity_level,
+            "maturity_level": self.get_maturity_level_from_score(score),
+            "status": "assessed" if configured else "not_configured",
+            "criteria": criteria,
             "details": details,
         }
 

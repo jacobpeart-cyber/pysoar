@@ -2,18 +2,143 @@
 
 Implements FAIR (Factor Analysis of Information Risk) Monte Carlo simulation
 and advanced risk analytics.
+
+Simulation model (``FAIREngine.run_simulation``), one draw per iteration:
+
+* every analyst estimate is a three-point (min, most likely, max) estimate
+  sampled from the standard PERT distribution: Beta(alpha, beta) scaled to
+  [min, max] with alpha = 1 + 4 (mode - min) / (max - min) and
+  beta = 1 + 4 (max - mode) / (max - min) (lambda = 4). The previous sampler
+  used p = (mu - min) / range, q = (max - mu) / range, which sum to 1 and give
+  a U-shaped Beta: the mean survived but every percentile and the
+  loss-exceedance curve were distorted;
+* Threat Event Frequency TEF ~ PERT(tef) events per year;
+* Vulnerability V ~ PERT(vuln): the analyst's direct estimate of the
+  probability that a threat event becomes a loss event (FAIR allows estimating
+  Vulnerability directly). Threat Capability and Resistance Strength are
+  stored as the supporting estimates and the result reports
+  ``derived_vulnerability`` = share of draws where TCap > RS, so an analyst can
+  see when the two disagree; they are not multiplied into the model (the old
+  ``TCap * (1 - RS)`` product is not a FAIR quantity);
+* Loss Event Frequency LEF = TEF * V;
+* the number of loss events in the simulated year N ~ Poisson(LEF);
+* each loss event costs LM = PL + SLEF * SL with PL ~ PERT(primary_loss),
+  SL ~ PERT(secondary_loss) and SLEF the stored secondary loss event
+  frequency (0-1). The stored ``lm_*`` triple is the analyst's overall
+  per-event estimate and is reported, not sampled, because primary and
+  secondary loss already define LM;
+* annual loss = sum of the N event losses (exact compound sampling while the
+  total number of events stays under ``MAX_COMPOUND_EVENTS``; above that the
+  year's loss is N times one LM draw and ``approximation`` says so).
+
+So ``ale_mean`` estimates E[LEF] * E[LM] and the percentiles / exceedance
+curve describe the distribution of a year's total loss. A per-analysis seed
+makes a run reproducible, so the stored figures and a portfolio re-simulation
+from the same stored inputs agree.
+
+No input is ever defaulted: ``validate_fair_inputs`` names the first missing
+or inconsistent estimate and callers turn that into a 422.
 """
 
+import hashlib
 import json
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import numpy as np
-from scipy.stats import beta
 
 from src.core.logging import get_logger
 
 logger = get_logger(__name__)
+
+#: Three-point estimates the simulation validates, with their upper bound.
+FAIR_TRIPLES: tuple[tuple[str, Optional[float]], ...] = (
+    ("tef", None),
+    ("vuln", 1.0),
+    ("tcap", 1.0),
+    ("rs", 1.0),
+    ("lm", None),
+    ("primary_loss", None),
+    ("secondary_loss", None),
+)
+
+#: Above this many simulated loss events the per-event compound sum is
+#: replaced by N x one LM draw (memory bound: one float per event).
+MAX_COMPOUND_EVENTS = 2_000_000
+
+
+class FAIRInputError(ValueError):
+    """A FAIR input is missing or inconsistent; ``field`` names it."""
+
+    def __init__(self, field_name: str, detail: str):
+        super().__init__(f"{field_name}: {detail}")
+        self.field = field_name
+        self.detail = detail
+
+
+def validate_fair_inputs(data: Any) -> None:
+    """Raise FAIRInputError for the first missing or inconsistent input.
+
+    ``data`` is a mapping or an object with the FAIRAnalysis attributes. Every
+    triple needs min <= mode <= max, all >= 0 (probabilities <= 1), and
+    ``secondary_loss_event_frequency`` must be stored in [0, 1].
+    """
+
+    def _get(name: str) -> Any:
+        if isinstance(data, dict):
+            return data.get(name)
+        return getattr(data, name, None)
+
+    for prefix, upper in FAIR_TRIPLES:
+        values = []
+        for part in ("min", "mode", "max"):
+            name = f"{prefix}_{part}"
+            raw = _get(name)
+            if raw is None:
+                raise FAIRInputError(name, "is required (no default is assumed)")
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                raise FAIRInputError(name, "must be a number") from None
+            if math.isnan(value) or math.isinf(value):
+                raise FAIRInputError(name, "must be a finite number")
+            if value < 0 or (upper is not None and value > upper):
+                bound = f"between 0 and {upper:g}" if upper is not None else ">= 0"
+                raise FAIRInputError(name, f"must be {bound}")
+            values.append(value)
+        lo, mode, hi = values
+        if not lo <= mode <= hi:
+            raise FAIRInputError(
+                f"{prefix}_mode",
+                f"{prefix} needs min <= mode <= max (got {lo:g} / {mode:g} / {hi:g})",
+            )
+    slef = _get("secondary_loss_event_frequency")
+    if slef is None:
+        raise FAIRInputError("secondary_loss_event_frequency", "is required (no default is assumed)")
+    try:
+        slef_value = float(slef)
+    except (TypeError, ValueError):
+        raise FAIRInputError("secondary_loss_event_frequency", "must be a number") from None
+    if not 0 <= slef_value <= 1:
+        raise FAIRInputError("secondary_loss_event_frequency", "must be between 0 and 1")
+
+
+def analysis_inputs(analysis: Any) -> dict[str, float]:
+    """The stored inputs of a FAIRAnalysis row as a plain dict (validated)."""
+    validate_fair_inputs(analysis)
+    out: dict[str, float] = {}
+    for prefix, _upper in FAIR_TRIPLES:
+        for part in ("min", "mode", "max"):
+            name = f"{prefix}_{part}"
+            out[name] = float(getattr(analysis, name))
+    out["secondary_loss_event_frequency"] = float(analysis.secondary_loss_event_frequency)
+    return out
+
+
+def analysis_seed(analysis_id: str) -> int:
+    """Deterministic RNG seed for an analysis (stable across runs)."""
+    return int(hashlib.sha256(str(analysis_id).encode("utf-8")).hexdigest()[:12], 16)
 
 
 @dataclass
@@ -31,138 +156,66 @@ class FAIRAnalysisResult:
     lef_distribution: list
     lm_distribution: list
     ale_distribution: list
+    derived_vulnerability: float = 0.0
+    iterations: int = 0
+    approximation: Optional[str] = None
+    model: dict = field(default_factory=dict)
 
 
 class FAIREngine:
-    """FAIR Model Monte Carlo simulation engine"""
+    """FAIR Model Monte Carlo simulation engine (see the module docstring)."""
 
-    def __init__(self):
-        """Initialize FAIR engine"""
+    def __init__(self, seed: Optional[int] = None):
+        """Initialize FAIR engine; ``seed`` makes a run reproducible."""
         self.logger = logger
+        self.rng = np.random.default_rng(seed)
 
     def sample_pert_distribution(
         self, min_val: float, mode_val: float, max_val: float, size: int = 1
     ) -> np.ndarray:
+        """Sample the standard PERT distribution on [min_val, max_val].
+
+        alpha = 1 + 4 (mode - min) / range, beta = 1 + 4 (max - mode) / range;
+        the mean is (min + 4 mode + max) / 6. A degenerate estimate
+        (min == max) is the constant. Raises ValueError for an inconsistent
+        triple instead of silently swapping in another distribution.
         """
-        Sample from PERT (Program Evaluation Review Technique) / Beta distribution.
-
-        The PERT distribution is ideal for risk modeling as it uses expert estimates:
-        - min: pessimistic (low probability) estimate
-        - mode: most likely estimate
-        - max: optimistic estimate
-
-        Args:
-            min_val: Minimum value
-            mode_val: Most likely (mode) value
-            max_val: Maximum value
-            size: Number of samples
-
-        Returns:
-            Samples from PERT distribution
-        """
-        if min_val == mode_val == max_val:
-            return np.full(size, min_val)
-
-        # Convert PERT to Beta distribution parameters
-        # PERT uses: mu = (a + 4*m + b) / 6
-        # Then transforms Beta(a, b) to fit [min, max]
+        min_val, mode_val, max_val = float(min_val), float(mode_val), float(max_val)
+        if not min_val <= mode_val <= max_val:
+            raise ValueError(f"PERT needs min <= mode <= max, got {min_val}/{mode_val}/{max_val}")
         range_val = max_val - min_val
-
         if range_val <= 0:
             return np.full(size, min_val)
-
-        # Normalized mode in [0, 1]
-        mode_normalized = (mode_val - min_val) / range_val
-
-        # Beta distribution shape parameters
-        # Using standard PERT formulation
-        mu = (min_val + 4 * mode_val + max_val) / 6
-        variance = ((max_val - min_val) ** 2) / 36
-
-        if variance <= 0:
-            return np.full(size, mu)
-
-        # Convert to Beta parameters
-        p = ((mu - min_val) / range_val) if range_val > 0 else 0.5
-        q = ((max_val - mu) / range_val) if range_val > 0 else 0.5
-
-        if p <= 0 or q <= 0:
-            return np.full(size, mu)
-
-        # Sample from Beta and scale to [min_val, max_val]
-        try:
-            samples = beta.rvs(a=p, b=q, size=size)
-            return min_val + samples * range_val
-        except Exception as e:
-            self.logger.warning(f"Beta sampling failed, using uniform: {e}")
-            return np.random.uniform(min_val, max_val, size=size)
+        alpha = 1.0 + 4.0 * (mode_val - min_val) / range_val
+        beta_shape = 1.0 + 4.0 * (max_val - mode_val) / range_val
+        return min_val + self.rng.beta(alpha, beta_shape, size=size) * range_val
 
     def calculate_tef(self, tef_params: dict, iterations: int = 10000) -> np.ndarray:
-        """
-        Calculate Threat Event Frequency (TEF) distribution.
-
-        TEF represents the number of threat events per year.
-
-        Args:
-            tef_params: Dictionary with 'min', 'mode', 'max' keys
-            iterations: Number of iterations for simulation
-
-        Returns:
-            Array of TEF samples
-        """
+        """Threat Event Frequency samples (events per year)."""
         tef = self.sample_pert_distribution(
             tef_params["min"], tef_params["mode"], tef_params["max"], size=iterations
         )
-        # Ensure non-negative
-        tef = np.maximum(tef, 0)
-        return tef
+        return np.maximum(tef, 0)
 
     def calculate_vulnerability(
         self,
         tcap_samples: np.ndarray,
         rs_samples: np.ndarray,
     ) -> np.ndarray:
+        """Per-draw indicator that Threat Capability exceeds Resistance Strength.
+
+        Its mean is the FAIR derivation P(TCap > RS); the simulation reports it
+        as ``derived_vulnerability`` next to the analyst's direct estimate.
         """
-        Calculate Vulnerability from Threat Capability and Resistance Strength.
-
-        Vulnerability = Threat Capability × (1 - Resistance Strength)
-        This represents the probability that a threat will successfully exploit vulnerability.
-
-        Args:
-            tcap_samples: Threat Capability samples (0-1)
-            rs_samples: Resistance Strength samples (0-1)
-
-        Returns:
-            Vulnerability samples (0-1)
-        """
-        # Clamp to valid ranges
-        tcap = np.clip(tcap_samples, 0, 1)
-        rs = np.clip(rs_samples, 0, 1)
-
-        # Vulnerability calculation
-        vuln = tcap * (1 - rs)
-        return np.clip(vuln, 0, 1)
+        return (np.asarray(tcap_samples) > np.asarray(rs_samples)).astype(float)
 
     def calculate_lef(
         self,
         tef_samples: np.ndarray,
         vuln_samples: np.ndarray,
     ) -> np.ndarray:
-        """
-        Calculate Loss Event Frequency (LEF).
-
-        LEF = TEF × Vulnerability
-        Represents the number of successful loss events per year.
-
-        Args:
-            tef_samples: Threat Event Frequency samples
-            vuln_samples: Vulnerability samples
-
-        Returns:
-            Loss Event Frequency samples
-        """
-        lef = tef_samples * vuln_samples
-        return np.maximum(lef, 0)
+        """Loss Event Frequency LEF = TEF x Vulnerability (events per year)."""
+        return np.maximum(tef_samples * vuln_samples, 0)
 
     def calculate_loss_magnitude(
         self,
@@ -170,202 +223,132 @@ class FAIREngine:
         secondary_samples: np.ndarray,
         secondary_lef_samples: np.ndarray,
     ) -> np.ndarray:
-        """
-        Calculate total loss per event.
-
-        LM = Primary Loss + (Secondary Loss × Secondary LEF)
-
-        Args:
-            primary_samples: Primary loss per event samples
-            secondary_samples: Secondary loss per event samples
-            secondary_lef_samples: Secondary loss event frequency
-
-        Returns:
-            Loss magnitude samples
-        """
-        lm = primary_samples + (secondary_samples * secondary_lef_samples)
-        return np.maximum(lm, 0)
+        """Loss per event LM = Primary + Secondary x Secondary LEF."""
+        return np.maximum(primary_samples + (secondary_samples * secondary_lef_samples), 0)
 
     def calculate_ale(
         self,
         lef_samples: np.ndarray,
         lm_samples: np.ndarray,
     ) -> np.ndarray:
-        """
-        Calculate Annualized Loss Expectancy (ALE).
+        """Expected annual loss per parameter draw, LEF x LM."""
+        return np.maximum(lef_samples * lm_samples, 0)
 
-        ALE = LEF × LM (across all simulations)
+    def _annual_losses(
+        self,
+        lef: np.ndarray,
+        primary: tuple[float, float, float],
+        secondary: tuple[float, float, float],
+        slef: float,
+    ) -> tuple[np.ndarray, np.ndarray, Optional[str]]:
+        """Compound annual loss: N ~ Poisson(LEF) events, each with a fresh LM draw."""
+        iterations = len(lef)
+        events = self.rng.poisson(lef)
+        total_events = int(events.sum())
 
-        Args:
-            lef_samples: Loss Event Frequency samples
-            lm_samples: Loss Magnitude samples
+        def _lm(size: int) -> np.ndarray:
+            pl = np.maximum(self.sample_pert_distribution(*primary, size=size), 0)
+            sl = np.maximum(self.sample_pert_distribution(*secondary, size=size), 0)
+            return self.calculate_loss_magnitude(pl, sl, np.full(size, slef))
 
-        Returns:
-            Annualized Loss Expectancy samples
-        """
-        ale = lef_samples * lm_samples
-        return np.maximum(ale, 0)
+        lm_per_year = _lm(iterations)  # one representative LM per draw (reported)
+        if total_events == 0:
+            return np.zeros(iterations), lm_per_year, None
+        if total_events > MAX_COMPOUND_EVENTS:
+            return events * lm_per_year, lm_per_year, "events_share_one_magnitude_per_year"
+        event_losses = _lm(total_events)
+        annual = np.zeros(iterations)
+        nonzero = np.nonzero(events)[0]
+        starts = np.concatenate(([0], np.cumsum(events[nonzero])[:-1])).astype(np.int64)
+        annual[nonzero] = np.add.reduceat(event_losses, starts)
+        return annual, lm_per_year, None
 
     def generate_loss_exceedance_curve(
         self, ale_samples: np.ndarray, num_points: int = 100
     ) -> dict:
-        """
-        Generate loss exceedance curve: P(Loss > X).
-
-        The exceedance curve shows the probability that losses will exceed given thresholds.
-
-        Args:
-            ale_samples: Annualized Loss Expectancy samples
-            num_points: Number of points for the curve
-
-        Returns:
-            Dictionary with x_values (loss thresholds) and y_values (probabilities)
-        """
+        """Loss exceedance curve P(annual loss > x) on an even grid up to the max loss."""
+        ale_samples = np.asarray(ale_samples, dtype=float)
         if len(ale_samples) == 0:
             return {"x_values": [], "y_values": []}
-
-        # Generate threshold values from 0 to max observed loss
-        max_loss = np.max(ale_samples)
+        max_loss = float(np.max(ale_samples))
         if max_loss <= 0:
-            return {"x_values": [0], "y_values": [1.0]}
-
+            return {"x_values": [0.0], "y_values": [0.0]}
         thresholds = np.linspace(0, max_loss, num_points)
-        exceedance_probs = []
-
-        for threshold in thresholds:
-            # Probability of exceeding threshold
-            prob = np.mean(ale_samples > threshold)
-            exceedance_probs.append(float(prob))
-
+        ordered = np.sort(ale_samples)
+        n = len(ordered)
+        exceed = n - np.searchsorted(ordered, thresholds, side="right")
         return {
             "x_values": [float(x) for x in thresholds],
-            "y_values": exceedance_probs,
+            "y_values": [float(c) / n for c in exceed],
         }
 
     def run_simulation(self, analysis_data: dict, iterations: int = 10000) -> FAIRAnalysisResult:
+        """Run the FAIR Monte Carlo simulation over stored inputs.
+
+        ``analysis_data`` must carry every triple in ``FAIR_TRIPLES`` and
+        ``secondary_loss_event_frequency``; a missing or inconsistent value
+        raises FAIRInputError naming it (nothing is defaulted).
         """
-        Run complete FAIR Monte Carlo simulation.
+        validate_fair_inputs(analysis_data)
+        iterations = int(iterations)
+        if iterations < 1:
+            raise FAIRInputError("simulation_iterations", "must be at least 1")
 
-        Args:
-            analysis_data: Dictionary containing FAIR analysis parameters
-            iterations: Number of iterations for Monte Carlo
-
-        Returns:
-            FAIRAnalysisResult with calculated metrics
-        """
-        try:
-            # Sample TEF distribution
-            tef_samples = self.sample_pert_distribution(
-                analysis_data["tef_min"],
-                analysis_data["tef_mode"],
-                analysis_data["tef_max"],
-                size=iterations,
-            )
-            tef_samples = np.maximum(tef_samples, 0)
-
-            # Sample Threat Capability
-            tcap_samples = self.sample_pert_distribution(
-                analysis_data["tcap_min"],
-                analysis_data["tcap_mode"],
-                analysis_data["tcap_max"],
-                size=iterations,
+        def _triple(prefix: str) -> tuple[float, float, float]:
+            return (
+                float(analysis_data[f"{prefix}_min"]),
+                float(analysis_data[f"{prefix}_mode"]),
+                float(analysis_data[f"{prefix}_max"]),
             )
 
-            # Sample Resistance Strength
-            rs_samples = self.sample_pert_distribution(
-                analysis_data["rs_min"],
-                analysis_data["rs_mode"],
-                analysis_data["rs_max"],
-                size=iterations,
-            )
+        tef_samples = np.maximum(self.sample_pert_distribution(*_triple("tef"), size=iterations), 0)
+        vuln_samples = np.clip(self.sample_pert_distribution(*_triple("vuln"), size=iterations), 0, 1)
+        tcap_samples = self.sample_pert_distribution(*_triple("tcap"), size=iterations)
+        rs_samples = self.sample_pert_distribution(*_triple("rs"), size=iterations)
+        derived_vulnerability = float(np.mean(self.calculate_vulnerability(tcap_samples, rs_samples)))
 
-            # Calculate Vulnerability
-            vuln_samples = self.calculate_vulnerability(tcap_samples, rs_samples)
+        lef_samples = self.calculate_lef(tef_samples, vuln_samples)
+        ale_samples, lm_samples, approximation = self._annual_losses(
+            lef_samples,
+            _triple("primary_loss"),
+            _triple("secondary_loss"),
+            float(analysis_data["secondary_loss_event_frequency"]),
+        )
 
-            # Calculate LEF
-            lef_samples = self.calculate_lef(tef_samples, vuln_samples)
+        ale_mean = float(np.mean(ale_samples))
+        p10, p50, p90, p99 = (float(v) for v in np.percentile(ale_samples, [10, 50, 90, 99]))
 
-            # Sample primary loss magnitude
-            primary_loss_samples = self.sample_pert_distribution(
-                analysis_data["primary_loss_min"],
-                analysis_data["primary_loss_mode"],
-                analysis_data["primary_loss_max"],
-                size=iterations,
-            )
-            primary_loss_samples = np.maximum(primary_loss_samples, 0)
+        self.logger.info(
+            "fair_simulation_completed",
+            iterations=iterations,
+            ale_mean=ale_mean,
+            ale_p50=p50,
+        )
 
-            # Sample secondary loss magnitude
-            secondary_loss_samples = self.sample_pert_distribution(
-                analysis_data["secondary_loss_min"],
-                analysis_data["secondary_loss_mode"],
-                analysis_data["secondary_loss_max"],
-                size=iterations,
-            )
-            secondary_loss_samples = np.maximum(secondary_loss_samples, 0)
-
-            # Secondary loss event frequency
-            secondary_lef = analysis_data.get("secondary_loss_event_frequency", 1.0)
-
-            # Calculate total loss magnitude
-            lm_samples = self.calculate_loss_magnitude(
-                primary_loss_samples,
-                secondary_loss_samples,
-                np.full(iterations, secondary_lef),
-            )
-
-            # Calculate ALE
-            ale_samples = self.calculate_ale(lef_samples, lm_samples)
-
-            # Calculate percentiles
-            ale_mean = float(np.mean(ale_samples))
-            ale_p10 = float(np.percentile(ale_samples, 10))
-            ale_p50 = float(np.percentile(ale_samples, 50))
-            ale_p90 = float(np.percentile(ale_samples, 90))
-            ale_p99 = float(np.percentile(ale_samples, 99))
-
-            # Generate loss exceedance curve
-            loss_exceedance_curve = self.generate_loss_exceedance_curve(ale_samples)
-
-            self.logger.info(
-                f"FAIR simulation completed",
-                extra={
-                    "iterations": iterations,
-                    "ale_mean": ale_mean,
-                    "ale_p50": ale_p50,
-                },
-            )
-
-            return FAIRAnalysisResult(
-                ale_mean=ale_mean,
-                ale_p10=ale_p10,
-                ale_p50=ale_p50,
-                ale_p90=ale_p90,
-                ale_p99=ale_p99,
-                loss_exceedance_curve=loss_exceedance_curve,
-                tef_distribution=tef_samples.tolist(),
-                vuln_distribution=vuln_samples.tolist(),
-                lef_distribution=lef_samples.tolist(),
-                lm_distribution=lm_samples.tolist(),
-                ale_distribution=ale_samples.tolist(),
-            )
-
-        except Exception as e:
-            self.logger.error(f"FAIR simulation failed: {e}")
-            raise
+        return FAIRAnalysisResult(
+            ale_mean=ale_mean,
+            ale_p10=p10,
+            ale_p50=p50,
+            ale_p90=p90,
+            ale_p99=p99,
+            loss_exceedance_curve=self.generate_loss_exceedance_curve(ale_samples),
+            tef_distribution=tef_samples.tolist(),
+            vuln_distribution=vuln_samples.tolist(),
+            lef_distribution=lef_samples.tolist(),
+            lm_distribution=lm_samples.tolist(),
+            ale_distribution=ale_samples.tolist(),
+            derived_vulnerability=derived_vulnerability,
+            iterations=iterations,
+            approximation=approximation,
+            model=dict(FAIR_MODEL_DESCRIPTION),
+        )
 
     def generate_risk_report(self, analysis_result: FAIRAnalysisResult) -> dict:
-        """
-        Generate comprehensive risk report from simulation results.
-
-        Args:
-            analysis_result: FAIRAnalysisResult from run_simulation
-
-        Returns:
-            Dictionary with risk report data
-        """
+        """Summary statistics of a simulation (terciles of the simulated annual loss)."""
         ale_dist = np.array(analysis_result.ale_distribution)
+        q33, q67 = np.percentile(ale_dist, [33, 67])
 
-        report = {
+        return {
             "ale_statistics": {
                 "mean": analysis_result.ale_mean,
                 "median": analysis_result.ale_p50,
@@ -375,21 +358,83 @@ class FAIREngine:
                 "std_dev": float(np.std(ale_dist)),
                 "min": float(np.min(ale_dist)),
                 "max": float(np.max(ale_dist)),
+                "derived_vulnerability": analysis_result.derived_vulnerability,
+                "iterations": analysis_result.iterations,
+                "approximation": analysis_result.approximation,
             },
             "loss_exceedance_curve": analysis_result.loss_exceedance_curve,
             "risk_distribution": {
-                "low_risk_count": int(np.sum(ale_dist < np.percentile(ale_dist, 33))),
-                "medium_risk_count": int(
-                    np.sum(
-                        (ale_dist >= np.percentile(ale_dist, 33))
-                        & (ale_dist < np.percentile(ale_dist, 67))
-                    )
-                ),
-                "high_risk_count": int(np.sum(ale_dist >= np.percentile(ale_dist, 67))),
+                "low_risk_count": int(np.sum(ale_dist < q33)),
+                "medium_risk_count": int(np.sum((ale_dist >= q33) & (ale_dist < q67))),
+                "high_risk_count": int(np.sum(ale_dist >= q67)),
             },
         }
 
-        return report
+
+#: What the simulation does, returned with every result so a reader of the
+#: figures knows which stored inputs drove them.
+FAIR_MODEL_DESCRIPTION: dict[str, Any] = {
+    "distribution": "pert (lambda 4)",
+    "vulnerability_source": "vuln_min/vuln_mode/vuln_max",
+    "loss_events_per_year": "poisson(tef x vuln)",
+    "loss_per_event": "primary_loss + secondary_loss_event_frequency x secondary_loss",
+    "reported_not_sampled": ["tcap", "rs", "lm"],
+}
+
+
+def simulate_analysis(analysis: Any, iterations: Optional[int] = None) -> FAIRAnalysisResult:
+    """Simulate a stored FAIRAnalysis row with its own deterministic seed."""
+    inputs = analysis_inputs(analysis)
+    runs = int(iterations or analysis.simulation_iterations or 0)
+    if runs < 1:
+        raise FAIRInputError("simulation_iterations", "is required (no default is assumed)")
+    return FAIREngine(seed=analysis_seed(analysis.id)).run_simulation(inputs, runs)
+
+
+def store_result(analysis: Any, result: FAIRAnalysisResult, completed_at: Any) -> None:
+    """Write a simulation result onto its FAIRAnalysis row."""
+    analysis.ale_mean = result.ale_mean
+    analysis.ale_p10 = result.ale_p10
+    analysis.ale_p50 = result.ale_p50
+    analysis.ale_p90 = result.ale_p90
+    analysis.ale_p99 = result.ale_p99
+    analysis.loss_exceedance_curve = json.dumps(result.loss_exceedance_curve)
+    analysis.completed_at = completed_at
+
+
+#: Probability grid of the portfolio loss-exceedance curve.
+PORTFOLIO_GRID = tuple(round(i * 0.05, 2) for i in range(21))
+
+
+def simulate_portfolio(analyses: list[Any], iterations: int = 10000) -> dict[str, Any]:
+    """Portfolio annual loss from stored analyses, assuming independent scenarios.
+
+    Each analysis is re-simulated from its stored inputs with its own seed and
+    a common iteration count; the portfolio loss of draw i is the sum of the
+    scenarios' draw-i losses. Percentiles, VaR and the exceedance curve come
+    from that summed distribution (summing per-scenario percentiles would
+    assume perfectly correlated scenarios and overstate the tail).
+    """
+    if not analyses:
+        return {"iterations": 0, "samples": np.zeros(0)}
+    total = np.zeros(iterations)
+    for analysis in analyses:
+        total += np.asarray(simulate_analysis(analysis, iterations).ale_distribution)
+    p50, p90, p95, p99 = (float(v) for v in np.percentile(total, [50, 90, 95, 99]))
+    curve = [
+        {"probability": p, "loss": round(float(np.quantile(total, 1.0 - p)), 2)}
+        for p in PORTFOLIO_GRID
+    ]
+    return {
+        "iterations": iterations,
+        "samples": total,
+        "mean": float(np.mean(total)),
+        "p50": p50,
+        "p90": p90,
+        "p95": p95,
+        "p99": p99,
+        "curve": curve,
+    }
 
 
 class RiskAggregator:
@@ -480,11 +525,11 @@ class RiskAggregator:
         """
         if not ale_samples:
             return 0.0
+        if len({len(s) for s in ale_samples}) != 1:
+            raise ValueError("portfolio VaR needs the same number of draws per risk")
 
-        # Sum across risks for each iteration
-        portfolio_losses = np.sum(
-            np.array(ale_samples), axis=0
-        ) if ale_samples else np.array([])
+        # Sum across risks for each iteration (independent risks)
+        portfolio_losses = np.sum(np.array(ale_samples), axis=0)
 
         if len(portfolio_losses) == 0:
             return 0.0
@@ -591,10 +636,12 @@ class ControlEffectivenessAnalyzer:
             else 0
         )
 
+        # No benefit means the control never pays back: None, not inf (inf is
+        # not valid JSON and turned the audit route into a 500).
         payback_months = (
             (annual_control_cost / annual_benefit) * 12
             if annual_benefit > 0
-            else float("inf")
+            else None
         )
 
         return {

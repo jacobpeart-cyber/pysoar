@@ -5,12 +5,18 @@ API routes for OT asset management, threat monitoring, zone administration,
 incident coordination, and compliance reporting.
 """
 
+import csv
+import io
+import json
 import math
+import os
 from datetime import datetime, timedelta, timezone
 from ipaddress import ip_network
-from typing import Annotated, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
-from fastapi import Depends, APIRouter, HTTPException, Query, status
+from fastapi import Body, Depends, APIRouter, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,6 +33,9 @@ from src.ot_security.models import (
     OTPolicyRule,
 )
 from src.ot_security.netguard import check_discovery_target, internal_network_reason, parse_cidrs
+from src.ot_security import actuation
+from src.ot_security.advisories import feed_state, load_advisories, refresh_ics_advisories
+from src.core.csvsafe import csv_safe
 from src.ot_security.engine import (
     MAX_DISCOVERY_PREFIX,
     OTMonitor,
@@ -419,11 +428,21 @@ async def get_asset_status(asset_id: str, org_id: OrganizationId, db: DatabaseSe
     }
 
 
+async def _assessor(db: AsyncSession, org_id: str) -> OTVulnerabilityAssessor:
+    """Assessor over the cached CISA ICS advisories (empty until the feed is fetched)."""
+    return OTVulnerabilityAssessor(org_id, await load_advisories(db))
+
+
 @router.get("/assets/{asset_id}/risk_assessment")
 async def get_asset_risk_assessment(asset_id: str, org_id: OrganizationId, db: DatabaseSession = None):
-    """Get risk assessment for OT asset"""
+    """Risk of one asset from its stored fields and the CISA ICS advisories naming it.
+
+    ``vulnerabilities`` is the number of matched advisories (vendor + model);
+    ``advisory_feed.status`` says whether the advisory cache was ever fetched
+    (``not_fetched`` means zero matches prove nothing).
+    """
     asset = await get_asset_or_404(db, asset_id, org_id)
-    assessor = OTVulnerabilityAssessor(org_id)
+    assessor = await _assessor(db, org_id)
 
     vulns = await assessor.check_known_vulnerabilities(asset.to_dict())
     risk_score = await assessor.calculate_ot_risk_score(asset.to_dict(), vulns)
@@ -431,18 +450,26 @@ async def get_asset_risk_assessment(asset_id: str, org_id: OrganizationId, db: D
     return {
         "asset_id": asset.id,
         "risk_score": risk_score,
-        "risk_level": "critical" if risk_score >= 0.75 else "high" if risk_score >= 0.5 else "medium",
+        "risk_level": assessor.risk_level(risk_score),
         "vulnerabilities": len(vulns),
         "exposure_level": asset.purdue_level,
         "criticality": asset.criticality,
+        "advisories": vulns,
+        "advisory_feed": await feed_state(db),
     }
 
 
 @router.post("/assets/{asset_id}/firmware_check")
 async def check_asset_firmware(asset_id: str, org_id: OrganizationId, db: DatabaseSession = None):
-    """Check firmware version and vulnerabilities"""
+    """CISA ICS advisories that name this asset's vendor and model.
+
+    Reads the cached feed only and persists nothing. Firmware versions are
+    not compared (the feed has no machine-readable version ranges), so
+    ``firmware_current`` is the stored value and every advisory says
+    ``affected_versions_evaluated: false``.
+    """
     asset = await get_asset_or_404(db, asset_id, org_id)
-    assessor = OTVulnerabilityAssessor(org_id)
+    assessor = await _assessor(db, org_id)
 
     vulns = await assessor.scan_firmware_versions([asset.to_dict()])
 
@@ -451,6 +478,8 @@ async def check_asset_firmware(asset_id: str, org_id: OrganizationId, db: Databa
         "firmware_version": asset.firmware_version,
         "firmware_current": asset.firmware_current,
         "vulnerabilities": vulns,
+        "advisory_feed": await feed_state(db),
+        "matchable": bool((asset.vendor or "").strip() and (asset.model or "").strip()),
     }
 
 
@@ -797,27 +826,58 @@ async def get_zone_communication_matrix(zone_id: str, org_id: OrganizationId, db
     }
 
 
-@router.post("/zones/{zone_id}/segmentation_audit")
-async def audit_zone_segmentation(
-    zone_id: str, org_id: OrganizationId, _user: AdminRoleUser = None, db: DatabaseSession = None
-):
-    """Audit network segmentation for zone: not implemented.
+class OTAgentActionRequest(BaseModel):
+    """Optional agent choice for an agent-commanded OT action."""
 
-    This used to stamp ``segmentation_verified=True`` without auditing
-    anything, which drove the UI's "Verified" badge. No firewall/flow data
-    source exists yet, so it now returns an honest 501 and changes nothing.
-    """
-    await get_zone_or_404(db, zone_id, org_id)
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail={
-            "error": "not_implemented",
-            "detail": (
-                "Segmentation auditing is not implemented: no firewall or flow data source is "
-                "connected, so the zone's segmentation cannot be verified. Nothing was changed."
-            ),
-        },
+    agent_id: Optional[str] = Field(
+        default=None, description="Endpoint agent to command (required when several are capable)",
     )
+
+
+def _refused(exc: actuation.ActuationRefused) -> HTTPException:
+    return HTTPException(status_code=exc.status_code, detail=exc.as_detail())
+
+
+@router.post("/zones/{zone_id}/segmentation_audit", status_code=status.HTTP_202_ACCEPTED)
+async def audit_zone_segmentation(
+    zone_id: str,
+    org_id: OrganizationId,
+    current_user: AdminRoleUser = None,
+    db: DatabaseSession = None,
+    payload: Optional[OTAgentActionRequest] = Body(default=None),
+):
+    """Probe the zone's segmentation from an agent inside it (admin; approval queue).
+
+    Plans TCP probes from this zone to the stored assets of the tenant's other
+    zones (expected ``allowed`` when ``allowed_communications`` names the
+    destination zone, otherwise ``blocked``) and queues an
+    ``ot_segmentation_probe`` command for an active agent with that
+    capability whose IP lies in the zone CIDR. The command waits for a second
+    admin's approval; ``GET .../segmentation_audit`` follows it.
+    ``segmentation_verified`` becomes True only from a completed probe with
+    every target answered and nothing forbidden reachable. 409
+    ``no_capable_agent`` / ``no_probe_targets`` / ``already_pending`` change
+    nothing. (This route used to stamp the zone verified without auditing.)
+    """
+    zone = await get_zone_or_404(db, zone_id, org_id)
+    try:
+        view = await actuation.request_segmentation_audit(
+            db, zone, user=current_user, agent_id=payload.agent_id if payload else None,
+        )
+    except actuation.ActuationRefused as exc:
+        raise _refused(exc) from None
+    await db.commit()
+    return view
+
+
+@router.get("/zones/{zone_id}/segmentation_audit")
+async def get_zone_segmentation_audit(zone_id: str, org_id: OrganizationId, db: DatabaseSession = None):
+    """Status of the zone's last segmentation audit, refreshed from the agent command."""
+    zone = await get_zone_or_404(db, zone_id, org_id)
+    if await actuation.reconcile_segmentation_audit(db, zone):
+        await db.commit()
+        await db.refresh(zone)
+    return actuation.segmentation_view(zone)
 
 
 # ===== OT INCIDENTS =====
@@ -936,35 +996,46 @@ async def set_containment_strategy(
     return {"incident_id": incident.id, "containment_strategy": strategy}
 
 
-@router.post("/incidents/{incident_id}/safe_shutdown")
+@router.post("/incidents/{incident_id}/safe_shutdown", status_code=status.HTTP_202_ACCEPTED)
 async def initiate_safe_shutdown(
-    incident_id: str, org_id: OrganizationId, current_user: AdminRoleUser = None, db: DatabaseSession = None
+    incident_id: str,
+    org_id: OrganizationId,
+    current_user: AdminRoleUser = None,
+    db: DatabaseSession = None,
+    payload: Optional[OTAgentActionRequest] = Body(default=None),
 ):
-    """Initiate safe shutdown for an incident: not implemented.
+    """Command a safe shutdown of the incident's assets through an endpoint agent (admin).
 
-    This used to return a fixed step template with status "initiated" and set
-    ``safe_shutdown_initiated=True`` although no PLC/SIS command was sent. No
-    OT control integration exists, so it now returns an honest 501 and leaves
-    the incident unchanged.
+    Queues an ``ot_safe_shutdown`` command (payload: the incident's affected
+    assets) for the active agent enrolled with that capability (``agent_id``
+    when several are). The command waits in the agent approval queue for a
+    second admin; ``GET .../safe_shutdown`` follows it, and
+    ``safe_shutdown_initiated`` is set only when the agent reports success.
+    409 ``no_capable_agent`` / ``agent_selection_required`` /
+    ``no_target_assets`` / ``already_pending`` change nothing. (This route
+    used to return a fixed plan with status "initiated" and send nothing.)
     """
-    await get_incident_or_404(db, incident_id, org_id)
-    logger.warning(
-        "ot_safe_shutdown_not_implemented",
-        user_id=str(getattr(current_user, "id", "")),
-        organization_id=org_id,
-        incident_id=incident_id,
-    )
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail={
-            "error": "not_implemented",
-            "detail": (
-                "Safe shutdown is not implemented: no PLC/SIS control integration is connected, so "
-                "no shutdown command was sent and the incident was not marked as shut down. "
-                "Follow the site's manual safe-shutdown procedure."
-            ),
-        },
-    )
+    incident = await get_incident_or_404(db, incident_id, org_id)
+    try:
+        view = await actuation.request_safe_shutdown(
+            db, incident, user=current_user, agent_id=payload.agent_id if payload else None,
+        )
+    except actuation.ActuationRefused as exc:
+        logger.warning("ot_safe_shutdown_refused", organization_id=org_id, incident_id=incident_id,
+                       error=exc.error)
+        raise _refused(exc) from None
+    await db.commit()
+    return view
+
+
+@router.get("/incidents/{incident_id}/safe_shutdown")
+async def get_safe_shutdown_status(incident_id: str, org_id: OrganizationId, db: DatabaseSession = None):
+    """Status of the incident's safe-shutdown command, refreshed from the agent."""
+    incident = await get_incident_or_404(db, incident_id, org_id)
+    if await actuation.reconcile_safe_shutdown(db, incident):
+        await db.commit()
+        await db.refresh(incident)
+    return actuation.safe_shutdown_view(incident)
 
 
 @router.get("/incidents/{incident_id}/post_incident")
@@ -1329,7 +1400,7 @@ async def get_risk_assessment(org_id: OrganizationId, db: DatabaseSession = None
     )
     assets = assets_result.scalars().all()
 
-    assessor = OTVulnerabilityAssessor(org_id)
+    assessor = await _assessor(db, org_id)
     report = await assessor.generate_risk_report([a.to_dict() for a in assets])
 
     asset_risks = [
@@ -1338,6 +1409,7 @@ async def get_risk_assessment(org_id: OrganizationId, db: DatabaseSession = None
             name=item.get("name"),
             risk_score=item.get("risk_score"),
             risk_level=item.get("risk_level"),
+            vulnerabilities=item.get("advisory_ids", []),
         )
         for item in report.get("assets_by_risk", [])
     ]
@@ -1348,5 +1420,261 @@ async def get_risk_assessment(org_id: OrganizationId, db: DatabaseSession = None
         critical_risk_assets=report.get("critical_risk_assets", 0),
         high_risk_assets=report.get("high_risk_assets", 0),
         medium_risk_assets=report.get("medium_risk_assets", 0),
+        low_risk_assets=report.get("low_risk_assets", 0),
         asset_risks=asset_risks,
+        advisory_feed=await feed_state(db),
+    )
+
+
+# ===== CISA ICS ADVISORIES (wave 4) =====
+
+
+@router.get("/advisories/status")
+async def get_advisory_feed_status(org_id: OrganizationId, db: DatabaseSession = None):
+    """State of the platform-wide CISA ICS advisory cache (not_fetched / current / stale)."""
+    return await feed_state(db)
+
+
+@router.post("/advisories/refresh")
+async def refresh_advisory_feed(
+    org_id: OrganizationId,
+    current_user: AdminRoleUser = None,
+    db: DatabaseSession = None,
+    force: bool = Query(False, description="Refetch even if the cache is younger than 6 hours"),
+):
+    """Refresh the CISA ICS advisory cache (admin; pinned outbound fetch).
+
+    Served from the cache when it is younger than 6 hours unless ``force``.
+    A failed fetch keeps the previous cache and answers 502 with the error.
+    """
+    result = await refresh_ics_advisories(db, force=force)
+    await db.commit()
+    logger.info("ot_advisory_refresh_requested", organization_id=org_id,
+                user_id=str(getattr(current_user, "id", "")), status=result["status"])
+    if result["status"] == "unavailable":
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"error": "advisory_feed_unavailable", "detail": result.get("error"),
+                    "cached_entries": result.get("entries", 0)},
+        )
+    return {**result, "feed": await feed_state(db)}
+
+
+@router.get("/advisories")
+async def list_matched_advisories(
+    org_id: OrganizationId,
+    db: DatabaseSession = None,
+    limit: int = Query(500, ge=1, le=2000),
+):
+    """CISA ICS advisories matched to this tenant's assets by vendor and model.
+
+    One row per (asset, advisory). Assets without a vendor or model cannot be
+    matched and are counted in ``unmatchable_assets``.
+    """
+    assets = list((await db.execute(
+        select(OTAsset).where(OTAsset.organization_id == org_id).order_by(OTAsset.name).limit(limit),
+    )).scalars().all())
+    assessor = await _assessor(db, org_id)
+    matches = await assessor.scan_firmware_versions([a.to_dict() for a in assets])
+    unmatchable = sum(1 for a in assets if not ((a.vendor or "").strip() and (a.model or "").strip()))
+    return {
+        "items": matches,
+        "total": len(matches),
+        "assets_checked": len(assets),
+        "unmatchable_assets": unmatchable,
+        "advisory_feed": await feed_state(db),
+    }
+
+
+# ===== BULK DISCOVERY AND EXPORT (moved from the dash-prefixed aliases) =====
+
+
+class OTDiscoverRequest(BaseModel):
+    """Bulk network discovery request body for /ot_security/discover."""
+
+    cidr: str = Field(..., description="CIDR network range to probe (e.g. 10.0.1.0/24)")
+    probe_ports: Optional[List[int]] = Field(
+        default=None,
+        description="Optional TCP ports to probe; default is the engine's OT/ICS protocol port set.",
+    )
+
+
+def _row_to_dict(row: Any) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for col in row.__mapper__.columns:
+        val = getattr(row, col.key, None)
+        out[col.key] = val.isoformat() if isinstance(val, datetime) else val
+    return out
+
+
+@router.post("/discover")
+async def bulk_discover_assets(
+    org_id: OrganizationId,
+    payload: OTDiscoverRequest = Body(...),
+    db: DatabaseSession = None,
+    current_user: AdminRoleUser = None,
+):
+    """Bulk TCP-connect discovery of OT assets across a CIDR (admin; live-network scan).
+
+    Moved from ``POST /ot-security/discover`` (that path now answers 410).
+    Safety gates: admin only; the CIDR must lie inside the platform allowlist
+    ``OT_DISCOVERY_ALLOWED_CIDRS`` (empty = disabled) and one of the tenant's
+    OT zone CIDRs; loopback / link-local / metadata ranges always refused;
+    nothing larger than /22; ``PYSOAR_DISABLE_NETWORK_SCAN=1`` opens no socket.
+    The probe-port subset is passed per call (the old route swapped a
+    module-level dict, racing concurrent requests).
+    """
+    from src.ot_security.engine import OT_PROBE_PORTS
+
+    try:
+        net = ip_network(payload.cidr, strict=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid CIDR: {exc}") from exc
+
+    if net.prefixlen < MAX_DISCOVERY_PREFIX:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"CIDR /{net.prefixlen} exceeds safety cap /{MAX_DISCOVERY_PREFIX}. "
+                "Refusing bulk scan of networks larger than /22."
+            ),
+        )
+
+    await enforce_discovery_targets(db, org_id, [net])
+
+    probe_ports: Optional[Dict[int, str]] = None
+    if payload.probe_ports:
+        bad = [p for p in payload.probe_ports if not (0 < p < 65536)]
+        if bad:
+            raise HTTPException(status_code=400, detail=f"Invalid TCP port(s): {bad}")
+        probe_ports = {p: OT_PROBE_PORTS.get(p, "unknown") for p in payload.probe_ports}
+
+    logger.info(
+        "ot_discover_requested",
+        user_id=str(getattr(current_user, "id", "")),
+        organization_id=org_id,
+        cidr=str(net),
+        zone_restricted=True,
+    )
+
+    if os.environ.get("PYSOAR_DISABLE_NETWORK_SCAN") == "1":
+        return {
+            "status": "skipped",
+            "reason": "network_scan_disabled",
+            "cidr": payload.cidr,
+            "discovered": [],
+            "count": 0,
+        }
+
+    monitor = OTMonitor(org_id)
+    if probe_ports:
+        discovered = await monitor.discover_assets(payload.cidr, probe_ports=probe_ports)
+    else:
+        discovered = await monitor.discover_assets(payload.cidr)
+
+    if discovered and isinstance(discovered[0], dict) and discovered[0].get("status") in {"rejected", "skipped"}:
+        return {
+            "status": discovered[0]["status"],
+            "reason": discovered[0].get("reason"),
+            "cidr": payload.cidr,
+            "discovered": [],
+            "count": 0,
+        }
+
+    ips = [d.get("ip_address") for d in discovered if d.get("ip_address")]
+    rows: List[Dict[str, Any]] = []
+    if ips:
+        res = await db.execute(
+            select(OTAsset).where(and_(OTAsset.organization_id == org_id, OTAsset.ip_address.in_(ips))),
+        )
+        rows = [_row_to_dict(a) for a in res.scalars().all()]
+
+    return {"status": "completed", "cidr": payload.cidr, "count": len(rows), "discovered": rows}
+
+
+_PURDUE_EXPORT_LEVEL = {
+    "level0_process": 0,
+    "level1_control": 1,
+    "level2_supervisory": 2,
+    "level3_operations": 3,
+    "level3_5_dmz": 3,
+    "level4_enterprise": 4,
+    "level5_internet": 5,
+}
+
+
+@router.get("/export")
+async def export_ot_report(
+    org_id: OrganizationId,
+    export_format: str = Query("json", alias="format", pattern="^(json|csv)$"),
+    db: DatabaseSession = None,
+):
+    """Download the tenant's full OT inventory report (moved from ``GET /ot-security/export``).
+
+    ``format=json``: assets, alerts, zones, Purdue map and summary KPIs.
+    ``format=csv``: one row per asset (formula-injection safe). Assets with an
+    unknown Purdue level are listed under ``unassigned`` instead of level 3.
+    """
+    now = datetime.now(timezone.utc)
+    assets = list((await db.execute(select(OTAsset).where(OTAsset.organization_id == org_id))).scalars().all())
+    alerts = list((await db.execute(select(OTAlert).where(OTAlert.organization_id == org_id))).scalars().all())
+    zones = list((await db.execute(select(OTZone).where(OTZone.organization_id == org_id))).scalars().all())
+
+    open_alert_states = {"new", "investigating", "confirmed"}
+    open_alert_counts: Dict[str, int] = {}
+    for a in alerts:
+        if a.status in open_alert_states:
+            open_alert_counts[a.asset_id] = open_alert_counts.get(a.asset_id, 0) + 1
+
+    stamp = now.strftime("%Y%m%d-%H%M%S")
+    if export_format == "csv":
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(("hostname", "ip", "vendor", "model", "protocol", "zone", "purdue_level",
+                         "criticality", "last_seen", "open_alerts"))
+        for a in assets:
+            writer.writerow(tuple(csv_safe(v) for v in (
+                a.name or "", a.ip_address or "", a.vendor or "", a.model or "", a.protocol or "",
+                a.zone or "", a.purdue_level or "", a.criticality or "",
+                a.last_seen.isoformat() if isinstance(a.last_seen, datetime) else "",
+                open_alert_counts.get(a.id, 0),
+            )))
+        return StreamingResponse(
+            iter([buf.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="ot-security-report-{stamp}.csv"'},
+        )
+
+    buckets: Dict[Any, List[Dict[str, Any]]] = {lvl: [] for lvl in range(6)}
+    buckets["unassigned"] = []
+    for a in assets:
+        buckets[_PURDUE_EXPORT_LEVEL.get(a.purdue_level, "unassigned")].append(_row_to_dict(a))
+    total_assets = len(assets)
+    online_assets = sum(1 for a in assets if a.is_online)
+    report: Dict[str, Any] = {
+        "org_id": org_id,
+        "generated_at": now.isoformat(),
+        "summary": {
+            "total_assets": total_assets,
+            "online_assets": online_assets,
+            "offline_assets": total_assets - online_assets,
+            "total_alerts": len(alerts),
+            "active_alerts": sum(1 for a in alerts if a.status not in ("resolved", "contained", "false_positive")),
+            "critical_alerts": sum(1 for a in alerts if a.severity == "critical"),
+            "total_zones": len(zones),
+        },
+        "assets": [_row_to_dict(a) for a in assets],
+        "alerts": [_row_to_dict(a) for a in alerts],
+        "zones": [_row_to_dict(z) for z in zones],
+        "purdue_map": {
+            "levels": [
+                {"level": lvl, "devices": devs, "device_count": len(devs)} for lvl, devs in buckets.items()
+            ],
+            "total_devices": total_assets,
+        },
+    }
+    return StreamingResponse(
+        iter([json.dumps(report, default=str, indent=2)]),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="ot-security-report-{stamp}.json"'},
     )

@@ -36,6 +36,10 @@ OT_PROBE_PORTS: Dict[int, str] = {
     47808: "bacnet",          # BACnet/IP
 }
 
+# Protocol values the asset schema accepts; a probe port outside the OT set
+# yields "unknown", which is not stored as a protocol.
+KNOWN_PROTOCOLS = frozenset(OT_PROBE_PORTS.values())
+
 # Refuse to scan networks larger than this (anti-foot-gun: prevents an
 # operator from accidentally typing 0.0.0.0/0 and having us TCP-probe
 # every host on the internet).
@@ -121,7 +125,9 @@ class OTMonitor:
             },
         }
 
-    async def discover_assets(self, network_range: str) -> List[Dict[str, Any]]:
+    async def discover_assets(
+        self, network_range: str, probe_ports: Optional[Dict[int, str]] = None
+    ) -> List[Dict[str, Any]]:
         """
         Actively discover OT assets in ``network_range`` by TCP-probing the
         well-known ICS ports on every host in the CIDR.
@@ -180,8 +186,11 @@ class OTMonitor:
             host_iter = list(network.hosts())
 
         sem = asyncio.Semaphore(DISCOVERY_CONCURRENCY)
+        # Per-call port set (the bulk route used to swap the module-level
+        # OT_PROBE_PORTS dict, which raced between concurrent requests).
+        ports = dict(probe_ports) if probe_ports else dict(OT_PROBE_PORTS)
         probe_tasks = [
-            self._probe_device(str(host), sem) for host in host_iter
+            self._probe_device(str(host), sem, ports) for host in host_iter
         ]
         probe_results = await asyncio.gather(*probe_tasks, return_exceptions=True)
 
@@ -225,7 +234,7 @@ class OTMonitor:
                         organization_id=self.organization_id,
                         name=f"discovered-{ip}",
                         asset_type="unknown",
-                        protocol=primary_proto,
+                        protocol=primary_proto if primary_proto in KNOWN_PROTOCOLS else None,
                         ip_address=ip,
                         purdue_level="level3_operations",
                         criticality="supporting",
@@ -236,7 +245,7 @@ class OTMonitor:
                 else:
                     asset.last_seen = now
                     asset.is_online = True
-                    if not asset.protocol and primary_proto:
+                    if not asset.protocol and primary_proto in KNOWN_PROTOCOLS:
                         asset.protocol = primary_proto
 
                 discovered.append({
@@ -264,6 +273,7 @@ class OTMonitor:
         self,
         ip_address_str: str,
         sem: Optional[asyncio.Semaphore] = None,
+        ports: Optional[Dict[int, str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Active TCP-connect probe of ``ip_address_str`` against every port
@@ -301,11 +311,12 @@ class OTMonitor:
                 except (asyncio.TimeoutError, OSError, ConnectionError):
                     return None
 
+        port_map = ports if ports is not None else OT_PROBE_PORTS
         port_results = await asyncio.gather(
-            *(_probe_port(p) for p in OT_PROBE_PORTS.keys())
+            *(_probe_port(p) for p in port_map.keys())
         )
         open_ports = [p for p in port_results if p is not None]
-        protocols = [OT_PROBE_PORTS[p] for p in open_ports]
+        protocols = [port_map[p] for p in open_ports]
 
         return {
             "ip_address": ip_address_str,
@@ -1048,72 +1059,16 @@ class SafetyManager:
     async def initiate_safe_shutdown(
         self, incident_id: str, affected_zones: List[str]
     ) -> Dict[str, Any]:
+        """Removed: this returned a fixed five-step plan with status "initiated"
+        although nothing was sent to any controller.
+
+        Safe shutdown is commanded through an endpoint agent enrolled with the
+        ``ot_safe_shutdown`` capability (``src.ot_security.actuation``), whose
+        result drives the incident's status.
         """
-        Initiate safe shutdown procedure.
-
-        Coordinates ordered shutdown that prevents physical damage:
-        - PLC mode changes (Run -> Stop in safe manner)
-        - Setpoint adjustments (gradual ramp-down)
-        - Output inhibition (controlled de-energization)
-        - SIS activation if needed
-        """
-        shutdown_plan = {
-            "incident_id": incident_id,
-            "status": "initiated",
-            "shutdown_sequence": [],
-            "estimated_duration_seconds": 0,
-        }
-
-        try:
-            # Build safe shutdown sequence
-            sequence = [
-                {
-                    "step": 1,
-                    "action": "Notify all operators",
-                    "duration": 10,
-                    "zone": "all",
-                },
-                {
-                    "step": 2,
-                    "action": "Reduce setpoints to safe values",
-                    "duration": 30,
-                    "zone": affected_zones,
-                },
-                {
-                    "step": 3,
-                    "action": "Transition PLCs to Stop mode",
-                    "duration": 20,
-                    "zone": affected_zones,
-                },
-                {
-                    "step": 4,
-                    "action": "De-energize field devices safely",
-                    "duration": 15,
-                    "zone": affected_zones,
-                },
-                {
-                    "step": 5,
-                    "action": "Activate monitoring-only mode",
-                    "duration": 5,
-                    "zone": affected_zones,
-                },
-            ]
-
-            shutdown_plan["shutdown_sequence"] = sequence
-            shutdown_plan["estimated_duration_seconds"] = sum(s["duration"] for s in sequence)
-
-            logger.info(
-                f"Safe shutdown initiated for incident {incident_id}, "
-                f"estimated {shutdown_plan['estimated_duration_seconds']} seconds"
-            )
-
-            return shutdown_plan
-
-        except Exception as e:
-            logger.error(f"Safe shutdown initiation failed: {str(e)}")
-            shutdown_plan["status"] = "failed"
-            shutdown_plan["error"] = str(e)
-            return shutdown_plan
+        raise NotImplementedError(
+            "safe shutdown runs through an ot_safe_shutdown endpoint agent; see src.ot_security.actuation"
+        )
 
     async def monitor_safety_systems(
         self, assets: List[Dict[str, Any]]
@@ -1194,224 +1149,157 @@ class OTVulnerabilityAssessor:
     """
     OT vulnerability assessment and risk scoring.
 
-    Scans firmware versions against ICS-CERT advisories, evaluates protocol
-    risks, assesses exposure, and calculates OT-specific risk scores.
+    Advisories come from the cached CISA ICS advisories feed
+    (``src.ot_security.advisories``), passed in by the caller; an asset matches
+    an advisory only by vendor and model. There is no built-in CVE catalogue:
+    with an empty cache every asset has zero matched advisories and the
+    caller reports the feed state (``not_fetched`` / ``unavailable``).
     """
 
-    def __init__(self, organization_id: str):
-        """Initialize assessor"""
+    def __init__(self, organization_id: str, advisories: Optional[List[Any]] = None):
+        """Initialize assessor with the cached advisories to match against."""
         self.organization_id = organization_id
-        self.known_cves = self._load_ics_cves()
-
-    def _load_ics_cves(self) -> Dict[str, Dict[str, Any]]:
-        """Load known ICS CVEs (simulated)"""
-        return {
-            "CVE-2021-22911": {
-                "vendor": "Siemens",
-                "product": "S7-1200",
-                "severity": "high",
-                "affected_versions": ["4.0", "4.1", "4.2"],
-                "exploit_available": True,
-            },
-            "CVE-2021-20884": {
-                "vendor": "Schneider Electric",
-                "product": "Modicon M241",
-                "severity": "critical",
-                "affected_versions": ["1.0", "1.1"],
-                "exploit_available": True,
-            },
-        }
+        self.advisories = list(advisories or [])
 
     async def scan_firmware_versions(
-        self, assets: List[Dict[str, Any]]
+        self, assets: List[Any]
     ) -> List[Dict[str, Any]]:
-        """Scan assets for known vulnerable firmware versions"""
-        vulnerabilities = []
+        """Advisories matching each asset's vendor and model (one row per match).
 
-        try:
-            for asset in assets:
-                vendor = asset.get("vendor", "").lower()
-                model = asset.get("model", "").lower()
-                version = asset.get("firmware_version", "")
+        Firmware versions are not evaluated (the feed has no machine-readable
+        affected-version ranges): every row says so.
+        """
+        from src.ot_security.advisories import match_asset
 
-                for cve_id, cve_data in self.known_cves.items():
-                    if vendor in cve_data["vendor"].lower():
-                        if version in cve_data.get("affected_versions", []):
-                            vulnerabilities.append(
-                                {
-                                    "asset_id": asset.get("id"),
-                                    "cve_id": cve_id,
-                                    "severity": cve_data["severity"],
-                                    "exploit_available": cve_data["exploit_available"],
-                                    "remediation": f"Update to latest firmware",
-                                }
-                            )
-
-            return vulnerabilities
-
-        except Exception as e:
-            logger.error(f"Firmware scanning failed: {str(e)}")
-            return vulnerabilities
+        findings: List[Dict[str, Any]] = []
+        for asset in assets:
+            asset_id = asset.get("id") if isinstance(asset, dict) else getattr(asset, "id", None)
+            firmware = asset.get("firmware_version") if isinstance(asset, dict) else getattr(asset, "firmware_version", None)
+            for match in match_asset(asset, self.advisories):
+                findings.append({
+                    "asset_id": asset_id,
+                    "firmware_version": firmware,
+                    **match,
+                    "remediation": "Review the advisory for affected versions and the vendor's fix or mitigations",
+                })
+        return findings
 
     async def check_known_vulnerabilities(
         self, asset: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
-        """Check asset against ICS-CERT vulnerability database"""
+        """Advisories matching one asset (see ``scan_firmware_versions``)."""
         return await self.scan_firmware_versions([asset])
 
     async def assess_protocol_risks(
         self, assets: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """
-        Assess protocol security risks.
+        """Flag assets whose stored protocol has no built-in authentication/encryption.
 
-        Identifies:
-        - Unencrypted protocols (Modbus, DNP3)
-        - Default credentials
-        - Missing authentication
-        - Lack of integrity checking
+        (A "default credentials" finding used to be raised for every asset
+        from a field no model has; it is gone.)
         """
         risks = []
         risky_protocols = ["modbus_tcp", "modbus_rtu", "dnp3", "bacnet", "profinet"]
-
-        try:
-            for asset in assets:
-                protocol = asset.get("protocol", "").lower()
-
-                if protocol in risky_protocols:
-                    risks.append(
-                        {
-                            "asset_id": asset.get("id"),
-                            "asset_name": asset.get("name"),
-                            "risk_type": "unencrypted_protocol",
-                            "protocol": protocol,
-                            "severity": "high",
-                            "recommendation": f"Consider transitioning to OPC-UA with encryption",
-                        }
-                    )
-
-                # Check for default credentials indicator
-                if not asset.get("credentials_changed", False):
-                    risks.append(
-                        {
-                            "asset_id": asset.get("id"),
-                            "risk_type": "default_credentials",
-                            "severity": "critical",
-                            "recommendation": "Change default credentials immediately",
-                        }
-                    )
-
-            return risks
-
-        except Exception as e:
-            logger.error(f"Protocol risk assessment failed: {str(e)}")
-            return risks
+        for asset in assets:
+            protocol = (asset.get("protocol") or "").lower()
+            if protocol in risky_protocols:
+                risks.append(
+                    {
+                        "asset_id": asset.get("id"),
+                        "asset_name": asset.get("name"),
+                        "risk_type": "unencrypted_protocol",
+                        "protocol": protocol,
+                        "severity": "high",
+                        "recommendation": "Consider transitioning to OPC-UA with encryption",
+                    }
+                )
+        return risks
 
     async def calculate_ot_risk_score(
         self, asset: Dict[str, Any], vulnerabilities: List[Dict[str, Any]]
     ) -> float:
         """
-        Calculate OT-specific risk score (0-1).
+        OT risk score (0-1) from stored asset fields and matched advisories.
 
-        Factors:
-        - Criticality (safety_critical, mission_critical, etc.)
-        - Exposure (internet-facing, DMZ, control network)
-        - Known vulnerabilities (count, exploit availability)
-        - Physical impact potential
-        - Protocol security
+        - Criticality (0-0.3): safety_critical 0.3, mission_critical 0.25,
+          important 0.15, supporting 0.05
+        - Exposure by Purdue level (0-0.3): internet 0.3, enterprise 0.2,
+          DMZ 0.15, otherwise 0.05
+        - Matched advisories (0-0.3): 0.1 per advisory, capped; +0.1 more
+          (within the cap) when one carries a CVSS >= 9
+        - Protocol without authentication (0.1)
         """
         score = 0.0
+        criticality_scores = {
+            "safety_critical": 0.3,
+            "mission_critical": 0.25,
+            "important": 0.15,
+            "supporting": 0.05,
+        }
+        score += criticality_scores.get(asset.get("criticality") or "supporting", 0.05)
 
-        try:
-            # Criticality factor (0-0.3)
-            criticality = asset.get("criticality", "supporting")
-            criticality_scores = {
-                "safety_critical": 0.3,
-                "mission_critical": 0.25,
-                "important": 0.15,
-                "supporting": 0.05,
-            }
-            score += criticality_scores.get(criticality, 0.05)
+        purdue_level = asset.get("purdue_level") or ""
+        if "internet" in purdue_level:
+            score += 0.3
+        elif "enterprise" in purdue_level:
+            score += 0.2
+        elif "dmz" in purdue_level:
+            score += 0.15
+        else:
+            score += 0.05
 
-            # Exposure factor (0-0.3)
-            purdue_level = asset.get("purdue_level", "level3_operations")
-            if "internet" in purdue_level:
-                score += 0.3
-            elif "enterprise" in purdue_level:
-                score += 0.2
-            elif "dmz" in purdue_level:
-                score += 0.15
-            else:
-                score += 0.05
+        advisory_points = len(vulnerabilities) * 0.1
+        if any((v.get("cvss_score") or 0) >= 9 for v in vulnerabilities):
+            advisory_points += 0.1
+        score += min(0.3, advisory_points)
 
-            # Vulnerability factor (0-0.2)
-            vuln_count = len(vulnerabilities)
-            score += min(0.2, vuln_count * 0.05)
+        if (asset.get("protocol") or "").lower() in ["modbus_tcp", "modbus_rtu", "dnp3", "bacnet", "profinet"]:
+            score += 0.1
 
-            # Exploit availability (0-0.2)
-            if any(v.get("exploit_available") for v in vulnerabilities):
-                score += 0.15
+        return round(min(1.0, score), 3)
 
-            # Protocol security (0-0.2)
-            risky_protocols = [
-                "modbus_tcp",
-                "modbus_rtu",
-                "dnp3",
-                "bacnet",
-                "profinet",
-            ]
-            if asset.get("protocol", "").lower() in risky_protocols:
-                score += 0.1
-
-            return min(1.0, score)
-
-        except Exception as e:
-            logger.error(f"Risk score calculation failed: {str(e)}")
-            return 0.5
+    @staticmethod
+    def risk_level(score: float) -> str:
+        """critical >= 0.75, high >= 0.5, medium >= 0.25, otherwise low."""
+        if score >= 0.75:
+            return "critical"
+        if score >= 0.5:
+            return "high"
+        if score >= 0.25:
+            return "medium"
+        return "low"
 
     async def generate_risk_report(
         self, assets: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
-        """Generate comprehensive risk assessment report"""
-        report = {
+        """Risk report over the given assets (computed, never defaulted)."""
+        report: Dict[str, Any] = {
             "timestamp": datetime.now(timezone.utc),
             "total_assets": len(assets),
             "critical_risk_assets": 0,
             "high_risk_assets": 0,
             "medium_risk_assets": 0,
+            "low_risk_assets": 0,
             "assets_by_risk": [],
         }
 
-        try:
-            for asset in assets:
-                vulns = await self.check_known_vulnerabilities(asset)
-                risk_score = await self.calculate_ot_risk_score(asset, vulns)
+        for asset in assets:
+            vulns = await self.check_known_vulnerabilities(asset)
+            risk_score = await self.calculate_ot_risk_score(asset, vulns)
+            risk_level = self.risk_level(risk_score)
+            report[f"{risk_level}_risk_assets"] += 1
+            report["assets_by_risk"].append(
+                {
+                    "asset_id": asset.get("id"),
+                    "name": asset.get("name"),
+                    "risk_score": risk_score,
+                    "risk_level": risk_level,
+                    "vulnerability_count": len(vulns),
+                    "advisory_ids": [v["advisory_id"] for v in vulns],
+                }
+            )
 
-                if risk_score >= 0.75:
-                    report["critical_risk_assets"] += 1
-                    risk_level = "critical"
-                elif risk_score >= 0.5:
-                    report["high_risk_assets"] += 1
-                    risk_level = "high"
-                else:
-                    report["medium_risk_assets"] += 1
-                    risk_level = "medium"
-
-                report["assets_by_risk"].append(
-                    {
-                        "asset_id": asset.get("id"),
-                        "name": asset.get("name"),
-                        "risk_score": risk_score,
-                        "risk_level": risk_level,
-                        "vulnerability_count": len(vulns),
-                    }
-                )
-
-            return report
-
-        except Exception as e:
-            logger.error(f"Risk report generation failed: {str(e)}")
-            return report
+        return report
 
 
 class ICSComplianceEngine:

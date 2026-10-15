@@ -4,7 +4,7 @@ Found in the 2026-10-08 feature audit:
   * the generic HTTP connector fallback requested any URL the caller sent;
   * ``POST /api-security/scan/compliance/{id}`` fetched a tenant-supplied
     URL server-side for any user, without an organization check;
-  * ``POST /ot-security/discover`` TCP-swept ranges from the API host for
+  * ``POST /ot_security/discover`` (moved from ``/ot-security/discover`` in wave 4) TCP-swept ranges from the API host for
     any user.
 """
 
@@ -174,14 +174,14 @@ async def test_ot_discover_admin_only_and_confined_to_ot_zones(client, db_sessio
     db_session.add(OTZone(organization_id=ORG_A, name="cell-1", purdue_level="level_1", network_cidr="10.10.0.0/16"))
     await db_session.commit()
 
-    refused_role = await client.post("/api/v1/ot-security/discover", headers=analyst, json={"cidr": "10.10.5.0/24"})
+    refused_role = await client.post("/api/v1/ot_security/discover", headers=analyst, json={"cidr": "10.10.5.0/24"})
     assert refused_role.status_code == 403
 
-    outside = await client.post("/api/v1/ot-security/discover", headers=admin, json={"cidr": "192.168.1.0/24"})
+    outside = await client.post("/api/v1/ot_security/discover", headers=admin, json={"cidr": "192.168.1.0/24"})
     assert outside.status_code == 403, outside.text
     assert outside.json()["detail"]["error"] == "cidr_outside_ot_zones"
 
-    inside = await client.post("/api/v1/ot-security/discover", headers=admin, json={"cidr": "10.10.5.0/24"})
+    inside = await client.post("/api/v1/ot_security/discover", headers=admin, json={"cidr": "10.10.5.0/24"})
     assert inside.status_code == 200, inside.text
     assert inside.json()["status"] == "skipped"
 
@@ -194,21 +194,21 @@ async def test_ot_discover_without_zones_is_admin_only_and_size_capped(client, d
 
     _, admin = await _org_user(db_session, email="ot-admin-b@ssrforg-b.io", org=ORG_B, role="admin")
 
-    too_big = await client.post("/api/v1/ot-security/discover", headers=admin, json={"cidr": "10.0.0.0/16"})
+    too_big = await client.post("/api/v1/ot_security/discover", headers=admin, json={"cidr": "10.0.0.0/16"})
     assert too_big.status_code == 400
 
     # Fail closed: no platform allowlist -> disabled; allowlist but no tenant zone -> refused.
     monkeypatch.setattr(settings, "ot_discovery_allowed_cidrs", [])
-    disabled = await client.post("/api/v1/ot-security/discover", headers=admin, json={"cidr": "10.0.0.0/24"})
+    disabled = await client.post("/api/v1/ot_security/discover", headers=admin, json={"cidr": "10.0.0.0/24"})
     assert disabled.status_code == 403, disabled.text
     assert disabled.json()["detail"]["error"] == "ot_discovery_disabled"
     monkeypatch.setattr(settings, "ot_discovery_allowed_cidrs", ["10.0.0.0/8"])
-    no_zone = await client.post("/api/v1/ot-security/discover", headers=admin, json={"cidr": "10.0.0.0/24"})
+    no_zone = await client.post("/api/v1/ot_security/discover", headers=admin, json={"cidr": "10.0.0.0/24"})
     assert no_zone.status_code == 403, no_zone.text
     assert no_zone.json()["detail"]["error"] == "ot_zones_required"
 
     db_session.add(OTZone(organization_id=ORG_B, name="cell-b", purdue_level="level_1", network_cidr="10.0.0.0/16"))
     await db_session.commit()
-    ok = await client.post("/api/v1/ot-security/discover", headers=admin, json={"cidr": "10.0.0.0/24"})
+    ok = await client.post("/api/v1/ot_security/discover", headers=admin, json={"cidr": "10.0.0.0/24"})
     assert ok.status_code == 200, ok.text
     assert ok.json()["status"] == "skipped"

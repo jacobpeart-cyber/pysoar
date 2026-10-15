@@ -11,17 +11,10 @@ organization. If the underlying table is empty the response is an honest
 empty list — no hardcoded data.
 """
 
-import csv
-import io
-import json
-import os
-from datetime import datetime, timedelta, timezone
-from ipaddress import ip_network
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import and_, desc, func, or_, select
 
 from src.api.deps import (
@@ -29,10 +22,8 @@ from src.api.deps import (
     DatabaseSession,
     OrganizationId,
     _organization_required,
-    require_role,
 )
 from src.core.logging import get_logger
-from src.models.user import User, UserRole
 
 logger = get_logger(__name__)
 
@@ -777,115 +768,11 @@ async def container_security_alerts(
 
 
 # --------------------------------------------------------------------------
-# OT/ICS Security dash-prefixed mirror.
-#
-# Canonical prefix in the repo is `/ot_security` (underscore). Some frontend
-# call sites use `/ot-security` (dash). We mirror the most-used list endpoints
-# here so both work.
+# OT/ICS Security: the dash-prefixed list mirrors (/ot-security/assets, /alerts,
+# /zones, /purdue-map) were deleted in wave 4. The frontend calls the canonical
+# underscore routes (/ot_security/...) exclusively, and the purdue-map mirror
+# always failed (int() of a Purdue level name) behind an empty-map fallback.
 # --------------------------------------------------------------------------
-
-
-@router.get("/ot-security/assets")
-async def ot_security_assets_dash(
-    db: DatabaseSession = None,
-    current_user: CurrentUser = None,
-    page: int = Query(1, ge=1),
-    size: int = Query(20, ge=1, le=100),
-):
-    from src.ot_security.models import OTAsset
-
-    return await _safe_list(
-        db,
-        OTAsset,
-        org_id=_org_id(current_user),
-        page=page,
-        size=size,
-    )
-
-
-@router.get("/ot-security/alerts")
-async def ot_security_alerts_dash(
-    db: DatabaseSession = None,
-    current_user: CurrentUser = None,
-    page: int = Query(1, ge=1),
-    size: int = Query(20, ge=1, le=100),
-):
-    from src.ot_security.models import OTAlert
-
-    return await _safe_list(
-        db,
-        OTAlert,
-        org_id=_org_id(current_user),
-        page=page,
-        size=size,
-    )
-
-
-@router.get("/ot-security/zones")
-async def ot_security_zones_dash(
-    db: DatabaseSession = None,
-    current_user: CurrentUser = None,
-    page: int = Query(1, ge=1),
-    size: int = Query(100, ge=1, le=500),
-):
-    from src.ot_security.models import OTZone
-
-    return await _safe_list(
-        db,
-        OTZone,
-        org_id=_org_id(current_user),
-        page=page,
-        size=size,
-    )
-
-
-@router.get("/ot-security/purdue-map")
-async def ot_security_purdue_map_dash(
-    org_id: OrganizationId,
-    db: DatabaseSession = None,
-):
-    """Purdue model map: zones + assets grouped by purdue level."""
-    from src.ot_security.models import OTAsset, OTZone
-
-    try:
-        # Zones
-        zone_stmt = select(OTZone).where(OTZone.organization_id == org_id)
-        zones = list((await db.execute(zone_stmt)).scalars().all())
-
-        # Assets
-        asset_stmt = select(OTAsset).where(OTAsset.organization_id == org_id)
-        assets = list((await db.execute(asset_stmt)).scalars().all())
-
-        # Group by purdue_level
-        by_level: Dict[int, Dict[str, Any]] = {}
-        for a in assets:
-            lvl = getattr(a, "purdue_level", None)
-            if lvl is None:
-                lvl = -1
-            bucket = by_level.setdefault(
-                int(lvl),
-                {"level": int(lvl), "assets": [], "zones": []},
-            )
-            bucket["assets"].append(_row_to_dict(a))
-        for z in zones:
-            lvl = getattr(z, "purdue_level", None)
-            if lvl is None:
-                lvl = -1
-            bucket = by_level.setdefault(
-                int(lvl),
-                {"level": int(lvl), "assets": [], "zones": []},
-            )
-            bucket["zones"].append(_row_to_dict(z))
-
-        levels = [by_level[k] for k in sorted(by_level.keys())]
-        return {
-            "levels": levels,
-            "total_assets": len(assets),
-            "total_zones": len(zones),
-        }
-    except Exception as exc:
-        logger.warning("ot_security_purdue_map_dash failed", error=str(exc))
-        return {"levels": [], "total_assets": 0, "total_zones": 0}
 
 
 # --------------------------------------------------------------------------
@@ -956,303 +843,28 @@ async def integrations_webhooks_flat(
 
 
 # --------------------------------------------------------------------------
-# OT Security bulk discover + server-side export
+# OT Security bulk discover + server-side export: moved in wave 4 to
+# POST /ot_security/discover and GET /ot_security/export (src/api/v1/endpoints/
+# ot_security.py). The old dash paths answer 410 Gone with the new path and do
+# nothing else.
 # --------------------------------------------------------------------------
 
 
-class OTDiscoverRequest(BaseModel):
-    """Bulk network discovery request body for /ot-security/discover."""
-
-    cidr: str = Field(..., description="CIDR network range to probe (e.g. 10.0.1.0/24)")
-    probe_ports: Optional[List[int]] = Field(
-        default=None,
-        description=(
-            "Optional list of TCP ports to probe. If omitted the engine's " "standard OT/ICS protocol port set is used."
-        ),
+def _ot_moved(new_path: str) -> HTTPException:
+    return HTTPException(
+        status_code=410,
+        detail={"error": "moved", "new_path": new_path,
+                "detail": f"This route moved to {new_path}."},
     )
 
 
-@router.post("/ot-security/discover")
-async def ot_security_bulk_discover(
-    org_id: OrganizationId,
-    payload: OTDiscoverRequest = Body(...),
-    db: DatabaseSession = None,
-    current_user: User = Depends(require_role([UserRole.ADMIN])),
-):
-    """
-    Bulk discover OT assets across an entire CIDR.
-
-    Dispatches to the real TCP-probe discovery implemented in
-    `src.ot_security.engine.OTMonitor.discover_assets()`. Returns the list
-    of OTAsset rows (newly inserted or refreshed) that responded on at
-    least one OT/ICS port.
-
-    Safety gates:
-      * Admin role only: the sweep runs from the API host's network.
-      * The CIDR must lie inside the platform allowlist
-        ``OT_DISCOVERY_ALLOWED_CIDRS`` (empty = discovery disabled) AND inside
-        one of the organization's OT zone ``network_cidr`` ranges; loopback,
-        link-local and cloud-metadata ranges are always refused.
-      * CIDRs larger than /22 are refused (same cap the engine enforces).
-      * If ``PYSOAR_DISABLE_NETWORK_SCAN=1`` is set, no sockets are opened
-        and the endpoint returns a skipped-result payload.
-    """
-    from src.ot_security.engine import (
-        MAX_DISCOVERY_PREFIX,
-        OT_PROBE_PORTS,
-        OTMonitor,
-    )
-    from src.ot_security.models import OTAsset
-
-    # Early safety check so we return a clean 400 instead of relying on
-    # the engine to log and silently return an empty list.
-    try:
-        net = ip_network(payload.cidr, strict=False)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid CIDR: {exc}") from exc
-
-    if net.prefixlen < MAX_DISCOVERY_PREFIX:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"CIDR /{net.prefixlen} exceeds safety cap /{MAX_DISCOVERY_PREFIX}. "
-                "Refusing bulk scan of networks larger than /22."
-            ),
-        )
-
-    # Confine the sweep: platform allowlist (OT_DISCOVERY_ALLOWED_CIDRS) AND the
-    # organization's OT zones; loopback/link-local/metadata ranges are always
-    # refused. Fails closed when either list is empty.
-    from src.api.v1.endpoints.ot_security import enforce_discovery_targets
-
-    await enforce_discovery_targets(db, org_id, [net])
-
-    logger.info(
-        "ot_discover_requested",
-        user_id=str(getattr(current_user, "id", "")),
-        organization_id=org_id,
-        cidr=str(net),
-        zone_restricted=True,
-    )
-
-    if os.environ.get("PYSOAR_DISABLE_NETWORK_SCAN") == "1":
-        return {
-            "status": "skipped",
-            "reason": "network_scan_disabled",
-            "cidr": payload.cidr,
-            "discovered": [],
-            "count": 0,
-        }
-
-    # Optionally narrow the probe set. The engine's module-level dict is
-    # the source of truth for supported ports; we temporarily swap it for
-    # the duration of the probe if the caller specified a subset.
-    monitor = OTMonitor(org_id)
-    original_ports = None
-    if payload.probe_ports:
-        import src.ot_security.engine as ot_engine
-
-        bad = [p for p in payload.probe_ports if not (0 < p < 65536)]
-        if bad:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid TCP port(s): {bad}",
-            )
-        original_ports = dict(ot_engine.OT_PROBE_PORTS)
-        ot_engine.OT_PROBE_PORTS = {p: OT_PROBE_PORTS.get(p, "unknown") for p in payload.probe_ports}
-
-    try:
-        discovered = await monitor.discover_assets(payload.cidr)
-    finally:
-        if original_ports is not None:
-            import src.ot_security.engine as ot_engine
-
-            ot_engine.OT_PROBE_PORTS = original_ports
-
-    # If the engine returned a status-only envelope (rejected / skipped),
-    # propagate it as-is. Otherwise refetch the canonical OTAsset rows so
-    # we return real DB state (with IDs and any enrichment that may have
-    # already been applied by earlier runs).
-    if (
-        discovered
-        and isinstance(discovered[0], dict)
-        and discovered[0].get("status")
-        in {
-            "rejected",
-            "skipped",
-        }
-    ):
-        return {
-            "status": discovered[0]["status"],
-            "reason": discovered[0].get("reason"),
-            "cidr": payload.cidr,
-            "discovered": [],
-            "count": 0,
-        }
-
-    ips = [d.get("ip_address") for d in discovered if d.get("ip_address")]
-    rows: List[Dict[str, Any]] = []
-    if ips:
-        res = await db.execute(
-            select(OTAsset).where(
-                and_(
-                    OTAsset.organization_id == org_id,
-                    OTAsset.ip_address.in_(ips),
-                ),
-            ),
-        )
-        rows = [_row_to_dict(a) for a in res.scalars().all()]
-
-    return {
-        "status": "completed",
-        "cidr": payload.cidr,
-        "count": len(rows),
-        "discovered": rows,
-    }
+@router.post("/ot-security/discover", status_code=410)
+async def ot_security_bulk_discover_moved(_user: CurrentUser = None):
+    """Gone: use ``POST /api/v1/ot_security/discover``."""
+    raise _ot_moved("/api/v1/ot_security/discover")
 
 
-def _asset_last_seen_iso(asset: Any) -> str:
-    ls = getattr(asset, "last_seen", None)
-    if isinstance(ls, datetime):
-        return ls.isoformat()
-    return ""
-
-
-@router.get("/ot-security/export")
-async def ot_security_export(
-    org_id: OrganizationId,
-    export_format: str = Query("json", alias="format", pattern="^(json|csv)$"),
-    db: DatabaseSession = None,
-):
-    """
-    Server-side OT security report download.
-
-    `format=json` returns the full inventory, alerts, zones, purdue map,
-    summary KPIs and generated_at metadata. `format=csv` returns one row
-    per asset with hostname, ip, vendor, protocol, zone, purdue_level,
-    criticality, last_seen, open_alerts.
-
-    Sends `Content-Disposition: attachment` so the browser downloads
-    the payload instead of rendering it.
-    """
-    from src.ot_security.models import OTAlert, OTAsset, OTZone
-
-    now = datetime.now(timezone.utc)
-    generated_at = now.isoformat()
-
-    assets_res = await db.execute(select(OTAsset).where(OTAsset.organization_id == org_id))
-    assets = list(assets_res.scalars().all())
-
-    alerts_res = await db.execute(select(OTAlert).where(OTAlert.organization_id == org_id))
-    alerts = list(alerts_res.scalars().all())
-
-    zones_res = await db.execute(
-        select(OTZone).where(OTZone.organization_id == org_id),
-    )
-    zones = list(zones_res.scalars().all())
-
-    # Compute per-asset open-alert counts once so the CSV branch is
-    # a single O(N) pass rather than N*M.
-    open_alert_states = {"new", "investigating", "confirmed"}
-    open_alert_counts: Dict[str, int] = {}
-    for a in alerts:
-        if a.status in open_alert_states:
-            open_alert_counts[a.asset_id] = open_alert_counts.get(a.asset_id, 0) + 1
-
-    if export_format == "csv":
-        buf = io.StringIO()
-        writer = csv.writer(buf)
-        writer.writerow(
-            (
-                "hostname",
-                "ip",
-                "vendor",
-                "protocol",
-                "zone",
-                "purdue_level",
-                "criticality",
-                "last_seen",
-                "open_alerts",
-            ),
-        )
-        for a in assets:
-            writer.writerow(
-                (
-                    a.name or "",
-                    a.ip_address or "",
-                    a.vendor or "",
-                    a.protocol or "",
-                    a.zone or "",
-                    a.purdue_level or "",
-                    a.criticality or "",
-                    _asset_last_seen_iso(a),
-                    open_alert_counts.get(a.id, 0),
-                ),
-            )
-        buf.seek(0)
-        filename = f"ot-security-report-{now.strftime('%Y%m%d-%H%M%S')}.csv"
-        return StreamingResponse(
-            iter([buf.getvalue()]),
-            media_type="text/csv",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-            },
-        )
-
-    # -------- JSON branch --------
-    # Build purdue map grouped by numeric level (mirrors the dashboard
-    # endpoint's layout so the UI can reuse the same renderer).
-    purdue_numeric = {
-        "level0_process": 0,
-        "level1_control": 1,
-        "level2_supervisory": 2,
-        "level3_operations": 3,
-        "level3_5_dmz": 3,
-        "level4_enterprise": 4,
-        "level5_internet": 5,
-    }
-    buckets: Dict[int, List[Dict[str, Any]]] = {lvl: [] for lvl in range(6)}
-    for a in assets:
-        lvl = purdue_numeric.get(a.purdue_level, 3)
-        buckets[lvl].append(_row_to_dict(a))
-
-    purdue_map = {
-        "levels": [
-            {"level": lvl, "devices": buckets[lvl], "device_count": len(buckets[lvl])} for lvl in sorted(buckets.keys())
-        ],
-        "total_devices": sum(len(v) for v in buckets.values()),
-        "segmentation_complete": sum(1 for v in buckets.values() if v) >= 4,
-    }
-
-    total_assets = len(assets)
-    online_assets = sum(1 for a in assets if a.is_online)
-    active_alerts = sum(1 for a in alerts if a.status not in ("resolved", "contained", "false_positive"))
-    critical_alerts = sum(1 for a in alerts if a.severity == "critical")
-
-    report: Dict[str, Any] = {
-        "org_id": org_id,
-        "generated_at": generated_at,
-        "summary": {
-            "total_assets": total_assets,
-            "online_assets": online_assets,
-            "offline_assets": total_assets - online_assets,
-            "total_alerts": len(alerts),
-            "active_alerts": active_alerts,
-            "critical_alerts": critical_alerts,
-            "total_zones": len(zones),
-        },
-        "assets": [_row_to_dict(a) for a in assets],
-        "alerts": [_row_to_dict(a) for a in alerts],
-        "zones": [_row_to_dict(z) for z in zones],
-        "purdue_map": purdue_map,
-    }
-
-    payload = json.dumps(report, default=str, indent=2)
-    filename = f"ot-security-report-{now.strftime('%Y%m%d-%H%M%S')}.json"
-    return StreamingResponse(
-        iter([payload]),
-        media_type="application/json",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-        },
-    )
+@router.get("/ot-security/export", status_code=410)
+async def ot_security_export_moved(_user: CurrentUser = None):
+    """Gone: use ``GET /api/v1/ot_security/export``."""
+    raise _ot_moved("/api/v1/ot_security/export")

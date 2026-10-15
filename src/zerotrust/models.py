@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.models.base import BaseModel
@@ -89,9 +89,14 @@ class DeviceTrustProfile(BaseModel):
     """Device trust and compliance assessment"""
 
     __tablename__ = "device_trust_profiles"
+    # A device id is unique within an organisation, not globally: two tenants
+    # may report the same hostname / agent-derived id (migration 032).
+    __table_args__ = (
+        Index("uq_device_trust_profiles_org_device", "organization_id", "device_id", unique=True),
+    )
 
     device_id: Mapped[str] = mapped_column(
-        String(255), nullable=False, index=True, unique=True
+        String(255), nullable=False, index=True
     )
     device_type: Mapped[str] = mapped_column(
         String(50), nullable=False
