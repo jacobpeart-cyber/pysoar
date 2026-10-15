@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
@@ -117,6 +119,52 @@ def _json_list(value: Any) -> list[Any]:
         return parsed if isinstance(parsed, list) else [parsed]
     return [value]
 
+# Custom patterns are tenant-authored and run in the shared worker over every
+# tenant's content, so a catastrophic expression from one tenant must not
+# stall the sweep for the others. Two defences: patterns with nested
+# quantifiers, backreferences or huge counted repeats are refused when the
+# policy is saved, and at run time each custom pattern gets a time budget per
+# record; a pattern that exceeds it deactivates its policy for the run with
+# the reason recorded on the policy.
+PATTERN_TIME_BUDGET_SECONDS = 1.0
+_NESTED_QUANTIFIER_RE = re.compile(r"(?:\([^()]*[+*][^()]*\)|\[[^\]]*\][+*]|[+*])\s*[+*{]")
+_BACKREF_RE = re.compile(r"\\[1-9]|\(\?P=")
+_HUGE_REPEAT_RE = re.compile(r"\{\s*(\d{4,})(?:\s*,\s*(\d*))?\s*\}|\{\s*\d*\s*,\s*(\d{4,})\s*\}")
+_MATCH_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="dlp-match")
+
+
+class PatternTimeout(Exception):
+    """A custom pattern exceeded its time budget on one record."""
+
+    def __init__(self, name: str, budget: float, chars: int) -> None:
+        super().__init__(f"pattern {name} exceeded {budget:.1f}s on a {chars}-char record")
+        self.name = name
+        self.budget = budget
+        self.chars = chars
+
+
+def reject_catastrophic_pattern(entry: str) -> None:
+    """Raise InvalidPattern for expressions that can backtrack exponentially."""
+    if _NESTED_QUANTIFIER_RE.search(entry):
+        raise InvalidPattern(
+            f"pattern {entry[:40]!r} nests a quantifier inside a quantified group; "
+            "rewrite it without nested repetition",
+        )
+    if _BACKREF_RE.search(entry):
+        raise InvalidPattern(f"pattern {entry[:40]!r} uses a backreference, which is not allowed")
+    if _HUGE_REPEAT_RE.search(entry):
+        raise InvalidPattern(f"pattern {entry[:40]!r} uses a counted repeat above 999")
+
+
+def _finditer_with_budget(name: str, pattern: "re.Pattern[str]", text: str, budget: float) -> list["re.Match[str]"]:
+    """Run ``pattern.finditer`` in a worker thread, bounded by ``budget`` seconds."""
+    future = _MATCH_EXECUTOR.submit(lambda: list(pattern.finditer(text)))
+    try:
+        return future.result(timeout=budget)
+    except FuturesTimeout:
+        future.cancel()
+        raise PatternTimeout(name, budget, len(text)) from None
+
 
 def compile_patterns(names: list[str]) -> dict[str, re.Pattern[str]]:
     """Compile built-in names and custom regexes; raise InvalidPattern."""
@@ -132,6 +180,7 @@ def compile_patterns(names: list[str]) -> dict[str, re.Pattern[str]]:
             raise InvalidPattern(
                 f"pattern longer than {MAX_CUSTOM_PATTERN_LENGTH} characters: {entry[:40]}..."
             )
+        reject_catastrophic_pattern(entry)
         try:
             compiled[f"custom:{entry}"] = re.compile(entry)
         except re.error as exc:
@@ -234,7 +283,11 @@ def find_matches(plan: PolicyPlan, text: str) -> list[tuple[str, int, int]]:
     """(pattern name, start, end) for every match in ``text`` (bounded)."""
     hits: list[tuple[str, int, int]] = []
     for name, pattern in plan.patterns.items():
-        for m in pattern.finditer(text):
+        if name.startswith("custom:"):
+            matches = _finditer_with_budget(name, pattern, text, PATTERN_TIME_BUDGET_SECONDS)
+        else:
+            matches = pattern.finditer(text)
+        for m in matches:
             value = m.group(0)
             if not value or value in plan.allow_values:
                 continue
@@ -584,7 +637,19 @@ async def _evaluate_window(
         for plan in plans:
             if (plan.policy.id, record.id) in existing:
                 continue
-            hits = find_matches(plan, text)
+            try:
+                hits = find_matches(plan, text)
+            except PatternTimeout as exc:
+                plan.status = "inactive"
+                plan.reason = f"{exc}; the policy was deactivated for this run"
+                plan.patterns = {}
+                plan.policy.evaluation_status = plan.status
+                plan.policy.evaluation_reason = plan.reason
+                logger.warning(
+                    "dlp_pattern_timeout", organization_id=org_id, policy_id=plan.policy.id, pattern=exc.name,
+                    chars=exc.chars, budget=exc.budget,
+                )
+                continue
             if not hits:
                 continue
             kinds = sorted({h[0] for h in hits})

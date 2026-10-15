@@ -223,3 +223,34 @@ def test_beat_entry_and_wall_clock() -> None:
     assert "src.dlp.tasks.dlp_content_scan_sweep" in tasks
     limits = celery_app.conf.task_annotations["src.dlp.tasks.dlp_content_scan_sweep"]
     assert limits["soft_time_limit"] <= 900 and limits["time_limit"] > limits["soft_time_limit"]
+
+
+def test_catastrophic_custom_patterns_are_refused_at_validation() -> None:
+    """Custom patterns run in the shared worker over every tenant's content."""
+    from src.dlp.scanner import InvalidPattern, validate_data_patterns
+
+    for bad in (r"(a+)+$", r"([a-z]+)*x", r"(\d+|\w+)*", r"(ab)\1", r"a{5000}", r"(?P<n>x)(?P=n)"):
+        with pytest.raises(InvalidPattern):
+            validate_data_patterns([bad])
+    validate_data_patterns([r"AKIA[0-9A-Z]{16}", r"\b\d{3}-\d{2}-\d{4}\b", "ssn"])
+
+
+def test_custom_pattern_time_budget_deactivates_the_policy_for_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    import re
+    import time
+
+    from src.dlp import scanner as mod
+
+    class _Slow:
+        def finditer(self, text):
+            time.sleep(0.5)
+            return iter([])
+
+    plan = mod.PolicyPlan(policy=None, status="active", reason=None, patterns={"custom:slow": _Slow()})  # type: ignore[arg-type]
+    monkeypatch.setattr(mod, "PATTERN_TIME_BUDGET_SECONDS", 0.05)
+    with pytest.raises(mod.PatternTimeout) as exc:
+        mod.find_matches(plan, "x" * 100)
+    assert exc.value.name == "custom:slow"
+    # Built-in detectors are trusted and run inline.
+    fast = mod.PolicyPlan(policy=None, status="active", reason=None, patterns={"ssn": re.compile(r"\d{3}-\d{2}-\d{4}")})  # type: ignore[arg-type]
+    assert mod.find_matches(fast, "ssn 123-45-6789 here") == [("ssn", 4, 15)]
