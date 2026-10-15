@@ -24,7 +24,10 @@ duplicates it.
 from __future__ import annotations
 
 import json
+import asyncio
+import contextvars
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
@@ -129,6 +132,12 @@ def _json_list(value: Any) -> list[Any]:
 #: matching runs in a killable child process (src/dlp/isolated_match.py) and
 #: records it did not finish are recorded as ``scan_incomplete`` findings.
 POLICY_WINDOW_BUDGET_SECONDS = 10.0
+#: Cumulative child-process time one organisation's run may spend across all
+#: of its policies and windows; past it, remaining custom-pattern work is
+#: recorded as scan_incomplete without spawning (a tenant with hundreds of
+#: slow policies cannot multiply the per-policy budget into hours).
+ORG_RUN_BUDGET_SECONDS = 60.0
+_RUN_BUDGET: contextvars.ContextVar[dict[str, float] | None] = contextvars.ContextVar("_dlp_run_budget", default=None)
 _NESTED_QUANTIFIER_RE = re.compile(r"(?:\([^()]*[+*][^()]*\)|\[[^\]]*\][+*]|[+*])\s*[+*{]")
 _BACKREF_RE = re.compile(r"\\[1-9]|\(\?P=")
 _HUGE_REPEAT_RE = re.compile(r"\{\s*(\d{4,})(?:\s*,\s*(\d*))?\s*\}|\{\s*\d*\s*,\s*(\d{4,})\s*\}")
@@ -266,6 +275,21 @@ def find_matches(plan: PolicyPlan, text: str) -> list[tuple[str, int, int]]:
     custom = {name: pattern.pattern for name, pattern in plan.patterns.items() if name.startswith("custom:")}
     if custom:
         found, unscanned, _timed_out = match_custom_patterns(custom, [("one", text)], POLICY_WINDOW_BUDGET_SECONDS)
+        if unscanned:
+            raise ScanIncomplete(POLICY_WINDOW_BUDGET_SECONDS, len(text))
+        hits.extend(_filter_hits(plan, text, found.get("one", [])))
+    hits.sort(key=lambda h: h[1])
+    return hits
+
+
+async def find_matches_async(plan: PolicyPlan, text: str) -> list[tuple[str, int, int]]:
+    """``find_matches`` for async callers: the child process runs in a worker thread."""
+    hits = _builtin_matches(plan, text)
+    custom = {name: pattern.pattern for name, pattern in plan.patterns.items() if name.startswith("custom:")}
+    if custom:
+        found, unscanned, _timed_out = await asyncio.to_thread(
+            match_custom_patterns, custom, [("one", text)], POLICY_WINDOW_BUDGET_SECONDS,
+        )
         if unscanned:
             raise ScanIncomplete(POLICY_WINDOW_BUDGET_SECONDS, len(text))
         hits.extend(_filter_hits(plan, text, found.get("one", [])))
@@ -547,6 +571,7 @@ async def scan_organization(
 
     The caller commits.
     """
+    _RUN_BUDGET.set({"remaining": ORG_RUN_BUDGET_SECONDS})
     now = datetime.now(timezone.utc)
     plans = await load_plans(db, org_id)
     active = [p for p in plans if p.status == "active"]
@@ -653,7 +678,18 @@ async def _evaluate_window(
         if not custom:
             continue
         todo = [(rid, text) for rid, text in texts.items() if text and (plan.policy.id, rid) not in existing]
-        found, missing, timed_out = match_custom_patterns(custom, todo, POLICY_WINDOW_BUDGET_SECONDS)
+        state = _RUN_BUDGET.get()
+        remaining = state["remaining"] if state is not None else POLICY_WINDOW_BUDGET_SECONDS
+        budget = min(POLICY_WINDOW_BUDGET_SECONDS, remaining)
+        if budget <= 0:
+            found, missing, timed_out = {}, [rid for rid, _ in todo], bool(todo)
+        else:
+            started = time.perf_counter()
+            # The child-process call is synchronous: run it in a worker thread so
+            # the event loop (and the other tenants' work) keeps moving.
+            found, missing, timed_out = await asyncio.to_thread(match_custom_patterns, custom, todo, budget)
+            if state is not None:
+                state["remaining"] = max(0.0, state["remaining"] - (time.perf_counter() - started))
         custom_hits[plan.policy.id] = found
         unscanned[plan.policy.id] = set(missing)
         if timed_out:

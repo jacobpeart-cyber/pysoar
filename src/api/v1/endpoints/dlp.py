@@ -73,7 +73,7 @@ from src.dlp.scanner import (
     InvalidPattern,
     apply_plan,
     ScanIncomplete,
-    find_matches,
+    find_matches_async,
     plan_policy,
     redacted_excerpt,
     reset_cursors,
@@ -409,7 +409,7 @@ async def test_policy(
     test_plan = plan if policy.enabled else plan_policy(policy, ignore_enabled=True)
     sample = (test_request.sample_content or "")[:20_000]
     try:
-        hits = find_matches(test_plan, sample) if test_plan.patterns else []
+        hits = await find_matches_async(test_plan, sample) if test_plan.patterns else []
     except ScanIncomplete as exc:
         raise HTTPException(
             status_code=422,

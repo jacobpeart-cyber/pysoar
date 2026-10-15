@@ -283,3 +283,34 @@ async def test_scan_records_unscanned_records_as_findings_instead_of_passing_the
     assert "NOT scanned" in (rows[0].redacted_excerpt or "")
     status = (await client.get(f"{BASE}/policies/{pol['id']}", headers=org_a_admin_headers)).json()
     assert status["evaluation_status"] == "active"
+
+
+async def test_org_run_budget_caps_total_child_time_across_policies(
+    client: AsyncClient, db_session: AsyncSession, org_a, org_a_admin_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tenant with many slow policies cannot multiply the per-policy budget:
+    once the run budget is spent, remaining custom-pattern work is recorded as
+    scan_incomplete without spawning another child."""
+    import time
+
+    from src.dlp import scanner as mod
+    from src.dlp.models import DLPViolation
+
+    org_id = org_a.id
+    monkeypatch.setattr(mod, "POLICY_WINDOW_BUDGET_SECONDS", 1.0)
+    monkeypatch.setattr(mod, "ORG_RUN_BUDGET_SECONDS", 1.5)
+    pols = [
+        await _policy(client, org_a_admin_headers, name=f"slow-{i}", data_patterns=[r"(a|aa)+$"], channels_monitored=["logs"])
+        for i in range(3)
+    ]
+    db_session.add(_log(org_id, "a" * 48 + "b"))
+    await db_session.commit()
+
+    t0 = time.perf_counter()
+    run = await client.post(f"{BASE}/scan/run", headers=org_a_admin_headers)
+    assert run.status_code == 200, run.text
+    assert time.perf_counter() - t0 < 12  # three policies x 1s budget would be 3s; the cap stops after ~1.5s
+    rows = (await db_session.execute(
+        select(DLPViolation).where(DLPViolation.organization_id == org_id, DLPViolation.policy_id.in_([p["id"] for p in pols]))
+    )).scalars().all()
+    assert len(rows) == 3 and all(r.violation_type == "scan_incomplete" for r in rows)

@@ -238,7 +238,10 @@ export default function OTSecurityDashboard() {
     setActionError(null);
     try {
       const res = await api.get('/ot_security/export', { params: { format }, responseType: 'blob' });
-      const url = URL.createObjectURL(res.data as Blob);
+      // Force a non-executable MIME type on the download regardless of what the
+      // response carried; the file is saved, never rendered.
+      const safeType = format === 'json' ? 'application/json' : 'text/csv';
+      const url = URL.createObjectURL(new Blob([res.data as Blob], { type: safeType }));
       const a = document.createElement('a');
       a.href = url;
       a.download = `ot-security-report.${format}`;
