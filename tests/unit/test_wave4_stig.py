@@ -72,7 +72,8 @@ async def _report(db: AsyncSession, agent_id: str, command_id: str, **kwargs) ->
 
 def test_stig_scan_action_is_capability_gated() -> None:
     assert capability_allows(["stig_scan"], "stig_scan")
-    assert capability_allows(["compliance"], "stig_scan")
+    # "compliance" alone never implies the whole-benchmark scan (no silent widening).
+    assert not capability_allows(["compliance"], "stig_scan")
     assert not capability_allows(["bas", "ir"], "stig_scan")
     assert not requires_approval("stig_scan")
 
@@ -153,7 +154,7 @@ async def test_agent_failure_and_garbage_fail_the_scan_via_the_reconcile_task(
 ) -> None:
     org_id = org_a.id
     bench_id, _ = await _benchmark(db_session, org_id)
-    agent_id = await _agent(db_session, org_id, "rhel-2", ["compliance"])
+    agent_id = await _agent(db_session, org_id, "rhel-2", ["stig_scan"])
     first = (await client.post(f"{BASE}/scans/launch", json={"host": "rhel-2", "benchmark_id": bench_id},
                                headers=org_a_admin_headers)).json()
     second = (await client.post(f"{BASE}/scans/launch", json={"host": "rhel-2", "benchmark_id": bench_id},

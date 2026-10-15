@@ -166,9 +166,11 @@ HIGH_BLAST_ACTIONS: set[AgentAction] = {
 # Wave 4 (OT): shutting down plant equipment and actively probing OT networks
 # both wait for a second administrator in the approval queue.
 HIGH_BLAST_ACTIONS |= {AgentAction.OT_SAFE_SHUTDOWN, AgentAction.OT_SEGMENTATION_PROBE}
-# Wave 4 (STIG): agents enrolled with "stig_scan" or "compliance" may run it.
+# Wave 4 (STIG): only agents enrolled with the explicit "stig_scan" capability
+# may run a whole-benchmark evaluation. Folding it into "compliance" would
+# silently widen every existing compliance enrolment; operators re-enrol
+# an agent with "stig_scan" to grant it.
 CAPABILITY_ACTIONS[AgentCapability.STIG_SCAN] = {AgentAction.STIG_SCAN}
-CAPABILITY_ACTIONS[AgentCapability.COMPLIANCE] = CAPABILITY_ACTIONS[AgentCapability.COMPLIANCE] | {AgentAction.STIG_SCAN}
 
 
 def capability_allows(capabilities: list[str], action: str) -> bool:
