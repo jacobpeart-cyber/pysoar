@@ -6,17 +6,20 @@ security findings, and runtime anomaly detection.
 """
 
 from datetime import datetime
-from typing import List, Dict, Any, Optional
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from typing import Any, Dict, Optional
+
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column
 
 from src.models.base import BaseModel, utc_now
 
 __all__ = [
     "ContainerImage",
+    "ContainerImageScan",
     "ImageVulnerability",
-    "KubernetesCluster",
+    "K8sCheckResult",
     "K8sSecurityFinding",
+    "KubernetesCluster",
     "RuntimeAlert",
 ]
 
@@ -43,11 +46,23 @@ class ContainerImage(BaseModel):
 
     # Timestamps
     created_at_source: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True
+        DateTime(timezone=True), nullable=True,
     )
-    scanned_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
+    # Set only when a scanner actually reported on the image (wave 4: it
+    # used to default to the insert time, so a never-scanned image showed a
+    # scan date).
+    scanned_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
     )
+
+    # Scan lifecycle: not_scanned, pending, awaiting_approval,
+    # awaiting_integration, completed, failed. ``scan_error`` carries the
+    # reason for awaiting_integration / failed.
+    scan_status: Mapped[Optional[str]] = mapped_column(
+        String(50), default="not_scanned", nullable=True,
+    )
+    scan_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    last_scan_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
 
     # Vulnerability counts
     vulnerability_count_critical: Mapped[int] = mapped_column(Integer, default=0)
@@ -65,7 +80,7 @@ class ContainerImage(BaseModel):
 
     # Compliance status: compliant, non_compliant, not_scanned, exception
     compliance_status: Mapped[str] = mapped_column(
-        String(50), default="not_scanned", index=True
+        String(50), default="not_scanned", index=True,
     )
 
     # Risk scoring (0-100)
@@ -76,11 +91,11 @@ class ContainerImage(BaseModel):
 
     # Last deployment timestamp
     last_deployed: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True
+        DateTime(timezone=True), nullable=True,
     )
 
     organization_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("organizations.id"), nullable=False, index=True
+        String(36), ForeignKey("organizations.id"), nullable=False, index=True,
     )
 
     __table_args__ = (
@@ -100,7 +115,7 @@ class ImageVulnerability(BaseModel):
     __tablename__ = "image_vulnerabilities"
 
     image_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("container_images.id"), nullable=False, index=True
+        String(36), ForeignKey("container_images.id"), nullable=False, index=True,
     )
 
     cve_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
@@ -127,7 +142,7 @@ class ImageVulnerability(BaseModel):
     remediation: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     organization_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("organizations.id"), nullable=False, index=True
+        String(36), ForeignKey("organizations.id"), nullable=False, index=True,
     )
 
     __table_args__ = (
@@ -146,7 +161,9 @@ class KubernetesCluster(BaseModel):
 
     __tablename__ = "kubernetes_clusters"
 
-    name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    # Unique per organisation (it used to be unique across all tenants, so a
+    # second tenant could not register a cluster with a name already taken).
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
     version: Mapped[str] = mapped_column(String(50), nullable=False)
 
     # Provider: eks, aks, gke, openshift, rancher, k3s, self_managed
@@ -165,7 +182,7 @@ class KubernetesCluster(BaseModel):
 
     # Pod Security Standards: privileged, baseline, restricted
     pod_security_standards: Mapped[str] = mapped_column(
-        String(50), default="baseline", index=True
+        String(50), default="baseline", index=True,
     )
 
     audit_logging_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -177,21 +194,51 @@ class KubernetesCluster(BaseModel):
 
     # Audit timestamps
     last_audit: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True, index=True
+        DateTime(timezone=True), nullable=True, index=True,
     )
 
     # Scores (0-100)
     compliance_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
     risk_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
 
+    # Kubernetes API credential (kubeconfig or bearer token), stored as an
+    # ``enc:v1:`` envelope from src.core.secrets; never returned by the API.
+    credential_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    credential_type: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    credential_set_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
+    # CIS assessment against the Kubernetes API: not_assessed (no credential
+    # or never run), assessed, failed (the API could not be read).
+    assessment_status: Mapped[Optional[str]] = mapped_column(
+        String(30), default="not_assessed", nullable=True,
+    )
+    assessment_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     organization_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("organizations.id"), nullable=False, index=True
+        String(36), ForeignKey("organizations.id"), nullable=False, index=True,
     )
 
     __table_args__ = (
         Index("ix_cluster_org_risk", "organization_id", "risk_score"),
         Index("ix_cluster_org_provider", "organization_id", "provider"),
+        UniqueConstraint("organization_id", "name", name="uq_kubernetes_clusters_org_name"),
     )
+
+    @property
+    def has_credential(self) -> bool:
+        return bool(self.credential_encrypted)
+
+    @property
+    def compliance_status(self) -> str:
+        """compliant / partial / non_compliant from an API assessment, else not_assessed."""
+        if self.assessment_status != "assessed":
+            return "not_assessed"
+        score = self.compliance_score or 0
+        if score >= 80:
+            return "compliant"
+        return "non_compliant" if score < 60 else "partial"
 
 
 class K8sSecurityFinding(BaseModel):
@@ -205,7 +252,7 @@ class K8sSecurityFinding(BaseModel):
     __tablename__ = "k8s_security_findings"
 
     cluster_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("kubernetes_clusters.id"), nullable=False, index=True
+        String(36), ForeignKey("kubernetes_clusters.id"), nullable=False, index=True,
     )
 
     # Finding types
@@ -234,20 +281,32 @@ class K8sSecurityFinding(BaseModel):
 
     # Status: open, remediated, accepted, false_positive
     status: Mapped[str] = mapped_column(
-        String(50), default="open", nullable=False, index=True
+        String(50), default="open", nullable=False, index=True,
     )
 
     detected_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
+        DateTime(timezone=True), default=utc_now, nullable=False,
+    )
+
+    # Wave 4: findings are deduplicated per (cluster, image, check).
+    # ``check_id`` is the CIS check, ``image_ref`` the container image the
+    # finding is about (NULL for cluster-wide checks) and ``dedupe_key`` the
+    # sha256 of the three, unique per organisation.
+    check_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    image_ref: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    dedupe_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
     )
 
     organization_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("organizations.id"), nullable=False, index=True
+        String(36), ForeignKey("organizations.id"), nullable=False, index=True,
     )
 
     __table_args__ = (
         Index("ix_finding_cluster_status", "cluster_id", "status"),
         Index("ix_finding_org_type", "organization_id", "finding_type"),
+        UniqueConstraint("organization_id", "dedupe_key", name="uq_k8s_findings_org_dedupe"),
     )
 
 
@@ -262,7 +321,7 @@ class RuntimeAlert(BaseModel):
     __tablename__ = "runtime_alerts"
 
     cluster_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("kubernetes_clusters.id"), nullable=False, index=True
+        String(36), ForeignKey("kubernetes_clusters.id"), nullable=False, index=True,
     )
 
     # Alert type: unexpected_process, file_system_modification, network_connection_anomaly,
@@ -294,15 +353,82 @@ class RuntimeAlert(BaseModel):
 
     # Status: new, investigating, confirmed, contained, resolved
     status: Mapped[str] = mapped_column(
-        String(50), default="new", nullable=False, index=True
+        String(50), default="new", nullable=False, index=True,
     )
 
     organization_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("organizations.id"), nullable=False, index=True
+        String(36), ForeignKey("organizations.id"), nullable=False, index=True,
     )
 
     __table_args__ = (
         Index("ix_alert_cluster_status", "cluster_id", "status"),
         Index("ix_alert_org_type", "organization_id", "alert_type"),
         Index("ix_alert_pod", "namespace", "pod_name"),
+    )
+
+
+class ContainerImageScan(BaseModel):
+    """One image scan request and its outcome (wave 4).
+
+    ``method`` is ``integration`` (an installed Trivy / Grype / Anchore
+    scanner integration answered over HTTP) or ``agent`` (an endpoint agent
+    enrolled with the ``container_scan`` capability ran ``trivy`` / ``grype``
+    and returned its JSON report). ``status``: pending, awaiting_approval,
+    completed, failed.
+    """
+
+    __tablename__ = "container_image_scans"
+
+    image_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("container_images.id"), nullable=False, index=True,
+    )
+    method: Mapped[str] = mapped_column(String(20), nullable=False)
+    scanner: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    integration_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    agent_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    command_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    requested_by: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    vulnerabilities_new: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    vulnerabilities_updated: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    vulnerabilities_total: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    organization_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("organizations.id"), nullable=False, index=True,
+    )
+
+    __table_args__ = (
+        Index("ix_image_scan_org_status", "organization_id", "status"),
+    )
+
+
+class K8sCheckResult(BaseModel):
+    """Latest result of one CIS Kubernetes check for one cluster (wave 4).
+
+    ``status`` is pass, fail, not_assessed or error. A check is only ever
+    ``pass`` after it was evaluated against data read from the cluster's
+    Kubernetes API; without a credential every check is ``not_assessed``.
+    """
+
+    __tablename__ = "k8s_check_results"
+
+    cluster_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("kubernetes_clusters.id"), nullable=False, index=True,
+    )
+    check_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    evidence: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    evaluated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    organization_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("organizations.id"), nullable=False, index=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("cluster_id", "check_id", name="uq_k8s_check_results_cluster_check"),
     )

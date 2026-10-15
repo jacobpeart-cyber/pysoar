@@ -1,70 +1,85 @@
 """
 Container Security REST API Endpoints
 
-Complete API for managing container images, Kubernetes clusters,
-security findings, runtime alerts, and compliance.
+Container images, Kubernetes clusters, CIS findings, runtime alerts and
+compliance, all scoped to the caller's organisation.
+
+Wave 4 (W4-B):
+- Images and clusters can be registered (``POST /images``, ``POST /clusters``)
+  and deleted; cluster names are unique per organisation.
+- ``POST /images/{id}/scan`` scans through an installed scanner integration
+  (Trivy / Grype / Anchore) or a ``scan_container_image`` endpoint-agent
+  command, or reports ``awaiting_integration`` without touching counts, scores
+  or compliance (src/container_security/scanning.py).
+- ``PUT /clusters/{id}/credential`` stores a kubeconfig / token encrypted;
+  ``POST /clusters/{id}/audit`` then runs the CIS checks against the
+  Kubernetes API through the pinned transport. Without a credential every
+  check is ``not_assessed``; nothing is ever ``pass`` without API data
+  (src/container_security/kube.py). Findings are deduplicated per
+  (cluster, image, check).
+- Compliance views read the stored CIS check results only.
 """
 
-from datetime import datetime, timedelta, timezone
-from typing import Annotated, List, Optional, Dict, Any
+from datetime import datetime, timezone
+from typing import Annotated, Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status, Query
-from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
-from src.models.user import User, UserRole
-from sqlalchemy import select, and_, func, desc
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import and_, delete, desc, func, select
 
-from src.core.logging import get_logger
-from src.services.automation import AutomationService
-from src.api.deps import get_current_active_user as get_current_user
-from src.core.database import get_db
-from src.schemas.container_security import (
-    ContainerImageResponse,
-    ContainerImageCreateRequest,
-    ContainerImageUpdateRequest,
-    ImageVulnerabilityResponse,
-    ImageVulnerabilityCreateRequest,
-    KubernetesClusterResponse,
-    KubernetesClusterCreateRequest,
-    KubernetesClusterUpdateRequest,
-    K8sSecurityFindingResponse,
-    K8sSecurityFindingCreateRequest,
-    K8sSecurityFindingUpdateRequest,
-    RuntimeAlertResponse,
-    RuntimeAlertCreateRequest,
-    RuntimeAlertUpdateRequest,
-    ImageScanRequest,
-    ImageScanResponse,
-    ClusterAuditRequest,
-    ClusterAuditResponse,
-    SecurityFindingRemediationRequest,
-    SecurityFindingRemediationResponse,
-    RuntimeAlertInvestigationRequest,
-    PodQuarantineRequest,
-    DashboardOverviewResponse,
-    ComplianceMatrixResponse,
-    ClusterComplianceResponse,
-    PaginationParams,
+from src.api.deps import DatabaseSession, OrganizationId, require_role
+from src.container_security.engine import ImageScanner, K8sRemediator
+from src.container_security.kube import (
+    CIS_BENCHMARK,
+    KubeCredentialError,
+    normalise_credential,
+    run_cis_audit,
+    store_credential,
 )
 from src.container_security.models import (
     ContainerImage,
+    ContainerImageScan,
     ImageVulnerability,
-    KubernetesCluster,
+    K8sCheckResult,
     K8sSecurityFinding,
+    KubernetesCluster,
     RuntimeAlert,
 )
-from src.container_security.engine import (
-    ImageScanner,
-    K8sSecurityAuditor,
-    K8sRemediator,
-    ComplianceChecker,
+from src.container_security.scanning import (
+    PENDING_SCAN_STATES,
+    SCAN_CAPABILITY,
+    reconcile_scan,
+    request_scan,
+    scan_agents,
+    scanner_integrations,
 )
-from src.container_security.tasks import (
-    scheduled_image_scan,
-    cluster_security_audit,
-    runtime_monitoring,
-    compliance_check,
-    stale_image_report,
+from src.core.logging import get_logger
+from src.models.audit import AuditLog
+from src.models.user import User, UserRole
+from src.schemas.container_security import (
+    ClusterAuditRequest,
+    ClusterAuditResponse,
+    ClusterComplianceResponse,
+    ClusterCredentialRequest,
+    ComplianceMatrixResponse,
+    ContainerImageCreateRequest,
+    ContainerImageResponse,
+    ContainerImageUpdateRequest,
+    DashboardOverviewResponse,
+    ImageScanRecordResponse,
+    ImageScanResponse,
+    ImageVulnerabilityResponse,
+    K8sCheckResultResponse,
+    K8sSecurityFindingResponse,
+    K8sSecurityFindingUpdateRequest,
+    KubernetesClusterCreateRequest,
+    KubernetesClusterResponse,
+    KubernetesClusterUpdateRequest,
+    RuntimeAlertInvestigationRequest,
+    RuntimeAlertResponse,
+    RuntimeAlertUpdateRequest,
+    ScannerAvailabilityResponse,
+    SecurityFindingRemediationRequest,
+    SecurityFindingRemediationResponse,
 )
 
 logger = get_logger(__name__)
@@ -89,6 +104,57 @@ def _days_since(moment: Optional[datetime]) -> Optional[int]:
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
     return (datetime.now(timezone.utc) - moment).days
+
+
+async def _audit(
+    db: DatabaseSession,
+    user: Optional[User],
+    org_id: str,
+    action: str,
+    resource_type: str,
+    resource_id: Optional[str],
+    description: str,
+    payload: Dict[str, Any],
+    success: bool = True,
+    error: Optional[str] = None,
+) -> None:
+    """One AuditLog row per container-security action."""
+    import json as _json
+
+    db.add(AuditLog(
+        user_id=str(user.id) if user is not None else None,
+        organization_id=org_id,
+        action=action,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        description=description[:4000],
+        new_value=_json.dumps(payload, default=str),
+        success=success,
+        error_message=error,
+    ))
+    await db.flush()
+
+
+async def _image_or_404(db: DatabaseSession, image_id: str, org_id: str) -> ContainerImage:
+    image = (await db.execute(
+        select(ContainerImage).where(
+            ContainerImage.id == image_id, ContainerImage.organization_id == org_id,
+        ),
+    )).scalar_one_or_none()
+    if not image:
+        raise HTTPException(status_code=404, detail="Image not found")
+    return image
+
+
+async def _cluster_or_404(db: DatabaseSession, cluster_id: str, org_id: str) -> KubernetesCluster:
+    cluster = (await db.execute(
+        select(KubernetesCluster).where(
+            KubernetesCluster.id == cluster_id, KubernetesCluster.organization_id == org_id,
+        ),
+    )).scalar_one_or_none()
+    if not cluster:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+    return cluster
 
 
 # ============================================================================
@@ -127,11 +193,9 @@ async def list_images(
     if risk_score_max is not None:
         stmt = stmt.where(ContainerImage.risk_score <= risk_score_max)
 
-    stmt = stmt.order_by(desc(ContainerImage.risk_score)).offset(skip).limit(limit)
+    stmt = stmt.order_by(desc(ContainerImage.risk_score), ContainerImage.id).offset(skip).limit(limit)
     result = await db.execute(stmt)
-    images = result.scalars().all()
-
-    return images
+    return result.scalars().all()
 
 
 @router.post("/images", response_model=ContainerImageResponse, status_code=201)
@@ -141,25 +205,49 @@ async def create_image(
     db: DatabaseSession = None,
     _user: AnalystUser = None,
 ):
-    """Create new container image record."""
+    """Register a container image (registry/repository:tag, optional digest).
+
+    The image starts ``not_scanned`` with no scan date; counts, risk and
+    compliance change only when a real scanner reports. 409 when the same
+    registry/repository:tag is already registered in this organisation.
+    """
+    dup = (await db.execute(
+        select(ContainerImage.id).where(
+            ContainerImage.organization_id == org_id,
+            ContainerImage.registry == request.registry,
+            ContainerImage.repository == request.repository,
+            ContainerImage.tag == request.tag,
+        ),
+    )).first()
+    if dup:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "image_exists", "image_id": dup[0],
+                    "detail": "This registry/repository:tag is already registered."},
+        )
     image = ContainerImage(
         registry=request.registry,
         repository=request.repository,
         tag=request.tag,
-        digest_sha256=request.digest_sha256,
+        digest_sha256=request.digest_sha256 or "",
         image_size_mb=request.image_size_mb,
         os=request.os,
         architecture=request.architecture,
         base_image=request.base_image,
         labels=request.labels or {},
         compliance_status="not_scanned",
+        scan_status="not_scanned",
+        scanned_at=None,
         organization_id=org_id,
     )
     db.add(image)
+    await db.flush()
+    await _audit(db, _user, org_id, "container_image_registered", "container_image", image.id,
+                 f"registered {request.registry}/{request.repository}:{request.tag}",
+                 {"registry": request.registry, "repository": request.repository, "tag": request.tag})
     await db.commit()
     await db.refresh(image)
-
-    logger.info(f"Created image {image.id}")
+    logger.info("container_image_registered", image_id=image.id)
     return image
 
 
@@ -169,19 +257,18 @@ async def get_image(
     org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
-    """Get image details."""
-    stmt = select(ContainerImage).where(
-        and_(
-            ContainerImage.id == image_id,
-            ContainerImage.organization_id == org_id,
-        )
-    )
-    result = await db.execute(stmt)
-    image = result.scalar_one_or_none()
-
-    if not image:
-        raise HTTPException(status_code=404, detail="Image not found")
-
+    """Get image details (a pending agent scan is reconciled first)."""
+    image = await _image_or_404(db, image_id, org_id)
+    if image.last_scan_id and image.scan_status in PENDING_SCAN_STATES:
+        scan = (await db.execute(
+            select(ContainerImageScan).where(
+                ContainerImageScan.id == image.last_scan_id,
+                ContainerImageScan.organization_id == org_id,
+            ),
+        )).scalar_one_or_none()
+        if scan is not None and await reconcile_scan(db, scan):
+            await db.commit()
+            await db.refresh(image)
     return image
 
 
@@ -194,17 +281,7 @@ async def update_image(
     _user: AnalystUser = None,
 ):
     """Update image metadata."""
-    stmt = select(ContainerImage).where(
-        and_(
-            ContainerImage.id == image_id,
-            ContainerImage.organization_id == org_id,
-        )
-    )
-    result = await db.execute(stmt)
-    image = result.scalar_one_or_none()
-
-    if not image:
-        raise HTTPException(status_code=404, detail="Image not found")
+    image = await _image_or_404(db, image_id, org_id)
 
     if request.labels is not None:
         image.labels = request.labels
@@ -219,144 +296,140 @@ async def update_image(
     return image
 
 
+@router.delete("/images/{image_id}", status_code=204)
+async def delete_image(
+    image_id: str,
+    org_id: OrganizationId,
+    db: DatabaseSession = None,
+    _user: AdminRoleUser = None,
+):
+    """Delete an image with its vulnerabilities and scan history."""
+    image = await _image_or_404(db, image_id, org_id)
+    await db.execute(delete(ImageVulnerability).where(
+        ImageVulnerability.image_id == image.id, ImageVulnerability.organization_id == org_id,
+    ))
+    await db.execute(delete(ContainerImageScan).where(
+        ContainerImageScan.image_id == image.id, ContainerImageScan.organization_id == org_id,
+    ))
+    await _audit(db, _user, org_id, "container_image_deleted", "container_image", image.id,
+                 f"deleted {image.registry}/{image.repository}:{image.tag}", {})
+    await db.delete(image)
+    await db.commit()
+
+
+@router.get("/scanners", response_model=ScannerAvailabilityResponse)
+async def get_scanner_availability(
+    org_id: OrganizationId,
+    db: DatabaseSession = None,
+):
+    """The real scan paths available to this organisation (integrations, agents)."""
+    integrations = await scanner_integrations(db, org_id)
+    agents = await scan_agents(db, org_id)
+    available = bool(integrations or agents)
+    return ScannerAvailabilityResponse(
+        status="available" if available else "awaiting_integration",
+        integrations=[
+            {"id": i.id, "display_name": i.display_name,
+             "connector": (i.connector.name if i.connector is not None else None)}
+            for i in integrations
+        ],
+        agents=[{"id": a.id, "hostname": a.hostname} for a in agents],
+        reason=None if available else (
+            "No image scanner: install an active Trivy, Grype or Anchore integration, or enrol an "
+            f"endpoint agent with the '{SCAN_CAPABILITY}' capability."
+        ),
+    )
+
+
 @router.post("/images/{image_id}/scan", response_model=ImageScanResponse)
 async def scan_image(
     image_id: str,
     org_id: OrganizationId,
     db: DatabaseSession = None,
     _user: AdminRoleUser = None,
+    agent_id: Optional[str] = Query(None, description="Scan on this container_scan agent"),
+    scanner: str = Query("trivy", pattern="^(trivy|grype)$", description="Scanner the agent runs"),
 ):
+    """Scan an image through a real scanner.
+
+    Order: an installed scanner integration (answers synchronously:
+    ``completed`` / ``failed``), else an endpoint agent with the
+    ``container_scan`` capability (``pending`` / ``awaiting_approval``; the
+    result is applied when the agent reports), else ``awaiting_integration``
+    with the reason. Without a scanner nothing changes on the image beyond
+    its scan status.
     """
-    Refresh an image's vulnerability summary.
-
-    No real scanning backend (Trivy/Grype) is configured, so this does not
-    discover new vulnerabilities — it recomputes the image's vuln counts,
-    risk score, and compliance status from ImageVulnerability records already
-    recorded for it. Response status is "no_scanner_backend" to make that clear.
-    """
-    stmt = select(ContainerImage).where(
-        and_(
-            ContainerImage.id == image_id,
-            ContainerImage.organization_id == org_id,
-        )
+    image = await _image_or_404(db, image_id, org_id)
+    outcome = await request_scan(
+        db, image, requested_by=str(_user.id) if _user is not None else None,
+        agent_id=agent_id, scanner=scanner,
     )
-    result = await db.execute(stmt)
-    image = result.scalar_one_or_none()
-
-    if not image:
-        raise HTTPException(status_code=404, detail="Image not found")
-
-    # Run the actual scanner. If the scanner itself blows up, mark the scan
-    # as failed on the row rather than pretending it succeeded.
-    scanner = ImageScanner()
-    try:
-        scan_result = await scanner.scan_image(
-            registry=image.registry or "docker.io",
-            repository=image.repository or "",
-            tag=image.tag or "latest",
-            digest=image.digest_sha256 or "",
-            db=db,
-            organization_id=org_id,
-        )
-    except Exception as scan_exc:
-        logger.error(f"Image scan failed for {image_id}: {scan_exc}")
-        image.scanned_at = datetime.now(timezone.utc)
-        image.compliance_status = "scan_failed"
-        await db.commit()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Image scan failed: {scan_exc}",
-        )
-
-    # Persist new vulnerabilities that aren't already in the DB (defense in depth)
-    existing_stmt = select(ImageVulnerability.cve_id).where(
-        and_(
-            ImageVulnerability.image_id == image_id,
-            ImageVulnerability.organization_id == org_id,
-        )
+    await _audit(
+        db, _user, org_id, "container_image_scan", "container_image", image.id,
+        f"image scan: {outcome.status}", {"status": outcome.status, "method": outcome.method,
+                                          "scan_id": outcome.scan.id if outcome.scan else None,
+                                          "detail": outcome.detail},
+        success=outcome.status not in ("failed",),
+        error=outcome.detail if outcome.status == "failed" else None,
     )
-    existing_result = await db.execute(existing_stmt)
-    existing_cves = {r[0] for r in existing_result.all()}
-
-    for vuln in scan_result.get("vulnerabilities", []):
-        if vuln["cve_id"] not in existing_cves:
-            db.add(ImageVulnerability(
-                image_id=image_id,
-                cve_id=vuln["cve_id"],
-                package_name=vuln.get("package", ""),
-                package_version=vuln.get("version", ""),
-                fixed_version=vuln.get("fixed_version"),
-                severity=vuln.get("severity", "medium"),
-                cvss_score=vuln.get("cvss", 0.0),
-                exploit_available=vuln.get("exploit_available", False),
-                description=vuln.get("description", ""),
-                organization_id=org_id,
-            ))
-
-    # Recompute severity counts from the authoritative vuln list (scanner
-    # returns same data, but this guards against any scanner bug where the
-    # aggregate counters and the per-vuln list disagree).
-    vulns_list = scan_result.get("vulnerabilities", [])
-    critical_n = sum(1 for v in vulns_list if v.get("severity") == "critical")
-    high_n = sum(1 for v in vulns_list if v.get("severity") == "high")
-    medium_n = sum(1 for v in vulns_list if v.get("severity") == "medium")
-    low_n = sum(1 for v in vulns_list if v.get("severity") == "low")
-
-    # Persist counts onto the ACTUAL columns on ContainerImage (see
-    # src/container_security/models.py). Previously these were being
-    # assigned to `critical_count` / `high_count` / etc. which are not
-    # mapped columns, so SQLAlchemy silently dropped them on commit and
-    # the dashboard always read zeros.
-    image.vulnerability_count_critical = critical_n
-    image.vulnerability_count_high = high_n
-    image.vulnerability_count_medium = medium_n
-    image.vulnerability_count_low = low_n
-    image.scanned_at = scan_result["scanned_at"]
-    image.risk_score = scanner.calculate_image_risk_score(
-        critical_n, high_n, medium_n,
-        bool(image.is_signed), bool(image.sbom_generated),
-    )
-    no_backend = scan_result.get("status") == "no_scanner_backend"
-    if critical_n or high_n:
-        image.compliance_status = "non_compliant"
-    elif no_backend:
-        # Nothing scanned the image, so zero recorded criticals is not
-        # evidence of compliance. Never stamp an unscanned image compliant.
-        image.compliance_status = "not_scanned"
-    else:
-        image.compliance_status = "compliant"
-
     await db.commit()
     await db.refresh(image)
-
-    # Trigger automation for each critical/high vulnerability found
-    try:
-        automation = AutomationService(db)
-        image_name = f"{image.repository or ''}:{image.tag or 'latest'}"
-        for vuln in scan_result.get("vulnerabilities", []):
-            if vuln.get("severity") in ("critical", "high"):
-                await automation.on_container_finding(
-                    image_name=image_name,
-                    finding_type=vuln.get("cve_id", "vulnerability"),
-                    cve_id=vuln.get("cve_id", ""),
-                    severity=vuln.get("severity", "medium"),
-                    organization_id=org_id,
-                )
-    except Exception as e:
-        logger.error(f"Automation failed for container scan {image_id}: {e}")
-
-    logger.info(
-        f"Scan complete for image {image_id}: "
-        f"{scan_result['total_vulnerabilities']} vulns, risk={image.risk_score}"
-    )
-
     return ImageScanResponse(
-        status=scan_result.get("status", "completed"),
+        status=outcome.status,
         image_id=image_id,
-        vulnerabilities=scan_result["total_vulnerabilities"],
-        risk_score=image.risk_score,
-        compliance_status=image.compliance_status,
+        vulnerabilities=(outcome.scan.vulnerabilities_total if outcome.scan else 0),
+        risk_score=image.risk_score or 0,
+        compliance_status=image.compliance_status or "not_scanned",
+        detail=outcome.detail,
+        scan_id=outcome.scan.id if outcome.scan else None,
+        method=outcome.method,
+        scan_status=image.scan_status,
     )
+
+
+@router.get("/images/{image_id}/scans", response_model=List[ImageScanRecordResponse])
+async def list_image_scans(
+    image_id: str,
+    org_id: OrganizationId,
+    db: DatabaseSession = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+):
+    """Scan history of an image, newest first (pending agent scans reconciled)."""
+    await _image_or_404(db, image_id, org_id)
+    scans = list((await db.execute(
+        select(ContainerImageScan).where(
+            ContainerImageScan.image_id == image_id,
+            ContainerImageScan.organization_id == org_id,
+        ).order_by(desc(ContainerImageScan.created_at)).offset(skip).limit(limit),
+    )).scalars())
+    changed = False
+    for scan in scans:
+        if scan.status in PENDING_SCAN_STATES:
+            changed = await reconcile_scan(db, scan) or changed
+    if changed:
+        await db.commit()
+    return scans
+
+
+@router.get("/scans/{scan_id}", response_model=ImageScanRecordResponse)
+async def get_image_scan(
+    scan_id: str,
+    org_id: OrganizationId,
+    db: DatabaseSession = None,
+):
+    """One scan (a pending agent scan is reconciled first)."""
+    scan = (await db.execute(
+        select(ContainerImageScan).where(
+            ContainerImageScan.id == scan_id, ContainerImageScan.organization_id == org_id,
+        ),
+    )).scalar_one_or_none()
+    if scan is None:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    if await reconcile_scan(db, scan):
+        await db.commit()
+        await db.refresh(scan)
+    return scan
 
 
 @router.get("/images/{image_id}/vulnerabilities", response_model=List[ImageVulnerabilityResponse])
@@ -369,18 +442,8 @@ async def get_image_vulnerabilities(
     limit: int = Query(50, ge=1, le=200),
 ):
     """Get vulnerabilities for image."""
-    # Verify image ownership
-    stmt = select(ContainerImage).where(
-        and_(
-            ContainerImage.id == image_id,
-            ContainerImage.organization_id == org_id,
-        )
-    )
-    result = await db.execute(stmt)
-    if not result.scalar_one_or_none():
-        raise HTTPException(status_code=404, detail="Image not found")
+    await _image_or_404(db, image_id, org_id)
 
-    # Get vulnerabilities
     stmt = select(ImageVulnerability).where(
         ImageVulnerability.image_id == image_id,
         ImageVulnerability.organization_id == org_id,
@@ -389,11 +452,9 @@ async def get_image_vulnerabilities(
     if severity:
         stmt = stmt.where(ImageVulnerability.severity == severity)
 
-    stmt = stmt.order_by(desc(ImageVulnerability.cvss_score)).offset(skip).limit(limit)
+    stmt = stmt.order_by(desc(ImageVulnerability.cvss_score), ImageVulnerability.id).offset(skip).limit(limit)
     result = await db.execute(stmt)
-    vulnerabilities = result.scalars().all()
-
-    return vulnerabilities
+    return result.scalars().all()
 
 
 @router.post("/images/{image_id}/verify-signature")
@@ -410,17 +471,7 @@ async def verify_image_signature(
     the response carries ``status: no_verifier_backend`` and repeats the
     recorded fields. The stored verification flags are left untouched.
     """
-    stmt = select(ContainerImage).where(
-        and_(
-            ContainerImage.id == image_id,
-            ContainerImage.organization_id == org_id,
-        )
-    )
-    result = await db.execute(stmt)
-    image = result.scalar_one_or_none()
-
-    if not image:
-        raise HTTPException(status_code=404, detail="Image not found")
+    image = await _image_or_404(db, image_id, org_id)
 
     scanner = ImageScanner()
     verification = await scanner.verify_image_signature(image)
@@ -435,35 +486,29 @@ async def assess_image_risk(
     org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
-    """Get image risk assessment."""
-    stmt = select(ContainerImage).where(
-        and_(
-            ContainerImage.id == image_id,
-            ContainerImage.organization_id == org_id,
-        )
-    )
-    result = await db.execute(stmt)
-    image = result.scalar_one_or_none()
-
-    if not image:
-        raise HTTPException(status_code=404, detail="Image not found")
+    """Get image risk assessment (only meaningful once a scanner reported)."""
+    image = await _image_or_404(db, image_id, org_id)
+    scanned = image.scan_status == "completed" and image.scanned_at is not None
+    if not scanned:
+        recommendation = "Not scanned: no scanner has reported on this image, so its risk is unknown"
+    elif image.risk_score >= 80:
+        recommendation = "High risk - remediate immediately"
+    elif image.risk_score >= 50:
+        recommendation = "Medium risk - plan remediation"
+    else:
+        recommendation = "Low risk - acceptable"
 
     return {
         "image_id": image_id,
-        "risk_score": image.risk_score,
+        "risk_score": image.risk_score if scanned else None,
         "compliance_status": image.compliance_status,
+        "scan_status": image.scan_status,
         "vulnerability_critical": image.vulnerability_count_critical,
         "vulnerability_high": image.vulnerability_count_high,
         "is_signed": image.is_signed,
         "signature_verified": image.signature_verified,
         "days_since_scan": _days_since(image.scanned_at),
-        "recommendation": (
-            "High risk - remediate immediately"
-            if image.risk_score >= 80
-            else "Medium risk - plan remediation"
-            if image.risk_score >= 50
-            else "Low risk - acceptable"
-        ),
+        "recommendation": recommendation,
     }
 
 
@@ -488,11 +533,9 @@ async def list_clusters(
     if provider:
         stmt = stmt.where(KubernetesCluster.provider == provider)
 
-    stmt = stmt.order_by(desc(KubernetesCluster.risk_score)).offset(skip).limit(limit)
+    stmt = stmt.order_by(desc(KubernetesCluster.risk_score), KubernetesCluster.id).offset(skip).limit(limit)
     result = await db.execute(stmt)
-    clusters = result.scalars().all()
-
-    return clusters
+    return result.scalars().all()
 
 
 @router.post("/clusters", response_model=KubernetesClusterResponse, status_code=201)
@@ -502,7 +545,22 @@ async def create_cluster(
     db: DatabaseSession = None,
     _user: AdminRoleUser = None,
 ):
-    """Create Kubernetes cluster record."""
+    """Register a Kubernetes cluster (name unique per organisation).
+
+    The cluster starts ``not_assessed``; install a credential with
+    ``PUT /clusters/{id}/credential`` and run ``POST /clusters/{id}/audit``.
+    """
+    dup = (await db.execute(
+        select(KubernetesCluster.id).where(
+            KubernetesCluster.organization_id == org_id, KubernetesCluster.name == request.name,
+        ),
+    )).first()
+    if dup:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "cluster_exists", "cluster_id": dup[0],
+                    "detail": "A cluster with this name is already registered."},
+        )
     cluster = KubernetesCluster(
         name=request.name,
         version=request.version,
@@ -510,13 +568,16 @@ async def create_cluster(
         endpoint=request.endpoint,
         pod_security_standards=request.pod_security_standards,
         admission_controllers=request.admission_controllers or {},
+        assessment_status="not_assessed",
         organization_id=org_id,
     )
     db.add(cluster)
+    await db.flush()
+    await _audit(db, _user, org_id, "k8s_cluster_registered", "kubernetes_cluster", cluster.id,
+                 f"registered cluster {request.name}", {"name": request.name, "endpoint": request.endpoint})
     await db.commit()
     await db.refresh(cluster)
-
-    logger.info(f"Created cluster {cluster.id}")
+    logger.info("k8s_cluster_registered", cluster_id=cluster.id)
     return cluster
 
 
@@ -527,19 +588,7 @@ async def get_cluster(
     db: DatabaseSession = None,
 ):
     """Get cluster details."""
-    stmt = select(KubernetesCluster).where(
-        and_(
-            KubernetesCluster.id == cluster_id,
-            KubernetesCluster.organization_id == org_id,
-        )
-    )
-    result = await db.execute(stmt)
-    cluster = result.scalar_one_or_none()
-
-    if not cluster:
-        raise HTTPException(status_code=404, detail="Cluster not found")
-
-    return cluster
+    return await _cluster_or_404(db, cluster_id, org_id)
 
 
 @router.patch("/clusters/{cluster_id}", response_model=KubernetesClusterResponse)
@@ -550,25 +599,93 @@ async def update_cluster(
     db: DatabaseSession = None,
     _user: AdminRoleUser = None,
 ):
-    """Update cluster configuration."""
-    stmt = select(KubernetesCluster).where(
-        and_(
-            KubernetesCluster.id == cluster_id,
-            KubernetesCluster.organization_id == org_id,
-        )
-    )
-    result = await db.execute(stmt)
-    cluster = result.scalar_one_or_none()
+    """Update the cluster's self-attested configuration.
 
-    if not cluster:
-        raise HTTPException(status_code=404, detail="Cluster not found")
+    These booleans are recorded as given; they are not inputs to the CIS
+    assessment, which reads the Kubernetes API.
+    """
+    cluster = await _cluster_or_404(db, cluster_id, org_id)
 
-    for field, value in request.dict(exclude_unset=True).items():
+    for field, value in request.model_dump(exclude_unset=True).items():
         setattr(cluster, field, value)
 
     await db.commit()
     await db.refresh(cluster)
 
+    return cluster
+
+
+@router.delete("/clusters/{cluster_id}", status_code=204)
+async def delete_cluster(
+    cluster_id: str,
+    org_id: OrganizationId,
+    db: DatabaseSession = None,
+    _user: AdminRoleUser = None,
+):
+    """Delete a cluster with its findings, check results, runtime alerts and credential."""
+    cluster = await _cluster_or_404(db, cluster_id, org_id)
+    for model in (K8sSecurityFinding, K8sCheckResult, RuntimeAlert):
+        await db.execute(delete(model).where(
+            model.cluster_id == cluster.id, model.organization_id == org_id,
+        ))
+    await _audit(db, _user, org_id, "k8s_cluster_deleted", "kubernetes_cluster", cluster.id,
+                 f"deleted cluster {cluster.name}", {})
+    await db.delete(cluster)
+    await db.commit()
+
+
+@router.put("/clusters/{cluster_id}/credential", response_model=KubernetesClusterResponse)
+async def set_cluster_credential(
+    cluster_id: str,
+    request: ClusterCredentialRequest,
+    org_id: OrganizationId,
+    db: DatabaseSession = None,
+    _user: AdminRoleUser = None,
+):
+    """Install the Kubernetes API credential (kubeconfig or bearer token).
+
+    Stored encrypted (``enc:v1:``); never returned. A kubeconfig's server
+    becomes the cluster endpoint. Supported user auth: token or inline client
+    certificate; exec / auth-provider plugins and file references are refused
+    (422 ``invalid_credential``).
+    """
+    cluster = await _cluster_or_404(db, cluster_id, org_id)
+    try:
+        ctype, cred = normalise_credential(
+            kubeconfig=request.kubeconfig, token=request.token, ca_data=request.ca_data,
+            context=request.context, endpoint=cluster.endpoint,
+        )
+    except KubeCredentialError as exc:
+        raise HTTPException(
+            status_code=422, detail={"error": "invalid_credential", "detail": str(exc)},
+        ) from exc
+    store_credential(cluster, ctype, cred)
+    cluster.assessment_status = "not_assessed"
+    cluster.assessment_error = None
+    await _audit(db, _user, org_id, "k8s_cluster_credential_set", "kubernetes_cluster", cluster.id,
+                 f"stored {ctype} credential for cluster {cluster.name}",
+                 {"credential_type": ctype, "server": cred["server"]})
+    await db.commit()
+    await db.refresh(cluster)
+    return cluster
+
+
+@router.delete("/clusters/{cluster_id}/credential", response_model=KubernetesClusterResponse)
+async def delete_cluster_credential(
+    cluster_id: str,
+    org_id: OrganizationId,
+    db: DatabaseSession = None,
+    _user: AdminRoleUser = None,
+):
+    """Remove the stored credential; the cluster can no longer be assessed."""
+    cluster = await _cluster_or_404(db, cluster_id, org_id)
+    cluster.credential_encrypted = None
+    cluster.credential_type = None
+    cluster.credential_set_at = None
+    await _audit(db, _user, org_id, "k8s_cluster_credential_removed", "kubernetes_cluster", cluster.id,
+                 f"removed credential of cluster {cluster.name}", {})
+    await db.commit()
+    await db.refresh(cluster)
     return cluster
 
 
@@ -581,86 +698,83 @@ async def audit_cluster(
     _user: AdminRoleUser = None,
 ):
     """
-    Review a cluster's recorded (self-attested) security configuration.
+    Run the CIS Kubernetes checks against the cluster's Kubernetes API.
 
-    No Kubernetes API call is made: the checks read the booleans stored on
-    the cluster row, so the response status is ``self_attested``. Re-running
-    the review does not duplicate findings that are already open.
+    ``status``: ``assessed`` (checks evaluated on API data), ``failed`` (the
+    API could not be read; reason given) or ``not_assessed`` (no credential).
+    Every check without API evidence is stored as ``not_assessed``, never as
+    a pass. Findings are upserted per (cluster, image, check): a re-run never
+    duplicates them, and an open finding whose check now passes is marked
+    remediated.
     """
-    stmt = select(KubernetesCluster).where(
-        and_(
-            KubernetesCluster.id == cluster_id,
-            KubernetesCluster.organization_id == org_id,
-        )
-    )
-    result = await db.execute(stmt)
-    cluster = result.scalar_one_or_none()
-
-    if not cluster:
-        raise HTTPException(status_code=404, detail="Cluster not found")
-
-    # Run the actual auditor
-    auditor = K8sSecurityAuditor()
-    audit_result = await auditor.audit_cluster_config(cluster)
-    cis_result = await auditor.check_cis_k8s_benchmark(cluster)
-
-    # Persist new findings to DB. Cluster-level findings (RBAC,
-    # encryption-at-rest, CIS benchmark misses) store namespace=NULL —
-    # the column is nullable specifically for these. Findings already open
-    # for the same type and resource are not inserted again.
-    open_result = await db.execute(
-        select(
-            K8sSecurityFinding.finding_type,
-            K8sSecurityFinding.resource_name,
-        ).where(
-            K8sSecurityFinding.cluster_id == cluster_id,
+    cluster = await _cluster_or_404(db, cluster_id, org_id)
+    summary = await run_cis_audit(db, cluster)
+    open_findings = (await db.execute(
+        select(func.count(K8sSecurityFinding.id)).where(
+            K8sSecurityFinding.cluster_id == cluster.id,
             K8sSecurityFinding.organization_id == org_id,
             K8sSecurityFinding.status == "open",
-        )
+        ),
+    )).scalar() or 0
+    await _audit(
+        db, _user, org_id, "k8s_cluster_cis_audit", "kubernetes_cluster", cluster.id,
+        f"CIS audit: {summary['assessment_status']}", summary,
+        success=summary["assessment_status"] != "failed", error=summary["reason"],
     )
-    already_open = {(row[0], row[1]) for row in open_result.all()}
-    for finding in audit_result.get("findings", []):
-        resource_name = (
-            finding.get("resource_name") or finding.get("resource") or cluster.name
-        )
-        if (finding["type"], resource_name) in already_open:
-            continue
-        already_open.add((finding["type"], resource_name))
-        db.add(K8sSecurityFinding(
-            cluster_id=cluster_id,
-            finding_type=finding["type"],
-            severity=finding["severity"],
-            description=finding.get("message", ""),
-            namespace=finding.get("namespace"),
-            resource_type=finding.get("resource_type") or "cluster",
-            resource_name=resource_name,
-            status="open",
-            detected_at=datetime.now(timezone.utc),
-            organization_id=org_id,
-        ))
-
-    # Update cluster scores
-    cluster.compliance_score = int(cis_result.get("compliance_percentage", 0))
-    findings_count = audit_result.get("findings_count", 0)
-    cluster.risk_score = min(100, findings_count * 15)
-    cluster.last_audit = datetime.now(timezone.utc)
-
     await db.commit()
     await db.refresh(cluster)
-
-    logger.info(
-        f"Audit complete for cluster {cluster_id}: "
-        f"{findings_count} findings, CIS {cis_result['compliance_percentage']}%"
-    )
-
+    logger.info("k8s_cluster_cis_audit", cluster_id=cluster_id, status=summary["assessment_status"])
     return ClusterAuditResponse(
-        status="self_attested",
+        status=summary["assessment_status"],
         cluster_id=cluster_id,
-        findings=findings_count,
-        risk_score=cluster.risk_score,
-        compliance_score=cluster.compliance_score,
-        cis_compliance=cis_result["compliance_percentage"],
+        findings=open_findings,
+        risk_score=cluster.risk_score or 0,
+        compliance_score=cluster.compliance_score or 0,
+        cis_compliance=summary["cis_compliance"],
+        compliance_status=cluster.compliance_status,
+        reason=summary["reason"],
+        checks=summary["checks"],
+        findings_new=summary["findings_new"],
+        findings_updated=summary["findings_updated"],
+        findings_resolved=summary["findings_resolved"],
+        benchmark=summary["benchmark"],
     )
+
+
+async def _check_counts(db: DatabaseSession, org_id: str, cluster_ids: List[str]) -> Dict[str, Dict[str, int]]:
+    out: Dict[str, Dict[str, int]] = {cid: {"pass": 0, "fail": 0, "not_assessed": 0} for cid in cluster_ids}
+    if not cluster_ids:
+        return out
+    rows = await db.execute(
+        select(K8sCheckResult.cluster_id, K8sCheckResult.status, func.count(K8sCheckResult.id))
+        .where(K8sCheckResult.organization_id == org_id, K8sCheckResult.cluster_id.in_(cluster_ids))
+        .group_by(K8sCheckResult.cluster_id, K8sCheckResult.status),
+    )
+    for cid, check_status, count in rows.all():
+        out.setdefault(cid, {})[check_status] = count
+    return out
+
+
+def _cis_score(counts: Dict[str, int]) -> Optional[float]:
+    assessed = counts.get("pass", 0) + counts.get("fail", 0)
+    return round(counts.get("pass", 0) / assessed * 100, 1) if assessed else None
+
+
+@router.get("/clusters/{cluster_id}/checks", response_model=List[K8sCheckResultResponse])
+async def list_cluster_checks(
+    cluster_id: str,
+    org_id: OrganizationId,
+    db: DatabaseSession = None,
+    status_filter: Optional[str] = Query(None, alias="status"),
+):
+    """Stored CIS check results of a cluster (pass / fail / not_assessed)."""
+    await _cluster_or_404(db, cluster_id, org_id)
+    stmt = select(K8sCheckResult).where(
+        K8sCheckResult.cluster_id == cluster_id, K8sCheckResult.organization_id == org_id,
+    )
+    if status_filter:
+        stmt = stmt.where(K8sCheckResult.status == status_filter)
+    return (await db.execute(stmt.order_by(K8sCheckResult.check_id))).scalars().all()
 
 
 @router.get("/clusters/{cluster_id}/compliance-check")
@@ -669,31 +783,25 @@ async def check_cluster_compliance(
     org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
-    """Get cluster compliance status."""
-    stmt = select(KubernetesCluster).where(
-        and_(
-            KubernetesCluster.id == cluster_id,
-            KubernetesCluster.organization_id == org_id,
-        )
-    )
-    result = await db.execute(stmt)
-    cluster = result.scalar_one_or_none()
-
-    if not cluster:
-        raise HTTPException(status_code=404, detail="Cluster not found")
-
-    # Framework scores are derived from the configuration booleans recorded
-    # on the cluster row (no Kubernetes API call), so the result is labelled
-    # self-attested. A GET no longer writes the score back to the cluster.
-    checker = ComplianceChecker()
-    matrix = await checker.generate_compliance_matrix(cluster)
-
+    """Cluster compliance from the stored CIS check results (read only)."""
+    cluster = await _cluster_or_404(db, cluster_id, org_id)
+    counts = (await _check_counts(db, org_id, [cluster.id]))[cluster.id]
+    score = _cis_score(counts)
     return {
-        "status": "self_attested",
-        "basis": "recorded_cluster_configuration",
+        "status": cluster.compliance_status,
+        "basis": "cis_checks_via_kubernetes_api",
+        "benchmark": CIS_BENCHMARK,
         "cluster_id": cluster_id,
-        "compliance_score": matrix.get("overall_compliance", 0),
-        "frameworks": matrix.get("frameworks", {}),
+        "assessment_status": cluster.assessment_status,
+        "assessment_error": cluster.assessment_error,
+        "last_audit": cluster.last_audit,
+        "compliance_score": score,
+        "checks": counts,
+        # No mapping from CIS results to these frameworks exists.
+        "frameworks": {
+            name: {"status": "not_assessed", "reason": "no control mapping from CIS Kubernetes checks"}
+            for name in ("nsa_cisa", "dod_stig", "soc2")
+        },
     }
 
 
@@ -708,18 +816,8 @@ async def get_cluster_findings(
     limit: int = Query(50, ge=1, le=200),
 ):
     """Get security findings for cluster."""
-    # Verify cluster ownership
-    stmt = select(KubernetesCluster).where(
-        and_(
-            KubernetesCluster.id == cluster_id,
-            KubernetesCluster.organization_id == org_id,
-        )
-    )
-    result = await db.execute(stmt)
-    if not result.scalar_one_or_none():
-        raise HTTPException(status_code=404, detail="Cluster not found")
+    await _cluster_or_404(db, cluster_id, org_id)
 
-    # Get findings
     stmt = select(K8sSecurityFinding).where(
         K8sSecurityFinding.cluster_id == cluster_id,
         K8sSecurityFinding.organization_id == org_id,
@@ -731,11 +829,9 @@ async def get_cluster_findings(
     if severity:
         stmt = stmt.where(K8sSecurityFinding.severity == severity)
 
-    stmt = stmt.order_by(desc(K8sSecurityFinding.detected_at)).offset(skip).limit(limit)
+    stmt = stmt.order_by(desc(K8sSecurityFinding.detected_at), K8sSecurityFinding.id).offset(skip).limit(limit)
     result = await db.execute(stmt)
-    findings = result.scalars().all()
-
-    return findings
+    return result.scalars().all()
 
 
 # ============================================================================
@@ -763,11 +859,9 @@ async def list_findings(
     if severity:
         stmt = stmt.where(K8sSecurityFinding.severity == severity)
 
-    stmt = stmt.order_by(desc(K8sSecurityFinding.detected_at)).offset(skip).limit(limit)
+    stmt = stmt.order_by(desc(K8sSecurityFinding.detected_at), K8sSecurityFinding.id).offset(skip).limit(limit)
     result = await db.execute(stmt)
-    findings = result.scalars().all()
-
-    return findings
+    return result.scalars().all()
 
 
 @router.post("/findings/{finding_id}/remediate", response_model=SecurityFindingRemediationResponse)
@@ -781,18 +875,19 @@ async def remediate_finding(
     """
     Generate a remediation manifest for a finding.
 
-    The manifest is NOT applied (there is no Kubernetes client), so the
-    finding stays in its current status and the response status is
-    ``manifest_generated``. Mark it remediated with PATCH once applied.
+    The manifest is NOT applied (PySOAR only reads the Kubernetes API), so
+    the finding stays in its current status and the response status is
+    ``manifest_generated``. The next CIS audit marks the finding remediated
+    once the check passes.
     """
-    stmt = select(K8sSecurityFinding).where(
-        and_(
-            K8sSecurityFinding.id == finding_id,
-            K8sSecurityFinding.organization_id == org_id,
+    finding = (await db.execute(
+        select(K8sSecurityFinding).where(
+            and_(
+                K8sSecurityFinding.id == finding_id,
+                K8sSecurityFinding.organization_id == org_id,
+            )
         )
-    )
-    result = await db.execute(stmt)
-    finding = result.scalar_one_or_none()
+    )).scalar_one_or_none()
 
     if not finding:
         raise HTTPException(status_code=404, detail="Finding not found")
@@ -813,8 +908,8 @@ async def remediate_finding(
         manifest=manifest,
         description=(
             f"Remediation manifest for {finding.finding_type}. Not applied: "
-            "no Kubernetes integration is configured; apply it yourself and "
-            "then mark the finding remediated."
+            "PySOAR has read-only Kubernetes access; apply it yourself and re-run "
+            "the cluster audit (or mark the finding remediated)."
         ),
     )
 
@@ -828,14 +923,14 @@ async def update_finding(
     _user: AnalystUser = None,
 ):
     """Update finding status."""
-    stmt = select(K8sSecurityFinding).where(
-        and_(
-            K8sSecurityFinding.id == finding_id,
-            K8sSecurityFinding.organization_id == org_id,
+    finding = (await db.execute(
+        select(K8sSecurityFinding).where(
+            and_(
+                K8sSecurityFinding.id == finding_id,
+                K8sSecurityFinding.organization_id == org_id,
+            )
         )
-    )
-    result = await db.execute(stmt)
-    finding = result.scalar_one_or_none()
+    )).scalar_one_or_none()
 
     if not finding:
         raise HTTPException(status_code=404, detail="Finding not found")
@@ -865,7 +960,7 @@ async def list_runtime_alerts(
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
 ):
-    """List runtime security alerts."""
+    """List runtime security alerts (written only by a runtime sensor integration)."""
     stmt = select(RuntimeAlert).where(
         RuntimeAlert.organization_id == org_id
     )
@@ -876,11 +971,9 @@ async def list_runtime_alerts(
     if severity:
         stmt = stmt.where(RuntimeAlert.severity == severity)
 
-    stmt = stmt.order_by(desc(RuntimeAlert.created_at)).offset(skip).limit(limit)
+    stmt = stmt.order_by(desc(RuntimeAlert.created_at), RuntimeAlert.id).offset(skip).limit(limit)
     result = await db.execute(stmt)
-    alerts = result.scalars().all()
-
-    return alerts
+    return result.scalars().all()
 
 
 @router.patch("/runtime-alerts/{alert_id}", response_model=RuntimeAlertResponse)
@@ -892,14 +985,14 @@ async def update_runtime_alert(
     _user: AnalystUser = None,
 ):
     """Update runtime alert status."""
-    stmt = select(RuntimeAlert).where(
-        and_(
-            RuntimeAlert.id == alert_id,
-            RuntimeAlert.organization_id == org_id,
+    alert = (await db.execute(
+        select(RuntimeAlert).where(
+            and_(
+                RuntimeAlert.id == alert_id,
+                RuntimeAlert.organization_id == org_id,
+            )
         )
-    )
-    result = await db.execute(stmt)
-    alert = result.scalar_one_or_none()
+    )).scalar_one_or_none()
 
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
@@ -924,14 +1017,14 @@ async def investigate_alert(
     _user: AnalystUser = None,
 ):
     """Investigate runtime alert."""
-    stmt = select(RuntimeAlert).where(
-        and_(
-            RuntimeAlert.id == alert_id,
-            RuntimeAlert.organization_id == org_id,
+    alert = (await db.execute(
+        select(RuntimeAlert).where(
+            and_(
+                RuntimeAlert.id == alert_id,
+                RuntimeAlert.organization_id == org_id,
+            )
         )
-    )
-    result = await db.execute(stmt)
-    alert = result.scalar_one_or_none()
+    )).scalar_one_or_none()
 
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
@@ -939,12 +1032,12 @@ async def investigate_alert(
     alert.status = "investigating"
     await db.commit()
 
-    logger.info(f"Investigating alert {alert_id}")
+    logger.info("container_runtime_alert_investigating", alert_id=alert_id)
 
     return {
         "status": "investigating",
         "alert_id": alert_id,
-        "timestamp": datetime.utcnow(),
+        "timestamp": datetime.now(timezone.utc),
     }
 
 
@@ -957,19 +1050,19 @@ async def quarantine_pod_from_alert(
 ):
     """Quarantine the pod named by a runtime alert: not implemented.
 
-    There is no Kubernetes client, so no NetworkPolicy can be applied. The
-    previous version returned ``quarantined`` and marked the alert
-    ``contained`` without touching the cluster. It now returns 501 and leaves
-    the alert unchanged.
+    PySOAR's Kubernetes access is read-only (CIS checks), so no NetworkPolicy
+    can be applied. The previous version returned ``quarantined`` and marked
+    the alert ``contained`` without touching the cluster. It returns 501 and
+    leaves the alert unchanged.
     """
-    stmt = select(RuntimeAlert).where(
-        and_(
-            RuntimeAlert.id == alert_id,
-            RuntimeAlert.organization_id == org_id,
+    alert = (await db.execute(
+        select(RuntimeAlert).where(
+            and_(
+                RuntimeAlert.id == alert_id,
+                RuntimeAlert.organization_id == org_id,
+            )
         )
-    )
-    result = await db.execute(stmt)
-    alert = result.scalar_one_or_none()
+    )).scalar_one_or_none()
 
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
@@ -979,9 +1072,9 @@ async def quarantine_pod_from_alert(
         detail={
             "error": "not_implemented",
             "detail": (
-                "Pod quarantine needs a Kubernetes integration, which is not "
-                "configured. No NetworkPolicy was applied and the alert status "
-                "was not changed."
+                "Pod quarantine needs write access to the cluster, which PySOAR does "
+                "not use (its Kubernetes access is read-only). No NetworkPolicy was "
+                "applied and the alert status was not changed."
             ),
         },
     )
@@ -992,167 +1085,106 @@ async def quarantine_pod_from_alert(
 # ============================================================================
 
 
+async def _count(db: DatabaseSession, stmt: Any) -> int:
+    return int((await db.execute(stmt)).scalar() or 0)
+
+
 @router.get("/dashboard/overview", response_model=DashboardOverviewResponse)
 async def get_dashboard_overview(
     org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """
-    Get container security dashboard overview.
+    Container security dashboard overview, from stored rows only.
 
-    Returns summary of images, clusters, vulnerabilities, and alerts.
+    Cluster compliance is ``not_assessed`` until a CIS audit read the
+    cluster's Kubernetes API; only assessed clusters count as non-compliant.
     """
-    # Count images
-    img_stmt = select(func.count(ContainerImage.id)).where(
-        ContainerImage.organization_id == org_id
-    )
-    img_result = await db.execute(img_stmt)
-    total_images = img_result.scalar() or 0
+    total_images = await _count(db, select(func.count(ContainerImage.id)).where(
+        ContainerImage.organization_id == org_id))
+    total_clusters = await _count(db, select(func.count(KubernetesCluster.id)).where(
+        KubernetesCluster.organization_id == org_id))
 
-    # Count clusters
-    cls_stmt = select(func.count(KubernetesCluster.id)).where(
-        KubernetesCluster.organization_id == org_id
-    )
-    cls_result = await db.execute(cls_stmt)
-    total_clusters = cls_result.scalar() or 0
+    vuln_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "negligible": 0}
+    for sev, count in (await db.execute(
+        select(ImageVulnerability.severity, func.count(ImageVulnerability.id))
+        .where(ImageVulnerability.organization_id == org_id)
+        .group_by(ImageVulnerability.severity),
+    )).all():
+        if sev in vuln_counts:
+            vuln_counts[sev] = int(count)
 
-    # Count vulnerabilities by severity
-    vuln_stmt = select(ImageVulnerability).where(
-        ImageVulnerability.organization_id == org_id
-    )
-    vuln_result = await db.execute(vuln_stmt)
-    vulns = vuln_result.scalars().all()
+    critical_findings = await _count(db, select(func.count(K8sSecurityFinding.id)).where(
+        K8sSecurityFinding.organization_id == org_id,
+        K8sSecurityFinding.severity == "critical",
+        K8sSecurityFinding.status == "open",
+    ))
+    open_findings = await _count(db, select(func.count(K8sSecurityFinding.id)).where(
+        K8sSecurityFinding.organization_id == org_id, K8sSecurityFinding.status == "open"))
+    new_alerts = await _count(db, select(func.count(RuntimeAlert.id)).where(
+        RuntimeAlert.organization_id == org_id, RuntimeAlert.status == "new"))
+    active_alerts = await _count(db, select(func.count(RuntimeAlert.id)).where(
+        RuntimeAlert.organization_id == org_id,
+        RuntimeAlert.status.notin_(["resolved", "false_positive"]),
+    ))
+    high_risk_images = await _count(db, select(func.count(ContainerImage.id)).where(
+        ContainerImage.organization_id == org_id,
+        ContainerImage.scan_status == "completed",
+        ContainerImage.risk_score >= 80,
+    ))
+    non_compliant_clusters = await _count(db, select(func.count(KubernetesCluster.id)).where(
+        KubernetesCluster.organization_id == org_id,
+        KubernetesCluster.assessment_status == "assessed",
+        KubernetesCluster.compliance_score < 60,
+    ))
 
-    vuln_counts = {
-        "critical": sum(1 for v in vulns if v.severity == "critical"),
-        "high": sum(1 for v in vulns if v.severity == "high"),
-        "medium": sum(1 for v in vulns if v.severity == "medium"),
-        "low": sum(1 for v in vulns if v.severity == "low"),
-        "negligible": sum(1 for v in vulns if v.severity == "negligible"),
-    }
-
-    # Count critical findings
-    finding_stmt = select(func.count(K8sSecurityFinding.id)).where(
-        and_(
-            K8sSecurityFinding.organization_id == org_id,
-            K8sSecurityFinding.severity == "critical",
-        )
-    )
-    finding_result = await db.execute(finding_stmt)
-    critical_findings = finding_result.scalar() or 0
-
-    # Count all open findings (status == "open")
-    open_stmt = select(func.count(K8sSecurityFinding.id)).where(
-        and_(
-            K8sSecurityFinding.organization_id == org_id,
-            K8sSecurityFinding.status == "open",
-        )
-    )
-    open_result = await db.execute(open_stmt)
-    open_findings = open_result.scalar() or 0
-
-    # Count new alerts
-    alert_stmt = select(func.count(RuntimeAlert.id)).where(
-        and_(
-            RuntimeAlert.organization_id == org_id,
-            RuntimeAlert.status == "new",
-        )
-    )
-    alert_result = await db.execute(alert_stmt)
-    new_alerts = alert_result.scalar() or 0
-
-    # Count all active (not-resolved) runtime alerts
-    active_alert_stmt = select(func.count(RuntimeAlert.id)).where(
-        and_(
-            RuntimeAlert.organization_id == org_id,
-            RuntimeAlert.status.notin_(["resolved", "false_positive"]),
-        )
-    )
-    active_alert_result = await db.execute(active_alert_stmt)
-    active_alerts = active_alert_result.scalar() or 0
-
-    # High risk images
-    high_risk_stmt = select(func.count(ContainerImage.id)).where(
-        and_(
-            ContainerImage.organization_id == org_id,
-            ContainerImage.risk_score >= 80,
-        )
-    )
-    high_risk_result = await db.execute(high_risk_stmt)
-    high_risk_images = high_risk_result.scalar() or 0
-
-    # Non-compliant clusters
-    non_compliant_stmt = select(func.count(KubernetesCluster.id)).where(
-        and_(
-            KubernetesCluster.organization_id == org_id,
-            KubernetesCluster.compliance_score < 60,
-        )
-    )
-    non_compliant_result = await db.execute(non_compliant_stmt)
-    non_compliant_clusters = non_compliant_result.scalar() or 0
-
-    # Top vulnerabilities (by severity, newest)
-    top_vulns_stmt = (
-        select(ImageVulnerability)
-        .where(
-            and_(
+    top_vulnerabilities = [
+        {
+            "cve_id": v.cve_id,
+            "severity": v.severity,
+            "package_name": v.package_name,
+            "image_id": v.image_id,
+            "cvss_score": v.cvss_score,
+        }
+        for v in (await db.execute(
+            select(ImageVulnerability)
+            .where(
                 ImageVulnerability.organization_id == org_id,
                 ImageVulnerability.severity.in_(["critical", "high"]),
             )
-        )
-        .order_by(ImageVulnerability.created_at.desc())
-        .limit(10)
-    )
-    top_vulns_result = await db.execute(top_vulns_stmt)
-    top_vulnerabilities = [
-        {
-            "cve_id": getattr(v, "cve_id", None),
-            "severity": v.severity,
-            "package_name": getattr(v, "package_name", None),
-            "image_id": getattr(v, "image_id", None),
-            "cvss_score": getattr(v, "cvss_score", None),
-        }
-        for v in top_vulns_result.scalars().all()
+            .order_by(ImageVulnerability.created_at.desc())
+            .limit(10)
+        )).scalars().all()
     ]
 
-    # Cluster compliance summary with REAL findings counts per cluster
-    cluster_list_stmt = select(KubernetesCluster).where(
-        KubernetesCluster.organization_id == org_id
-    )
-    cluster_list_result = await db.execute(cluster_list_stmt)
-    clusters = list(cluster_list_result.scalars().all())
-
-    # Fetch findings counts for all clusters in a single grouped query
-    findings_by_cluster: dict = {}
+    clusters = list((await db.execute(
+        select(KubernetesCluster).where(KubernetesCluster.organization_id == org_id)
+        .order_by(KubernetesCluster.name).limit(200),
+    )).scalars().all())
+    findings_by_cluster: Dict[str, int] = {}
     if clusters:
-        findings_count_result = await db.execute(
-            select(
-                K8sSecurityFinding.cluster_id,
-                func.count(K8sSecurityFinding.id),
-            )
+        for cid, count in (await db.execute(
+            select(K8sSecurityFinding.cluster_id, func.count(K8sSecurityFinding.id))
             .where(
-                and_(
-                    K8sSecurityFinding.organization_id == org_id,
-                    K8sSecurityFinding.cluster_id.in_([c.id for c in clusters]),
-                    K8sSecurityFinding.status == "open",
-                )
+                K8sSecurityFinding.organization_id == org_id,
+                K8sSecurityFinding.cluster_id.in_([c.id for c in clusters]),
+                K8sSecurityFinding.status == "open",
             )
             .group_by(K8sSecurityFinding.cluster_id)
-        )
-        for cluster_id, count in findings_count_result.all():
-            findings_by_cluster[cluster_id] = count
+        )).all():
+            findings_by_cluster[cid] = int(count)
 
-    cluster_compliance = []
-    for c in clusters:
-        score = getattr(c, "compliance_score", 0) or 0
-        cluster_compliance.append(
-            ClusterComplianceResponse(
-                cluster_name=c.name,
-                compliance_score=int(score),
-                findings_count=findings_by_cluster.get(c.id, 0),
-                status="compliant" if score >= 80 else ("non_compliant" if score < 60 else "partial"),
-            )
+    cluster_compliance = [
+        ClusterComplianceResponse(
+            cluster_name=c.name,
+            risk_score=int(c.risk_score or 0),
+            compliance_score=int(c.compliance_score or 0),
+            findings_count=findings_by_cluster.get(c.id, 0),
+            status=c.compliance_status,
+            assessment_status=c.assessment_status,
         )
+        for c in clusters
+    ]
 
     return DashboardOverviewResponse(
         total_images=total_images,
@@ -1177,37 +1209,31 @@ async def get_compliance_matrix(
     org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
-    """Get compliance matrix across frameworks."""
-    stmt = select(KubernetesCluster).where(
-        KubernetesCluster.organization_id == org_id
-    )
-    result = await db.execute(stmt)
-    clusters = result.scalars().all()
+    """Per-cluster compliance from stored CIS check results.
 
-    checker = ComplianceChecker()
-    matrices = []
-
+    Only CIS Kubernetes checks are evaluated (against the API); NSA/CISA,
+    DoD STIG and SOC 2 have no mapping, so their scores are null.
+    """
+    clusters = list((await db.execute(
+        select(KubernetesCluster).where(KubernetesCluster.organization_id == org_id)
+        .order_by(KubernetesCluster.name).limit(200),
+    )).scalars().all())
+    counts = await _check_counts(db, org_id, [c.id for c in clusters])
+    out = []
     for cluster in clusters:
-        nsa_cisa = await checker.check_nsa_cisa_hardening(cluster)
-        dod_stig = await checker.check_dod_stig(cluster)
-        soc2 = await checker.check_soc2_controls(cluster)
-
-        matrices.append(
-            ComplianceMatrixResponse(
-                cluster_name=cluster.name,
-                nsa_cisa_score=nsa_cisa["compliance_score"],
-                dod_stig_score=dod_stig["compliance_score"],
-                soc2_score=soc2["compliance_score"],
-                overall_compliance=int(
-                    (
-                        nsa_cisa["compliance_score"]
-                        + dod_stig["compliance_score"]
-                        + soc2["compliance_score"]
-                    )
-                    / 3
-                ),
-                timestamp=datetime.utcnow(),
-            )
-        )
-
-    return matrices
+        c_counts = counts.get(cluster.id, {})
+        score = _cis_score(c_counts) if cluster.assessment_status == "assessed" else None
+        out.append(ComplianceMatrixResponse(
+            cluster_name=cluster.name,
+            cluster_id=cluster.id,
+            cis_score=score,
+            overall_compliance=int(round(score)) if score is not None else None,
+            status=cluster.compliance_status,
+            reason=(
+                None if score is not None
+                else cluster.assessment_error or "not assessed: run a CIS audit with a stored credential"
+            ),
+            checks=c_counts,
+            timestamp=cluster.last_audit,
+        ))
+    return out

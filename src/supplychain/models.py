@@ -8,7 +8,7 @@ from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import Boolean, Float, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -126,10 +126,12 @@ class SoftwareComponent(BaseModel):
     license_type: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     license_spdx_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
-    # Identification standards
-    purl: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True, unique=True)
-    cpe: Mapped[Optional[str]] = mapped_column(String(500), nullable=True, unique=True)
-    checksum_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, unique=True)
+    # Identification standards. Unique per organisation (wave 4): they used
+    # to be unique across all tenants, so a second tenant importing the same
+    # package failed or was linked to the first tenant's row.
+    purl: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
+    cpe: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    checksum_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
 
     # Source and provenance
     source_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -169,10 +171,17 @@ class SoftwareComponent(BaseModel):
         Index("idx_component_org", "organization_id"),
         Index("idx_component_purl", "purl"),
         Index("idx_component_cpe", "cpe"),
+        UniqueConstraint("organization_id", "purl", name="uq_software_components_org_purl"),
+        UniqueConstraint("organization_id", "cpe", name="uq_software_components_org_cpe"),
     )
 
     def __repr__(self) -> str:
         return f"<SoftwareComponent {self.name}@{self.version}>"
+
+    @property
+    def vulnerability_scan_status(self) -> str:
+        """``not_scanned`` until an OSV / NVD lookup ran for this component."""
+        return "scanned" if self.last_scanned is not None else "not_scanned"
 
 
 class SBOM(BaseModel):
@@ -329,6 +338,12 @@ class SupplyChainRisk(BaseModel):
     cve_ids: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON array
     remediation_advice: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # Wave 4: the advisory a known_vulnerability risk came from (OSV id such
+    # as GHSA-... / PYSEC-..., or a CVE id from NVD) and its source (osv / nvd).
+    # Lookups deduplicate on (component_id, advisory_id).
+    advisory_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    source: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+
     # Status tracking
     status: Mapped[str] = mapped_column(
         String(50),
@@ -350,6 +365,7 @@ class SupplyChainRisk(BaseModel):
         Index("idx_risk_component_type", "component_id", "risk_type"),
         Index("idx_risk_org_status", "organization_id", "status"),
         Index("idx_risk_severity", "severity"),
+        Index("idx_risk_component_advisory", "component_id", "advisory_id"),
     )
 
     def __repr__(self) -> str:
@@ -421,3 +437,67 @@ class VendorAssessment(BaseModel):
 
     def __repr__(self) -> str:
         return f"<VendorAssessment {self.vendor_name}: {self.risk_tier}>"
+
+    @property
+    def assessment_summary(self) -> dict:
+        from src.supplychain.assessment import summarise_answers
+
+        return summarise_answers(self.questionnaire_responses)
+
+    @property
+    def assessment_status(self) -> str:
+        """not_assessed (no stored answers), partial or complete."""
+        return self.assessment_summary["status"]
+
+    @property
+    def answered_questions(self) -> int:
+        return self.assessment_summary["answered"]
+
+    @property
+    def total_questions(self) -> int:
+        return self.assessment_summary["total"]
+
+
+class SupplyChainVulnCache(BaseModel):
+    """Per-organisation cache of vulnerability-provider answers (wave 4).
+
+    ``provider``: ``osv`` (querybatch answer for one package query),
+    ``osv_vuln`` (one OSV advisory document) or ``nvd`` (CVE list for one CPE).
+    ``payload`` is the JSON the provider returned (trimmed to what is used).
+    """
+
+    __tablename__ = "supplychain_vuln_cache"
+
+    organization_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("organizations.id"), nullable=False, index=True,
+    )
+    provider: Mapped[str] = mapped_column(String(20), nullable=False)
+    query_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    query: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    payload: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("organization_id", "provider", "query_key", name="uq_supplychain_vuln_cache_key"),
+    )
+
+
+class SupplyChainProviderStatus(BaseModel):
+    """Last outcome of each vulnerability provider for one organisation (wave 4)."""
+
+    __tablename__ = "supplychain_provider_status"
+
+    organization_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("organizations.id"), nullable=False, index=True,
+    )
+    provider: Mapped[str] = mapped_column(String(20), nullable=False)
+    # ok | error | not_configured
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    last_success_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    requests_total: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("organization_id", "provider", name="uq_supplychain_provider_status"),
+    )

@@ -1,27 +1,45 @@
 """Supply Chain Security and SBOM Management Endpoints
 
 API endpoints for SBOM management, component tracking, risk assessment,
-vendor management, and compliance validation.
+vendor management, and compliance validation, all scoped to the caller's
+organisation.
+
+Wave 4 (W4-B):
+- Components are looked up in OSV (and NVD when ``NVD_API_KEY`` is set)
+  through the pinned transport with per-organisation caching
+  (``POST /components/lookup``, ``POST /components/{id}/lookup``,
+  ``GET /vulnerability-sources``); results are ``known_vulnerability`` risks
+  deduplicated per (component, advisory). A component never looked up reads
+  ``vulnerability_scan_status: not_scanned``.
+- SBOMs come from uploaded / imported CycloneDX or SPDX JSON (validated,
+  size-capped, stored with their components and dependency counts) or are
+  generated from stored components (``POST /sboms/generate``); nothing is
+  synthesised.
+- SBOM compliance is derived from the stored components (NTIA minimum
+  elements) and cannot be set by hand; vendor scores are derived from stored
+  questionnaire answers.
 """
 
+import io
 import json
 import math
-from datetime import datetime
-from typing import Annotated, Optional
+from datetime import datetime, timezone
+from typing import Annotated, Any, Optional
 
-from fastapi import Depends, APIRouter, Path, HTTPException, Query, UploadFile, File, status
+from fastapi import APIRouter, Depends, File, HTTPException, Path, Query, UploadFile, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import DatabaseSession, OrganizationId, require_role
-from src.models.user import User, UserRole
 from src.core.logging import get_logger
 from src.core.utils import safe_json_loads
-
-logger = get_logger(__name__)
+from src.models.audit import AuditLog
+from src.models.user import User, UserRole
 from src.schemas.supplychain import (
     ComponentDependencyTree,
+    ComponentLookupRequest,
     ComponentVulnerabilityLookup,
     DashboardOverview,
     LicenseBreakdown,
@@ -47,8 +65,21 @@ from src.schemas.supplychain import (
     VendorAssessmentUpdate,
     VendorScoreSummary,
 )
+from src.supplychain.assessment import (
+    MAX_SBOM_BYTES,
+    MAX_SBOM_COMPONENTS,
+    VALID_ANSWERS,
+    VENDOR_QUESTIONS,
+    SBOMValidationError,
+    assess_sbom,
+    dependency_stats,
+    detect_format,
+    normalise_answers,
+    stored_graph,
+    summarise_answers,
+    validate_sbom_document,
+)
 from src.supplychain.engine import (
-    CISASBOMCompliance,
     SBOMGenerator,
     SupplyChainRiskAnalyzer,
 )
@@ -59,6 +90,9 @@ from src.supplychain.models import (
     SupplyChainRisk,
     VendorAssessment,
 )
+from src.supplychain.vulnlookup import MAX_COMPONENTS_PER_LOOKUP, lookup_components, provider_status
+
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/supplychain", tags=["Supply Chain"])
 
@@ -67,14 +101,30 @@ router = APIRouter(prefix="/supplychain", tags=["Supply Chain"])
 AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
 AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
 
-
-# Helper functions
+SEVERITY_RANK = {"critical": 5, "high": 4, "medium": 3, "low": 2, "unknown": 1, "none": 0}
 
 
 class SBOMValidationRequest(BaseModel):
     """Body for ``POST /compliance/validate-sbom``."""
 
     sbom_id: str = Field(..., min_length=1, description="SBOM to validate")
+
+
+async def _audit(
+    db: AsyncSession, user: Optional[User], org_id: str, action: str, resource_type: str,
+    resource_id: Optional[str], description: str, payload: dict[str, Any],
+) -> None:
+    db.add(AuditLog(
+        user_id=str(user.id) if user is not None else None,
+        organization_id=org_id,
+        action=action,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        description=description[:4000],
+        new_value=json.dumps(payload, default=str),
+        success=True,
+    ))
+    await db.flush()
 
 
 # Helper functions take the caller's organisation and 404 on any id outside
@@ -148,85 +198,139 @@ async def get_vendor_or_404(db: AsyncSession, vendor_id: str, org_id: str) -> Ve
     return vendor
 
 
-# SBOM Endpoints
+# ---------------------------------------------------------------------------
+# SBOM persistence and compliance
+# ---------------------------------------------------------------------------
 
 
-@router.post("/sboms/generate", response_model=SBOMResponse)
-async def generate_sbom(
-    _sbom_create: SBOMCreate,
-    _org_id: OrganizationId,
-    _user: AnalystUser = None,
-):
-    """Generate an SBOM for an application: not implemented.
+def _supplier(c: dict) -> Optional[str]:
+    """Supplier name from SPDX ("Organization: X") or CycloneDX ({"name": X})."""
+    for key in ("supplier", "manufacturer", "vendor", "publisher", "originator"):
+        value = c.get(key)
+        if isinstance(value, dict):
+            value = value.get("name")
+        if isinstance(value, str) and value.strip() and value.strip().upper() != "NOASSERTION":
+            text = value.strip()
+            for prefix in ("Organization:", "Person:", "Tool:"):
+                if text.startswith(prefix):
+                    text = text[len(prefix):].strip()
+            return text[:255] or None
+    return None
 
-    There is no build or dependency scanner behind this route. It used to
-    report success after inserting an empty SBOM header (no components, no
-    content). It now returns 501 and writes nothing; import a real SBOM
-    through ``POST /sboms/upload`` or ``POST /sboms/import`` instead.
-    """
-    raise HTTPException(
-        status_code=501,
-        detail={
-            "error": "not_implemented",
-            "detail": (
-                "SBOM generation needs a dependency scanner, which is not "
-                "configured. Nothing was created. Upload an SPDX or CycloneDX "
-                "SBOM with POST /supplychain/sboms/upload instead."
-            ),
-        },
+
+def _external_ref(c: dict, kinds: tuple[str, ...]) -> Optional[str]:
+    for ref in c.get("externalRefs") or []:
+        if isinstance(ref, dict) and ref.get("referenceType") in kinds and ref.get("referenceLocator"):
+            return str(ref["referenceLocator"])
+    return None
+
+
+def _flatten_cdx(components: list, limit: int) -> list[dict]:
+    out: list[dict] = []
+    stack = list(reversed(components or []))
+    while stack and len(out) <= limit:
+        c = stack.pop()
+        if not isinstance(c, dict):
+            continue
+        out.append(c)
+        stack.extend(reversed(c.get("components") or []))
+    return out
+
+
+async def _sbom_component_rows(db: AsyncSession, sbom_id: str, org_id: str) -> list[dict[str, Any]]:
+    rows = (await db.execute(
+        select(
+            SoftwareComponent.name, SoftwareComponent.version, SoftwareComponent.vendor,
+            SoftwareComponent.purl, SoftwareComponent.cpe, SoftwareComponent.checksum_sha256,
+        )
+        .join(SBOMComponent, SBOMComponent.component_id == SoftwareComponent.id)
+        .where(SBOMComponent.sbom_id == sbom_id, SoftwareComponent.organization_id == org_id),
+    )).all()
+    return [dict(r._mapping) for r in rows]
+
+
+async def _assess_and_store(db: AsyncSession, sbom: SBOM, org_id: str) -> dict[str, Any]:
+    """NTIA assessment from the stored components; stores the derived status."""
+    components = await _sbom_component_rows(db, sbom.id, org_id)
+    graph = stored_graph(sbom.sbom_content, sbom.sbom_format)
+    report = assess_sbom(
+        components=components,
+        author=sbom.created_by_tool or sbom.created_by_user,
+        timestamp=sbom.last_generated or sbom.created_at,
+        has_dependency_graph=graph["has_graph"],
+        sbom_format=sbom.sbom_format,
+        sbom_id=sbom.id,
     )
+    sbom.compliance_status = report["status"]
+    return report
 
 
 async def _persist_sbom_with_components(
     db: AsyncSession,
     *,
-    organization_id: Optional[str],
+    organization_id: str,
     sbom_format: str,
     sbom_content: str,
     parsed: dict,
     application_name: Optional[str],
+    doc: dict,
+    user: Optional[User],
 ) -> SBOM:
-    """Create an SBOM row AND every SoftwareComponent + SBOMComponent
-    row the parsed dict declares. Previously import only wrote the
-    SBOM header and silently dropped the components list — the
-    Components table rendered blank for every imported SBOM.
-    Components are deduped by purl/cpe/(name,version) so re-importing
-    the same SBOM doesn't balloon the software_components table.
+    """Create the SBOM row, every SoftwareComponent + SBOMComponent it declares,
+    its dependency counts (from the document's graph) and its derived
+    compliance status. Components are deduplicated within the organisation by
+    purl, then CPE, then (name, version).
     """
+    raw_components = parsed.get("components") or []
+    if sbom_format == "cyclonedx_json":
+        raw_components = _flatten_cdx(raw_components, MAX_SBOM_COMPONENTS)
+    if len(raw_components) > MAX_SBOM_COMPONENTS:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "too_many_components",
+                    "detail": f"SBOM declares more than {MAX_SBOM_COMPONENTS} components"},
+        )
+    graph = dependency_stats(doc, sbom_format)
     sbom = SBOM(
         organization_id=organization_id,
-        name=parsed.get("name") or "Imported SBOM",
-        application_name=application_name or parsed.get("name") or "Unknown",
-        application_version=parsed.get("version") or "1.0",
+        name=(parsed.get("name") or "Imported SBOM")[:500],
+        application_name=(application_name or parsed.get("name") or "Unknown")[:500],
+        application_version=str(parsed.get("version") or (
+            ((doc.get("metadata") or {}).get("component") or {}).get("version")
+        ) or "unspecified")[:100],
         sbom_format=sbom_format,
-        spec_version=parsed.get("spec_version") or "2.3",
-        created_by_tool=parsed.get("created_by_tool"),
-        sbom_content=sbom_content[:10_000_000],  # cap 10 MB
+        spec_version=str(parsed.get("spec_version") or "")[:50] or "unknown",
+        created_by_tool=(str(parsed.get("created_by_tool"))[:255] if parsed.get("created_by_tool") else None),
+        created_by_user=str(user.id) if user is not None else None,
+        sbom_content=sbom_content,
         last_generated=datetime.utcnow(),
     )
     db.add(sbom)
     await db.flush()
 
-    components = parsed.get("components") or []
-    added = 0
-    for c in components:
+    linked: set[str] = set()
+    for c in raw_components:
         if not isinstance(c, dict):
             continue
         name = c.get("name") or c.get("packageName")
         version = c.get("version") or c.get("versionInfo") or "unknown"
         if not name:
             continue
-        purl = c.get("purl")
-        cpe = c.get("cpe")
-        # Dedupe by purl first (primary identifier), then (name, version),
-        # both within the org: another tenant's component must never be
-        # linked into this tenant's SBOM (it would then appear in exports).
+        purl = c.get("purl") or _external_ref(c, ("purl",))
+        cpe = c.get("cpe") or _external_ref(c, ("cpe23Type", "cpe22Type"))
         existing = None
         if purl:
             existing = (await db.execute(
                 select(SoftwareComponent).where(
                     SoftwareComponent.organization_id == organization_id,
-                    SoftwareComponent.purl == purl,
+                    SoftwareComponent.purl == purl[:2048],
+                ),
+            )).scalars().first()
+        if existing is None and cpe:
+            existing = (await db.execute(
+                select(SoftwareComponent).where(
+                    SoftwareComponent.organization_id == organization_id,
+                    SoftwareComponent.cpe == cpe[:500],
                 ),
             )).scalars().first()
         if existing is None:
@@ -238,14 +342,15 @@ async def _persist_sbom_with_components(
                 ),
             )).scalars().first()
         if existing is None:
+            lic = _extract_spdx_license(c)
             existing = SoftwareComponent(
                 organization_id=organization_id,
                 name=str(name)[:500],
                 version=str(version)[:100],
-                vendor=(c.get("supplier") or c.get("vendor") or (c.get("publisher") if isinstance(c.get("publisher"), str) else None)),
+                vendor=_supplier(c),
                 package_type=_derive_package_type(purl, c.get("type")),
-                license_spdx_id=_extract_spdx_license(c),
-                license_type=_extract_spdx_license(c),
+                license_spdx_id=lic,
+                license_type=lic,
                 purl=purl[:2048] if purl else None,
                 cpe=cpe[:500] if cpe else None,
                 checksum_sha256=_extract_sha256(c),
@@ -254,14 +359,152 @@ async def _persist_sbom_with_components(
             )
             db.add(existing)
             await db.flush()
+        if existing.id in linked:
+            continue
+        linked.add(existing.id)
         db.add(SBOMComponent(
             organization_id=organization_id,
             sbom_id=sbom.id,
             component_id=existing.id,
             relationship_type="depends_on",
         ))
-        added += 1
 
+    sbom.components_count = len(linked)
+    sbom.total_dependencies = len(linked)
+    sbom.direct_dependencies = graph["direct"]
+    sbom.transitive_dependencies = graph["transitive"]
+    await db.flush()
+    await _assess_and_store(db, sbom, organization_id)
+    await _audit(db, user, organization_id, "sbom_imported", "sbom", sbom.id,
+                 f"imported {sbom_format} SBOM with {len(linked)} components",
+                 {"format": sbom_format, "components": len(linked), "has_dependency_graph": graph["has_graph"]})
+    await db.commit()
+    await db.refresh(sbom)
+    return sbom
+
+
+def _parse_and_validate(content: str, sbom_format: Optional[str]) -> tuple[str, dict, dict]:
+    """(format, parsed, document) or HTTPException 400/413/422."""
+    if len(content.encode("utf-8")) > MAX_SBOM_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={"error": "sbom_too_large", "detail": f"SBOM larger than {MAX_SBOM_BYTES} bytes"},
+        )
+    try:
+        doc = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"not valid JSON: {exc}") from exc
+    detected = detect_format(doc)
+    if detected is None:
+        raise HTTPException(
+            status_code=400,
+            detail="unknown SBOM format — expected top-level spdxVersion (SPDX) or bomFormat=CycloneDX",
+        )
+    if sbom_format and sbom_format != detected:
+        raise HTTPException(
+            status_code=400, detail=f"sbom_format {sbom_format!r} does not match the document ({detected})",
+        )
+    try:
+        validate_sbom_document(doc, detected)
+    except SBOMValidationError as exc:
+        raise HTTPException(
+            status_code=422, detail={"error": "invalid_sbom", "errors": exc.errors[:50]},
+        ) from exc
+    generator = SBOMGenerator()
+    parsed = generator.parse_spdx_json(content) if detected == "spdx_json" else generator.parse_cyclonedx_json(content)
+    return detected, parsed, doc
+
+
+# SBOM Endpoints
+
+
+@router.post("/sboms/generate", response_model=SBOMResponse)
+async def generate_sbom(
+    sbom_create: SBOMCreate,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
+    db: DatabaseSession = None,
+):
+    """Generate an SBOM document from stored components.
+
+    Uses ``component_ids`` (or all of the organisation's components, up to
+    the cap) and writes a real CycloneDX / SPDX document listing them, linked
+    to the SBOM row. 422 ``no_components`` when there is nothing stored to
+    describe; nothing is synthesised.
+    """
+    if sbom_create.sbom_format not in ("cyclonedx_json", "spdx_json"):
+        raise HTTPException(status_code=400, detail="sbom_format must be cyclonedx_json or spdx_json")
+    stmt = select(SoftwareComponent).where(SoftwareComponent.organization_id == org_id)
+    if sbom_create.component_ids is not None:
+        stmt = stmt.where(SoftwareComponent.id.in_(sbom_create.component_ids))
+    components = list((await db.execute(
+        stmt.order_by(SoftwareComponent.name, SoftwareComponent.id).limit(MAX_SBOM_COMPONENTS + 1),
+    )).scalars())
+    if sbom_create.component_ids is not None:
+        found = {c.id for c in components}
+        unknown = [cid for cid in sbom_create.component_ids if cid not in found]
+        if unknown:
+            raise HTTPException(status_code=404, detail={"error": "component_not_found", "component_ids": unknown[:20]})
+    if not components:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "no_components",
+                    "detail": "No stored components to describe. Add components or upload an SBOM first."},
+        )
+    if len(components) > MAX_SBOM_COMPONENTS:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "too_many_components", "detail": f"more than {MAX_SBOM_COMPONENTS} components"},
+        )
+    sbom = SBOM(
+        organization_id=org_id,
+        name=sbom_create.name,
+        application_name=sbom_create.application_name,
+        application_version=sbom_create.application_version,
+        sbom_format=sbom_create.sbom_format,
+        spec_version="",
+        created_by_tool="PySOAR",
+        created_by_user=str(_user.id) if _user is not None else None,
+        last_generated=datetime.utcnow(),
+    )
+    db.add(sbom)
+    await db.flush()
+    ids = {c.id for c in components}
+    shaped = [_export_shape(c) for c in components]
+    relationships = [
+        {
+            "spdxElementId": f"SPDXRef-Package-{c.parent_component_id}",
+            "relatedSpdxElement": f"SPDXRef-Package-{c.id}",
+            "relationshipType": "DEPENDS_ON",
+        }
+        for c in components if c.parent_component_id and c.parent_component_id in ids
+    ]
+    data = {
+        "id": sbom.id, "name": sbom.application_name, "version": sbom.application_version,
+        "created_by_tool": "PySOAR", "components": shaped, "relationships": relationships,
+    }
+    generator = SBOMGenerator()
+    if sbom_create.sbom_format == "spdx_json":
+        sbom.sbom_content = generator.generate_spdx_output(data)
+        sbom.spec_version = generator.SPDX_VERSION
+    else:
+        sbom.sbom_content = generator.generate_cyclonedx_output(data)
+        sbom.spec_version = generator.CYCLONEDX_VERSION
+    for c in components:
+        db.add(SBOMComponent(organization_id=org_id, sbom_id=sbom.id, component_id=c.id,
+                             relationship_type="depends_on"))
+    graph = stored_graph(sbom.sbom_content, sbom.sbom_format)
+    sbom.components_count = len(components)
+    sbom.total_dependencies = len(components)
+    sbom.direct_dependencies = graph["direct"]
+    sbom.transitive_dependencies = graph["transitive"]
+    scores = [c.risk_score for c in components if c.last_scanned is not None]
+    sbom.vulnerability_risk_score = float(max(scores)) if scores else 0.0
+    await db.flush()
+    await _assess_and_store(db, sbom, org_id)
+    await _audit(db, _user, org_id, "sbom_generated", "sbom", sbom.id,
+                 f"generated {sbom.sbom_format} SBOM from {len(components)} stored components",
+                 {"components": len(components)})
     await db.commit()
     await db.refresh(sbom)
     return sbom
@@ -276,13 +519,9 @@ def _derive_package_type(purl: Optional[str], cdx_type: Optional[str]) -> str:
     """
     if isinstance(purl, str) and purl.startswith("pkg:"):
         # pkg:<type>/<namespace>/<name>@<version>
-        try:
-            after = purl[4:]
-            reg = after.split("/", 1)[0].split("@", 1)[0]
-            if reg:
-                return reg[:50].lower()
-        except Exception:  # noqa: BLE001
-            pass
+        reg = purl[4:].split("/", 1)[0].split("@", 1)[0]
+        if reg:
+            return reg[:50].lower()
     if isinstance(cdx_type, str) and cdx_type:
         return cdx_type[:50].lower()
     return "library"
@@ -328,30 +567,24 @@ async def import_sbom(
     _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
-    """Import SBOM from inline content (JSON-stringified).
+    """Import an SBOM from inline JSON content (SPDX or CycloneDX).
 
-    Also persists every parsed component into software_components +
-    sbom_components so the Components table renders correctly.
-    For file uploads, use POST /sboms/upload instead.
+    Validated against the spec structure (422 ``invalid_sbom`` with the
+    errors), size-capped (413), then stored with its components. XML formats
+    are not supported (400).
     """
-    generator = SBOMGenerator()
-    try:
-        if import_request.sbom_format == "spdx_json":
-            parsed = generator.parse_spdx_json(import_request.sbom_content)
-        elif import_request.sbom_format == "cyclonedx_json":
-            parsed = generator.parse_cyclonedx_json(import_request.sbom_content)
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported SBOM format")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to parse SBOM: {str(e)}")
-
+    if import_request.sbom_format not in ("spdx_json", "cyclonedx_json"):
+        raise HTTPException(status_code=400, detail="Unsupported SBOM format (spdx_json or cyclonedx_json)")
+    fmt, parsed, doc = _parse_and_validate(import_request.sbom_content, import_request.sbom_format)
     return await _persist_sbom_with_components(
         db,
         organization_id=org_id,
-        sbom_format=import_request.sbom_format,
+        sbom_format=fmt,
         sbom_content=import_request.sbom_content,
         parsed=parsed,
         application_name=import_request.application_name,
+        doc=doc,
+        user=_user,
     )
 
 
@@ -365,55 +598,60 @@ async def upload_sbom(
 ):
     """Upload an SBOM file (SPDX JSON or CycloneDX JSON) via multipart.
 
-    Format is auto-detected from the file content (SPDX has a
-    `spdxVersion` key, CycloneDX has `bomFormat: CycloneDX`).
-    Components are parsed and persisted so the Components tab
-    populates immediately. For SPDX XML or CycloneDX XML, use the
-    /sboms/import JSON endpoint with sbom_format set explicitly.
+    Format is auto-detected (``spdxVersion`` / ``bomFormat: CycloneDX``),
+    the document is validated (422 ``invalid_sbom``) and capped at
+    ``MAX_SBOM_BYTES`` (413); components are stored so the Components tab
+    populates immediately.
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="file is required")
-    raw = await file.read()
+    raw = await file.read(MAX_SBOM_BYTES + 1)
     if not raw:
         raise HTTPException(status_code=400, detail="empty file")
+    if len(raw) > MAX_SBOM_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={"error": "sbom_too_large", "detail": f"SBOM larger than {MAX_SBOM_BYTES} bytes"},
+        )
     try:
         content = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        raise HTTPException(status_code=400, detail="file is not UTF-8 text")
-
-    # Autodetect format.
-    try:
-        probe = json.loads(content)
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=400, detail=f"not valid JSON: {e}")
-    if isinstance(probe, dict) and "spdxVersion" in probe:
-        sbom_format = "spdx_json"
-    elif isinstance(probe, dict) and probe.get("bomFormat") == "CycloneDX":
-        sbom_format = "cyclonedx_json"
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="unknown SBOM format — expected top-level spdxVersion (SPDX) or bomFormat=CycloneDX",
-        )
-
-    generator = SBOMGenerator()
-    try:
-        parsed = (
-            generator.parse_spdx_json(content)
-            if sbom_format == "spdx_json"
-            else generator.parse_cyclonedx_json(content)
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"parse error: {e}")
-
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="file is not UTF-8 text") from exc
+    fmt, parsed, doc = _parse_and_validate(content, None)
     return await _persist_sbom_with_components(
         db,
         organization_id=org_id,
-        sbom_format=sbom_format,
+        sbom_format=fmt,
         sbom_content=content,
         parsed=parsed,
         application_name=application_name,
+        doc=doc,
+        user=_user,
     )
+
+
+def _export_shape(sw: SoftwareComponent) -> dict[str, Any]:
+    return {
+        "id": sw.id,
+        "SPDXID": f"SPDXRef-Package-{sw.id}",
+        "bom-ref": sw.id,
+        "name": sw.name,
+        "version": sw.version,
+        "type": sw.package_type or "library",
+        "supplier": f"Organization: {sw.vendor}" if sw.vendor else "NOASSERTION",
+        "licenseConcluded": sw.license_spdx_id or sw.license_type or "NOASSERTION",
+        "licenseDeclared": sw.license_spdx_id or sw.license_type or "NOASSERTION",
+        "purl": sw.purl,
+        "cpe": sw.cpe,
+        "hashes": (
+            [{"alg": "SHA-256", "content": sw.checksum_sha256}]
+            if sw.checksum_sha256
+            else []
+        ),
+        "externalRefs": (
+            [{"referenceType": "purl", "referenceLocator": sw.purl}] if sw.purl else []
+        ),
+    }
 
 
 @router.post("/sboms/{sbom_id}/export")
@@ -426,53 +664,25 @@ async def export_sbom(
 ):
     """Export SBOM as a real, spec-compliant SPDX or CycloneDX document.
 
-    Loads every SBOMComponent + joined SoftwareComponent row for this SBOM
-    and passes them to the generator so the output contains real packages,
-    versions, licenses, purls, and SHA-256 checksums — not an empty envelope.
-
-    Returns a ``StreamingResponse`` with the proper ``Content-Disposition``
-    header so the browser downloads it as a file instead of rendering JSON.
+    Built from every SBOMComponent + SoftwareComponent row of this SBOM in
+    the caller's organisation; downloaded as a file.
     """
-    from fastapi.responses import StreamingResponse
-    import io
-
     sbom = await get_sbom_or_404(db, sbom_id, org_id)
 
-    # Load the real component list (tenant-scoped via SBOM ownership check above)
-    comp_result = await db.execute(
+    rows = (await db.execute(
         select(SoftwareComponent, SBOMComponent.relationship_type)
         .join(SBOMComponent, SBOMComponent.component_id == SoftwareComponent.id)
         .where(
             SBOMComponent.sbom_id == sbom_id,
+            SBOMComponent.organization_id == org_id,
             SoftwareComponent.organization_id == org_id,
         ),
-    )
-    rows = comp_result.all()
+    )).all()
 
     components = []
     relationships = []
     for sw, rel_type in rows:
-        components.append({
-            "id": sw.id,
-            "SPDXID": f"SPDXRef-Package-{sw.id}",
-            "bom-ref": sw.id,
-            "name": sw.name,
-            "version": sw.version,
-            "type": sw.package_type or "library",
-            "supplier": f"Organization: {sw.vendor}" if sw.vendor else "NOASSERTION",
-            "licenseConcluded": sw.license_spdx_id or sw.license_type or "NOASSERTION",
-            "licenseDeclared": sw.license_spdx_id or sw.license_type or "NOASSERTION",
-            "purl": sw.purl,
-            "cpe": sw.cpe,
-            "hashes": (
-                [{"alg": "SHA-256", "content": sw.checksum_sha256}]
-                if sw.checksum_sha256
-                else []
-            ),
-            "externalRefs": (
-                [{"referenceType": "purl", "referenceLocator": sw.purl}] if sw.purl else []
-            ),
-        })
+        components.append(_export_shape(sw))
         if sw.parent_component_id:
             relationships.append({
                 "spdxElementId": f"SPDXRef-Package-{sw.parent_component_id}",
@@ -513,6 +723,9 @@ async def export_sbom(
     )
 
 
+_SBOM_SORT = {"created_at", "name", "application_name", "components_count", "vulnerability_risk_score"}
+
+
 @router.get("/sboms", response_model=SBOMListResponse)
 async def list_sboms(
     org_id: OrganizationId,
@@ -533,31 +746,16 @@ async def list_sboms(
             | (SBOM.application_name.ilike(search_filter))
         )
 
-    # Count total (of the filtered, org-scoped query)
-    total_result = await db.execute(select(func.count()).select_from(query.subquery()))
-    total = total_result.scalar()
+    total = (await db.execute(select(func.count()).select_from(query.subquery()))).scalar() or 0
 
-    # Order and pagination
-    order_col = getattr(SBOM, sort_by, SBOM.created_at)
-    if sort_order == "desc":
-        query = query.order_by(order_col.desc())
-    else:
-        query = query.order_by(order_col)
-
+    order_col = getattr(SBOM, sort_by if sort_by in _SBOM_SORT else "created_at")
+    query = query.order_by(order_col.desc() if sort_order == "desc" else order_col, SBOM.id)
     query = query.offset((page - 1) * size).limit(size)
 
-    result = await db.execute(query)
-    items = result.scalars().all()
-
+    items = (await db.execute(query)).scalars().all()
     pages = math.ceil(total / size) if total > 0 else 1
 
-    return SBOMListResponse(
-        items=items,
-        total=total,
-        page=page,
-        size=size,
-        pages=pages,
-    )
+    return SBOMListResponse(items=items, total=total, page=page, size=size, pages=pages)
 
 
 @router.get("/sboms/{sbom_id}", response_model=SBOMResponse)
@@ -567,9 +765,27 @@ async def get_sbom(
     sbom_id: str = Path(...),
 ):
     """Get SBOM details"""
-    sbom = await get_sbom_or_404(db, sbom_id, org_id)
+    return await get_sbom_or_404(db, sbom_id, org_id)
 
-    return sbom
+
+@router.get("/sboms/{sbom_id}/compliance")
+async def get_sbom_compliance(
+    org_id: OrganizationId,
+    db: DatabaseSession = None,
+    sbom_id: str = Path(...),
+):
+    """NTIA minimum-element assessment of the SBOM's stored components (read only)."""
+    sbom = await get_sbom_or_404(db, sbom_id, org_id)
+    components = await _sbom_component_rows(db, sbom.id, org_id)
+    graph = stored_graph(sbom.sbom_content, sbom.sbom_format)
+    return assess_sbom(
+        components=components,
+        author=sbom.created_by_tool or sbom.created_by_user,
+        timestamp=sbom.last_generated or sbom.created_at,
+        has_dependency_graph=graph["has_graph"],
+        sbom_format=sbom.sbom_format,
+        sbom_id=sbom.id,
+    )
 
 
 @router.patch("/sboms/{sbom_id}", response_model=SBOMResponse)
@@ -580,16 +796,45 @@ async def update_sbom(
     db: DatabaseSession = None,
     sbom_id: str = Path(...),
 ):
-    """Update SBOM"""
+    """Rename an SBOM.
+
+    ``compliance_status`` is derived from the stored components and is
+    refused (422 ``derived_field``); the edit used to pre-select "compliant",
+    so a rename silently certified the SBOM.
+    """
     sbom = await get_sbom_or_404(db, sbom_id, org_id)
-
     update_data = sbom_update.model_dump(exclude_unset=True)
-    for field, value in update_data.items():
-        setattr(sbom, field, value)
-
+    if update_data.get("compliance_status") is not None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "derived_field",
+                "detail": "compliance_status is computed from the SBOM's stored components "
+                          "(GET /supplychain/sboms/{id}/compliance) and cannot be set.",
+            },
+        )
+    if update_data.get("name"):
+        sbom.name = update_data["name"]
     await db.commit()
     await db.refresh(sbom)
     return sbom
+
+
+@router.delete("/sboms/{sbom_id}", status_code=204)
+async def delete_sbom(
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
+    db: DatabaseSession = None,
+    sbom_id: str = Path(...),
+):
+    """Delete an SBOM and its component links (the components stay)."""
+    sbom = await get_sbom_or_404(db, sbom_id, org_id)
+    await db.execute(delete(SBOMComponent).where(
+        SBOMComponent.sbom_id == sbom.id, SBOMComponent.organization_id == org_id,
+    ))
+    await _audit(db, _user, org_id, "sbom_deleted", "sbom", sbom.id, f"deleted SBOM {sbom.name}", {})
+    await db.delete(sbom)
+    await db.commit()
 
 
 @router.post("/sboms/compare")
@@ -599,23 +844,43 @@ async def compare_sboms(
     _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
-    """Compare two SBOM versions: not implemented.
+    """Compare the stored components of two SBOMs of this organisation.
 
-    The diff was never computed: the route always answered with empty
-    added/removed/updated lists, which reads as "identical". Both ids are
-    still checked against the caller's organisation (404 otherwise), then it
-    returns 501.
+    Components are matched by package identity (purl without version, else
+    package type + name); a version change is reported as ``updated``.
     """
-    await get_sbom_or_404(db, comparison_request.sbom_id_1, org_id)
-    await get_sbom_or_404(db, comparison_request.sbom_id_2, org_id)
+    sbom1 = await get_sbom_or_404(db, comparison_request.sbom_id_1, org_id)
+    sbom2 = await get_sbom_or_404(db, comparison_request.sbom_id_2, org_id)
 
-    raise HTTPException(
-        status_code=501,
-        detail={
-            "error": "not_implemented",
-            "detail": "SBOM comparison is not implemented; no diff was computed.",
-        },
-    )
+    async def components_of(sbom_id: str) -> dict[str, SoftwareComponent]:
+        rows = (await db.execute(
+            select(SoftwareComponent)
+            .join(SBOMComponent, SBOMComponent.component_id == SoftwareComponent.id)
+            .where(SBOMComponent.sbom_id == sbom_id, SoftwareComponent.organization_id == org_id),
+        )).scalars().all()
+        out: dict[str, SoftwareComponent] = {}
+        for c in rows:
+            ident = (c.purl.split("@", 1)[0] if c.purl else f"{c.package_type}:{c.name}").lower()
+            out.setdefault(ident, c)
+        return out
+
+    first, second = await components_of(sbom1.id), await components_of(sbom2.id)
+    added = [SoftwareComponentResponse.model_validate(second[k]) for k in sorted(second.keys() - first.keys())]
+    removed = [SoftwareComponentResponse.model_validate(first[k]) for k in sorted(first.keys() - second.keys())]
+    updated = [
+        {"name": second[k].name, "from_version": first[k].version, "to_version": second[k].version,
+         "component_id_1": first[k].id, "component_id_2": second[k].id}
+        for k in sorted(first.keys() & second.keys()) if first[k].version != second[k].version
+    ]
+    return {
+        "sbom_1": SBOMResponse.model_validate(sbom1),
+        "sbom_2": SBOMResponse.model_validate(sbom2),
+        "components_added": added,
+        "components_removed": removed,
+        "components_updated": updated,
+        "unchanged": len(first.keys() & second.keys()) - len(updated),
+        "risk_score_change": round((sbom2.vulnerability_risk_score or 0.0) - (sbom1.vulnerability_risk_score or 0.0), 1),
+    }
 
 
 # Component Endpoints
@@ -628,18 +893,32 @@ async def create_component(
     _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
-    """Create software component.
+    """Create software component (``not_scanned`` until looked up).
 
-    A manual add no longer fires the supply-chain vulnerability automation:
-    it used to raise a HIGH alert with an empty CVE for every component,
-    although nothing had looked the component up.
+    A manual add does not fire the supply-chain vulnerability automation:
+    nothing has looked the component up yet. 409 when its purl or CPE is
+    already registered in this organisation.
     """
-    if component_create.parent_component_id:
-        await get_component_or_404(db, component_create.parent_component_id, org_id)
-    component = SoftwareComponent(
-        organization_id=org_id,
-        **component_create.model_dump(),
-    )
+    data = component_create.model_dump()
+    license_value = data.pop("license", None)
+    if license_value:
+        data["license_spdx_id"] = data.get("license_spdx_id") or license_value[:50]
+        data["license_type"] = data.get("license_type") or license_value[:100]
+    if data.get("parent_component_id"):
+        await get_component_or_404(db, data["parent_component_id"], org_id)
+    for col in ("purl", "cpe"):
+        if data.get(col):
+            dup = (await db.execute(
+                select(SoftwareComponent.id).where(
+                    SoftwareComponent.organization_id == org_id, getattr(SoftwareComponent, col) == data[col],
+                ),
+            )).first()
+            if dup:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "component_exists", "component_id": dup[0], "detail": f"{col} already registered"},
+                )
+    component = SoftwareComponent(organization_id=org_id, **data)
     db.add(component)
     await db.commit()
     await db.refresh(component)
@@ -656,6 +935,7 @@ async def list_components(
     search: Optional[str] = None,
     package_type: Optional[str] = None,
     min_risk_score: Optional[float] = None,
+    scan_status: Optional[str] = Query(None, pattern="^(scanned|not_scanned)$"),
 ):
     """List software components"""
     query = select(SoftwareComponent).where(
@@ -675,24 +955,89 @@ async def list_components(
     if min_risk_score is not None:
         query = query.where(SoftwareComponent.risk_score >= min_risk_score)
 
-    total_result = await db.execute(select(func.count()).select_from(query.subquery()))
-    total = total_result.scalar()
+    if scan_status == "scanned":
+        query = query.where(SoftwareComponent.last_scanned.is_not(None))
+    elif scan_status == "not_scanned":
+        query = query.where(SoftwareComponent.last_scanned.is_(None))
 
-    query = query.order_by(SoftwareComponent.created_at.desc())
+    total = (await db.execute(select(func.count()).select_from(query.subquery()))).scalar() or 0
+
+    query = query.order_by(SoftwareComponent.created_at.desc(), SoftwareComponent.id)
     query = query.offset((page - 1) * size).limit(size)
 
-    result = await db.execute(query)
-    items = result.scalars().all()
-
+    items = (await db.execute(query)).scalars().all()
     pages = math.ceil(total / size) if total > 0 else 1
 
-    return SoftwareComponentListResponse(
-        items=items,
-        total=total,
-        page=page,
-        size=size,
-        pages=pages,
-    )
+    return SoftwareComponentListResponse(items=items, total=total, page=page, size=size, pages=pages)
+
+
+@router.post("/components/lookup")
+async def lookup_vulnerabilities(
+    request: ComponentLookupRequest,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
+    db: DatabaseSession = None,
+):
+    """Look components up in OSV (and NVD with ``NVD_API_KEY``).
+
+    ``component_ids`` or every component of the organisation (oldest lookup
+    first, capped). Answers are cached per organisation for 24 hours. 502
+    ``provider_unavailable`` when OSV could not be reached and nothing was
+    looked up.
+    """
+    stmt = select(SoftwareComponent).where(SoftwareComponent.organization_id == org_id)
+    if request.component_ids is not None:
+        stmt = stmt.where(SoftwareComponent.id.in_(request.component_ids))
+    components = list((await db.execute(
+        stmt.order_by(SoftwareComponent.last_scanned.is_not(None), SoftwareComponent.last_scanned,
+                      SoftwareComponent.id).limit(MAX_COMPONENTS_PER_LOOKUP + 1),
+    )).scalars())
+    if request.component_ids is not None:
+        unknown = sorted(set(request.component_ids) - {c.id for c in components})
+        if unknown:
+            raise HTTPException(status_code=404, detail={"error": "component_not_found", "component_ids": unknown[:20]})
+    return await _run_lookup(db, org_id, components, request.use_cache, _user)
+
+
+@router.post("/components/{component_id}/lookup")
+async def lookup_component_vulnerabilities(
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
+    db: DatabaseSession = None,
+    component_id: str = Path(...),
+    use_cache: bool = Query(True),
+):
+    """Look one component up in OSV (and NVD with ``NVD_API_KEY``)."""
+    component = await get_component_or_404(db, component_id, org_id)
+    return await _run_lookup(db, org_id, [component], use_cache, _user)
+
+
+async def _run_lookup(
+    db: AsyncSession, org_id: str, components: list[SoftwareComponent], use_cache: bool, user: Optional[User],
+) -> dict[str, Any]:
+    summary = await lookup_components(db, org_id, components, use_cache=use_cache)
+    await _audit(db, user, org_id, "supplychain_vuln_lookup", "software_component",
+                 components[0].id if len(components) == 1 else None,
+                 f"OSV/NVD lookup of {len(components)} component(s)",
+                 {k: summary[k] for k in ("components_checked", "components_failed", "risks_new", "providers")})
+    await db.commit()
+    osv = summary["providers"].get("osv", {})
+    if osv.get("status") == "error" and summary["components_checked"] == 0 and components:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "provider_unavailable", "detail": f"OSV lookup failed: {osv.get('error')}",
+                    "summary": summary},
+        )
+    return summary
+
+
+@router.get("/vulnerability-sources")
+async def get_vulnerability_sources(
+    org_id: OrganizationId,
+    db: DatabaseSession = None,
+):
+    """OSV / NVD provider status and cache size for this organisation."""
+    return await provider_status(db, org_id)
 
 
 @router.get("/components/{component_id}", response_model=SoftwareComponentResponse)
@@ -702,9 +1047,7 @@ async def get_component(
     component_id: str = Path(...),
 ):
     """Get component details"""
-    component = await get_component_or_404(db, component_id, org_id)
-
-    return component
+    return await get_component_or_404(db, component_id, org_id)
 
 
 @router.patch("/components/{component_id}", response_model=SoftwareComponentResponse)
@@ -715,12 +1058,20 @@ async def update_component(
     db: DatabaseSession = None,
     component_id: str = Path(...),
 ):
-    """Update component"""
+    """Update component (a name / version change clears the lookup state)."""
     component = await get_component_or_404(db, component_id, org_id)
 
     update_data = component_update.model_dump(exclude_unset=True)
+    identity_changed = any(
+        k in update_data and update_data[k] != getattr(component, k) for k in ("name", "version")
+    )
     for field, value in update_data.items():
         setattr(component, field, value)
+    if identity_changed:
+        # Previous advisories describe another package version.
+        component.last_scanned = None
+        component.known_vulnerabilities_count = 0
+        component.risk_score = 0.0
 
     await db.commit()
     await db.refresh(component)
@@ -768,72 +1119,52 @@ async def get_component_vulnerabilities(
     db: DatabaseSession = None,
     component_id: str = Path(...),
 ):
-    """Look up known vulnerabilities for a component.
+    """Known vulnerabilities of a component from its stored OSV / NVD risks.
 
-    Previously hardcoded ``highest_severity = "critical"`` whenever
-    the component had any CVE at all, regardless of actual CVSS
-    scores. An informational CVE looked critical on the dashboard;
-    a component with 12 high-severity CVEs looked the same as one
-    with 1 medium. Now:
-      - pulls SupplyChainRisk rows linked to this component
-      - joins the collected CVE IDs back to the Vulnerability table
-        to get the real severity
-      - returns the highest actual severity in the standard
-        critical > high > medium > low > informational ordering
+    ``highest_severity`` is the highest severity among those advisories;
+    ``scan_status`` is ``not_scanned`` until a lookup ran.
     """
-    from src.vulnmgmt.models import Vulnerability, VulnerabilitySeverity
-
     component = await get_component_or_404(db, component_id, org_id)
 
-    result = await db.execute(
+    risks = (await db.execute(
         select(SupplyChainRisk).where(
-            (SupplyChainRisk.component_id == component_id)
-            & (SupplyChainRisk.organization_id == org_id)
-            & (SupplyChainRisk.risk_type == "known_vulnerability")
+            SupplyChainRisk.component_id == component_id,
+            SupplyChainRisk.organization_id == org_id,
+            SupplyChainRisk.risk_type == "known_vulnerability",
         )
-    )
-    risks = result.scalars().all()
+    )).scalars().all()
 
     cves: list[str] = []
+    advisories: list[dict[str, Any]] = []
+    highest: Optional[str] = None
     for risk in risks:
-        if risk.cve_ids:
-            cve_list = safe_json_loads(risk.cve_ids, [])
-            if isinstance(cve_list, list):
-                cves.extend(cve_list)
+        cve_list = safe_json_loads(risk.cve_ids, []) if risk.cve_ids else []
+        if isinstance(cve_list, list):
+            cves.extend(str(c) for c in cve_list)
+        advisories.append({
+            "risk_id": risk.id, "advisory_id": risk.advisory_id, "source": risk.source,
+            "severity": risk.severity, "status": risk.status, "cves": cve_list,
+        })
+        if risk.status == "open" and SEVERITY_RANK.get(risk.severity, 0) > SEVERITY_RANK.get(highest or "none", 0):
+            highest = risk.severity
     unique_cves = sorted(set(cves))
 
-    # Resolve highest real severity from the Vulnerability table (tenant-scoped)
-    highest: Optional[str] = None
-    if unique_cves:
-        sev_result = await db.execute(
-            select(Vulnerability.severity).where(
-                and_(
-                    Vulnerability.cve_id.in_(unique_cves),
-                    Vulnerability.organization_id == org_id,
-                )
-            )
-        )
-        severities = [row[0] for row in sev_result.all() if row[0]]
-        if severities:
-            # Rank by the canonical enum ordering — critical > low
-            rank = {
-                VulnerabilitySeverity.CRITICAL.value: 5,
-                VulnerabilitySeverity.HIGH.value: 4,
-                VulnerabilitySeverity.MEDIUM.value: 3,
-                VulnerabilitySeverity.LOW.value: 2,
-                VulnerabilitySeverity.INFORMATIONAL.value: 1,
-            }
-            highest = max(severities, key=lambda s: rank.get(s, 0))
-
-    return ComponentVulnerabilityLookup(
+    result = ComponentVulnerabilityLookup(
         component=component,
         cves=unique_cves,
-        vulnerability_count=len(unique_cves),
+        vulnerability_count=len(advisories),
         highest_severity=highest,
-    )
+    ).model_dump()
+    result["advisories"] = advisories
+    result["scan_status"] = component.vulnerability_scan_status
+    return result
 
 
 # Supply Chain Risk Endpoints
+
+
+def _json_text(value: Any) -> Optional[str]:
+    return json.dumps(value, default=str) if value is not None else None
 
 
 @router.post("/risks", response_model=SupplyChainRiskResponse)
@@ -843,13 +1174,18 @@ async def create_risk(
     _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
-    """Create supply chain risk record"""
-    if risk_create.component_id:
-        await get_component_or_404(db, risk_create.component_id, org_id)
+    """Create supply chain risk record (component must belong to the org)."""
+    if not risk_create.component_id:
+        raise HTTPException(status_code=422, detail="component_id is required")
+    await get_component_or_404(db, risk_create.component_id, org_id)
+    data = risk_create.model_dump()
+    data["evidence"] = _json_text(data.get("evidence"))
+    data["cve_ids"] = _json_text(data.get("cve_ids"))
     risk = SupplyChainRisk(
         organization_id=org_id,
         detected_date=datetime.utcnow(),
-        **risk_create.model_dump(),
+        source="manual",
+        **data,
     )
     db.add(risk)
     await db.commit()
@@ -881,24 +1217,15 @@ async def list_risks(
     if status:
         query = query.where(SupplyChainRisk.status == status)
 
-    total_result = await db.execute(select(func.count()).select_from(query.subquery()))
-    total = total_result.scalar()
+    total = (await db.execute(select(func.count()).select_from(query.subquery()))).scalar() or 0
 
-    query = query.order_by(SupplyChainRisk.created_at.desc())
+    query = query.order_by(SupplyChainRisk.created_at.desc(), SupplyChainRisk.id)
     query = query.offset((page - 1) * size).limit(size)
 
-    result = await db.execute(query)
-    items = result.scalars().all()
-
+    items = (await db.execute(query)).scalars().all()
     pages = math.ceil(total / size) if total > 0 else 1
 
-    return SupplyChainRiskListResponse(
-        items=items,
-        total=total,
-        page=page,
-        size=size,
-        pages=pages,
-    )
+    return SupplyChainRiskListResponse(items=items, total=total, page=page, size=size, pages=pages)
 
 
 @router.get("/risks/{risk_id}", response_model=SupplyChainRiskResponse)
@@ -908,9 +1235,7 @@ async def get_risk(
     risk_id: str = Path(...),
 ):
     """Get risk details"""
-    risk = await get_risk_or_404(db, risk_id, org_id)
-
-    return risk
+    return await get_risk_or_404(db, risk_id, org_id)
 
 
 @router.patch("/risks/{risk_id}", response_model=SupplyChainRiskResponse)
@@ -936,6 +1261,36 @@ async def update_risk(
 # Vendor Assessment Endpoints
 
 
+def _vendor_values(data: dict[str, Any]) -> dict[str, Any]:
+    """Validate answers and serialise the JSON-in-Text columns."""
+    if "questionnaire_responses" in data:
+        try:
+            answers = normalise_answers(data["questionnaire_responses"])
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail={"error": "invalid_answers", "detail": str(exc)}) from exc
+        data["questionnaire_responses"] = json.dumps(answers) if answers else None
+    for key in ("certifications", "third_party_subprocessors"):
+        if key in data:
+            data[key] = _json_text(data[key])
+    data.pop("security_score", None)
+    return data
+
+
+def _apply_score(vendor: VendorAssessment) -> None:
+    summary = summarise_answers(vendor.questionnaire_responses)
+    vendor.security_score = summary["score"] if summary["score"] is not None else 0.0
+
+
+@router.get("/vendors/questionnaire")
+async def get_vendor_questionnaire():
+    """The questions a vendor security score is computed from."""
+    return {
+        "answers": list(VALID_ANSWERS),
+        "scoring": "weighted share of yes (1) / partial (0.5) / no (0) answers; n/a excluded",
+        "questions": [{"key": k, "question": q, "weight": w} for k, q, w in VENDOR_QUESTIONS],
+    }
+
+
 @router.post("/vendors", response_model=VendorAssessmentResponse)
 async def create_vendor(
     vendor_create: VendorAssessmentCreate,
@@ -943,12 +1298,13 @@ async def create_vendor(
     _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
-    """Create vendor assessment"""
+    """Create vendor assessment; the score comes from the stored answers."""
     vendor = VendorAssessment(
         organization_id=org_id,
         assessment_date=datetime.utcnow(),
-        **vendor_create.model_dump(),
+        **_vendor_values(vendor_create.model_dump()),
     )
+    _apply_score(vendor)
     db.add(vendor)
     await db.commit()
     await db.refresh(vendor)
@@ -976,24 +1332,15 @@ async def list_vendors(
     if risk_tier:
         query = query.where(VendorAssessment.risk_tier == risk_tier)
 
-    total_result = await db.execute(select(func.count()).select_from(query.subquery()))
-    total = total_result.scalar()
+    total = (await db.execute(select(func.count()).select_from(query.subquery()))).scalar() or 0
 
-    query = query.order_by(VendorAssessment.created_at.desc())
+    query = query.order_by(VendorAssessment.created_at.desc(), VendorAssessment.id)
     query = query.offset((page - 1) * size).limit(size)
 
-    result = await db.execute(query)
-    items = result.scalars().all()
-
+    items = (await db.execute(query)).scalars().all()
     pages = math.ceil(total / size) if total > 0 else 1
 
-    return VendorAssessmentListResponse(
-        items=items,
-        total=total,
-        page=page,
-        size=size,
-        pages=pages,
-    )
+    return VendorAssessmentListResponse(items=items, total=total, page=page, size=size, pages=pages)
 
 
 @router.get("/vendors/{vendor_id}", response_model=VendorAssessmentResponse)
@@ -1003,9 +1350,7 @@ async def get_vendor(
     vendor_id: str = Path(...),
 ):
     """Get vendor assessment"""
-    vendor = await get_vendor_or_404(db, vendor_id, org_id)
-
-    return vendor
+    return await get_vendor_or_404(db, vendor_id, org_id)
 
 
 @router.patch("/vendors/{vendor_id}", response_model=VendorAssessmentResponse)
@@ -1016,12 +1361,15 @@ async def update_vendor(
     db: DatabaseSession = None,
     vendor_id: str = Path(...),
 ):
-    """Update vendor assessment"""
+    """Update vendor assessment; the score is recomputed from the stored answers."""
     vendor = await get_vendor_or_404(db, vendor_id, org_id)
 
-    update_data = vendor_update.model_dump(exclude_unset=True)
+    update_data = _vendor_values(vendor_update.model_dump(exclude_unset=True))
     for field, value in update_data.items():
         setattr(vendor, field, value)
+    if "questionnaire_responses" in update_data:
+        vendor.assessment_date = datetime.utcnow()
+    _apply_score(vendor)
 
     await db.commit()
     await db.refresh(vendor)
@@ -1037,36 +1385,25 @@ async def validate_sbom_compliance(
     org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
-    """Validate SBOM compliance with CISA and NTIA minimum elements.
+    """NTIA minimum-element check of an SBOM's stored components.
 
-    Body: ``{"sbom_id": "<id>"}``. It used to declare ``sbom_id`` as a path
-    parameter on a route with no path segment, so every call was a 422. It is
-    a read-only check (nothing is persisted), so viewers may call it.
+    Body: ``{"sbom_id": "<id>"}``. Read only (nothing is persisted), so
+    viewers may call it. ``status`` is compliant / non_compliant, or
+    not_assessed for an SBOM without components.
     """
     sbom = await get_sbom_or_404(db, request.sbom_id, org_id)
-
-    component_rows = (await db.execute(
-        select(SoftwareComponent.name, SoftwareComponent.version)
-        .join(SBOMComponent, SBOMComponent.component_id == SoftwareComponent.id)
-        .where(
-            SBOMComponent.sbom_id == sbom.id,
-            SoftwareComponent.organization_id == org_id,
-        ),
-    )).all()
-
-    compliance = CISASBOMCompliance()
-
-    sbom_data = {
-        "id": sbom.id,
-        "name": sbom.application_name,
-        "version": sbom.application_version,
-        "created_by_tool": sbom.created_by_tool,
-        "created_at": sbom.created_at,
-        "sbom_format": sbom.sbom_format,
-        "components": [{"name": n, "version": v} for n, v in component_rows],
-    }
-
-    return compliance.generate_compliance_report(sbom_data)
+    components = await _sbom_component_rows(db, sbom.id, org_id)
+    graph = stored_graph(sbom.sbom_content, sbom.sbom_format)
+    report = assess_sbom(
+        components=components,
+        author=sbom.created_by_tool or sbom.created_by_user,
+        timestamp=sbom.last_generated or sbom.created_at,
+        has_dependency_graph=graph["has_graph"],
+        sbom_format=sbom.sbom_format,
+        sbom_id=sbom.id,
+    )
+    report["report_generated"] = datetime.now(timezone.utc).isoformat()
+    return report
 
 
 @router.get("/compliance/license-audit")
@@ -1074,28 +1411,17 @@ async def license_audit(
     org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
-    """Audit license compliance across organization.
+    """Audit license compliance across the organisation's stored components.
 
-    Fixed logic bugs in the previous version:
-      - ``conflicts = []`` was always empty, so the UI never showed
-        which components were in conflict
-      - compliance_status was ``"compliant" if proprietary_count == 0
-        OR gpl_count == 0 else "conflict"``, meaning the endpoint
-        reported "compliant" whenever EITHER count was zero. A tenant
-        with 50 proprietary + 0 GPL got "compliant" (the real concern
-        is the mix, not the individual count).
-
-    Now calls the engine's ``SupplyChainRiskAnalyzer.assess_license_
-    compliance`` on the unique license set for real GPL↔proprietary
-    conflict detection, and populates ``conflicts`` with the
-    specific components that carry conflicting licenses.
+    Real GPL / proprietary conflict detection over the stored SPDX license
+    ids (``SupplyChainRiskAnalyzer.assess_license_compliance``); components
+    without a license are counted, not guessed.
     """
-    result = await db.execute(
-        select(SoftwareComponent).where(
+    rows = (await db.execute(
+        select(SoftwareComponent.id, SoftwareComponent.name, SoftwareComponent.license_spdx_id).where(
             SoftwareComponent.organization_id == org_id
         )
-    )
-    components = result.scalars().all()
+    )).all()
 
     licenses: dict[str, int] = {}
     gpl_count = 0
@@ -1109,46 +1435,44 @@ async def license_audit(
     gpl_components: list[str] = []
     proprietary_components: list[str] = []
 
-    for component in components:
-        lic = component.license_spdx_id
+    for comp_id, name, lic in rows:
         if not lic:
             continue
         licenses[lic] = licenses.get(lic, 0) + 1
         if any(g in lic for g in gpl_license_set) or "GPL" in lic:
             gpl_count += 1
-            gpl_components.append(component.name or component.id)
+            gpl_components.append(name or comp_id)
         elif lic in proprietary_license_set:
             proprietary_count += 1
-            proprietary_components.append(component.name or component.id)
+            proprietary_components.append(name or comp_id)
         elif lic in permissive_license_set:
             permissive_count += 1
 
-    # Real conflict detection via the engine
     analyzer = SupplyChainRiskAnalyzer()
     license_assessment = analyzer.assess_license_compliance(list(licenses.keys()))
 
-    conflicts: list[str] = []
-    for reason in license_assessment.get("conflicts", []):
-        # Reason is a description like "GPL incompatible with
-        # proprietary license" — enrich it with the specific
-        # components so the operator can act.
-        conflicts.append(
-            f"{reason}: GPL in {gpl_components[:5]}, "
-            f"Proprietary in {proprietary_components[:5]}"
-        )
+    conflicts: list[str] = [
+        f"{reason}: GPL in {gpl_components[:5]}, Proprietary in {proprietary_components[:5]}"
+        for reason in license_assessment.get("conflicts", [])
+    ]
 
+    status_value = license_assessment.get("compliance_status", "unknown") if licenses else "not_assessed"
     return LicenseBreakdown(
-        total_components=len(components),
+        total_components=len(rows),
         licenses=licenses,
         gpl_components=gpl_count,
         proprietary_components=proprietary_count,
         permissive_components=permissive_count,
         conflicts=conflicts,
-        compliance_status=license_assessment.get("compliance_status", "unknown"),
+        compliance_status=status_value,
     )
 
 
 # Dashboard Endpoints
+
+
+async def _scalar(db: AsyncSession, stmt: Any) -> Any:
+    return (await db.execute(stmt)).scalar()
 
 
 @router.get("/dashboard/overview")
@@ -1156,75 +1480,39 @@ async def dashboard_overview(
     org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
-    """Get supply chain security dashboard overview"""
-    sbom_result = await db.execute(
-        select(func.count()).select_from(SBOM).where(SBOM.organization_id == org_id)
-    )
-    total_sboms = sbom_result.scalar() or 0
+    """Supply chain overview from stored rows (scanned / assessed only for averages)."""
+    total_sboms = await _scalar(db, select(func.count()).select_from(SBOM).where(SBOM.organization_id == org_id)) or 0
+    total_components = await _scalar(db, select(func.count()).select_from(SoftwareComponent).where(
+        SoftwareComponent.organization_id == org_id)) or 0
+    components_scanned = await _scalar(db, select(func.count()).select_from(SoftwareComponent).where(
+        SoftwareComponent.organization_id == org_id, SoftwareComponent.last_scanned.is_not(None))) or 0
+    components_with_vuln = await _scalar(db, select(func.count()).select_from(SoftwareComponent).where(
+        SoftwareComponent.organization_id == org_id, SoftwareComponent.known_vulnerabilities_count > 0)) or 0
+    critical_risks = await _scalar(db, select(func.count()).select_from(SupplyChainRisk).where(
+        SupplyChainRisk.organization_id == org_id, SupplyChainRisk.severity == "critical",
+        SupplyChainRisk.status == "open")) or 0
+    high_risks = await _scalar(db, select(func.count()).select_from(SupplyChainRisk).where(
+        SupplyChainRisk.organization_id == org_id, SupplyChainRisk.severity == "high",
+        SupplyChainRisk.status == "open")) or 0
 
-    component_result = await db.execute(
-        select(func.count()).select_from(SoftwareComponent).where(
-            SoftwareComponent.organization_id == org_id
-        )
-    )
-    total_components = component_result.scalar() or 0
+    vendors = (await db.execute(
+        select(VendorAssessment.questionnaire_responses, VendorAssessment.security_score,
+               VendorAssessment.risk_tier)
+        .where(VendorAssessment.organization_id == org_id).limit(50_000),
+    )).all()
+    assessed_scores = [
+        float(score) for answers, score, _tier in vendors
+        if summarise_answers(answers)["status"] != "not_assessed"
+    ]
+    critical_vendors = sum(1 for _a, _s, tier in vendors if tier == "critical")
 
-    vuln_result = await db.execute(
-        select(func.count()).select_from(SoftwareComponent).where(
-            (SoftwareComponent.organization_id == org_id)
-            & (SoftwareComponent.known_vulnerabilities_count > 0)
-        )
-    )
-    components_with_vuln = vuln_result.scalar() or 0
+    avg_component_risk = await _scalar(db, select(func.avg(SoftwareComponent.risk_score)).where(
+        SoftwareComponent.organization_id == org_id, SoftwareComponent.last_scanned.is_not(None)))
 
-    critical_result = await db.execute(
-        select(func.count()).select_from(SupplyChainRisk).where(
-            (SupplyChainRisk.organization_id == org_id)
-            & (SupplyChainRisk.severity == "critical")
-            & (SupplyChainRisk.status == "open")
-        )
-    )
-    critical_risks = critical_result.scalar() or 0
-
-    high_result = await db.execute(
-        select(func.count()).select_from(SupplyChainRisk).where(
-            (SupplyChainRisk.organization_id == org_id)
-            & (SupplyChainRisk.severity == "high")
-            & (SupplyChainRisk.status == "open")
-        )
-    )
-    high_risks = high_result.scalar() or 0
-
-    vendor_result = await db.execute(
-        select(func.count()).select_from(VendorAssessment).where(
-            VendorAssessment.organization_id == org_id
-        )
-    )
-    total_vendors = vendor_result.scalar() or 0
-
-    vendor_critical_result = await db.execute(
-        select(func.count()).select_from(VendorAssessment).where(
-            (VendorAssessment.organization_id == org_id)
-            & (VendorAssessment.risk_tier == "critical")
-        )
-    )
-    critical_vendors = vendor_critical_result.scalar() or 0
-
-    # Real averages (were hardcoded 45.5 / 62.3 — cosmetic fake data that
-    # would have been the first thing an auditor noticed)
-    avg_comp_result = await db.execute(
-        select(func.avg(SoftwareComponent.risk_score)).where(
-            SoftwareComponent.organization_id == org_id
-        )
-    )
-    avg_component_risk = float(avg_comp_result.scalar() or 0.0)
-
-    avg_vendor_result = await db.execute(
-        select(func.avg(VendorAssessment.security_score)).where(
-            VendorAssessment.organization_id == org_id
-        )
-    )
-    avg_vendor_score = float(avg_vendor_result.scalar() or 0.0)
+    sbom_status = dict((await db.execute(
+        select(SBOM.compliance_status, func.count(SBOM.id)).where(SBOM.organization_id == org_id)
+        .group_by(SBOM.compliance_status),
+    )).all())
 
     return DashboardOverview(
         total_sboms=total_sboms,
@@ -1232,10 +1520,18 @@ async def dashboard_overview(
         components_with_vulnerabilities=components_with_vuln,
         critical_risks_open=critical_risks,
         high_risks_open=high_risks,
-        vendors_assessed=total_vendors,
+        vendors_assessed=len(assessed_scores),
         critical_risk_vendors=critical_vendors,
-        average_component_risk=round(avg_component_risk, 1),
-        average_vendor_score=round(avg_vendor_score, 1),
+        average_component_risk=round(float(avg_component_risk), 1) if components_scanned and avg_component_risk is not None else None,
+        average_vendor_score=round(sum(assessed_scores) / len(assessed_scores), 1) if assessed_scores else None,
+        total_vendors=len(vendors),
+        vendors_not_assessed=len(vendors) - len(assessed_scores),
+        components_scanned=components_scanned,
+        components_not_scanned=total_components - components_scanned,
+        sboms_compliant=int(sbom_status.get("compliant", 0)),
+        sboms_non_compliant=int(sbom_status.get("non_compliant", 0)),
+        sboms_not_assessed=int(total_sboms - sbom_status.get("compliant", 0) - sbom_status.get("non_compliant", 0)),
+        vulnerability_sources=await provider_status(db, org_id),
     )
 
 
@@ -1245,29 +1541,30 @@ async def get_top_risky_components(
     db: DatabaseSession = None,
     limit: int = Query(10, ge=1, le=50),
 ):
-    """Get top risky components by risk score"""
-    result = await db.execute(
+    """Top looked-up components by risk score (highest CVSS of their advisories)."""
+    components = (await db.execute(
         select(SoftwareComponent)
-        .where(SoftwareComponent.organization_id == org_id)
-        .order_by(SoftwareComponent.risk_score.desc())
+        .where(
+            SoftwareComponent.organization_id == org_id,
+            SoftwareComponent.last_scanned.is_not(None),
+            SoftwareComponent.known_vulnerabilities_count > 0,
+        )
+        .order_by(SoftwareComponent.risk_score.desc(), SoftwareComponent.id)
         .limit(limit)
-    )
-    components = result.scalars().all()
+    )).scalars().all()
 
     summaries = []
     for comp in components:
-        risk_result = await db.execute(
-            select(SupplyChainRisk).where(
-                (SupplyChainRisk.component_id == comp.id)
-                & (SupplyChainRisk.organization_id == org_id)
-                & (SupplyChainRisk.status == "open")
+        risks = (await db.execute(
+            select(SupplyChainRisk.risk_type, SupplyChainRisk.severity).where(
+                and_(
+                    SupplyChainRisk.component_id == comp.id,
+                    SupplyChainRisk.organization_id == org_id,
+                    SupplyChainRisk.status == "open",
+                )
             )
-        )
-        risks = risk_result.scalars().all()
-
-        risk_type = risks[0].risk_type if risks else "unknown"
-        severity = risks[0].severity if risks else "low"
-
+        )).all()
+        top = max(risks, key=lambda r: SEVERITY_RANK.get(r.severity, 0), default=None)
         summaries.append(
             RiskyComponentSummary(
                 component_id=comp.id,
@@ -1275,8 +1572,8 @@ async def get_top_risky_components(
                 version=comp.version,
                 risk_score=comp.risk_score,
                 vulnerability_count=comp.known_vulnerabilities_count,
-                risk_type=risk_type,
-                severity=severity,
+                risk_type=top.risk_type if top else "",
+                severity=top.severity if top else "",
             )
         )
 
@@ -1288,22 +1585,23 @@ async def get_vendor_scores(
     org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
-    """Get vendor risk scores"""
-    result = await db.execute(
+    """Vendor scores: security_score from stored answers, risk_score = 100 - it."""
+    vendors = (await db.execute(
         select(VendorAssessment).where(VendorAssessment.organization_id == org_id)
-    )
-    vendors = result.scalars().all()
+        .order_by(VendorAssessment.vendor_name).limit(5_000)
+    )).scalars().all()
 
-    summaries = [
-        VendorScoreSummary(
+    out = []
+    for vendor in vendors:
+        assessed = vendor.assessment_status != "not_assessed"
+        out.append(VendorScoreSummary(
             vendor_id=vendor.id,
             vendor_name=vendor.vendor_name,
-            risk_score=vendor.security_score,
+            risk_score=round(100.0 - vendor.security_score, 1) if assessed else None,
+            security_score=vendor.security_score if assessed else None,
+            assessment_status=vendor.assessment_status,
             risk_tier=vendor.risk_tier,
             last_assessment=vendor.assessment_date,
             incident_count=vendor.incident_count,
-        )
-        for vendor in vendors
-    ]
-
-    return summaries
+        ))
+    return out

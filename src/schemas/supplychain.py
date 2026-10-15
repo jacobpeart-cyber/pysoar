@@ -8,7 +8,22 @@ from datetime import datetime
 from typing import Any, Optional
 
 from src.schemas.base import DBModel
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+
+def _reject_derived(fields: tuple[str, ...]):
+    """A ``before`` validator refusing client-supplied derived fields."""
+
+    def check(cls, data):  # noqa: ARG001
+        if isinstance(data, dict):
+            given = [f for f in fields if data.get(f) is not None]
+            if given:
+                raise ValueError(
+                    f"{', '.join(given)} is derived from stored data and cannot be set by the client",
+                )
+        return data
+
+    return model_validator(mode="before")(classmethod(check))
 
 
 # Base Schemas
@@ -34,6 +49,9 @@ class SoftwareComponentCreate(SoftwareComponentBase):
     """Schema for creating a software component"""
 
     parent_component_id: Optional[str] = None
+    # The UI form sends ``license``; stored as license_spdx_id / license_type
+    # when those are not given.
+    license: Optional[str] = Field(None, max_length=100)
 
 
 class SoftwareComponentUpdate(BaseModel):
@@ -57,6 +75,9 @@ class SoftwareComponentResponse(SoftwareComponentBase, DBModel):
     last_scanned: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # Wave 4: not_scanned until an OSV / NVD lookup ran (the counts above are
+    # then meaningful); scanned afterwards.
+    vulnerability_scan_status: str = "not_scanned"
 
     class Config:
         from_attributes = True
@@ -74,15 +95,25 @@ class SBOMBase(BaseModel):
 
 
 class SBOMCreate(SBOMBase):
-    """Schema for creating an SBOM"""
+    """Generate an SBOM from stored components.
+
+    ``component_ids`` picks the components (all of the organisation's when
+    omitted, up to the component cap). ``sbom_content`` is ignored: the
+    document is built from the stored rows.
+    """
 
     sbom_content: Optional[str] = None
+    component_ids: Optional[list[str]] = Field(None, max_length=20_000)
 
 
 class SBOMUpdate(BaseModel):
-    """Schema for updating an SBOM"""
+    """Schema for updating an SBOM (name only).
 
-    name: Optional[str] = None
+    ``compliance_status`` is derived from the stored components (NTIA minimum
+    elements) and is refused with 422 when sent.
+    """
+
+    name: Optional[str] = Field(None, min_length=1, max_length=500)
     compliance_status: Optional[str] = None
 
 
@@ -166,6 +197,9 @@ class SupplyChainRiskResponse(SupplyChainRiskBase, DBModel):
     organization_id: str = ""
     detected_date: Optional[datetime] = None
     remediation_date: Optional[datetime] = None
+    # Wave 4: OSV / NVD advisory behind a known_vulnerability risk
+    advisory_id: Optional[str] = None
+    source: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -185,21 +219,36 @@ class VendorAssessmentBase(BaseModel):
 
 
 class VendorAssessmentCreate(VendorAssessmentBase):
-    """Schema for creating vendor assessment"""
+    """Create a vendor assessment.
+
+    ``security_score`` is computed from ``questionnaire_responses`` (keys from
+    ``GET /supplychain/vendors/questionnaire``, answers yes / partial / no /
+    n/a); sending it is refused with 422.
+    """
 
     questionnaire_responses: Optional[dict[str, Any]] = None
-    certifications: Optional[list[str]] = None
+    certifications: Optional[list[Any]] = None
     third_party_subprocessors: Optional[list[str]] = None
     notes: Optional[str] = None
 
+    _no_score = _reject_derived(("security_score",))
+
 
 class VendorAssessmentUpdate(BaseModel):
-    """Schema for updating vendor assessment"""
+    """Update a vendor assessment; the score is recomputed from the answers."""
 
     security_score: Optional[float] = None
     risk_tier: Optional[str] = None
-    certifications: Optional[list[str]] = None
+    certifications: Optional[list[Any]] = None
     notes: Optional[str] = None
+    questionnaire_responses: Optional[dict[str, Any]] = None
+    third_party_subprocessors: Optional[list[str]] = None
+    vendor_url: Optional[str] = None
+    assessment_type: Optional[str] = None
+    data_handling_classification: Optional[str] = None
+    contract_expiry: Optional[datetime] = None
+
+    _no_score = _reject_derived(("security_score",))
 
 
 class VendorAssessmentResponse(VendorAssessmentBase, DBModel):
@@ -213,6 +262,14 @@ class VendorAssessmentResponse(VendorAssessmentBase, DBModel):
     contract_expiry: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # Wave 4: score derived from stored answers; not_assessed without any.
+    assessment_status: str = "not_assessed"
+    answered_questions: int = 0
+    total_questions: int = 0
+    questionnaire_responses: Optional[dict[str, Any]] = None
+    certifications: Optional[list[Any]] = None
+    third_party_subprocessors: Optional[list[str]] = None
+    notes: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -373,7 +430,7 @@ class CISAComplianceReport(BaseModel):
 
 
 class DashboardOverview(BaseModel):
-    """Supply chain dashboard overview"""
+    """Supply chain dashboard overview (stored rows only)"""
 
     total_sboms: int = 0
     total_components: int = 0
@@ -382,8 +439,18 @@ class DashboardOverview(BaseModel):
     high_risks_open: int = 0
     vendors_assessed: int = 0
     critical_risk_vendors: int = 0
-    average_component_risk: float = 0.0
-    average_vendor_score: float = 0.0
+    # Averages over looked-up components / assessed vendors only; null when none.
+    average_component_risk: Optional[float] = None
+    average_vendor_score: Optional[float] = None
+    # Wave 4
+    total_vendors: int = 0
+    vendors_not_assessed: int = 0
+    components_scanned: int = 0
+    components_not_scanned: int = 0
+    sboms_compliant: int = 0
+    sboms_non_compliant: int = 0
+    sboms_not_assessed: int = 0
+    vulnerability_sources: dict[str, Any] = Field(default_factory=dict)
 
 
 class RiskyComponentSummary(BaseModel):
@@ -403,10 +470,13 @@ class VendorScoreSummary(BaseModel):
 
     vendor_id: str = ""
     vendor_name: str = ""
-    risk_score: float = 0.0
+    # 100 - security_score for assessed vendors; null when not assessed
+    risk_score: Optional[float] = None
     risk_tier: str = ""
     last_assessment: datetime
     incident_count: int = 0
+    security_score: Optional[float] = None
+    assessment_status: str = "not_assessed"
 
 
 class LicenseBreakdown(BaseModel):
@@ -431,3 +501,10 @@ class ComplianceAudit(BaseModel):
     license_compliant: bool = False
     recommendations: list[str]
     auditor: str = ""
+
+
+class ComponentLookupRequest(BaseModel):
+    """OSV / NVD lookup of stored components (all of the org's when omitted)."""
+
+    component_ids: Optional[list[str]] = Field(None, max_length=2_000)
+    use_cache: bool = True

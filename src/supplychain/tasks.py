@@ -125,7 +125,6 @@ def scheduled_dependency_scan(self, organization_id: str, scan_type: str = "full
 
 async def _vulnerability_cross_reference_async(component_id: str) -> dict[str, Any]:
     """Known risks for one component, read in id windows of three columns."""
-    severity_order = {"critical": 4, "high": 3, "medium": 2, "low": 1, "none": 0}
     cves: list[dict[str, Any]] = []
     max_severity = "none"
     cap_hit = False
@@ -145,19 +144,15 @@ async def _vulnerability_cross_reference_async(component_id: str) -> dict[str, A
             last_id = rows[-1].id
 
             for risk in rows:
-                # SupplyChainRisk has no ``risk_details`` column, so the old
-                # ``hasattr(risk, "risk_details")`` branch always produced {}:
-                # the CVE id and description below are exactly what it emitted.
-                cve_entry = {
-                    "cve_id": f"RISK-{risk.id[:8]}",
-                    "severity": risk.risk_type or "medium",
-                    "description": "Supply chain risk identified",
-                    "published_date": risk.created_at.isoformat() if risk.created_at else None,
-                }
-                cves.append(cve_entry)
-                sev = cve_entry["severity"]
-                if severity_order.get(sev, 0) > severity_order.get(max_severity, 0):
-                    max_severity = sev
+                # Wave 4: report the stored risk as what it is. The old entry
+                # invented a "RISK-xxxxxxxx" CVE id and used risk_type as the
+                # severity; real advisories come from the OSV / NVD lookup
+                # (src/supplychain/vulnlookup.py) as known_vulnerability risks.
+                cves.append({
+                    "risk_id": risk.id,
+                    "risk_type": risk.risk_type,
+                    "detected_at": risk.created_at.isoformat() if risk.created_at else None,
+                })
 
             if len(rows) < window:
                 break
@@ -205,7 +200,11 @@ def vulnerability_cross_reference(
             "component_name": component_name,
             "component_version": component_version,
             "cross_reference_date": datetime.utcnow().isoformat(),
-            "databases_checked": ["NVD", "OSV", "GitHub"],
+            # Stored risks only; nothing external is queried by this task.
+            # OSV / NVD lookups: supplychain_vulnerability_lookup_sweep or
+            # POST /supplychain/components/{id}/lookup.
+            "databases_checked": [],
+            "source": "stored_supply_chain_risks",
             "vulnerabilities_found": cves,
             "total_cves": len(cves),
             "max_severity": found["max_severity"],
@@ -384,7 +383,10 @@ def sbom_regeneration(self, sbom_id: str, regeneration_type: str = "standard"):
                 sbom.updated_at = datetime.utcnow()
                 await db.commit()
 
-                compliance = "compliant" if vuln_count == 0 else "non_compliant"
+                # Wave 4: compliance is the stored, derived NTIA status (set
+                # when the SBOM is imported / generated); "no risks" is not
+                # evidence of compliance.
+                compliance = sbom.compliance_status or "not_assessed"
 
                 return {
                     "components_updated": components_count,
@@ -735,6 +737,12 @@ async def _supplychain_cross_org_sweep_async(factory: Any) -> dict[str, Any]:
                     already_open = await _open_risk_component_ids(
                         db, [c.id for c in vuln_comps], "vulnerability",
                     )
+                    # Components whose advisories are already stored as
+                    # known_vulnerability risks (OSV / NVD lookup) need no
+                    # summary row on top of them.
+                    already_open |= await _open_risk_component_ids(
+                        db, [c.id for c in vuln_comps], "known_vulnerability",
+                    )
                     for comp in vuln_comps:
                         if comp.id in already_open:
                             continue
@@ -862,3 +870,67 @@ def supplychain_cross_org_sweep(self):
     except Exception as exc:
         logger.warning(f"supplychain_cross_org_sweep failed: {exc}")
         return {"error": str(exc)[:200]}
+
+
+# ---------------------------------------------------------------------------
+# Wave 4: OSV / NVD lookups of stored components
+# ---------------------------------------------------------------------------
+LOOKUP_STALE_AFTER = timedelta(days=7)
+MAX_LOOKUP_COMPONENTS_PER_ORG = 500
+MAX_LOOKUP_COMPONENTS_PER_RUN = 5_000
+
+
+async def _vulnerability_lookup_sweep_async(factory: Any = None) -> dict[str, Any]:
+    """Per org: components never looked up or looked up > 7 days ago, capped."""
+    from src.models.organization import Organization
+    from src.supplychain.vulnlookup import lookup_components
+
+    factory = factory or _AsyncSessionLocal
+    totals: dict[str, Any] = {"orgs": 0, "components_checked": 0, "risks_new": 0, "errors": 0, "truncated": False}
+    cutoff = datetime.utcnow() - LOOKUP_STALE_AFTER
+    last_org: str | None = None
+    async with factory() as db:
+        while True:
+            stmt = select(Organization.id).order_by(Organization.id).limit(SUPPLYCHAIN_BATCH_SIZE)
+            if last_org is not None:
+                stmt = stmt.where(Organization.id > last_org)
+            org_ids = [r[0] for r in (await db.execute(stmt)).all()]
+            if not org_ids:
+                break
+            last_org = org_ids[-1]
+            for org_id in org_ids:
+                budget = MAX_LOOKUP_COMPONENTS_PER_RUN - totals["components_checked"]
+                if budget <= 0:
+                    totals["truncated"] = True
+                    break
+                comps = list((await db.execute(
+                    select(SoftwareComponent).where(
+                        SoftwareComponent.organization_id == org_id,
+                        (SoftwareComponent.last_scanned.is_(None)) | (SoftwareComponent.last_scanned < cutoff),
+                    ).order_by(SoftwareComponent.last_scanned.is_not(None), SoftwareComponent.last_scanned,
+                               SoftwareComponent.id)
+                    .limit(min(MAX_LOOKUP_COMPONENTS_PER_ORG, budget)),
+                )).scalars())
+                if not comps:
+                    continue
+                totals["orgs"] += 1
+                summary = await lookup_components(db, org_id, comps)
+                totals["components_checked"] += summary["components_checked"]
+                totals["risks_new"] += summary["risks_new"]
+                if summary["providers"].get("osv", {}).get("status") == "error":
+                    totals["errors"] += 1
+                await db.commit()
+                db.expunge_all()
+            if totals["truncated"] or len(org_ids) < SUPPLYCHAIN_BATCH_SIZE:
+                break
+    logger.info(f"supplychain_vulnerability_lookup_sweep: {totals}")
+    return totals
+
+
+@shared_task(name="src.supplychain.tasks.supplychain_vulnerability_lookup_sweep")
+def supplychain_vulnerability_lookup_sweep() -> dict[str, Any]:
+    """Daily OSV / NVD lookup of stale components, per org, capped per run."""
+    from src.core.database import async_session_factory
+    from src.siem.tasks import run_async
+
+    return run_async(_vulnerability_lookup_sweep_async(async_session_factory))

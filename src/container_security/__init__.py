@@ -9,7 +9,9 @@ and real-time runtime anomaly detection.
 
 from src.container_security.models import (
     ContainerImage,
+    ContainerImageScan,
     ImageVulnerability,
+    K8sCheckResult,
     KubernetesCluster,
     K8sSecurityFinding,
     RuntimeAlert,
@@ -22,16 +24,18 @@ from src.container_security.engine import (
     ComplianceChecker,
 )
 from src.container_security.tasks import (
-    scheduled_image_scan,
+    cis_audit_sweep,
     cluster_security_audit,
-    runtime_monitoring,
-    compliance_check,
+    reconcile_image_scans,
+    scheduled_image_scan,
     stale_image_report,
 )
 
 __all__ = [
     "ContainerImage",
+    "ContainerImageScan",
     "ImageVulnerability",
+    "K8sCheckResult",
     "KubernetesCluster",
     "K8sSecurityFinding",
     "RuntimeAlert",
@@ -42,7 +46,7 @@ __all__ = [
     "ComplianceChecker",
     "scheduled_image_scan",
     "cluster_security_audit",
-    "runtime_monitoring",
-    "compliance_check",
+    "reconcile_image_scans",
+    "cis_audit_sweep",
     "stale_image_report",
 ]

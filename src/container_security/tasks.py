@@ -1,629 +1,237 @@
 """
-Container Security Celery Tasks
+Container Security Celery Tasks (wave 4)
 
-Background tasks for image scanning, cluster auditing, runtime monitoring,
-compliance checking, and vulnerability reporting.
+Every task works on stored rows of one organisation at a time, reads in
+keyset windows, caps the rows it touches per run and commits per window.
+
+- ``reconcile_image_scans`` (beat): applies endpoint-agent results to image
+  scans queued through ``scan_container_image`` commands.
+- ``cis_audit_sweep`` (beat): runs the CIS checks against the Kubernetes API
+  of every cluster that has a stored credential (capped per run).
+- ``scheduled_image_scan`` / ``cluster_security_audit``: on-demand,
+  tenant-scoped versions for one image / cluster.
+- ``stale_image_report``: images not deployed for N days (read only).
+
+Removed in wave 4: ``runtime_monitoring`` (it read pod names with an
+unpinned client and an environment token, then evaluated an empty event list:
+it could never raise an alert) and ``compliance_check`` (framework scores from
+self-attested booleans). Compliance now comes from stored CIS check results.
 """
 
-import os
-import re
-from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
-import asyncio
-import httpx
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
+
 from celery import shared_task
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import sessionmaker
 from sqlalchemy import select
 
+from src.container_security.models import ContainerImage, ContainerImageScan, KubernetesCluster
 from src.core.logging import get_logger
-from src.core.config import settings
-
-
-def _cluster_auth(cluster) -> Optional[tuple[str, str]]:
-    """Resolve (api_url, bearer_token) for a KubernetesCluster row.
-
-    Precedence:
-      1. env var ``PYSOAR_KUBE_TOKEN_{NAME}`` (name uppercased, non-alnum → _)
-      2. env var ``PYSOAR_KUBE_TOKEN`` (single-cluster deployments)
-      3. in-cluster service account token at /var/run/secrets/kubernetes.io/serviceaccount/token
-    Returns None if no credentials found.
-    """
-    if not cluster or not cluster.endpoint:
-        return None
-    sanitized = re.sub(r"[^A-Z0-9]", "_", cluster.name.upper())
-    token = (
-        os.getenv(f"PYSOAR_KUBE_TOKEN_{sanitized}")
-        or os.getenv("PYSOAR_KUBE_TOKEN")
-    )
-    if not token:
-        sa_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-        if os.path.exists(sa_path):
-            try:
-                with open(sa_path) as f:
-                    token = f.read().strip()
-            except OSError:
-                token = None
-    if not token:
-        return None
-    return cluster.endpoint.rstrip("/"), token
-
-
-async def _list_cluster_pods(cluster) -> List[tuple[str, str]]:
-    """Query the cluster's Kubernetes API for running pods.
-
-    Returns list of (namespace, pod_name). Returns [] on failure; caller
-    must treat empty as 'no pods found / cluster unreachable' and not
-    fabricate targets.
-    """
-    auth = _cluster_auth(cluster)
-    if not auth:
-        logger.warning(
-            "KubernetesCluster %s has no bearer token configured "
-            "(set PYSOAR_KUBE_TOKEN_%s or PYSOAR_KUBE_TOKEN); skipping pod list",
-            cluster.name,
-            re.sub(r"[^A-Z0-9]", "_", cluster.name.upper()),
-        )
-        return []
-    api_url, token = auth
-    url = f"{api_url}/api/v1/pods?limit=500"
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    try:
-        # TLS verification is on by default. Clusters with a private CA set
-        # PYSOAR_KUBE_CA_BUNDLE to the bundle path; PYSOAR_KUBE_VERIFY_TLS=false
-        # is the explicit, logged opt-out (SC-8).
-        ca_bundle = os.getenv("PYSOAR_KUBE_CA_BUNDLE")
-        verify: bool | str = ca_bundle or os.getenv("PYSOAR_KUBE_VERIFY_TLS", "true").lower() != "false"
-        if verify is False:
-            logger.warning("TLS verification disabled for cluster %s via PYSOAR_KUBE_VERIFY_TLS", cluster.name)
-        async with httpx.AsyncClient(verify=verify, timeout=10.0) as client:
-            r = await client.get(url, headers=headers)
-        if r.status_code != 200:
-            logger.error(
-                "K8s API %s returned HTTP %d: %s",
-                cluster.name, r.status_code, r.text[:200],
-            )
-            return []
-        data = r.json()
-        pods: List[tuple[str, str]] = []
-        for item in data.get("items", []):
-            meta = item.get("metadata") or {}
-            ns = meta.get("namespace")
-            name = meta.get("name")
-            if ns and name:
-                pods.append((ns, name))
-        logger.info("Fetched %d pods from cluster %s", len(pods), cluster.name)
-        return pods
-    except (httpx.HTTPError, ValueError, KeyError) as e:
-        logger.error("K8s pod list failed for cluster %s: %s", cluster.name, e)
-        return []
-from src.container_security.models import (
-    ContainerImage,
-    ImageVulnerability,
-    KubernetesCluster,
-    K8sSecurityFinding,
-    RuntimeAlert,
-)
-from src.container_security.engine import (
-    ImageScanner,
-    K8sSecurityAuditor,
-    RuntimeProtector,
-    K8sRemediator,
-    ComplianceChecker,
-)
 
 logger = get_logger(__name__)
 
-# Database session factory
-engine = create_async_engine(settings.database_url, echo=False, pool_pre_ping=True)
-AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
 __all__ = [
-    "scheduled_image_scan",
+    "cis_audit_sweep",
     "cluster_security_audit",
-    "runtime_monitoring",
-    "compliance_check",
+    "reconcile_image_scans",
+    "scheduled_image_scan",
     "stale_image_report",
 ]
 
+#: Scans reconciled per window / per run.
+SCAN_RECONCILE_BATCH = 100
+MAX_SCAN_RECONCILE_PER_RUN = 2_000
+#: Clusters audited per sweep (each audit makes ~10 paginated API reads).
+MAX_CLUSTERS_PER_SWEEP = 200
+CLUSTER_BATCH = 20
+MAX_STALE_IMAGES = 5_000
 
-@shared_task(bind=True, max_retries=3)
-def scheduled_image_scan(self, image_id: str, org_id: str):
-    """
-    Scheduled container image vulnerability scan.
 
-    Scans image registry, checks for vulnerabilities, verifies signature,
-    and updates image risk score.
+def _factory() -> Any:
+    from src.core.database import async_session_factory
 
-    Args:
-        self: Celery task context
-        image_id: Container image ID
-        org_id: Organization ID
-    """
-    try:
-        logger.info(f"Starting scheduled scan for image {image_id}")
+    return async_session_factory
 
-        async def _scan():
-            async with AsyncSessionLocal() as db:
-                # Fetch image
-                stmt = select(ContainerImage).where(ContainerImage.id == image_id)
-                result = await db.execute(stmt)
-                image = result.scalar_one_or_none()
 
-                if not image:
-                    logger.error(f"Image {image_id} not found")
-                    return {"status": "failed", "error": "Image not found"}
+def _run(coro: Any) -> Any:
+    from src.siem.tasks import run_async
 
-                # Run scan
-                scanner = ImageScanner()
-                scan_result = await scanner.scan_image(
-                    image.registry,
-                    image.repository,
-                    image.tag,
-                    image.digest_sha256,
-                )
+    return run_async(coro)
 
-                # Update image with scan results
-                image.vulnerability_count_critical = scan_result[
-                    "vulnerability_count_critical"
-                ]
-                image.vulnerability_count_high = scan_result["vulnerability_count_high"]
-                image.vulnerability_count_medium = scan_result[
-                    "vulnerability_count_medium"
-                ]
-                image.vulnerability_count_low = scan_result["vulnerability_count_low"]
 
-                # Calculate risk score
-                image.risk_score = scanner.calculate_image_risk_score(
-                    scan_result["vulnerability_count_critical"],
-                    scan_result["vulnerability_count_high"],
-                    scan_result["vulnerability_count_medium"],
-                    image.is_signed,
-                )
+async def reconcile_image_scans_async(factory: Any = None) -> dict[str, Any]:
+    """Apply agent results to pending scans, in keyset windows with a per-run cap."""
+    from src.agents.models import AgentCommand, AgentResult
+    from src.container_security.scanning import PENDING_SCAN_STATES, reconcile_scan
 
-                # Check compliance status
-                if (
-                    scan_result["vulnerability_count_critical"] > 0
-                    or scan_result["vulnerability_count_high"] > 1
+    factory = factory or _factory()
+    totals = {"scanned": 0, "changed": 0, "truncated": False}
+    last_id: Optional[str] = None
+    async with factory() as db:
+        while True:
+            if totals["scanned"] >= MAX_SCAN_RECONCILE_PER_RUN:
+                totals["truncated"] = True
+                break
+            window = min(SCAN_RECONCILE_BATCH, MAX_SCAN_RECONCILE_PER_RUN - totals["scanned"])
+            stmt = select(ContainerImageScan).where(
+                ContainerImageScan.status.in_(PENDING_SCAN_STATES),
+                ContainerImageScan.command_id.is_not(None),
+            )
+            if last_id is not None:
+                stmt = stmt.where(ContainerImageScan.id > last_id)
+            scans = list((await db.execute(stmt.order_by(ContainerImageScan.id).limit(window))).scalars())
+            if not scans:
+                break
+            last_id = scans[-1].id
+            totals["scanned"] += len(scans)
+            command_ids = sorted({s.command_id for s in scans if s.command_id})
+            results: dict[str, Any] = {}
+            for result in (await db.execute(
+                select(AgentResult).where(AgentResult.command_id.in_(command_ids))
+                .order_by(AgentResult.reported_at.desc()),
+            )).scalars():
+                results.setdefault(result.command_id, result)
+            statuses = dict((await db.execute(
+                select(AgentCommand.id, AgentCommand.status).where(AgentCommand.id.in_(command_ids)),
+            )).all())
+            for scan in scans:
+                if await reconcile_scan(
+                    db, scan, command_status=statuses.get(scan.command_id),
+                    result=results.get(scan.command_id), loaded=True,
                 ):
-                    image.compliance_status = "non_compliant"
-                else:
-                    image.compliance_status = "compliant"
+                    totals["changed"] += 1
+            await db.commit()
+            db.expunge_all()
+            if len(scans) < window:
+                break
+    if totals["truncated"]:
+        logger.warning("container_scan_reconcile_capped", cap=MAX_SCAN_RECONCILE_PER_RUN)
+    return totals
 
-                image.scanned_at = scan_result["scanned_at"]
 
-                # Store vulnerabilities
-                for vuln in scan_result["vulnerabilities"]:
-                    existing = await db.execute(
-                        select(ImageVulnerability).where(
-                            ImageVulnerability.image_id == image_id,
-                            ImageVulnerability.cve_id == vuln["cve_id"],
-                        )
-                    )
-                    if not existing.scalar_one_or_none():
-                        db.add(
-                            ImageVulnerability(
-                                image_id=image_id,
-                                cve_id=vuln["cve_id"],
-                                package_name=vuln["package"],
-                                package_version=vuln["version"],
-                                fixed_version=vuln.get("fixed_version"),
-                                severity=vuln["severity"],
-                                cvss_score=vuln.get("cvss"),
-                                exploit_available=vuln.get("exploit_available", False),
-                                description=vuln["description"],
-                                remediation=f"Update {vuln['package']} to {vuln.get('fixed_version')}",
-                                organization_id=org_id,
-                            )
-                        )
+@shared_task(name="src.container_security.tasks.reconcile_image_scans")
+def reconcile_image_scans() -> dict[str, Any]:
+    """Beat entry point: apply agent scan results."""
+    return _run(reconcile_image_scans_async())
 
+
+async def cis_audit_sweep_async(factory: Any = None) -> dict[str, Any]:
+    """CIS audit of every credentialed cluster, oldest audit first, capped per run."""
+    from src.container_security.kube import run_cis_audit
+
+    factory = factory or _factory()
+    totals: dict[str, Any] = {"clusters": 0, "assessed": 0, "failed": 0, "truncated": False}
+    last_id: Optional[str] = None
+    async with factory() as db:
+        while True:
+            if totals["clusters"] >= MAX_CLUSTERS_PER_SWEEP:
+                totals["truncated"] = True
+                break
+            window = min(CLUSTER_BATCH, MAX_CLUSTERS_PER_SWEEP - totals["clusters"])
+            stmt = select(KubernetesCluster).where(KubernetesCluster.credential_encrypted.is_not(None))
+            if last_id is not None:
+                stmt = stmt.where(KubernetesCluster.id > last_id)
+            clusters = list((await db.execute(stmt.order_by(KubernetesCluster.id).limit(window))).scalars())
+            if not clusters:
+                break
+            last_id = clusters[-1].id
+            for cluster in clusters:
+                totals["clusters"] += 1
+                summary = await run_cis_audit(db, cluster)
+                key = "assessed" if summary["assessment_status"] == "assessed" else "failed"
+                totals[key] += 1
                 await db.commit()
-
-                logger.info(
-                    f"Image {image_id} scan complete: "
-                    f"{scan_result['vulnerability_count_critical']} critical vulnerabilities"
-                )
-
-                return {
-                    "status": "completed",
-                    "image_id": image_id,
-                    "vulnerabilities": scan_result["total_vulnerabilities"],
-                    "risk_score": image.risk_score,
-                }
-
-        return asyncio.run(_scan())
-
-    except Exception as exc:
-        logger.error(f"Image scan failed: {str(exc)}")
-        raise self.retry(exc=exc, countdown=60)
-
-
-@shared_task(bind=True, max_retries=3)
-def cluster_security_audit(self, cluster_id: str, org_id: str):
-    """
-    Scheduled Kubernetes cluster security audit.
-
-    Audits cluster configuration, checks CIS benchmarks, RBAC, network policies,
-    pod security, and secrets management.
-
-    Args:
-        self: Celery task context
-        cluster_id: Kubernetes cluster ID
-        org_id: Organization ID
-    """
-    try:
-        logger.info(f"Starting security audit for cluster {cluster_id}")
-
-        async def _audit():
-            async with AsyncSessionLocal() as db:
-                # Fetch cluster
-                stmt = select(KubernetesCluster).where(
-                    KubernetesCluster.id == cluster_id
-                )
-                result = await db.execute(stmt)
-                cluster = result.scalar_one_or_none()
-
-                if not cluster:
-                    logger.error(f"Cluster {cluster_id} not found")
-                    return {"status": "failed", "error": "Cluster not found"}
-
-                auditor = K8sSecurityAuditor()
-
-                # Run audits
-                config_audit = await auditor.audit_cluster_config(cluster)
-                rbac_audit = await auditor.audit_rbac(cluster)
-                policy_audit = await auditor.audit_network_policies(cluster)
-                pod_audit = await auditor.audit_pod_security(cluster)
-                secrets_audit = await auditor.audit_secrets_management(cluster)
-                controller_audit = await auditor.audit_admission_controllers(cluster)
-                cis_audit = await auditor.check_cis_k8s_benchmark(cluster)
-
-                # Store findings
-                finding_types = []
-
-                for finding in config_audit.get("findings", []):
-                    f = K8sSecurityFinding(
-                        cluster_id=cluster_id,
-                        finding_type=finding["type"],
-                        namespace="cluster",
-                        resource_type="Cluster",
-                        resource_name=cluster.name,
-                        severity=finding["severity"],
-                        description=finding.get("message", ""),
-                        status="open",
-                        organization_id=org_id,
-                    )
-                    db.add(f)
-                    finding_types.append(finding["type"])
-
-                for finding in rbac_audit.get("findings", []):
-                    f = K8sSecurityFinding(
-                        cluster_id=cluster_id,
-                        finding_type=finding.get("type", "rbac_misconfiguration"),
-                        namespace=finding.get("namespace", "kube-system"),
-                        resource_type="Role",
-                        resource_name=finding.get("role", "unknown"),
-                        severity=finding.get("severity", "high"),
-                        description=f"RBAC: {finding}",
-                        status="open",
-                        organization_id=org_id,
-                    )
-                    db.add(f)
-
-                for finding in policy_audit.get("findings", []):
-                    f = K8sSecurityFinding(
-                        cluster_id=cluster_id,
-                        finding_type=finding.get("type", "network_policy_missing"),
-                        namespace=finding.get("namespace", "default"),
-                        resource_type="NetworkPolicy",
-                        resource_name="default",
-                        severity=finding.get("severity", "high"),
-                        description=f"Network Policy: {finding}",
-                        status="open",
-                        organization_id=org_id,
-                    )
-                    db.add(f)
-
-                # Update cluster scores
-                total_findings = (
-                    config_audit.get("findings_count", 0)
-                    + rbac_audit.get("rbac_findings", 0)
-                    + policy_audit.get("policy_findings", 0)
-                    + pod_audit.get("pod_security_findings", 0)
-                )
-
-                cluster.risk_score = min(100, total_findings * 5)
-                cluster.compliance_score = max(
-                    0, 100 - cluster.risk_score
-                )
-                cluster.last_audit = datetime.utcnow()
-
-                await db.commit()
-
-                logger.info(
-                    f"Cluster {cluster_id} audit complete: "
-                    f"{total_findings} findings, risk_score={cluster.risk_score}"
-                )
-
-                return {
-                    "status": "completed",
-                    "cluster_id": cluster_id,
-                    "findings": total_findings,
-                    "risk_score": cluster.risk_score,
-                    "cis_compliance": cis_audit.get("compliance_percentage", 0),
-                }
-
-        return asyncio.run(_audit())
-
-    except Exception as exc:
-        logger.error(f"Cluster audit failed: {str(exc)}")
-        raise self.retry(exc=exc, countdown=60)
-
-
-@shared_task(bind=True, max_retries=3)
-def runtime_monitoring(self, cluster_id: str, org_id: str):
-    """
-    Continuous container runtime anomaly monitoring.
-
-    Monitors runtime behavior, detects container escapes, crypto mining,
-    reverse shells, and lateral movement.
-
-    Args:
-        self: Celery task context
-        cluster_id: Kubernetes cluster ID
-        org_id: Organization ID
-    """
-    try:
-        logger.info(f"Starting runtime monitoring for cluster {cluster_id}")
-
-        async def _monitor():
-            async with AsyncSessionLocal() as db:
-                cluster_stmt = select(KubernetesCluster).where(
-                    KubernetesCluster.id == cluster_id
-                )
-                result = await db.execute(cluster_stmt)
-                cluster = result.scalar_one_or_none()
-
-                if not cluster:
-                    return {"status": "failed", "error": "Cluster not found"}
-
-                protector = RuntimeProtector()
-                alerts_created = 0
-
-                # Query real RuntimeAlert rows and cluster pod information from DB
-                existing_alerts_query = select(RuntimeAlert).where(
-                    RuntimeAlert.cluster_id == cluster_id,
-                    RuntimeAlert.status == "new",
-                )
-                existing_result = await db.execute(existing_alerts_query)
-                existing_alerts = list(existing_result.scalars().all())
-
-                # Derive namespaces and pods from existing alert data
-                ns_pod_pairs = set()
-                for existing_alert in existing_alerts:
-                    ns = existing_alert.namespace or "default"
-                    pod = existing_alert.pod_name or "unknown"
-                    ns_pod_pairs.add((ns, pod))
-
-                # If no prior alerts exist, pull the live pod list from the
-                # cluster's Kubernetes API so we can monitor real workloads.
-                if not ns_pod_pairs:
-                    live = await _list_cluster_pods(cluster)
-                    ns_pod_pairs = set(live)
-                    if not ns_pod_pairs:
-                        # Cluster unreachable or no pods running — return
-                        # cleanly. We never fabricate monitoring targets.
-                        logger.info(
-                            "No pods retrievable from cluster %s; skipping this cycle",
-                            cluster_id,
-                        )
-                        return {
-                            "status": "skipped",
-                            "cluster_id": cluster_id,
-                            "reason": "no_pods_available",
-                        }
-
-                for namespace, pod in ns_pod_pairs:
-                        # Check for anomalies
-                        runtime_check = await protector.monitor_container_runtime(
-                            cluster_id, namespace, pod
-                        )
-
-                        for alert in runtime_check.get("alerts", []):
-                            runtime_alert = RuntimeAlert(
-                                cluster_id=cluster_id,
-                                alert_type=alert.get("type", "unexpected_process"),
-                                namespace=namespace,
-                                pod_name=pod,
-                                container_name=None,
-                                process_name=alert.get("process"),
-                                severity=alert.get("severity", "medium"),
-                                description=f"Runtime anomaly: {alert.get('type')}",
-                                status="new",
-                                organization_id=org_id,
-                            )
-                            db.add(runtime_alert)
-                            alerts_created += 1
-
-                        # Check for specific threats
-                        escape_check = await protector.detect_container_escape(
-                            namespace, pod, "container-0"
-                        )
-                        if escape_check.get("escape_detected"):
-                            runtime_alert = RuntimeAlert(
-                                cluster_id=cluster_id,
-                                alert_type="container_escape",
-                                namespace=namespace,
-                                pod_name=pod,
-                                container_name="container-0",
-                                severity="critical",
-                                description="Potential container escape detected",
-                                status="new",
-                                organization_id=org_id,
-                            )
-                            db.add(runtime_alert)
-                            alerts_created += 1
-
-                        # Check crypto mining
-                        mining_check = await protector.detect_crypto_mining(
-                            namespace, pod
-                        )
-                        if mining_check.get("crypto_mining_detected"):
-                            runtime_alert = RuntimeAlert(
-                                cluster_id=cluster_id,
-                                alert_type="crypto_mining",
-                                namespace=namespace,
-                                pod_name=pod,
-                                severity="high",
-                                description="Crypto mining process detected",
-                                status="new",
-                                organization_id=org_id,
-                            )
-                            db.add(runtime_alert)
-                            alerts_created += 1
-
-                await db.commit()
-
-                logger.info(
-                    f"Runtime monitoring for {cluster_id} complete: {alerts_created} alerts"
-                )
-
-                return {
-                    "status": "completed",
-                    "cluster_id": cluster_id,
-                    "alerts_created": alerts_created,
-                }
-
-        return asyncio.run(_monitor())
-
-    except Exception as exc:
-        logger.error(f"Runtime monitoring failed: {str(exc)}")
-        raise self.retry(exc=exc, countdown=60)
-
-
-@shared_task(bind=True, max_retries=3)
-def compliance_check(self, cluster_id: str, org_id: str):
-    """
-    Compliance framework checking.
-
-    Checks NSA/CISA hardening, DoD STIG, and SOC 2 compliance.
-
-    Args:
-        self: Celery task context
-        cluster_id: Kubernetes cluster ID
-        org_id: Organization ID
-    """
-    try:
-        logger.info(f"Starting compliance check for cluster {cluster_id}")
-
-        async def _check():
-            async with AsyncSessionLocal() as db:
-                stmt = select(KubernetesCluster).where(
-                    KubernetesCluster.id == cluster_id
-                )
-                result = await db.execute(stmt)
-                cluster = result.scalar_one_or_none()
-
-                if not cluster:
-                    return {"status": "failed", "error": "Cluster not found"}
-
-                checker = ComplianceChecker()
-
-                nsa_cisa = await checker.check_nsa_cisa_hardening(cluster)
-                dod_stig = await checker.check_dod_stig(cluster)
-                soc2 = await checker.check_soc2_controls(cluster)
-
-                overall_compliance = int(
-                    (
-                        nsa_cisa["compliance_score"]
-                        + dod_stig["compliance_score"]
-                        + soc2["compliance_score"]
-                    )
-                    / 3
-                )
-
-                cluster.compliance_score = overall_compliance
-
-                await db.commit()
-
-                logger.info(
-                    f"Compliance check for {cluster_id} complete: {overall_compliance}% compliant"
-                )
-
-                return {
-                    "status": "completed",
-                    "cluster_id": cluster_id,
-                    "compliance_score": overall_compliance,
-                    "frameworks": {
-                        "nsa_cisa": nsa_cisa["compliance_score"],
-                        "dod_stig": dod_stig["compliance_score"],
-                        "soc2": soc2["compliance_score"],
-                    },
-                }
-
-        return asyncio.run(_check())
-
-    except Exception as exc:
-        logger.error(f"Compliance check failed: {str(exc)}")
-        raise self.retry(exc=exc, countdown=60)
-
-
-@shared_task(bind=True, max_retries=3)
-def stale_image_report(self, org_id: str, days_threshold: int = 90):
-    """
-    Generate stale image report.
-
-    Identifies container images not deployed in specified days.
-
-    Args:
-        self: Celery task context
-        org_id: Organization ID
-        days_threshold: Days threshold for stale image
-    """
-    try:
-        logger.info(f"Generating stale image report for org {org_id}")
-
-        async def _report():
-            async with AsyncSessionLocal() as db:
-                # Find stale images
-                cutoff_date = datetime.utcnow() - timedelta(days=days_threshold)
-
-                stmt = select(ContainerImage).where(
-                    ContainerImage.organization_id == org_id,
-                    ContainerImage.last_deployed < cutoff_date,
-                )
-
-                result = await db.execute(stmt)
-                stale_images = result.scalars().all()
-
-                stale_list = [
-                    {
-                        "id": img.id,
-                        "registry": img.registry,
-                        "repository": img.repository,
-                        "tag": img.tag,
-                        "last_deployed": img.last_deployed,
-                        "risk_score": img.risk_score,
-                        "vulnerability_count": (
-                            img.vulnerability_count_critical
-                            + img.vulnerability_count_high
-                        ),
-                    }
-                    for img in stale_images
-                ]
-
-                logger.info(f"Found {len(stale_list)} stale images")
-
-                return {
-                    "status": "completed",
-                    "org_id": org_id,
-                    "stale_image_count": len(stale_list),
-                    "images": stale_list,
-                    "generated_at": datetime.utcnow(),
-                }
-
-        return asyncio.run(_report())
-
-    except Exception as exc:
-        logger.error(f"Stale image report failed: {str(exc)}")
-        raise self.retry(exc=exc, countdown=60)
+            db.expunge_all()
+            if len(clusters) < window:
+                break
+    logger.info("container_cis_audit_sweep", **totals)
+    return totals
+
+
+@shared_task(name="src.container_security.tasks.cis_audit_sweep")
+def cis_audit_sweep() -> dict[str, Any]:
+    """Beat entry point: daily CIS audit of credentialed clusters."""
+    return _run(cis_audit_sweep_async())
+
+
+async def _scan_one(image_id: str, org_id: str) -> dict[str, Any]:
+    from src.container_security.scanning import request_scan
+
+    async with _factory()() as db:
+        image = (await db.execute(
+            select(ContainerImage).where(
+                ContainerImage.id == image_id, ContainerImage.organization_id == org_id,
+            ),
+        )).scalar_one_or_none()
+        if image is None:
+            return {"status": "not_found", "image_id": image_id}
+        outcome = await request_scan(db, image, requested_by=None)
+        await db.commit()
+        return {"status": outcome.status, "detail": outcome.detail, "image_id": image_id}
+
+
+@shared_task(name="src.container_security.tasks.scheduled_image_scan")
+def scheduled_image_scan(image_id: str, org_id: str) -> dict[str, Any]:
+    """Scan one image of ``org_id`` through an integration or agent (or awaiting_integration)."""
+    return _run(_scan_one(image_id, org_id))
+
+
+async def _audit_one(cluster_id: str, org_id: str) -> dict[str, Any]:
+    from src.container_security.kube import run_cis_audit
+
+    async with _factory()() as db:
+        cluster = (await db.execute(
+            select(KubernetesCluster).where(
+                KubernetesCluster.id == cluster_id, KubernetesCluster.organization_id == org_id,
+            ),
+        )).scalar_one_or_none()
+        if cluster is None:
+            return {"status": "not_found", "cluster_id": cluster_id}
+        summary = await run_cis_audit(db, cluster)
+        await db.commit()
+        return {"cluster_id": cluster_id, **summary}
+
+
+@shared_task(name="src.container_security.tasks.cluster_security_audit")
+def cluster_security_audit(cluster_id: str, org_id: str) -> dict[str, Any]:
+    """CIS audit of one cluster of ``org_id`` against its Kubernetes API."""
+    return _run(_audit_one(cluster_id, org_id))
+
+
+async def _stale(org_id: str, days_threshold: int) -> dict[str, Any]:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days_threshold)
+    async with _factory()() as db:
+        rows = (await db.execute(
+            select(
+                ContainerImage.id, ContainerImage.registry, ContainerImage.repository,
+                ContainerImage.tag, ContainerImage.last_deployed, ContainerImage.risk_score,
+            ).where(
+                ContainerImage.organization_id == org_id,
+                ContainerImage.last_deployed.is_not(None),
+                ContainerImage.last_deployed < cutoff,
+            ).order_by(ContainerImage.last_deployed).limit(MAX_STALE_IMAGES + 1),
+        )).all()
+    truncated = len(rows) > MAX_STALE_IMAGES
+    rows = rows[:MAX_STALE_IMAGES]
+    return {
+        "status": "completed",
+        "org_id": org_id,
+        "stale_image_count": len(rows),
+        "truncated": truncated,
+        "images": [
+            {
+                "id": r.id, "registry": r.registry, "repository": r.repository, "tag": r.tag,
+                "last_deployed": r.last_deployed.isoformat() if r.last_deployed else None,
+                "risk_score": r.risk_score,
+            }
+            for r in rows
+        ],
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@shared_task(name="src.container_security.tasks.stale_image_report")
+def stale_image_report(org_id: str, days_threshold: int = 90) -> dict[str, Any]:
+    """Images of ``org_id`` not deployed for ``days_threshold`` days."""
+    return _run(_stale(org_id, days_threshold))
