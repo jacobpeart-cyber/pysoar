@@ -349,8 +349,5 @@ class AIDashboardResponse(BaseModel):
     active_threat_predictions: int = 0
     critical_risk_entities: int = 0
 
-    queries_processed: int = 0
-    queries_today: int = 0
-    avg_query_accuracy: float = 0.0
 
     last_updated: Optional[datetime] = None

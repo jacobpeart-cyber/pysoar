@@ -11,7 +11,7 @@ from typing import Any
 from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from src.models.base import Base, BaseModel, utc_now
+from src.models.base import BaseModel
 
 
 class MLModel(BaseModel):
@@ -203,27 +203,3 @@ class ThreatPrediction(BaseModel):
     def __repr__(self) -> str:
         return f"<ThreatPrediction {self.prediction_type} risk={self.risk_score:.1f}>"
 
-
-class NLQuery(BaseModel):
-    """
-    Natural Language Queries.
-
-    Records user natural language queries and their interpretations, generated
-    queries, and results. Used for conversational security intelligence.
-    """
-
-    __tablename__ = "nl_queries"
-
-    natural_language: Mapped[str] = mapped_column(Text, nullable=False)
-    interpreted_intent: Mapped[str] = mapped_column(String(100), nullable=False)
-    generated_query: Mapped[str] = mapped_column(Text, nullable=False)
-    query_parameters: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    results_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
-    result_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    execution_time_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"))
-    was_helpful: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-    organization_id: Mapped[str] = mapped_column(String(36), ForeignKey("organizations.id"))
-
-    def __repr__(self) -> str:
-        return f"<NLQuery intent={self.interpreted_intent} results={self.result_count}>"

@@ -6,7 +6,6 @@ predictions, incident analysis, and ML model management.
 """
 
 import json
-import math
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
@@ -14,11 +13,11 @@ from fastapi import APIRouter, Depends, Query, HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
+from src.api.deps import DatabaseSession, OrganizationId, require_role
 from src.core.logging import get_logger
-from src.ai.engine import AIAnalyzer, AnomalyDetector, ThreatPredictor
+from src.ai.engine import AIAnalyzer
 from src.llm.base import LLMNotConfigured
-from src.ai.models import MLModel, AnomalyDetection, AIAnalysis, ThreatPrediction, NLQuery
+from src.ai.models import MLModel, AnomalyDetection, AIAnalysis, ThreatPrediction
 from src.models.user import User, UserRole
 from src.schemas.ai import (
     AlertTriageResponse,
@@ -2173,37 +2172,6 @@ async def ai_dashboard(
     )
     critical_risk_entities = critical_ent_result.scalar() or 0
 
-    # --- Queries ---
-    queries_total_result = await db.execute(
-        select(func.count(NLQuery.id)).where(NLQuery.organization_id == org_id)
-    )
-    queries_processed = queries_total_result.scalar() or 0
-
-    queries_today_result = await db.execute(
-        select(func.count(NLQuery.id)).where(
-            NLQuery.organization_id == org_id,
-            NLQuery.created_at >= today_start,
-        )
-    )
-    queries_today = queries_today_result.scalar() or 0
-
-    helpful_result = await db.execute(
-        select(func.count(NLQuery.id)).where(
-            NLQuery.organization_id == org_id,
-            NLQuery.was_helpful == True,
-        )
-    )
-    helpful = helpful_result.scalar() or 0
-
-    rated_result = await db.execute(
-        select(func.count(NLQuery.id)).where(
-            NLQuery.organization_id == org_id,
-            NLQuery.was_helpful.isnot(None),
-        )
-    )
-    rated = rated_result.scalar() or 0
-    avg_query_accuracy = (helpful / rated) if rated > 0 else 0.0
-
     return AIDashboardResponse(
         total_analyses=total_analyses,
         analyses_today=analyses_today,
@@ -2218,8 +2186,5 @@ async def ai_dashboard(
         models_needing_retrain=models_needing_retrain,
         active_threat_predictions=active_threat_predictions,
         critical_risk_entities=critical_risk_entities,
-        queries_processed=queries_processed,
-        queries_today=queries_today,
-        avg_query_accuracy=round(avg_query_accuracy, 4),
         last_updated=now,
     )
