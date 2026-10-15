@@ -18,6 +18,12 @@ class TokenBlacklist:
 
     REVOKED_TOKEN_PREFIX = "blacklist:"
     USER_REVOKED_PREFIX = "revoke:"
+    #: Per-user token generation. Every token carries the generation it was
+    #: issued under (``gen`` claim); revoking all tokens increments it, and the
+    #: auth dependency refuses any token whose generation is older. No clock
+    #: comparison, so a token issued in the same second as a revocation is
+    #: judged by its generation, never by timing.
+    USER_GENERATION_PREFIX = "revoke_gen:"
     CLOCK_SKEW_BUFFER = 5  # seconds
 
     def __init__(self, redis_client):
@@ -74,6 +80,7 @@ class TokenBlacklist:
             import time
             revocation_time = int(time.time())
             await self.redis.set(key, revocation_time)
+            await self.redis.incr(f"{self.USER_GENERATION_PREFIX}{user_id}")
             logger.info(f"All tokens revoked for user: {user_id}")
             return True
         except Exception as e:
@@ -136,3 +143,9 @@ class TokenBlacklist:
             logger.error(f"Error checking user revocation for {user_id}: {e}")
             # Fail closed: treat as revoked on error
             return True
+
+    async def current_generation(self, user_id: str) -> int:
+        """The generation new tokens for ``user_id`` must carry (0 until the
+        first revocation). Raises on a Redis error so callers fail closed."""
+        raw = await self.redis.get(f"{self.USER_GENERATION_PREFIX}{user_id}")
+        return int(raw) if raw is not None else 0

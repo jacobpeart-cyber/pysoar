@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
+from unittest.mock import AsyncMock
+
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -62,3 +64,43 @@ async def test_limited_token_changes_the_password_and_nothing_else(
         headers={"Authorization": f"Bearer {other}"},
     )
     assert refused_scope.status_code == 401, refused_scope.text
+
+
+async def test_mfa_comes_before_the_forced_change_and_mfa_tokens_cannot_be_replayed(
+    client: AsyncClient, db_session: AsyncSession, test_user, monkeypatch: pytest.MonkeyPatch, redis_mock: AsyncMock,
+) -> None:
+    """An MFA user with a forced change gets the MFA challenge first; the limited
+    token is only issued by /mfa/verify after the second factor, and a verified
+    MFA token cannot be used twice."""
+    from src.core.mfa import MFAManager
+    from tests.unit.test_token_revocation import _stateful
+
+    _stateful(redis_mock)  # a real key store, so the used MFA token is remembered
+    email = test_user.email
+    test_user.force_password_change = True
+    test_user.mfa_enabled = True
+    test_user.mfa_secret = "test-secret"
+    await db_session.commit()
+    monkeypatch.setattr(MFAManager, "verify_totp", staticmethod(lambda secret, code: code == "123456"))
+
+    first = await client.post(LOGIN, json={"email": email, "password": OLD})
+    assert first.status_code == 200, first.text  # the MFA challenge, not the limited token
+    assert first.json()["mfa_required"] is True and "X-Limited-Token" not in first.headers
+    mfa_token = first.json()["mfa_token"]
+
+    wrong = await client.post("/api/v1/mfa/verify", json={"mfa_token": mfa_token, "code": "000000"})
+    assert wrong.status_code == 401, wrong.text
+    done = await client.post("/api/v1/mfa/verify", json={"mfa_token": mfa_token, "code": "123456"})
+    assert done.status_code == 403, done.text
+    assert done.headers.get("X-Password-Change-Required") == "true"
+    limited = done.headers.get("X-Limited-Token")
+    assert limited
+
+    # The MFA token was consumed by the successful verification: no replay.
+    replay = await client.post("/api/v1/mfa/verify", json={"mfa_token": mfa_token, "code": "123456"})
+    assert replay.status_code == 401, replay.text
+
+    changed = await client.post(
+        CHANGE, json={"current_password": OLD, "new_password": NEW}, headers={"Authorization": f"Bearer {limited}"},
+    )
+    assert changed.status_code == 200, changed.text

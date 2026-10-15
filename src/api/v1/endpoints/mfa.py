@@ -127,6 +127,15 @@ async def verify_mfa_login(
             detail="Invalid MFA token",
         )
 
+    # A used MFA token (blacklisted after a successful verification) is refused.
+    used_jti = token_payload.get("jti")
+    if used_jti and await TokenBlacklist(redis).is_revoked(used_jti):
+        logger.warning("Replayed MFA token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid MFA token",
+        )
+
     # Verify token type is "mfa"
     if token_payload.get("type") != "mfa":
         logger.warning("Token is not an MFA token")
@@ -209,6 +218,14 @@ async def verify_mfa_login(
     mfa_jti = token_payload.get("jti")
     if mfa_jti:
         await blacklist.revoke_token(mfa_jti, expires_in=300)
+    generation = await blacklist.current_generation(user.id)
+
+    # Both factors done: a forced password change is offered now, never before.
+    if getattr(user, "force_password_change", False):
+        from src.api.v1.endpoints.auth import forced_password_change
+
+        logger.info(f"User {user.id} required to change password after MFA")
+        raise forced_password_change(user.id, generation)
 
     # Update last login
     await user_service.update_last_login(user_id)
@@ -220,9 +237,9 @@ async def verify_mfa_login(
     access_token = create_access_token(
         subject=user.id,
         expires_delta=timedelta(minutes=session_minutes),
-        extra_claims={"role": user.role},
+        extra_claims={"role": user.role, "gen": generation},
     )
-    refresh_token = create_refresh_token(subject=user.id)
+    refresh_token = create_refresh_token(subject=user.id, extra_claims={"gen": generation})
 
     logger.info(f"Tokens issued after MFA verification for user {user_id}")
 

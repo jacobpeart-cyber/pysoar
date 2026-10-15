@@ -75,6 +75,7 @@ def create_access_token(
 def create_refresh_token(
     subject: str | Any,
     expires_delta: Optional[timedelta] = None,
+    extra_claims: Optional[dict] = None,
 ) -> str:
     """Create a JWT refresh token with revocation support"""
     if expires_delta:
@@ -91,6 +92,8 @@ def create_refresh_token(
         "jti": str(uuid4()),
         "iat": int(time.time()),
     }
+    if extra_claims:
+        to_encode.update(extra_claims)
 
     encoded_jwt = jwt.encode(
         to_encode,

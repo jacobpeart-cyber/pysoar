@@ -35,7 +35,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.config import settings
 from src.core.database import get_db
 from src.core.security import decode_token_full
-from src.core.token_blacklist import TokenBlacklist
 from src.models.user import User, UserRole
 from src.services.user_service import UserService
 
@@ -150,11 +149,11 @@ async def _user_from_token(
                     headers={"WWW-Authenticate": "Bearer"},
                 )
 
-            # Check user-level revocation (user_id, iat)
-            user_revocation = await redis.get(f"revoke:{user_id}")
-            # Tokens issued before the revocation second are dead; one issued in
-            # the same second (a login right after a password change) survives.
-            if user_revocation and int(user_revocation) > iat:
+            # User-level revocation: the token's generation must be current.
+            # (Tokens from before this scheme carry no ``gen`` and count as 0, so
+            # the first revocation kills them too.)
+            current_generation = await redis.get(f"revoke_gen:{user_id}")
+            if int(token_payload.get("gen") or 0) < int(current_generation or 0):
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="User tokens have been revoked",

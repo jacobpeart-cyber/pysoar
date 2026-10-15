@@ -13,6 +13,7 @@ from src.models.user import User
 from src.core.account_lockout import AccountLockoutManager
 from src.core.password_policy import PasswordValidator
 from src.core.security import (
+    decode_token_full,
     create_access_token,
     create_refresh_token,
     get_password_hash,
@@ -33,6 +34,22 @@ from src.services.user_service import UserService
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+
+def forced_password_change(user_id: str, generation: int) -> HTTPException:
+    """The 403 a caller gets when their password must change before they may
+    sign in: ``X-Limited-Token`` is a five-minute token accepted only by
+    ``POST /auth/change-password`` (see ``get_password_change_user``)."""
+    limited_token = create_access_token(
+        subject=user_id,
+        expires_delta=timedelta(minutes=5),
+        extra_claims={"type": "limited", "scope": "password_change", "gen": generation},
+    )
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Password change required",
+        headers={"X-Password-Change-Required": "true", "X-Limited-Token": limited_token},
+    )
 
 
 @router.post("/login")
@@ -75,33 +92,27 @@ async def login(
     # Reset failed attempts on successful authentication
     await lockout_manager.reset_attempts(request.email)
 
-    # Check if user must change password
-    if getattr(user, "force_password_change", False):
-        logger.info(f"User {user.id} required to change password")
-        limited_token = create_access_token(
-            subject=user.id,
-            expires_delta=timedelta(minutes=5),
-            extra_claims={"type": "limited", "scope": "password_change"},
-        )
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Password change required",
-            headers={"X-Password-Change-Required": "true", "X-Limited-Token": limited_token},
-        )
+    generation = await TokenBlacklist(redis).current_generation(user.id)
 
-    # Check if MFA is enabled
+    # MFA comes first: a forced password change is only offered to a caller
+    # who completed every login factor (POST /mfa/verify raises the same 403
+    # with the limited token for an MFA user).
     if getattr(user, "mfa_enabled", False):
         logger.info(f"MFA required for user {user.id}")
         mfa_token = create_access_token(
             subject=user.id,
             expires_delta=timedelta(minutes=5),
-            extra_claims={"type": "mfa"},
+            extra_claims={"type": "mfa", "gen": generation},
         )
         return MFARequiredResponse(
             mfa_required=True,
             mfa_token=mfa_token,
             expires_in=300,
         )
+
+    # Check if user must change password
+    if getattr(user, "force_password_change", False):
+        raise forced_password_change(user.id, generation)
 
     # Update last login
     await user_service.update_last_login(user.id)
@@ -113,9 +124,9 @@ async def login(
     access_token = create_access_token(
         subject=user.id,
         expires_delta=timedelta(minutes=session_minutes),
-        extra_claims={"role": user.role},
+        extra_claims={"role": user.role, "gen": generation},
     )
-    refresh_token = create_refresh_token(subject=user.id)
+    refresh_token = create_refresh_token(subject=user.id, extra_claims={"gen": generation})
 
     logger.info(f"Successful login for user {user.id}")
 
@@ -130,9 +141,11 @@ async def login(
 async def refresh_token_endpoint(
     request: RefreshTokenRequest,
     db: DatabaseSession = None,
+    redis: RedisClient = None,
 ):
     """Refresh access token using refresh token"""
     user_id = verify_token(request.refresh_token, token_type="refresh")
+    payload = decode_token_full(request.refresh_token) or {}
 
     if not user_id:
         logger.warning("Refresh attempt with invalid or expired refresh token")
@@ -151,6 +164,15 @@ async def refresh_token_endpoint(
             detail="User not found or inactive",
         )
 
+    # A refresh token from before the user's last revocation is dead too.
+    generation = await TokenBlacklist(redis).current_generation(user.id)
+    if int(payload.get("gen") or 0) < generation:
+        logger.warning(f"Refresh attempt with a revoked refresh token for user {user_id}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User tokens have been revoked",
+        )
+
     # Create new tokens
     # Token lifetime is the organisation's session timeout (Settings >
     # Security / General), else the platform default.
@@ -158,9 +180,9 @@ async def refresh_token_endpoint(
     access_token = create_access_token(
         subject=user.id,
         expires_delta=timedelta(minutes=session_minutes),
-        extra_claims={"role": user.role},
+        extra_claims={"role": user.role, "gen": generation},
     )
-    refresh_token = create_refresh_token(subject=user.id)
+    refresh_token = create_refresh_token(subject=user.id, extra_claims={"gen": generation})
 
     logger.info(f"Token refreshed for user {user.id}")
 
