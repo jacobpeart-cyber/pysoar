@@ -208,7 +208,8 @@ async def test_pipeline_status_empty_org_is_honest_zero(client, two_tenants):
     assert body["error_pipelines"] == 0
     assert body["total_pipelines"] == 0
     assert body["recent_executions"] == []
-    assert body["avg_success_rate"] == 0.0
+    # Nothing processed: no success rate (W4-E), not a fabricated 0.0.
+    assert body["avg_success_rate"] is None
 
 
 # ---------------------------------------------------------------------------

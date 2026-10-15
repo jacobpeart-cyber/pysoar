@@ -1,9 +1,9 @@
 """
 DLP Celery Tasks
 
-Background tasks for sensitive data discovery, policy testing,
-violation detection, audit reporting, and incident tracking.
-Every task queries real database rows.
+Background tasks for the DLP content scan (``dlp_content_scan_sweep``, on
+beat), policy evaluation status, violation / incident counts and audit
+reports. Every task queries real database rows.
 """
 
 import asyncio
@@ -25,47 +25,82 @@ def _run_async(coro):
         loop.close()
 
 
-@shared_task(bind=True, max_retries=3)
+@shared_task(bind=True, max_retries=0)
 def discover_sensitive_data(
     self,
     organization_id: str,
     scan_scope: str = "all",
     data_types: list | None = None,
 ):
-    """Discover sensitive data by counting real SensitiveDataDiscovery rows."""
+    """Not implemented: no discovery agent or storage connector exists.
+
+    This used to count ``sensitive_data_discoveries`` rows (and read a
+    ``risk_level`` column that does not exist) and report them as
+    "locations scanned". Content the platform holds is scanned by
+    ``dlp_content_scan_sweep`` instead.
+    """
+    return {
+        "status": "not_implemented",
+        "organization_id": organization_id,
+        "detail": (
+            "sensitive data discovery over endpoints / storage is not implemented: no "
+            "DLP agent or storage connector exists; stored platform content is scanned "
+            "by dlp_content_scan_sweep"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Wave 4: the content scan (beat entry in src/workers/celery_app.py)
+# ---------------------------------------------------------------------------
+async def _content_scan_sweep(organization_id: str | None = None) -> dict:
     from src.core.database import async_session_factory
-    from src.dlp.models import SensitiveDataDiscovery
+    from src.dlp.models import DLPPolicy
+    from src.dlp.scanner import MAX_ORGS_PER_SWEEP, scan_organization
 
-    async def _run():
+    if organization_id:
+        org_ids = [organization_id]
+    else:
         async with async_session_factory() as session:
-            query = select(func.count(SensitiveDataDiscovery.id)).where(
-                SensitiveDataDiscovery.organization_id == organization_id
-            )
-            total = (await session.execute(query)).scalar() or 0
+            org_ids = [
+                o for o in (await session.execute(
+                    select(DLPPolicy.organization_id)
+                    .where(DLPPolicy.enabled.is_(True))
+                    .distinct()
+                    .limit(MAX_ORGS_PER_SWEEP)
+                )).scalars().all() if o
+            ]
+    rows = findings = 0
+    failures: list[dict] = []
+    for oid in org_ids:
+        try:
+            async with async_session_factory() as session:
+                summary = await scan_organization(session, oid)
+                await session.commit()
+            rows += summary["rows_scanned"]
+            findings += summary["findings_created"]
+        except Exception as exc:  # one org failing must not stop the sweep
+            logger.error("dlp_content_scan_failed", organization_id=oid, error=str(exc))
+            failures.append({"organization_id": oid, "error": str(exc)[:500]})
+    return {
+        "organizations": len(org_ids),
+        "rows_scanned": rows,
+        "findings_created": findings,
+        "failures": failures,
+    }
 
-            high_risk = (await session.execute(
-                select(func.count(SensitiveDataDiscovery.id)).where(
-                    and_(
-                        SensitiveDataDiscovery.organization_id == organization_id,
-                        SensitiveDataDiscovery.risk_level == "high",
-                    )
-                )
-            )).scalar() or 0
 
-            return {
-                "status": "success",
-                "organization_id": organization_id,
-                "locations_scanned": total,
-                "sensitive_data_found": total,
-                "high_risk_findings": high_risk,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-
+@shared_task(bind=True, max_retries=1)
+def dlp_content_scan_sweep(self, organization_id: str | None = None):
+    """Evaluate every org's active DLP policies over newly stored logs,
+    evidence, ticket comments and incident / case-note text (bounded)."""
     try:
-        return _run_async(_run())
-    except Exception as e:
-        logger.error(f"Sensitive data discovery failed: {e}")
-        raise self.retry(exc=e, countdown=60)
+        result = _run_async(_content_scan_sweep(organization_id))
+        logger.info("dlp_content_scan_complete", **{k: v for k, v in result.items() if k != "failures"})
+        return result
+    except Exception as exc:
+        logger.error("dlp_content_scan_sweep_failed", error=str(exc))
+        raise self.retry(exc=exc, countdown=300) from exc
 
 
 @shared_task(bind=True, max_retries=2)
@@ -75,7 +110,7 @@ def test_dlp_policy(
     organization_id: str,
     test_data: dict | None = None,
 ):
-    """Test a DLP policy by loading the real policy and checking recent violations."""
+    """Report a policy's real evaluation status and its stored violations."""
     from src.core.database import async_session_factory
     from src.dlp.models import DLPPolicy, DLPViolation
 
@@ -91,20 +126,25 @@ def test_dlp_policy(
             if not policy:
                 return {"status": "error", "detail": "Policy not found"}
 
+            from src.dlp.scanner import plan_policy
+
             violations = (await session.execute(
                 select(func.count(DLPViolation.id)).where(
                     DLPViolation.policy_id == policy_id,
                     DLPViolation.organization_id == organization_id,
                 )
             )).scalar() or 0
+            plan = plan_policy(policy)
 
             return {
                 "status": "success",
                 "policy_id": policy_id,
                 "policy_name": policy.name,
-                "is_enabled": policy.is_enabled,
+                "is_enabled": policy.enabled,
                 "historical_violations": violations,
-                "test_result": "pass" if policy.is_enabled else "disabled",
+                "evaluation_status": plan.status,
+                "evaluation_reason": plan.reason,
+                "sources": plan.sources,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
@@ -190,7 +230,7 @@ def generate_dlp_audit_report(
                 select(func.count(DLPPolicy.id)).where(
                     and_(
                         DLPPolicy.organization_id == organization_id,
-                        DLPPolicy.is_enabled == True,
+                        DLPPolicy.enabled.is_(True),
                     )
                 )
             )).scalar() or 0

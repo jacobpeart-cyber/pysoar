@@ -69,7 +69,18 @@ from src.schemas.dlp import (
 )
 
 from src.services.automation import AutomationService
-from src.core.utils import safe_json_loads
+from src.dlp.scanner import (
+    InvalidPattern,
+    apply_plan,
+    find_matches,
+    plan_policy,
+    redacted_excerpt,
+    reset_cursors,
+    scan_organization,
+    scan_status,
+    validate_data_patterns,
+)
+from src.models.audit import AuditLog
 
 logger = get_logger(__name__)
 
@@ -149,14 +160,47 @@ async def get_incident_or_404(
     return incident
 
 
+def _validate_patterns_or_422(patterns: Optional[list[str]]) -> None:
+    try:
+        validate_data_patterns(patterns)
+    except InvalidPattern as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "invalid_pattern", "field": "data_patterns", "detail": str(exc)},
+        ) from exc
+
+
+async def _audit(
+    db: AsyncSession,
+    user: Optional[User],
+    org_id: str,
+    action: str,
+    resource_id: Optional[str],
+    description: str,
+    payload: dict[str, Any],
+) -> None:
+    """One AuditLog row per DLP configuration change or scan."""
+    db.add(AuditLog(
+        user_id=str(user.id) if user is not None else None,
+        organization_id=org_id,
+        action=action,
+        resource_type="dlp",
+        resource_id=resource_id,
+        description=description[:4000],
+        new_value=json.dumps(payload, default=str),
+        success=True,
+    ))
+    await db.flush()
+
+
 def convert_json_fields(model_obj):
-    """Convert JSON string fields to Python objects"""
-    if hasattr(model_obj, "data_patterns") and model_obj.data_patterns:
-        model_obj.data_patterns = safe_json_loads(model_obj.data_patterns, {}) if isinstance(model_obj.data_patterns, str) else model_obj.data_patterns
-    if hasattr(model_obj, "channels_monitored") and model_obj.channels_monitored:
-        model_obj.channels_monitored = safe_json_loads(model_obj.channels_monitored, {}) if isinstance(model_obj.channels_monitored, str) else model_obj.channels_monitored
-    if hasattr(model_obj, "sensitive_data_types") and model_obj.sensitive_data_types:
-        model_obj.sensitive_data_types = safe_json_loads(model_obj.sensitive_data_types, {}) if isinstance(model_obj.sensitive_data_types, str) else model_obj.sensitive_data_types
+    """Return the row for serialisation without touching it.
+
+    This used to assign the parsed lists back onto the ORM row, which marked
+    it dirty and made the request's commit write a Python list into a TEXT
+    column (500 on any policy with data_patterns). The DBModel response
+    schemas parse the JSON text themselves.
+    """
     return model_obj
 
 
@@ -170,7 +214,16 @@ async def create_policy(
     _user: AdminRoleUser = None,
     db: DatabaseSession = None,
 ):
-    """Create a new DLP policy"""
+    """Create a new DLP policy.
+
+    ``data_patterns`` entries are built-in detector names (ssn, credit_card,
+    email, phone, api_key, ipv4, ipv6, aws_key, private_key,
+    medical_diagnosis, medical_medication, medical_procedure) or regular
+    expressions (422 when invalid). ``channels_monitored`` maps to the data
+    the platform holds (logs, evidence, tickets, cases); the response's
+    ``evaluation_status`` says whether the content scanner evaluates it.
+    """
+    _validate_patterns_or_422(policy_data.data_patterns)
     policy = DLPPolicy(
         organization_id=org_id,
         name=policy_data.name,
@@ -188,9 +241,12 @@ async def create_policy(
         response_actions=json.dumps(policy_data.response_actions) if policy_data.response_actions else None,
         exceptions=json.dumps(policy_data.exceptions) if policy_data.exceptions else None,
     )
+    apply_plan(policy)
 
     db.add(policy)
     await db.flush()
+    await _audit(db, _user, org_id, "dlp.policy_create", policy.id, f"DLP policy {policy.name!r} created",
+                 {"evaluation_status": policy.evaluation_status, "evaluation_reason": policy.evaluation_reason})
     await db.refresh(policy)
 
     return convert_json_fields(policy)
@@ -258,17 +314,24 @@ async def update_policy(
     policy = await get_policy_or_404(db, policy_id, org_id)
 
     update_data = policy_data.model_dump(exclude_unset=True, exclude_none=True)
-
-    # Handle JSON fields
     if "data_patterns" in update_data:
-        update_data["data_patterns"] = json.dumps(update_data["data_patterns"])
-    if "channels_monitored" in update_data:
-        update_data["channels_monitored"] = json.dumps(update_data["channels_monitored"])
+        _validate_patterns_or_422(update_data["data_patterns"])
+
+    # JSON (list) columns are stored as text.
+    for json_field in (
+        "data_patterns", "file_types_monitored", "channels_monitored",
+        "response_actions", "exceptions",
+    ):
+        if json_field in update_data:
+            update_data[json_field] = json.dumps(update_data[json_field])
 
     for key, value in update_data.items():
         setattr(policy, key, value)
+    apply_plan(policy)
 
     await db.flush()
+    await _audit(db, _user, org_id, "dlp.policy_update", policy.id, f"DLP policy {policy.name!r} updated",
+                 {"fields": sorted(update_data), "evaluation_status": policy.evaluation_status})
     await db.refresh(policy)
 
     return convert_json_fields(policy)
@@ -283,6 +346,7 @@ async def delete_policy(
 ):
     """Delete a DLP policy"""
     policy = await get_policy_or_404(db, policy_id, org_id)
+    await _audit(db, _user, org_id, "dlp.policy_delete", policy.id, f"DLP policy {policy.name!r} deleted", {})
     await db.delete(policy)
     await db.flush()
 
@@ -297,6 +361,9 @@ async def enable_policy(
     """Enable a DLP policy"""
     policy = await get_policy_or_404(db, policy_id, org_id)
     policy.enabled = True
+    apply_plan(policy)
+    await _audit(db, _user, org_id, "dlp.policy_enable", policy.id, f"DLP policy {policy.name!r} enabled",
+                 {"evaluation_status": policy.evaluation_status, "evaluation_reason": policy.evaluation_reason})
     await db.flush()
     await db.refresh(policy)
     return convert_json_fields(policy)
@@ -312,6 +379,8 @@ async def disable_policy(
     """Disable a DLP policy"""
     policy = await get_policy_or_404(db, policy_id, org_id)
     policy.enabled = False
+    apply_plan(policy)
+    await _audit(db, _user, org_id, "dlp.policy_disable", policy.id, f"DLP policy {policy.name!r} disabled", {})
     await db.flush()
     await db.refresh(policy)
     return convert_json_fields(policy)
@@ -325,23 +394,74 @@ async def test_policy(
     _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
-    """Test a policy against sample data"""
-    policy = await get_policy_or_404(db, policy_id, org_id)
+    """Test a policy against sample data with the policy's own patterns.
 
-    # Evaluate content
-    evaluation = dlp_engine.evaluate_content(
-        test_request.sample_content,
-        test_request.sample_metadata,
-    )
+    The sample is evaluated exactly as the content scanner evaluates stored
+    records (same patterns, exceptions and Luhn check). The response carries
+    the policy's real ``evaluation_status`` / reason; a disabled policy is
+    still tested with its patterns so the analyst sees what it would match.
+    """
+    from datetime import datetime, timezone
+
+    policy = await get_policy_or_404(db, policy_id, org_id)
+    plan = plan_policy(policy)
+    test_plan = plan if policy.enabled else plan_policy(policy, ignore_enabled=True)
+    sample = (test_request.sample_content or "")[:20_000]
+    hits = find_matches(test_plan, sample) if test_plan.patterns else []
+    kinds = sorted({h[0] for h in hits})
 
     return DLPPolicyTestResponse(
         policy_id=policy_id,
-        test_passed=not evaluation["has_violations"],
-        violations_detected=len(evaluation["violations"]),
-        matched_patterns=evaluation["detected_data_types"],
-        sample_result=evaluation,
-        timestamp=evaluation["timestamp"],
+        test_passed=not hits,
+        violations_detected=len(hits),
+        matched_patterns=kinds,
+        sample_result={
+            "has_violations": bool(hits),
+            "matches": [{"pattern": name, "start": start, "end": end} for name, start, end in hits],
+            "patterns_evaluated": sorted(test_plan.patterns),
+            "sources": test_plan.sources,
+        },
+        timestamp=datetime.now(timezone.utc),
+        evaluation_status=plan.status,
+        evaluation_reason=plan.reason or test_plan.reason,
+        redacted_excerpt=redacted_excerpt(sample, hits) if hits else None,
     )
+
+
+# ==================== CONTENT SCAN ====================
+
+
+@router.get("/scan/status")
+async def get_scan_status(
+    org_id: OrganizationId,
+    db: DatabaseSession = None,
+):
+    """Content-scan state: per data source (logs, evidence, ticket comments,
+    incidents, case notes) the last run, rows scanned, findings and cursor
+    position; per policy its evaluation status and the sources it covers."""
+    return await scan_status(db, org_id)
+
+
+@router.post("/scan/run")
+async def run_content_scan(
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
+    db: DatabaseSession = None,
+    rescan: bool = Query(
+        False,
+        description="Rewind every source to the initial lookback window first "
+        "(findings are never duplicated)",
+    ),
+):
+    """Run the bounded DLP content scan for this organisation now (the scan
+    the ``dlp_content_scan_sweep`` beat task runs every 15 minutes)."""
+    rewound = await reset_cursors(db, org_id) if rescan else 0
+    summary = await scan_organization(db, org_id)
+    summary["sources_rewound"] = rewound
+    await _audit(db, _user, org_id, "dlp.content_scan", None, "DLP content scan run",
+                 {k: v for k, v in summary.items() if k != "inactive_policies"})
+    await db.commit()
+    return summary
 
 
 # ==================== VIOLATIONS ====================
@@ -394,9 +514,21 @@ async def list_violations(
     severity: Optional[str] = None,
     user: Optional[str] = None,
     search: Optional[str] = None,
+    policy_id: Optional[str] = None,
+    source_type: Optional[str] = Query(
+        None, description="Content-scan data source (log_entries, compliance_evidence, ...)"
+    ),
+    detected_by: Optional[str] = Query(None, description="content_scan for scanner findings"),
 ):
-    """List DLP violations"""
+    """List DLP violations (manual ones and content-scan findings)."""
     query = select(DLPViolation).where(DLPViolation.organization_id == org_id)
+
+    if policy_id:
+        query = query.where(DLPViolation.policy_id == policy_id)
+    if source_type:
+        query = query.where(DLPViolation.source_type == source_type)
+    if detected_by:
+        query = query.where(DLPViolation.detected_by == detected_by)
 
     if status_filter:
         query = query.where(DLPViolation.status == status_filter)
@@ -412,6 +544,7 @@ async def list_violations(
         query = query.where(
             DLPViolation.file_name.ilike(search_filter)
             | DLPViolation.destination.ilike(search_filter)
+            | DLPViolation.location.ilike(search_filter)
         )
 
     count_result = await db.execute(select(func.count()).select_from(query.subquery()))
@@ -1097,38 +1230,43 @@ async def get_dlp_dashboard(
         for v in top_violations_raw
     ]
 
-    # Data risk map — real counts from SensitiveDataDiscovery scans
-    data_risk_map: dict[str, Any] = {}
-    try:
-        scan_rows = await db.execute(
-            select(SensitiveDataDiscovery).where(
-                SensitiveDataDiscovery.organization_id == org_id
-            )
+    # Data risk map from the content scan: distinct stored records with an
+    # open high/critical (or medium) finding, per data source, and the
+    # sources the scanner has actually read.
+    from src.dlp.models import DLPScanCursor
+
+    open_statuses = ["new", "investigating", "confirmed", "escalated"]
+    risk_rows = (await db.execute(
+        select(
+            DLPViolation.source_type,
+            DLPViolation.severity,
+            func.count(func.distinct(DLPViolation.source_id)),
         )
-        scans = list(scan_rows.scalars().all())
-        data_risk_map = {
-            "high_risk_locations": sum(
-                1 for s in scans if (getattr(s, "risk_level", "") or "") == "high"
-            ),
-            "medium_risk_locations": sum(
-                1 for s in scans if (getattr(s, "risk_level", "") or "") == "medium"
-            ),
-            "monitored_locations": len(scans),
-        }
-    except Exception as exc:  # noqa: BLE001
-        logger.error(
-            "DLP dashboard: data_risk_map computation failed for org %s",
-            org_id,
-            exc_info=True,
+        .where(
+            DLPViolation.organization_id == org_id,
+            DLPViolation.source_type.is_not(None),
+            DLPViolation.status.in_(open_statuses),
         )
-        # Schema requires dict[str, Any]; surface a clear error indicator
-        # instead of silent zeros that look like "no data".
-        data_risk_map = {
-            "high_risk_locations": None,
-            "medium_risk_locations": None,
-            "monitored_locations": None,
-            "error": f"computation failed: {type(exc).__name__}",
-        }
+        .group_by(DLPViolation.source_type, DLPViolation.severity)
+    )).all()
+    high_locations = sum(int(n) for _s, sev, n in risk_rows if sev in ("critical", "high"))
+    medium_locations = sum(int(n) for _s, sev, n in risk_rows if sev == "medium")
+    by_source: dict[str, int] = {}
+    for source_type, _sev, n in risk_rows:
+        by_source[source_type] = by_source.get(source_type, 0) + int(n)
+    monitored = (await db.execute(
+        select(func.count(DLPScanCursor.id)).where(
+            DLPScanCursor.organization_id == org_id,
+            DLPScanCursor.rows_scanned_total > 0,
+        )
+    )).scalar() or 0
+    data_risk_map: dict[str, Any] = {
+        "high_risk_locations": high_locations,
+        "medium_risk_locations": medium_locations,
+        "monitored_locations": int(monitored),
+        "open_findings_by_source": by_source,
+        "basis": "dlp content scan of stored logs, evidence, ticket comments and incident text",
+    }
 
     # Real compliance_status — query ComplianceFramework like ITDR
     compliance_status: dict[str, Any] = {}

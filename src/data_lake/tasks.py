@@ -9,17 +9,21 @@ from datetime import datetime, timedelta, timezone
 
 from celery import shared_task
 
-from src.core.config import settings
 from src.core.logging import get_logger
-from src.data_lake.engine import (
-    DataCatalog,
-    DataIngestionEngine,
-    PipelineOrchestrator,
-    QueryEngine,
-    StorageManager,
-)
 
 logger = get_logger(__name__)
+
+
+def _not_implemented(task: str, detail: str, **context) -> dict:
+    """Honest result for data-lake work nothing in PySOAR performs."""
+    logger.info("data_lake_task_not_implemented", task=task, **context)
+    return {
+        "status": "not_implemented",
+        "task": task,
+        "detail": detail,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        **context,
+    }
 
 
 @shared_task(bind=True, max_retries=3)
@@ -50,9 +54,9 @@ def scheduled_ingestion(
             f"Starting scheduled ingestion for source {source_id} in org {organization_id}"
         )
 
-        ingestion_engine = DataIngestionEngine()
-
-        # Query real DataSource and compute ingestion metrics from DB
+        # No connector ingests registered sources: this reports what is
+        # stored for the source (partitions registered against it), never
+        # an events-per-second rate or a success rate it did not measure.
         import asyncio
         from src.core.database import async_session_factory
         from src.data_lake.models import DataSource, DataPartition
@@ -69,12 +73,7 @@ def scheduled_ingestion(
                 source = result.scalar_one_or_none()
 
                 if not source:
-                    return {
-                        "total_events": 0,
-                        "events_per_second": 0,
-                        "success_rate": 0.0,
-                        "error": "data_source_not_found",
-                    }
+                    return {"error": "data_source_not_found"}
 
                 # Count partitions and compute metrics
                 partition_query = select(
@@ -94,8 +93,6 @@ def scheduled_ingestion(
 
                 return {
                     "total_events": total_records,
-                    "events_per_second": total_records / 3600 if total_records > 0 else 0,
-                    "success_rate": 100.0 if partition_count > 0 else 0.0,
                     "partition_count": partition_count,
                     "total_bytes": total_bytes,
                     "source_name": source.name,
@@ -104,15 +101,11 @@ def scheduled_ingestion(
 
         metrics = asyncio.run(_get_real_metrics())
 
-        logger.info(
-            f"Ingestion completed: {metrics.get('total_events'):,} events at "
-            f"{metrics.get('events_per_second')} eps, success rate {metrics.get('success_rate')}%"
-        )
-
         result = {
             "source_id": source_id,
             "organization_id": organization_id,
-            "status": "completed",
+            "status": "not_implemented" if "error" not in metrics else "error",
+            "detail": "no connector ingests registered data sources; stored totals only",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "ingestion_metrics": metrics,
         }
@@ -153,29 +146,13 @@ def tier_management(
             f"Starting tier management for source {source_id} in org {organization_id}"
         )
 
-        storage_mgr = StorageManager()
-
-        # Perform tiering
-        tier_actions = storage_mgr.manage_tiers(
-            source_id,
-            days_threshold_warm=days_hot_to_warm,
-            days_threshold_cold=days_warm_to_cold,
+        return _not_implemented(
+            "tier_management",
+            "storage tiering is not implemented: the data lake is PostgreSQL tables with "
+            "no tiered storage; tiers shown by the dashboard are row ages",
+            source_id=source_id,
+            organization_id=organization_id,
         )
-
-        logger.info(
-            f"Tier management completed: {tier_actions['tier_changes']['hot_to_warm']} "
-            f"hot→warm, {tier_actions['tier_changes']['warm_to_cold']} warm→cold"
-        )
-
-        result = {
-            "source_id": source_id,
-            "organization_id": organization_id,
-            "status": "completed",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "tier_changes": tier_actions,
-        }
-
-        return result
 
     except Exception as exc:
         logger.error(f"Tier management task failed: {str(exc)}", exc_info=True)
@@ -208,25 +185,14 @@ def retention_enforcement(
             f"Starting retention enforcement for source {source_id}: {retention_days} days"
         )
 
-        storage_mgr = StorageManager()
-
-        # Enforce retention
-        retention_result = storage_mgr.enforce_retention(source_id, retention_days)
-
-        logger.info(
-            f"Retention enforced: {retention_result.get('partitions_deleted')} partitions "
-            f"deleted, {retention_result.get('storage_freed_gb')} GB freed"
+        return _not_implemented(
+            "retention_enforcement",
+            "data-lake retention enforcement is not implemented: nothing deletes rows by "
+            "source retention_days (the in-memory partition registry was always empty)",
+            source_id=source_id,
+            organization_id=organization_id,
+            retention_days=retention_days,
         )
-
-        result = {
-            "source_id": source_id,
-            "organization_id": organization_id,
-            "status": "completed",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "retention_result": retention_result,
-        }
-
-        return result
 
     except Exception as exc:
         logger.error(f"Retention enforcement failed: {str(exc)}", exc_info=True)
@@ -261,34 +227,15 @@ def pipeline_execution(
             f"Starting pipeline execution: {pipeline_id} in org {organization_id}"
         )
 
-        orchestrator = PipelineOrchestrator()
-
-        # Create pipeline if needed
-        pipeline = orchestrator.pipelines.get(pipeline_id)
-        if not pipeline:
-            logger.info(f"Pipeline {pipeline_id} not found, skipping execution")
-            return {"status": "skipped", "reason": "pipeline_not_found"}
-
-        # Execute pipeline
-        input_data = [{"event_id": i, "timestamp": datetime.now(timezone.utc).isoformat()}
-                      for i in range(batch_count * 1000)]
-
-        execution_result = orchestrator.execute_pipeline(pipeline_id, input_data)
-
-        logger.info(
-            f"Pipeline execution completed: {execution_result['output_records']} records "
-            f"processed in {execution_result['execution_time_ms']}ms"
+        # This used to run the (always empty) in-memory orchestrator over
+        # synthetic events generated here.
+        return _not_implemented(
+            "pipeline_execution",
+            "no executor runs user-defined data-lake pipelines",
+            pipeline_id=pipeline_id,
+            organization_id=organization_id,
+            source_id=source_id,
         )
-
-        result = {
-            "pipeline_id": pipeline_id,
-            "organization_id": organization_id,
-            "status": "completed",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "execution_result": execution_result,
-        }
-
-        return result
 
     except Exception as exc:
         logger.error(f"Pipeline execution failed: {str(exc)}", exc_info=True)
@@ -321,8 +268,6 @@ def data_quality_check(
             f"Starting data quality check for dataset {dataset_id} "
             f"(threshold: {quality_threshold}%)"
         )
-
-        catalog = DataCatalog()
 
         # Query real DataPartition rows for quality assessment
         import asyncio

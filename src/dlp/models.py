@@ -9,7 +9,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text, func
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.models.base import BaseModel
@@ -149,6 +149,14 @@ class DLPPolicy(BaseModel):
         DateTime(timezone=True), nullable=True
     )
     trigger_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Wave 4: whether the content scanner can evaluate this policy over data
+    # the platform holds (``active``) or not (``inactive`` + the reason, e.g.
+    # no patterns, or no monitored channel has a data source here).
+    evaluation_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    evaluation_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    last_evaluated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
 
     def __repr__(self) -> str:
         return f"<DLPPolicy {self.name}>"
@@ -158,6 +166,13 @@ class DLPViolation(BaseModel):
     """DLP Violation model for tracking detected violations"""
 
     __tablename__ = "dlp_violations"
+    # One finding per (policy, stored record): re-scans never duplicate it.
+    # Manual violations leave source_type / source_id NULL (never collide).
+    __table_args__ = (
+        UniqueConstraint(
+            "policy_id", "source_type", "source_id", name="uq_dlp_violation_policy_source",
+        ),
+    )
 
     organization_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     policy_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
@@ -193,6 +208,13 @@ class DLPViolation(BaseModel):
     )
     justification: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     reviewed_by: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # Wave 4 content-scan findings: where the match is (source table + row id
+    # + a readable location) and an excerpt with every match redacted.
+    source_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    source_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    location: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    redacted_excerpt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    detected_by: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
 
     def __repr__(self) -> str:
         return f"<DLPViolation {self.id}>"
@@ -291,6 +313,39 @@ class DLPIncident(BaseModel):
     incident_commander: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     remediation_steps: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON
     lessons_learned: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    resolution_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     def __repr__(self) -> str:
         return f"<DLPIncident {self.incident_title}>"
+
+
+class DLPScanCursor(BaseModel):
+    """Per-organisation, per-data-source position of the DLP content scanner.
+
+    The scanner walks each source in (created_at, id) order from this cursor,
+    so every stored record is evaluated once; the counters are the real run
+    history the DLP and data-lake pages show.
+    """
+
+    __tablename__ = "dlp_scan_cursors"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "source_type", name="uq_dlp_scan_cursor_org_source"),
+    )
+
+    organization_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    source_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    last_created_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    last_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    rows_scanned_total: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    findings_total: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_run_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    last_run_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_run_findings: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    def __repr__(self) -> str:
+        return f"<DLPScanCursor {self.organization_id}:{self.source_type}>"

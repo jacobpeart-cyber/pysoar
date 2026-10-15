@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from src.schemas.base import DBModel
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # Base Schemas
@@ -56,6 +56,11 @@ class DLPPolicyResponse(DLPPolicyBase, DBModel):
     organization_id: str = ""
     last_triggered: Optional[datetime] = None
     trigger_count: int = 0
+    # Wave 4: ``active`` (the content scanner evaluates it) or ``inactive``
+    # with the reason; None until the policy is first planned.
+    evaluation_status: Optional[str] = None
+    evaluation_reason: Optional[str] = None
+    last_evaluated_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -76,8 +81,18 @@ class DLPPolicyListResponse(BaseModel):
 class DLPPolicyTestRequest(BaseModel):
     """Schema for testing a policy against sample data"""
 
-    sample_content: str = Field(..., min_length=1)
+    sample_content: Optional[str] = Field(None, min_length=1)
+    # Accepted alias (the frontend's dlpApi.testPolicy sends ``sample_text``).
+    sample_text: Optional[str] = Field(None, min_length=1)
     sample_metadata: Optional[dict[str, Any]] = None
+
+    @model_validator(mode="after")
+    def _one_sample(self) -> "DLPPolicyTestRequest":
+        if not (self.sample_content or self.sample_text):
+            raise ValueError("sample_content (or sample_text) is required")
+        if not self.sample_content:
+            self.sample_content = self.sample_text
+        return self
 
 
 class DLPPolicyTestResponse(BaseModel):
@@ -89,6 +104,10 @@ class DLPPolicyTestResponse(BaseModel):
     matched_patterns: list[str]
     sample_result: dict[str, Any]
     timestamp: Optional[datetime] = None
+    # Wave 4: evaluated with the policy's own patterns (not the global set).
+    evaluation_status: Optional[str] = None
+    evaluation_reason: Optional[str] = None
+    redacted_excerpt: Optional[str] = None
 
 
 # Violation Schemas
@@ -134,6 +153,12 @@ class DLPViolationResponse(DLPViolationBase, DBModel):
 
     id: str = ""
     organization_id: str = ""
+    # Wave 4 content-scan findings (None on manually created violations).
+    source_type: Optional[str] = None
+    source_id: Optional[str] = None
+    location: Optional[str] = None
+    redacted_excerpt: Optional[str] = None
+    detected_by: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -360,6 +385,7 @@ class DLPIncidentUpdate(BaseModel):
     affected_data_subjects_count: Optional[int] = None
     incident_commander: Optional[str] = None
     remediation_steps: Optional[list[str]] = None
+    resolution_notes: Optional[str] = None
 
 
 class DLPIncidentResponse(DLPIncidentBase, DBModel):
@@ -374,6 +400,7 @@ class DLPIncidentResponse(DLPIncidentBase, DBModel):
     incident_commander: Optional[str] = None
     remediation_steps: Optional[list[str]] = None
     regulatory_implications: Optional[dict[str, Any]] = None
+    resolution_notes: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
 from src.models.user import User, UserRole
 from src.core.logging import get_logger
+from src.core.secrets import SecretUnreadable, encrypt_secret_json
 from src.data_lake.models import (
     DataPartition,
     DataPipeline,
@@ -58,10 +59,6 @@ from src.schemas.data_lake import (
     UnifiedDataModelResponse,
     UnifiedDataModelUpdate,
 )
-from src.data_lake.engine import (
-    PipelineOrchestrator,
-    StorageManager,
-)
 
 logger = get_logger(__name__)
 
@@ -79,6 +76,164 @@ def _not_implemented(detail: str) -> HTTPException:
         status_code=status.HTTP_501_NOT_IMPLEMENTED,
         detail={"error": "not_implemented", "detail": detail},
     )
+
+
+SOURCE_REGISTERED = "registered"
+PIPELINE_REGISTERED = "registered"
+PIPELINE_NO_EXECUTOR = (
+    "no executor runs user-defined data-lake pipelines: the row records the "
+    "pipeline's definition only; built-in pipelines are the scheduled platform tasks"
+)
+SOURCE_NO_CONNECTOR = (
+    "no connector ingests registered data sources; built-in sources are the "
+    "platform's own tables"
+)
+
+# Platform tasks (in the beat schedule) that read a built-in table: the
+# lineage of a built-in source. Each entry is a code path in this
+# repository, not a guess.
+BUILTIN_TABLE_CONSUMERS: dict[str, list[dict]] = {
+    "log_entries": [
+        {"task": "src.ueba.tasks.bridge_siem_logs", "name": "UEBA SIEM bridge",
+         "reads": "authentication / access events into behavior events"},
+        {"task": "src.itdr.tasks.analyze_identity_auth_events", "name": "ITDR auth-event analysis",
+         "reads": "authentication events per identity"},
+        {"task": "src.exposure.tasks.run_asset_discovery", "name": "Exposure asset discovery",
+         "reads": "hosts and addresses seen in logs"},
+        {"task": "src.dlp.tasks.dlp_content_scan_sweep", "name": "DLP content scan",
+         "reads": "message / raw log text against active DLP policies"},
+    ],
+    "alerts": [
+        {"task": "automation.periodic_ioc_sweep", "name": "IOC sweep",
+         "reads": "recent alerts against threat indicators"},
+        {"task": "automation.hourly_correlation_sweep", "name": "Correlation sweep",
+         "reads": "recent alerts for correlation"},
+        {"task": "automation.auto_escalate_stale_alerts", "name": "Stale alert escalation",
+         "reads": "open alerts past their SLA"},
+        {"task": "automation.auto_close_resolved_alerts", "name": "Resolved alert closure",
+         "reads": "resolved alerts"},
+        {"task": "src.agentic.tasks.auto_triage_new_alerts", "name": "Agentic auto-triage",
+         "reads": "new alerts"},
+    ],
+    "incidents": [
+        {"task": "src.agentic.tasks.followup_open_incidents", "name": "Agentic incident follow-up",
+         "reads": "open incidents"},
+        {"task": "src.dlp.tasks.dlp_content_scan_sweep", "name": "DLP content scan",
+         "reads": "incident text against active DLP policies"},
+    ],
+    "threat_indicators": [
+        {"task": "automation.periodic_ioc_sweep", "name": "IOC sweep",
+         "reads": "active indicators matched against alerts"},
+    ],
+}
+
+
+def _beat_schedule() -> dict:
+    from src.workers.celery_app import celery_app
+
+    return celery_app.conf.beat_schedule or {}
+
+
+def _builtin_table(source: DataSource) -> Optional[str]:
+    """The platform table behind a built-in source, else None."""
+    cfg = source.connection_config_encrypted or {}
+    if isinstance(cfg, dict) and cfg.get("builtin") and cfg.get("table") in DATA_LAKE_READABLE_TABLES:
+        return cfg["table"]
+    return None
+
+
+async def _builtin_table_quality(
+    db: AsyncSession, org_id: str, source: DataSource, table: str,
+) -> dict:
+    """Quality of a built-in source measured on its table (org rows only):
+    freshness of the newest row, volume over 24 h / 7 d / 30 d and the
+    number of the last 7 days with no rows at all."""
+    from sqlalchemy import text as sa_text
+
+    now = datetime.now(timezone.utc)
+    params = {
+        "org_id": org_id,
+        "d1": now - timedelta(days=1),
+        "d7": now - timedelta(days=7),
+        "d30": now - timedelta(days=30),
+    }
+    try:
+        async with db.begin_nested():
+            row = (await db.execute(
+                sa_text(
+                    f"SELECT COUNT(*), MAX(created_at), "
+                    f"SUM(CASE WHEN created_at >= :d1 THEN 1 ELSE 0 END), "
+                    f"SUM(CASE WHEN created_at >= :d7 THEN 1 ELSE 0 END), "
+                    f"SUM(CASE WHEN created_at >= :d30 THEN 1 ELSE 0 END) "
+                    f"FROM {table} WHERE organization_id = :org_id",
+                ),
+                params,
+            )).first()
+            day_rows = (await db.execute(
+                sa_text(
+                    f"SELECT created_at FROM {table} "
+                    f"WHERE organization_id = :org_id AND created_at >= :d7 "
+                    f"ORDER BY created_at DESC LIMIT 50000",
+                ),
+                params,
+            )).scalars().all()
+    except Exception as exc:  # table absent in this deployment
+        raise _not_implemented(
+            f"quality of {table!r} cannot be measured here: {type(exc).__name__}",
+        ) from exc
+
+    total, newest, n1, n7, n30 = row if row else (0, None, 0, 0, 0)
+    if isinstance(newest, str):
+        try:
+            newest = datetime.fromisoformat(newest.replace("Z", "+00:00"))
+        except ValueError:
+            newest = None
+    if newest is not None and newest.tzinfo is None:
+        newest = newest.replace(tzinfo=timezone.utc)
+    freshness_hours = round((now - newest).total_seconds() / 3600.0, 2) if newest else None
+
+    seen_days: set = set()
+    for value in day_rows:
+        if isinstance(value, str):
+            try:
+                value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+        if value is not None:
+            seen_days.add(value.date())
+    expected_days = {(now - timedelta(days=i)).date() for i in range(7)}
+    empty_days = len(expected_days - seen_days)
+
+    total = int(total or 0)
+    if total == 0:
+        status_ = "no_data"
+    elif freshness_hours is None:
+        status_ = "unknown"
+    elif freshness_hours < 24:
+        status_ = "healthy"
+    elif freshness_hours < 168:
+        status_ = "degraded"
+    else:
+        status_ = "stale"
+
+    return {
+        "dataset_id": source.id,
+        "dataset_name": source.name,
+        "source_type": source.source_type,
+        "status": status_,
+        "freshness_hours": freshness_hours,
+        "partition_count": 0,
+        "total_records": total,
+        "total_bytes": None,
+        "indexed_ratio": None,
+        "storage_bytes_by_tier": {},
+        "time_range": {"earliest": None, "latest": newest.isoformat() if newest else None},
+        "basis": f"table {table} (this organisation's rows)",
+        "records_24h": int(n1 or 0),
+        "records_7d": int(n7 or 0),
+        "records_30d": int(n30 or 0),
+        "empty_days_last_7": empty_days,
+    }
 
 
 # ==================== BUILT-IN DATA SOURCES ====================
@@ -233,14 +388,17 @@ async def _ensure_builtin_sources(db: AsyncSession, org_id: str) -> None:
         # Live row count + last-event timestamp. Use :org_id param to
         # prevent any tenant leakage even though these are fixed literals.
         try:
-            count_q = sa_text(
-                f"SELECT COUNT(*), MAX({ts_col}) FROM {table} "
-                f"WHERE organization_id = :org_id"
-            )
-            count_row = (await db.execute(count_q, {"org_id": org_id})).first()
+            # Savepoint: a missing table / column must not abort the
+            # transaction for the remaining tables (Postgres).
+            async with db.begin_nested():
+                count_q = sa_text(
+                    f"SELECT COUNT(*), MAX({ts_col}) FROM {table} "
+                    f"WHERE organization_id = :org_id",
+                )
+                count_row = (await db.execute(count_q, {"org_id": org_id})).first()
             live_count = int(count_row[0] or 0) if count_row else 0
             last_event = count_row[1] if count_row else None
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 - table absent in this deployment
             live_count = 0
             last_event = None
 
@@ -329,9 +487,12 @@ def _builtin_celery_pipelines(org_id: str) -> list[dict]:
             "destination": task,
             "transform_rules": [],
             "schedule_cron": cadence,
-            "status": "active",
-            # Beat entries carry no run history here: last_run and the
-            # counters are unknown (None), not "now" / 0.
+            # A beat entry is scheduled work; Celery keeps no per-run
+            # history PySOAR can read, so it is never reported "active"
+            # with a success rate.
+            "status": "scheduled",
+            "run_history": "not_recorded",
+            "task": task,
             "last_run": None,
             "next_run": None,
             "avg_processing_time_ms": None,
@@ -355,7 +516,28 @@ async def create_data_source(
     _user: AdminRoleUser = None,
     db: DatabaseSession = None,
 ):
-    """Create new data source"""
+    """Register a data source.
+
+    The connection settings (``connection_config``, or the legacy
+    ``connection_config_encrypted``) are stored as an ``enc:v1:`` envelope
+    and never returned; the response lists only which keys are set. No
+    connector ingests registered sources yet, so the source is
+    ``registered`` (not "initializing" forever) and its
+    ``ingestion_note`` says so.
+    """
+    raw_config = source_in.connection_config or source_in.connection_config_encrypted or {}
+    stored_config: dict = {}
+    if raw_config:
+        try:
+            stored_config = {
+                "envelope": encrypt_secret_json(raw_config),
+                "keys": sorted(str(k) for k in raw_config),
+            }
+        except SecretUnreadable as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"error": "encryption_unavailable", "detail": exc.reason},
+            ) from exc
     try:
         source = DataSource(
             organization_id=org_id,
@@ -366,9 +548,9 @@ async def create_data_source(
             format=source_in.format,
             schema_definition=source_in.schema_definition,
             normalization_mapping=source_in.normalization_mapping,
-            connection_config_encrypted=source_in.connection_config_encrypted,
+            connection_config_encrypted=stored_config,
             retention_days=source_in.retention_days,
-            status="initializing",
+            status=SOURCE_REGISTERED,
         )
         db.add(source)
         await db.commit()
@@ -784,6 +966,9 @@ async def create_pipeline(
             destination=pipeline_in.destination,
             transform_rules=[r.dict() for r in pipeline_in.transform_rules],
             schedule_cron=pipeline_in.schedule_cron,
+            # No executor runs user-defined pipelines: the row is a
+            # registration and says so (it never turns "active").
+            status=PIPELINE_REGISTERED,
         )
         db.add(pipeline)
         await db.commit()
@@ -854,6 +1039,8 @@ async def list_pipelines(
             "created_at": p.created_at.isoformat() if p.created_at else None,
             "updated_at": p.updated_at.isoformat() if p.updated_at else None,
             "builtin": False,
+            "executor": None,
+            "execution_note": PIPELINE_NO_EXECUTOR,
         }
         for p in items
     ]
@@ -896,8 +1083,13 @@ async def update_pipeline(
     if not pipeline:
         raise HTTPException(status_code=404, detail="Pipeline not found")
 
+    update_data = pipeline_in.dict(exclude_unset=True)
+    if str(update_data.get("status") or "").lower() in ("active", "running"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"error": "no_executor", "detail": PIPELINE_NO_EXECUTOR},
+        )
     try:
-        update_data = pipeline_in.dict(exclude_unset=True)
         for field, value in update_data.items():
             if field == "transform_rules" and value:
                 value = [r.dict() if hasattr(r, "dict") else r for r in value]
@@ -1740,6 +1932,16 @@ async def get_data_lineage(
     upstream: list[dict] = []
     downstream: list[dict] = []
     partitions: list[dict] = []
+    builtin_table = _builtin_table(src) if src else None
+
+    if builtin_table:
+        # A built-in source *is* a platform table: its producers and
+        # consumers are the platform code paths that write / read it,
+        # listed only when the consuming task is in the beat schedule.
+        scheduled = {cfg.get("task") for cfg in _beat_schedule().values()}
+        for consumer in BUILTIN_TABLE_CONSUMERS.get(builtin_table, []):
+            if consumer["task"] in scheduled:
+                downstream.append({"type": "scheduled_task", "basis": "platform code", **consumer})
 
     if src:
         upstream.append({
@@ -1801,6 +2003,7 @@ async def get_data_lineage(
         "downstream_consumers": downstream,
         "partitions": partitions,
         "resolved_as": "source" if src else "unified_model",
+        "builtin_table": builtin_table,
     }
 
 
@@ -1830,6 +2033,10 @@ async def get_data_quality(
     ).scalar_one_or_none()
     if not src:
         raise HTTPException(status_code=404, detail="Dataset not found")
+
+    builtin_table = _builtin_table(src)
+    if builtin_table:
+        return await _builtin_table_quality(db, org_id, src, builtin_table)
 
     part_rows = (
         await db.execute(
@@ -1966,13 +2173,26 @@ async def get_dashboard_metrics(
     except Exception:
         pass
 
+    # Success rate = (records processed - errors) / records processed over
+    # the org's pipeline rows; None when no pipeline has processed anything
+    # (it used to be active / total pipelines, which is not a success rate).
+    records_total, errors_total = (await db.execute(
+        select(
+            func.coalesce(func.sum(DataPipeline.records_processed_total), 0),
+            func.coalesce(func.sum(DataPipeline.error_count), 0),
+        ).where(DataPipeline.organization_id == org_id),
+    )).one()
+    records_total = int(records_total or 0)
+    success_rate = (
+        round(max(0.0, (records_total - int(errors_total or 0)) / records_total) * 100.0, 2)
+        if records_total > 0 else None
+    )
+
     return {
         "ingestion_metrics": {
             "active_sources": sources_active,
             "total_sources": sources_total,
-            "success_rate": round(
-                (pipelines_active / pipelines_total * 100) if pipelines_total else 0.0, 2
-            ),
+            "success_rate": success_rate,
         },
         "storage_usage": {
             "total_bytes": int(total_bytes),
@@ -1985,9 +2205,7 @@ async def get_dashboard_metrics(
             "active_pipelines": pipelines_active,
             "total_pipelines": pipelines_total,
             "failed_pipelines": pipelines_failed,
-            "avg_success_rate": round(
-                (pipelines_active / pipelines_total * 100) if pipelines_total else 0.0, 2
-            ),
+            "avg_success_rate": success_rate,
         },
         "timestamp": now.isoformat(),
     }
@@ -2017,6 +2235,21 @@ async def get_storage_breakdown(
     tiers = {"hot": 0, "warm": 0, "cold": 0, "archived": 0}
     by_source: dict[str, int] = {}
     by_table_detail: list[dict] = []
+
+    dialect = db.bind.dialect.name if db.bind is not None else "postgresql"
+    if dialect != "postgresql":
+        return {
+            "total_bytes": None,
+            "by_tier": dict.fromkeys(tiers),
+            "by_source": {},
+            "by_table": [],
+            "probe": {
+                "method": "pg_total_relation_size",
+                "available": False,
+                "reason": f"storage sizes are measured on PostgreSQL only (database is {dialect})",
+            },
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
 
     for table, _cols in DATA_LAKE_READABLE_TABLES.items():
         try:
@@ -2109,6 +2342,13 @@ async def get_storage_breakdown(
         "by_tier": tiers,
         "by_source": by_source,
         "by_table": by_table_detail,
+        "probe": {
+            "method": "pg_total_relation_size",
+            "available": True,
+            "reason": None,
+            "attribution": "each table's bytes shared by its rows; this organisation's rows bucketed by created_at age",
+            "tables_measured": len(by_table_detail),
+        },
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -2162,14 +2402,11 @@ async def get_pipeline_status(
     )).one()
     records_total = int(records_total or 0)
     errors_total = int(errors_total or 0)
+    avg_success_rate: Optional[float] = None
     if records_total > 0:
         avg_success_rate = round(
             max(0.0, (records_total - errors_total) / records_total) * 100.0, 2
         )
-    elif total_db > 0:
-        avg_success_rate = round(active / total_db * 100.0, 2)
-    else:
-        avg_success_rate = 0.0
 
     # Most recent real runs (org-scoped; empty when nothing has run).
     ran = (await db.execute(
@@ -2195,15 +2432,17 @@ async def get_pipeline_status(
         for p in ran
     ]
 
-    # Live Celery beat pipelines are always "active" — same builtins the
-    # /pipelines list shows, so the two views agree.
-    builtin_active = len(_builtin_celery_pipelines(org_id)) if include_builtins else 0
+    # Beat entries are scheduled work with no readable run history: they
+    # are counted separately, never as "active".
+    builtin_scheduled = len(_builtin_celery_pipelines(org_id)) if include_builtins else 0
 
     return {
-        "active_pipelines": active + builtin_active,
+        "active_pipelines": active,
+        "scheduled_builtin_pipelines": builtin_scheduled,
+        "registered_pipelines": by_status.get(PIPELINE_REGISTERED, 0),
         "paused_pipelines": paused,
         "error_pipelines": error,
-        "total_pipelines": total_db + builtin_active,
+        "total_pipelines": total_db + builtin_scheduled,
         "recent_executions": recent_executions,
         "avg_success_rate": avg_success_rate,
         "generated_at": datetime.now(timezone.utc).isoformat(),

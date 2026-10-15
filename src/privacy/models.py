@@ -6,10 +6,11 @@ Manages Data Subject Requests, Privacy Impact Assessments, Consent Records,
 Data Processing Activities, and Privacy Incidents.
 """
 
+from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import BaseModel
@@ -109,6 +110,27 @@ class DataSubjectRequest(BaseModel):
     denial_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     processing_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # Wave 4 workflow record. Identity verification is an analyst's recorded
+    # attestation (method + evidence reference), never assumed.
+    identity_verified_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    identity_verified_by: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    identity_verification_method: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    identity_verification_evidence: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    searched_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    exported_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    export_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    export_record_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    erasure_executed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    erasure_log: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    deadline_breached_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
     __table_args__ = (
         Index("idx_dsr_org_status", "organization_id", "status"),
         Index("idx_dsr_org_subject", "organization_id", "subject_email"),
@@ -146,6 +168,7 @@ class RiskLevel(str, Enum):
     MEDIUM = "medium"
     HIGH = "high"
     CRITICAL = "critical"
+    NOT_ASSESSED = "not_assessed"
 
 
 class PrivacyImpactAssessment(BaseModel):

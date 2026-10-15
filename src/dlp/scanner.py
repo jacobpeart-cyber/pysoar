@@ -1,0 +1,662 @@
+"""DLP content scanner: policies evaluated over data the platform holds.
+
+PySOAR has no inline inspection point (no mail gateway, proxy or endpoint
+file hook), so DLP policies are evaluated where the platform really holds
+content: stored SIEM log entries, compliance evidence text, ticket comments,
+and incident / case-note text. Each policy resolves to
+
+* ``active``: it has evaluable patterns and at least one monitored channel
+  maps to a data source here; the scanner evaluates it, or
+* ``inactive`` with the reason (disabled, no patterns, invalid pattern, every
+  monitored channel has no data source in PySOAR, exfiltration rules that
+  need transfer events).
+
+The scan is bounded: per organisation and per source it reads windows of
+``WINDOW_ROWS`` rows in (created_at, id) order from a stored cursor
+(``dlp_scan_cursors``), at most ``MAX_ROWS_PER_SOURCE`` rows per run, and
+inspects at most ``MAX_TEXT_CHARS`` characters per record. A source never
+scanned before starts ``INITIAL_LOOKBACK_DAYS`` back. Every match becomes
+one ``dlp_violations`` row per (policy, record) carrying the policy, the
+location and an excerpt in which every match is redacted; a re-scan never
+duplicates it.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Optional
+
+from sqlalchemy import and_, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.core.logging import get_logger
+from src.dlp.engine import DLPEngine
+from src.dlp.models import DLPPolicy, DLPScanCursor, DLPViolation
+
+logger = get_logger(__name__)
+
+WINDOW_ROWS = 200
+MAX_ROWS_PER_SOURCE = 2_000
+MAX_TEXT_CHARS = 20_000
+MAX_CUSTOM_PATTERN_LENGTH = 500
+INITIAL_LOOKBACK_DAYS = 30
+EXCERPT_RADIUS = 120
+MAX_ORGS_PER_SWEEP = 500
+
+# Built-in detectors, by the names a policy's ``data_patterns`` may use.
+BUILTIN_PATTERNS: dict[str, str] = {
+    **DLPEngine.SENSITIVE_PATTERNS,
+    **{f"medical_{k}": v for k, v in DLPEngine.MEDICAL_TERMS.items()},
+}
+
+# Detectors a policy type uses when the policy lists no ``data_patterns``.
+# Types missing here (exfiltration_prevention, intellectual_property,
+# custom_pattern) cannot be evaluated without explicit patterns.
+TYPE_DEFAULT_PATTERNS: dict[str, list[str]] = {
+    "pii_detection": ["ssn", "credit_card"],
+    "pci_detection": ["credit_card"],
+    "phi_detection": ["medical_diagnosis", "medical_medication", "medical_procedure"],
+    "regulatory": ["ssn", "credit_card"],
+    "data_classification": ["ssn", "credit_card", "aws_key", "private_key", "api_key"],
+}
+
+POLICY_TYPE_TO_VIOLATION: dict[str, str] = {
+    "pii_detection": "pii_exposure",
+    "phi_detection": "phi_exposure",
+    "pci_detection": "pci_data_leak",
+    "intellectual_property": "ip_theft",
+    "regulatory": "pii_exposure",
+}
+
+# Channel names a policy may list in ``channels_monitored`` -> data sources.
+CHANNEL_SOURCES: dict[str, list[str]] = {
+    "logs": ["log_entries"],
+    "log": ["log_entries"],
+    "siem": ["log_entries"],
+    "log_entries": ["log_entries"],
+    "evidence": ["compliance_evidence"],
+    "compliance_evidence": ["compliance_evidence"],
+    "tickets": ["ticket_comments"],
+    "ticket_comments": ["ticket_comments"],
+    "cases": ["incidents", "case_notes"],
+    "incidents": ["incidents"],
+    "case_notes": ["case_notes"],
+}
+
+
+class InvalidPattern(ValueError):
+    """A policy pattern that is neither a built-in name nor a valid regex."""
+
+
+@dataclass
+class PolicyPlan:
+    """What the scanner can do with one policy."""
+
+    policy: DLPPolicy
+    status: str
+    reason: Optional[str]
+    patterns: dict[str, re.Pattern[str]] = field(default_factory=dict)
+    sources: list[str] = field(default_factory=list)
+    allow_values: set[str] = field(default_factory=set)
+    excluded_sources: set[str] = field(default_factory=set)
+
+
+def _json_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return [value]
+        return parsed if isinstance(parsed, list) else [parsed]
+    return [value]
+
+
+def compile_patterns(names: list[str]) -> dict[str, re.Pattern[str]]:
+    """Compile built-in names and custom regexes; raise InvalidPattern."""
+    compiled: dict[str, re.Pattern[str]] = {}
+    for raw in names:
+        entry = str(raw).strip()
+        if not entry:
+            continue
+        if entry in BUILTIN_PATTERNS:
+            compiled[entry] = re.compile(BUILTIN_PATTERNS[entry], re.IGNORECASE)
+            continue
+        if len(entry) > MAX_CUSTOM_PATTERN_LENGTH:
+            raise InvalidPattern(
+                f"pattern longer than {MAX_CUSTOM_PATTERN_LENGTH} characters: {entry[:40]}..."
+            )
+        try:
+            compiled[f"custom:{entry}"] = re.compile(entry)
+        except re.error as exc:
+            raise InvalidPattern(f"invalid regular expression {entry!r}: {exc}") from exc
+    return compiled
+
+
+def validate_data_patterns(names: Optional[list[str]]) -> None:
+    """Route-level validation (422 on failure)."""
+    compile_patterns(list(names or []))
+
+
+def resolve_sources(channels: list[Any]) -> tuple[list[str], list[str]]:
+    """(data sources, channels with no data source in PySOAR)."""
+    if not channels:
+        return sorted({s for v in CHANNEL_SOURCES.values() for s in v}), []
+    sources: list[str] = []
+    unsupported: list[str] = []
+    for ch in channels:
+        key = str(ch).strip().lower()
+        mapped = CHANNEL_SOURCES.get(key)
+        if mapped is None:
+            unsupported.append(str(ch))
+            continue
+        for s in mapped:
+            if s not in sources:
+                sources.append(s)
+    return sources, unsupported
+
+
+def plan_policy(policy: DLPPolicy, *, ignore_enabled: bool = False) -> PolicyPlan:
+    """Decide whether (and how) the scanner evaluates ``policy``."""
+    if not policy.enabled and not ignore_enabled:
+        return PolicyPlan(policy, "inactive", "policy is disabled")
+
+    names = [str(n) for n in _json_list(policy.data_patterns)]
+    if not names:
+        names = list(TYPE_DEFAULT_PATTERNS.get(policy.policy_type or "", []))
+    if not names:
+        if policy.policy_type == "exfiltration_prevention":
+            reason = (
+                "exfiltration rules need transfer events (destination, volume); no "
+                "data source in PySOAR provides them; add data_patterns to scan stored content"
+            )
+        else:
+            reason = (
+                f"policy type {policy.policy_type!r} has no built-in detectors and the "
+                "policy lists no data_patterns"
+            )
+        return PolicyPlan(policy, "inactive", reason)
+    try:
+        patterns = compile_patterns(names)
+    except InvalidPattern as exc:
+        return PolicyPlan(policy, "inactive", str(exc))
+    if not patterns:
+        return PolicyPlan(policy, "inactive", "the policy lists no usable data_patterns")
+
+    sources, unsupported = resolve_sources(_json_list(policy.channels_monitored))
+    if not sources:
+        return PolicyPlan(
+            policy,
+            "inactive",
+            "no data source for the monitored channel(s): "
+            + ", ".join(unsupported)
+            + "; PySOAR scans logs, evidence, tickets and cases",
+        )
+
+    allow_values: set[str] = set()
+    excluded_sources: set[str] = set()
+    for exc in _json_list(policy.exceptions):
+        if isinstance(exc, dict):
+            if exc.get("value"):
+                allow_values.add(str(exc["value"]))
+            if exc.get("source_type"):
+                excluded_sources.add(str(exc["source_type"]))
+    reason = None
+    if unsupported:
+        reason = "not scanned (no data source): " + ", ".join(unsupported)
+    return PolicyPlan(
+        policy, "active", reason, patterns, [s for s in sources if s not in excluded_sources],
+        allow_values, excluded_sources,
+    )
+
+
+def _luhn_ok(candidate: str) -> bool:
+    digits = [int(c) for c in candidate if c.isdigit()]
+    if len(digits) < 13 or len(digits) > 19:
+        return False
+    total = 0
+    for i, d in enumerate(reversed(digits)):
+        if i % 2 == 1:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def find_matches(plan: PolicyPlan, text: str) -> list[tuple[str, int, int]]:
+    """(pattern name, start, end) for every match in ``text`` (bounded)."""
+    hits: list[tuple[str, int, int]] = []
+    for name, pattern in plan.patterns.items():
+        for m in pattern.finditer(text):
+            value = m.group(0)
+            if not value or value in plan.allow_values:
+                continue
+            if name == "credit_card" and not _luhn_ok(value):
+                continue
+            hits.append((name, m.start(), m.end()))
+    hits.sort(key=lambda h: h[1])
+    return hits
+
+
+# Secrets redacted from every excerpt even when the policy did not look for
+# them, so a finding never re-exposes another credential or identifier.
+_ALWAYS_REDACT = {
+    name: re.compile(BUILTIN_PATTERNS[name], re.IGNORECASE)
+    for name in ("ssn", "credit_card", "api_key", "aws_key", "private_key")
+}
+
+
+def redacted_excerpt(text: str, hits: list[tuple[str, int, int]]) -> str:
+    """Excerpt around the first policy match; every policy match and every
+    other secret-shaped value in the text is redacted."""
+    first = hits[0][1] if hits else 0
+    extra = [
+        (name, m.start(), m.end())
+        for name, pattern in _ALWAYS_REDACT.items()
+        for m in pattern.finditer(text)
+    ]
+    out = ""
+    markers: list[tuple[int, int]] = []
+    anchor: Optional[int] = None
+    cursor = 0
+    for name, start, end in sorted(hits + extra, key=lambda h: (h[1], -h[2])):
+        if start < cursor:
+            continue  # overlaps a match already redacted
+        out += text[cursor:start]
+        marker = f"[REDACTED:{name.split(':', 1)[0]}]"
+        if anchor is None and start >= first:
+            anchor = len(out)
+        markers.append((len(out), len(out) + len(marker)))
+        out += marker
+        cursor = end
+    out += text[cursor:]
+    anchor = anchor or 0
+    lo = max(0, anchor - EXCERPT_RADIUS)
+    hi = min(len(out), anchor + EXCERPT_RADIUS * 2)
+    # Never cut a marker in half at the window edges.
+    for m_start, m_end in markers:
+        if m_start < lo < m_end:
+            lo = m_start
+        if m_start < hi < m_end:
+            hi = m_end
+    return ("..." if lo > 0 else "") + out[lo:hi] + ("..." if hi < len(out) else "")
+
+
+# ---------------------------------------------------------------------------
+# Data sources
+# ---------------------------------------------------------------------------
+@dataclass
+class _Record:
+    id: str
+    created_at: Any
+    text: str
+    location: str
+    user: Optional[str]
+
+
+@dataclass
+class _Source:
+    key: str
+    label: str
+    fetch: Callable[[AsyncSession, str, Any, Optional[str], Any, int], Any]
+
+
+def _keyset(model_created, model_id, last_created, last_id, floor):
+    clauses = []
+    if last_created is not None:
+        clauses.append(
+            or_(
+                model_created > last_created,
+                and_(model_created == last_created, model_id > (last_id or "")),
+            )
+        )
+    elif floor is not None:
+        clauses.append(model_created >= floor)
+    return clauses
+
+
+async def _fetch_log_entries(db, org_id, last_created, last_id, floor, limit):
+    from src.siem.models import LogEntry
+
+    stmt = (
+        select(
+            LogEntry.id, LogEntry.created_at, LogEntry.raw_log, LogEntry.message,
+            LogEntry.source_name, LogEntry.timestamp, LogEntry.username,
+        )
+        .where(LogEntry.organization_id == org_id, *_keyset(LogEntry.created_at, LogEntry.id, last_created, last_id, floor))
+        .order_by(LogEntry.created_at, LogEntry.id)
+        .limit(limit)
+    )
+    rows = (await db.execute(stmt)).all()
+    return [
+        _Record(
+            r.id, r.created_at, "\n".join(x for x in (r.message, r.raw_log) if x),
+            f"log_entries/{r.id} ({r.source_name}, {r.timestamp})", r.username,
+        )
+        for r in rows
+    ]
+
+
+async def _fetch_evidence(db, org_id, last_created, last_id, floor, limit):
+    from src.compliance.models import ComplianceEvidence as E
+
+    stmt = (
+        select(E.id, E.created_at, E.title, E.description, E.content, E.collected_by)
+        .where(E.organization_id == org_id, *_keyset(E.created_at, E.id, last_created, last_id, floor))
+        .order_by(E.created_at, E.id)
+        .limit(limit)
+    )
+    rows = (await db.execute(stmt)).all()
+    return [
+        _Record(
+            r.id, r.created_at, "\n".join(x for x in (r.title, r.description, r.content) if x),
+            f"compliance_evidence/{r.id} ({(r.title or '')[:80]})", r.collected_by,
+        )
+        for r in rows
+    ]
+
+
+async def _fetch_ticket_comments(db, org_id, last_created, last_id, floor, limit):
+    from src.tickethub.models import TicketComment as T
+
+    stmt = (
+        select(T.id, T.created_at, T.content, T.source_type, T.source_id, T.author_id)
+        .where(T.organization_id == org_id, *_keyset(T.created_at, T.id, last_created, last_id, floor))
+        .order_by(T.created_at, T.id)
+        .limit(limit)
+    )
+    rows = (await db.execute(stmt)).all()
+    return [
+        _Record(
+            r.id, r.created_at, r.content or "",
+            f"ticket_comments/{r.id} on {r.source_type}/{r.source_id}", r.author_id,
+        )
+        for r in rows
+    ]
+
+
+async def _fetch_incidents(db, org_id, last_created, last_id, floor, limit):
+    from src.models.incident import Incident as I
+
+    stmt = (
+        select(I.id, I.created_at, I.title, I.description, I.resolution, I.root_cause)
+        .where(I.organization_id == org_id, *_keyset(I.created_at, I.id, last_created, last_id, floor))
+        .order_by(I.created_at, I.id)
+        .limit(limit)
+    )
+    rows = (await db.execute(stmt)).all()
+    return [
+        _Record(
+            r.id, r.created_at,
+            "\n".join(x for x in (r.title, r.description, r.resolution, r.root_cause) if x),
+            f"incidents/{r.id} ({(r.title or '')[:80]})", None,
+        )
+        for r in rows
+    ]
+
+
+async def _fetch_case_notes(db, org_id, last_created, last_id, floor, limit):
+    from src.models.case import CaseNote as N
+    from src.models.incident import Incident as I
+
+    stmt = (
+        select(N.id, N.created_at, N.content, N.incident_id, N.author_id)
+        .join(I, I.id == N.incident_id)
+        .where(I.organization_id == org_id, *_keyset(N.created_at, N.id, last_created, last_id, floor))
+        .order_by(N.created_at, N.id)
+        .limit(limit)
+    )
+    rows = (await db.execute(stmt)).all()
+    return [
+        _Record(r.id, r.created_at, r.content or "", f"case_notes/{r.id} on incident {r.incident_id}", r.author_id)
+        for r in rows
+    ]
+
+
+SOURCES: dict[str, _Source] = {
+    "log_entries": _Source("log_entries", "SIEM log entries", _fetch_log_entries),
+    "compliance_evidence": _Source("compliance_evidence", "Compliance evidence", _fetch_evidence),
+    "ticket_comments": _Source("ticket_comments", "Ticket comments", _fetch_ticket_comments),
+    "incidents": _Source("incidents", "Incidents", _fetch_incidents),
+    "case_notes": _Source("case_notes", "Case notes", _fetch_case_notes),
+}
+
+
+# ---------------------------------------------------------------------------
+# Scan
+# ---------------------------------------------------------------------------
+async def load_plans(db: AsyncSession, org_id: str, *, persist: bool = True) -> list[PolicyPlan]:
+    """Plan every policy of the org and (optionally) store each status."""
+    policies = (
+        await db.execute(
+            select(DLPPolicy).where(DLPPolicy.organization_id == org_id).order_by(DLPPolicy.created_at).limit(500)
+        )
+    ).scalars().all()
+    plans = [plan_policy(p) for p in policies]
+    if persist:
+        for plan in plans:
+            plan.policy.evaluation_status = plan.status
+            plan.policy.evaluation_reason = plan.reason
+    return plans
+
+
+def apply_plan(policy: DLPPolicy) -> PolicyPlan:
+    """Store the evaluation status on a policy just created / edited."""
+    plan = plan_policy(policy)
+    policy.evaluation_status = plan.status
+    policy.evaluation_reason = plan.reason
+    return plan
+
+
+async def _cursor(db: AsyncSession, org_id: str, source: str) -> DLPScanCursor:
+    row = (
+        await db.execute(
+            select(DLPScanCursor).where(
+                DLPScanCursor.organization_id == org_id, DLPScanCursor.source_type == source
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        row = DLPScanCursor(organization_id=org_id, source_type=source, rows_scanned_total=0,
+                            findings_total=0, last_run_rows=0, last_run_findings=0)
+        db.add(row)
+        await db.flush()
+    return row
+
+
+async def scan_organization(
+    db: AsyncSession,
+    org_id: str,
+    *,
+    max_rows_per_source: int = MAX_ROWS_PER_SOURCE,
+    window_rows: int = WINDOW_ROWS,
+) -> dict[str, Any]:
+    """Evaluate the org's active policies over new stored records (bounded).
+
+    The caller commits.
+    """
+    now = datetime.now(timezone.utc)
+    plans = await load_plans(db, org_id)
+    active = [p for p in plans if p.status == "active"]
+    summary: dict[str, Any] = {
+        "organization_id": org_id,
+        "policies_active": len(active),
+        "policies_inactive": len(plans) - len(active),
+        "inactive_policies": [
+            {"policy_id": p.policy.id, "name": p.policy.name, "reason": p.reason}
+            for p in plans if p.status != "active"
+        ],
+        "sources": {},
+        "findings_created": 0,
+        "rows_scanned": 0,
+    }
+    if not active:
+        return summary
+
+    floor = now - timedelta(days=INITIAL_LOOKBACK_DAYS)
+    for key, source in SOURCES.items():
+        source_plans = [p for p in active if key in p.sources]
+        if not source_plans:
+            continue
+        cursor = await _cursor(db, org_id, key)
+        scanned = 0
+        created = 0
+        error = None
+        try:
+            while scanned < max_rows_per_source:
+                limit = min(window_rows, max_rows_per_source - scanned)
+                # One savepoint per window: a failing window is rolled back on
+                # its own (findings and cursor move together) and the
+                # transaction stays usable for the other sources.
+                async with db.begin_nested():
+                    records = await source.fetch(
+                        db, org_id, cursor.last_created_at, cursor.last_id, floor, limit
+                    )
+                    if not records:
+                        break
+                    window_created = await _evaluate_window(
+                        db, org_id, key, source.label, source_plans, records, now
+                    )
+                    cursor.last_created_at = records[-1].created_at
+                    cursor.last_id = records[-1].id
+                    await db.flush()
+                created += window_created
+                scanned += len(records)
+                if len(records) < limit:
+                    break
+        except Exception as exc:  # one source failing must not stop the others
+            logger.error("dlp_scan_source_failed", organization_id=org_id, source=key, error=str(exc))
+            error = f"{type(exc).__name__}: {str(exc)[:400]}"
+            # The rolled-back savepoint expired what it touched; reload it
+            # explicitly (no lazy IO under asyncio).
+            await db.refresh(cursor)
+            for plan in source_plans:
+                await db.refresh(plan.policy)
+        cursor.last_run_at = now
+        cursor.last_run_rows = scanned
+        cursor.last_run_findings = created
+        cursor.rows_scanned_total = (cursor.rows_scanned_total or 0) + scanned
+        cursor.findings_total = (cursor.findings_total or 0) + created
+        cursor.last_error = error
+        summary["sources"][key] = {"rows_scanned": scanned, "findings_created": created, "error": error}
+        summary["rows_scanned"] += scanned
+        summary["findings_created"] += created
+
+    for plan in active:
+        plan.policy.last_evaluated_at = now
+    await db.flush()
+    return summary
+
+
+async def _evaluate_window(
+    db: AsyncSession,
+    org_id: str,
+    source_key: str,
+    source_label: str,
+    plans: list[PolicyPlan],
+    records: list[_Record],
+    now: datetime,
+) -> int:
+    ids = [r.id for r in records]
+    existing = set(
+        (
+            await db.execute(
+                select(DLPViolation.policy_id, DLPViolation.source_id).where(
+                    DLPViolation.organization_id == org_id,
+                    DLPViolation.source_type == source_key,
+                    DLPViolation.source_id.in_(ids),
+                )
+            )
+        ).all()
+    )
+    created = 0
+    for record in records:
+        text = (record.text or "")[:MAX_TEXT_CHARS]
+        if not text:
+            continue
+        for plan in plans:
+            if (plan.policy.id, record.id) in existing:
+                continue
+            hits = find_matches(plan, text)
+            if not hits:
+                continue
+            kinds = sorted({h[0] for h in hits})
+            db.add(DLPViolation(
+                organization_id=org_id,
+                policy_id=plan.policy.id,
+                violation_type=POLICY_TYPE_TO_VIOLATION.get(plan.policy.policy_type or "", "classification_violation"),
+                severity=plan.policy.severity or "medium",
+                source_user=(record.user or None) and str(record.user)[:255],
+                source_application=source_label,
+                sensitive_data_types=json.dumps(kinds),
+                action_taken="logged",
+                status="new",
+                source_type=source_key,
+                source_id=record.id,
+                location=record.location[:2000],
+                redacted_excerpt=redacted_excerpt(text, hits),
+                detected_by="content_scan",
+            ))
+            existing.add((plan.policy.id, record.id))
+            plan.policy.trigger_count = (plan.policy.trigger_count or 0) + 1
+            plan.policy.last_triggered = now
+            created += 1
+    return created
+
+
+async def reset_cursors(db: AsyncSession, org_id: str) -> int:
+    """Rewind every source of the org to the initial lookback window."""
+    rows = (
+        await db.execute(select(DLPScanCursor).where(DLPScanCursor.organization_id == org_id))
+    ).scalars().all()
+    for row in rows:
+        row.last_created_at = None
+        row.last_id = None
+    await db.flush()
+    return len(rows)
+
+
+async def scan_status(db: AsyncSession, org_id: str) -> dict[str, Any]:
+    """Cursor state per source plus each policy's evaluation status."""
+    plans = await load_plans(db, org_id, persist=False)
+    cursors = {
+        c.source_type: c
+        for c in (
+            await db.execute(select(DLPScanCursor).where(DLPScanCursor.organization_id == org_id))
+        ).scalars().all()
+    }
+    sources = []
+    for key, source in SOURCES.items():
+        c = cursors.get(key)
+        covering = [p.policy.id for p in plans if p.status == "active" and key in p.sources]
+        sources.append({
+            "source_type": key,
+            "label": source.label,
+            "policies_covering": len(covering),
+            "last_run_at": c.last_run_at.isoformat() if c and c.last_run_at else None,
+            "last_run_rows": c.last_run_rows if c else 0,
+            "last_run_findings": c.last_run_findings if c else 0,
+            "rows_scanned_total": c.rows_scanned_total if c else 0,
+            "findings_total": c.findings_total if c else 0,
+            "position": c.last_created_at.isoformat() if c and c.last_created_at else None,
+            "last_error": c.last_error if c else None,
+        })
+    return {
+        "organization_id": org_id,
+        "window_rows": WINDOW_ROWS,
+        "max_rows_per_source_per_run": MAX_ROWS_PER_SOURCE,
+        "initial_lookback_days": INITIAL_LOOKBACK_DAYS,
+        "sources": sources,
+        "policies": [
+            {"policy_id": p.policy.id, "name": p.policy.name, "evaluation_status": p.status,
+             "evaluation_reason": p.reason, "sources": p.sources}
+            for p in plans
+        ],
+    }

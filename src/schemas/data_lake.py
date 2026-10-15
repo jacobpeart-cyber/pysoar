@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from src.schemas.base import DBModel
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # Data Source Schemas
@@ -27,7 +27,9 @@ class DataSourceBase(BaseModel):
 class DataSourceCreate(DataSourceBase):
     """Schema for creating a data source"""
 
-    pass
+    # What the UI sends; stored encrypted (``connection_config_encrypted``
+    # is accepted for older clients).
+    connection_config: Optional[dict[str, Any]] = None
 
 
 class DataSourceUpdate(BaseModel):
@@ -57,9 +59,32 @@ class DataSourceResponse(DataSourceBase, DBModel):
     is_enabled: bool = False
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # Wave 4: built-in sources are platform tables; registered ones have no
+    # connector (the note says so). Connection secrets are never returned.
+    builtin: bool = False
+    builtin_table: Optional[str] = None
+    ingestion_note: Optional[str] = None
 
     class Config:
         from_attributes = True
+
+    @model_validator(mode="after")
+    def _redact_connection(self) -> "DataSourceResponse":
+        cfg = self.connection_config_encrypted or {}
+        if isinstance(cfg, dict) and cfg.get("builtin"):
+            self.builtin = True
+            self.builtin_table = cfg.get("table")
+        else:
+            self.ingestion_note = (
+                "no connector ingests registered data sources; built-in sources are "
+                "the platform's own tables"
+            )
+            if isinstance(cfg, dict) and cfg:
+                self.connection_config_encrypted = {
+                    "configured": True,
+                    "keys": list(cfg.get("keys") or [k for k in cfg if k != "envelope"]),
+                }
+        return self
 
 
 class DataSourceListResponse(BaseModel):

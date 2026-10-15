@@ -10,7 +10,7 @@ from typing import List, Dict, Any, Optional
 from enum import Enum
 
 from src.schemas.base import DBModel
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 __all__ = [
     "DSRType",
@@ -120,6 +120,8 @@ class RiskLevel(str, Enum):
     MEDIUM = "medium"
     HIGH = "high"
     CRITICAL = "critical"
+    # A PIA nobody has assessed yet (new PIAs used to start at "medium").
+    NOT_ASSESSED = "not_assessed"
 
 
 class ConsentType(str, Enum):
@@ -193,7 +195,8 @@ class DataSubjectRequestBase(BaseModel):
 class DataSubjectRequestCreate(DataSubjectRequestBase):
     """Create Data Subject Request"""
 
-    pass
+    # Free-text request details (stored as the request's processing notes).
+    description: Optional[str] = None
 
 
 class DataSubjectRequestUpdate(BaseModel):
@@ -214,9 +217,60 @@ class DataSubjectRequestResponse(DataSubjectRequestBase, DBModel):
     response_sent: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # Wave 4 workflow fields.
+    processing_notes: Optional[str] = None
+    denial_reason: Optional[str] = None
+    data_found: Optional[Dict[str, Any]] = None
+    identity_verified_at: Optional[datetime] = None
+    identity_verified_by: Optional[str] = None
+    identity_verification_method: Optional[str] = None
+    searched_at: Optional[datetime] = None
+    exported_at: Optional[datetime] = None
+    export_sha256: Optional[str] = None
+    export_record_count: Optional[int] = None
+    erasure_executed_at: Optional[datetime] = None
+    erasure_log: Optional[Dict[str, Any]] = None
+    completed_at: Optional[datetime] = None
+    deadline_breached_at: Optional[datetime] = None
+    # Computed from ``deadline`` and ``completed_at`` (or now while open).
+    days_remaining: Optional[int] = None
+    overdue: bool = False
+
+    @model_validator(mode="after")
+    def _deadline_state(self) -> "DataSubjectRequestResponse":
+        if not self.deadline:
+            return self
+        try:
+            deadline = datetime.fromisoformat(str(self.deadline).replace("Z", "+00:00"))
+        except ValueError:
+            return self
+        from datetime import timezone as _tz
+
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=_tz.utc)
+        end = self.completed_at or datetime.now(_tz.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=_tz.utc)
+        delta = deadline - end
+        self.days_remaining = delta.days
+        self.overdue = delta.total_seconds() < 0
+        return self
 
     class Config:
         from_attributes = True
+
+
+class DSRIdentityVerification(BaseModel):
+    """An analyst's record of how the subject's identity was verified."""
+
+    verification_method: str = Field(..., min_length=2, max_length=50)
+    evidence: str = Field(..., min_length=3, max_length=2000)
+
+
+class DSRErasureRequest(BaseModel):
+    """Explicit confirmation for an erasure run."""
+
+    confirm: bool = False
 
 
 class DataSubjectRequestListResponse(BaseModel):
@@ -258,6 +312,13 @@ class PrivacyImpactAssessmentUpdate(BaseModel):
     risk_level: Optional[RiskLevel] = None
     dpo_approval_date: Optional[str] = None
     supervisory_authority_consulted: Optional[bool] = None
+    # Wave 4: assessment content recorded by the assessor.
+    data_types_processed: Optional[List[str]] = None
+    processing_purposes: Optional[List[str]] = None
+    legal_basis: Optional[str] = Field(None, max_length=100)
+    data_subjects_affected: Optional[int] = Field(None, ge=0)
+    cross_border_transfers: Optional[List[str]] = None
+    mitigations: Optional[List[str]] = None
 
 
 class PrivacyImpactAssessmentResponse(PrivacyImpactAssessmentBase, DBModel):
@@ -269,6 +330,8 @@ class PrivacyImpactAssessmentResponse(PrivacyImpactAssessmentBase, DBModel):
     dpo_review: bool = False
     dpo_approval_date: Optional[str] = None
     mitigations: Optional[List[str]] = None
+    cross_border_transfers: Optional[List[str]] = None
+    supervisory_authority_consulted: bool = False
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -413,7 +476,9 @@ class PrivacyIncidentBase(BaseModel):
 class PrivacyIncidentCreate(PrivacyIncidentBase):
     """Create Privacy Incident"""
 
-    pass
+    # Regulations the reporter determined apply (gdpr, ccpa, hipaa, ...);
+    # notification deadlines are computed only for these.
+    regulations_implicated: Optional[List[str]] = None
 
 
 class PrivacyIncidentUpdate(BaseModel):
@@ -437,6 +502,7 @@ class PrivacyIncidentResponse(PrivacyIncidentBase, DBModel):
     supervisory_authority_notified: bool = False
     subjects_notified: bool = False
     root_cause: Optional[str] = None
+    regulations_implicated: Optional[List[str]] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -464,8 +530,9 @@ class RetentionViolation(BaseModel):
 
     record_id: str = ""
     name: str = ""
-    status: str  # RETENTION_EXCEEDED
+    status: str  # NOT_REVIEWED, REVIEW_OVERDUE
     days_overdue: int = 0
+    detail: Optional[str] = None
 
 
 class PrivacyDashboardStats(BaseModel):
@@ -473,7 +540,11 @@ class PrivacyDashboardStats(BaseModel):
 
     total_dsrs: int = 0
     pending_dsrs: int = 0
-    dsr_compliance_rate: float = 0.0
+    # Closed (completed or denied) DSRs closed by their deadline, as a % of
+    # closed DSRs; None when nothing has been closed yet.
+    dsr_compliance_rate: Optional[float] = None
+    closed_dsrs: int = 0
+    overdue_dsrs: int = 0
     active_pias: int = 0
     pias_requiring_review: int = 0
     total_consents: int = 0
@@ -481,7 +552,8 @@ class PrivacyDashboardStats(BaseModel):
     processing_records: int = 0
     pending_incidents: int = 0
     incidents_this_month: int = 0
-    avg_incident_resolution_days: float = 0.0
+    # None until an incident has been closed / remediated.
+    avg_incident_resolution_days: Optional[float] = None
 
 
 class PaginationParams(BaseModel):

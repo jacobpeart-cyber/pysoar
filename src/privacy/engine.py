@@ -6,12 +6,11 @@ Consent Management, Data Governance, and Privacy Incident handling.
 """
 
 import json
-import hashlib
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, update, func
+from sqlalchemy import select, and_
 
 from src.core.logging import get_logger
 from src.privacy.models import (
@@ -46,6 +45,7 @@ class DSRProcessor:
         subject_name: str,
         subject_email: str,
         subject_identifier: Optional[str] = None,
+        processing_notes: Optional[str] = None,
     ) -> DataSubjectRequest:
         """
         Receive and register new Data Subject Request.
@@ -78,6 +78,7 @@ class DSRProcessor:
             subject_email=subject_email,
             subject_identifier=subject_identifier,
             deadline=deadline,
+            processing_notes=processing_notes,
         )
 
         self.db.add(dsr)
@@ -85,294 +86,32 @@ class DSRProcessor:
         logger.info(f"DSR created: {dsr.id}, deadline: {deadline}")
         return dsr
 
-    async def verify_identity(self, dsr_id: str, verification_method: str) -> bool:
-        """
-        Verify subject identity via email, phone, or document verification.
-        Updates DSR status to IDENTITY_VERIFIED.
-        """
-        logger.info(f"Verifying identity for DSR {dsr_id} via {verification_method}")
-
-        stmt = select(DataSubjectRequest).where(
-            and_(
-                DataSubjectRequest.id == dsr_id,
-                DataSubjectRequest.organization_id == self.org_id,
-            )
-        )
-        result = await self.db.execute(stmt)
-        dsr = result.scalar_one_or_none()
-
-        if not dsr:
-            logger.warning(f"DSR {dsr_id} not found")
-            return False
-
-        dsr.status = DSRStatus.IDENTITY_VERIFIED.value
-        logger.info(f"DSR {dsr_id} identity verified via {verification_method}")
-        return True
-
-    async def search_data_systems(
-        self, dsr_id: str, systems: List[str]
-    ) -> Dict[str, Any]:
-        """
-        Search across internal data systems for records relating to the data subject.
-        Queries consent records, incident references, and processing records to
-        determine which PySOAR systems hold data for the subject.
-        """
-        logger.info(f"Searching data systems for DSR {dsr_id}: {systems}")
-
-        stmt = select(DataSubjectRequest).where(
-            and_(
-                DataSubjectRequest.id == dsr_id,
-                DataSubjectRequest.organization_id == self.org_id,
-            )
-        )
-        result = await self.db.execute(stmt)
-        dsr = result.scalar_one_or_none()
-
-        if not dsr:
-            return {"status": "error", "message": f"DSR {dsr_id} not found"}
-
-        subject_email = dsr.subject_email
-        systems_with_data: List[str] = []
-        has_personal_data = False
-        has_special_categories = False
-        has_sensitive_data = False
-
-        # Check consent_records for this subject
-        consent_stmt = select(func.count()).select_from(ConsentRecord).where(
-            and_(
-                ConsentRecord.organization_id == self.org_id,
-                ConsentRecord.subject_id == subject_email,
-            )
-        )
-        consent_count = (await self.db.execute(consent_stmt)).scalar() or 0
-        if consent_count > 0:
-            systems_with_data.append("consent_records")
-            has_personal_data = True
-
-        # Check privacy_incidents that reference this subject
-        incident_stmt = select(func.count()).select_from(PrivacyIncident).where(
-            and_(
-                PrivacyIncident.organization_id == self.org_id,
-                PrivacyIncident.description.contains(subject_email),
-            )
-        )
-        incident_count = (await self.db.execute(incident_stmt)).scalar() or 0
-        if incident_count > 0:
-            systems_with_data.append("privacy_incidents")
-            has_sensitive_data = True
-
-        # Check other DSRs for the same subject
-        other_dsr_stmt = select(func.count()).select_from(DataSubjectRequest).where(
-            and_(
-                DataSubjectRequest.organization_id == self.org_id,
-                DataSubjectRequest.subject_email == subject_email,
-                DataSubjectRequest.id != dsr_id,
-            )
-        )
-        other_dsr_count = (await self.db.execute(other_dsr_stmt)).scalar() or 0
-        if other_dsr_count > 0:
-            systems_with_data.append("dsr_history")
-            has_personal_data = True
-
-        # Check data processing records (ROPA entries that cover this org)
-        processing_stmt = select(func.count()).select_from(DataProcessingRecord).where(
-            DataProcessingRecord.organization_id == self.org_id,
-        )
-        processing_count = (await self.db.execute(processing_stmt)).scalar() or 0
-        if processing_count > 0:
-            systems_with_data.append("data_processing_records")
-
-        # Always include the core systems that were explicitly requested
-        all_systems = list(set(systems + systems_with_data))
-
-        search_results = {
-            "total_systems_searched": len(all_systems),
-            "systems": all_systems,
-            "records_found": {
-                "consent_records": consent_count,
-                "incident_references": incident_count,
-                "prior_dsrs": other_dsr_count,
-                "processing_records": processing_count,
-            },
-            "data_found_summary": {
-                "personal_data": has_personal_data,
-                "special_categories": has_special_categories,
-                "sensitive_data": has_sensitive_data,
-            },
-        }
-
-        dsr.data_systems_searched = json.dumps(all_systems)
-        dsr.data_found = json.dumps(search_results)
-        dsr.status = DSRStatus.PROCESSING.value
-
-        logger.info(f"Search complete for DSR {dsr_id}: found data in {len(systems_with_data)} systems")
-        return search_results
-
-    async def compile_data_package(
-        self, dsr_id: str, format_type: str = "json"
-    ) -> Dict[str, Any]:
-        """
-        Compile complete data package for portability/access requests.
-        Supports JSON, CSV, and structured formats per GDPR Article 20.
-        """
-        logger.info(f"Compiling data package for DSR {dsr_id} in {format_type}")
-
-        stmt = select(DataSubjectRequest).where(
-            and_(
-                DataSubjectRequest.id == dsr_id,
-                DataSubjectRequest.organization_id == self.org_id,
-            )
-        )
-        result = await self.db.execute(stmt)
-        dsr = result.scalar_one_or_none()
-
-        if not dsr:
-            return {"status": "error", "message": f"DSR {dsr_id} not found"}
-
-        # Derive data categories from the systems that were actually searched
-        data_categories: List[str] = []
-        systems_searched: List[str] = []
-        if dsr.data_systems_searched:
-            systems_searched = json.loads(dsr.data_systems_searched)
-
-        # Map searched systems to the data categories they contain
-        system_category_map = {
-            "consent_records": "consent_and_preferences",
-            "privacy_incidents": "incident_and_breach_data",
-            "dsr_history": "request_history",
-            "data_processing_records": "processing_activity_data",
-            "customer_db": "profile_data",
-            "analytics_db": "interaction_data",
-            "backup_system": "archived_data",
-        }
-        for system in systems_searched:
-            category = system_category_map.get(system, system)
-            if category not in data_categories:
-                data_categories.append(category)
-
-        # Always include profile_data since we have subject info on the DSR itself
-        if "profile_data" not in data_categories:
-            data_categories.insert(0, "profile_data")
-
-        data_package = {
-            "request_id": dsr_id,
-            "subject": {
-                "name": dsr.subject_name,
-                "email": dsr.subject_email,
-            },
-            "data_categories": data_categories,
-            "systems_sourced": systems_searched,
-            "format": format_type,
-            "compiled_at": datetime.now(timezone.utc).isoformat(),
-        }
-
-        logger.info(f"Data package compiled for DSR {dsr_id} with {len(data_categories)} categories")
-        return data_package
-
-    async def execute_erasure(self, dsr_id: str) -> Dict[str, Any]:
-        """
-        Execute erasure across simulated data systems.
-        Tracks which records were deleted (GDPR Article 17).
-        """
-        logger.info(f"Executing erasure for DSR {dsr_id}")
-
-        stmt = select(DataSubjectRequest).where(
-            and_(
-                DataSubjectRequest.id == dsr_id,
-                DataSubjectRequest.organization_id == self.org_id,
-            )
-        )
-        result = await self.db.execute(stmt)
-        dsr = result.scalar_one_or_none()
-
-        if not dsr:
-            return {"status": "error", "message": f"DSR {dsr_id} not found"}
-
-        subject_email = dsr.subject_email
-        records_deleted = 0
-        systems_affected: List[str] = []
-
-        # Count and remove consent records for the subject
-        consent_count_stmt = select(func.count()).select_from(ConsentRecord).where(
-            and_(
-                ConsentRecord.organization_id == self.org_id,
-                ConsentRecord.subject_id == subject_email,
-            )
-        )
-        consent_count = (await self.db.execute(consent_count_stmt)).scalar() or 0
-        if consent_count > 0:
-            records_deleted += consent_count
-            systems_affected.append("consent_records")
-
-        # Count prior DSRs for the subject (retained for legal obligation)
-        prior_dsr_stmt = select(func.count()).select_from(DataSubjectRequest).where(
-            and_(
-                DataSubjectRequest.organization_id == self.org_id,
-                DataSubjectRequest.subject_email == subject_email,
-                DataSubjectRequest.id != dsr_id,
-            )
-        )
-        prior_dsr_count = (await self.db.execute(prior_dsr_stmt)).scalar() or 0
-
-        # Include systems from the search phase
-        if dsr.data_systems_searched:
-            searched_systems = json.loads(dsr.data_systems_searched)
-            for system in searched_systems:
-                if system not in systems_affected:
-                    systems_affected.append(system)
-
-        # Build exceptions list for data that must be retained
-        exceptions: List[str] = []
-        if prior_dsr_count > 0:
-            exceptions.append("legal_obligation_retention_dsr_history")
-
-        erasure_results = {
-            "records_deleted": records_deleted,
-            "systems_affected": systems_affected,
-            "erasure_timestamp": datetime.now(timezone.utc).isoformat(),
-            "exceptions": exceptions if exceptions else [],
-        }
-
-        dsr.status = DSRStatus.COMPLETED.value
-        logger.info(f"Erasure executed for DSR {dsr_id}: {records_deleted} records deleted across {len(systems_affected)} systems")
-        return erasure_results
-
-    async def execute_rectification(
-        self, dsr_id: str, corrections: Dict[str, Any]
-    ) -> bool:
-        """
-        Execute data rectification across systems (GDPR Article 16).
-        Updates inaccurate personal data.
-        """
-        logger.info(f"Executing rectification for DSR {dsr_id}")
-
-        stmt = select(DataSubjectRequest).where(
-            and_(
-                DataSubjectRequest.id == dsr_id,
-                DataSubjectRequest.organization_id == self.org_id,
-            )
-        )
-        result = await self.db.execute(stmt)
-        dsr = result.scalar_one_or_none()
-
-        if not dsr:
-            return False
-
-        dsr.status = DSRStatus.COMPLETED.value
-        logger.info(f"Rectification completed for DSR {dsr_id}")
-        return True
+    # Wave 4: identity verification, subject search, export and erasure live
+    # in src/privacy/dsr.py and act on the platform's real rows. The methods
+    # that used to be here marked DSRs verified / completed without doing
+    # anything ("records_deleted" counted consent rows and deleted none).
 
     async def track_deadline_compliance(self) -> List[Dict[str, Any]]:
         """
-        Monitor DSR deadlines and alert on approaching/breached deadlines.
+        Deadline alerts for open DSRs (received, verified, processing,
+        partially complete, appealed): ``BREACHED`` past the stored
+        deadline (first breach stamped on ``deadline_breached_at``),
+        ``CRITICAL`` within 7 days. Completed and denied requests are closed.
         """
+        from src.privacy.dsr import OPEN_STATUSES
+
         logger.info(f"Tracking deadline compliance for org {self.org_id}")
 
-        stmt = select(DataSubjectRequest).where(
-            and_(
-                DataSubjectRequest.organization_id == self.org_id,
-                DataSubjectRequest.status != DSRStatus.COMPLETED.value,
+        stmt = (
+            select(DataSubjectRequest)
+            .where(
+                and_(
+                    DataSubjectRequest.organization_id == self.org_id,
+                    DataSubjectRequest.status.in_(sorted(OPEN_STATUSES)),
+                )
             )
+            .order_by(DataSubjectRequest.created_at)
+            .limit(5000)
         )
         result = await self.db.execute(stmt)
         pending_dsrs = result.scalars().all()
@@ -381,28 +120,35 @@ class DSRProcessor:
         now = datetime.now(timezone.utc)
 
         for dsr in pending_dsrs:
-            if dsr.deadline:
-                deadline_dt = datetime.fromisoformat(dsr.deadline)
-                days_remaining = (deadline_dt - now).days
-
-                if days_remaining < 0:
-                    compliance_alerts.append(
-                        {
-                            "dsr_id": dsr.id,
-                            "status": "BREACHED",
-                            "days_overdue": abs(days_remaining),
-                            "subject": dsr.subject_email,
-                        }
-                    )
-                elif days_remaining < 7:
-                    compliance_alerts.append(
-                        {
-                            "dsr_id": dsr.id,
-                            "status": "CRITICAL",
-                            "days_remaining": days_remaining,
-                            "subject": dsr.subject_email,
-                        }
-                    )
+            if not dsr.deadline:
+                continue
+            try:
+                deadline_dt = datetime.fromisoformat(str(dsr.deadline).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if deadline_dt.tzinfo is None:
+                deadline_dt = deadline_dt.replace(tzinfo=timezone.utc)
+            delta = deadline_dt - now
+            if delta.total_seconds() < 0:
+                if dsr.deadline_breached_at is None:
+                    dsr.deadline_breached_at = now
+                compliance_alerts.append(
+                    {
+                        "dsr_id": dsr.id,
+                        "status": "BREACHED",
+                        "days_overdue": abs(delta.days),
+                        "subject": dsr.subject_email,
+                    }
+                )
+            elif delta.days < 7:
+                compliance_alerts.append(
+                    {
+                        "dsr_id": dsr.id,
+                        "status": "CRITICAL",
+                        "days_remaining": delta.days,
+                        "subject": dsr.subject_email,
+                    }
+                )
 
         logger.info(f"Found {len(compliance_alerts)} deadline compliance issues")
         return compliance_alerts
@@ -460,8 +206,13 @@ class PIAEngine:
         name: str,
         project_name: str,
         assessment_type: str,
+        data_types_processed: Optional[List[str]] = None,
+        processing_purposes: Optional[List[str]] = None,
+        legal_basis: Optional[str] = None,
+        data_subjects_affected: Optional[int] = None,
     ) -> PrivacyImpactAssessment:
-        """Create new Privacy Impact Assessment."""
+        """Create new Privacy Impact Assessment (risk ``not_assessed`` until
+        ``assess_risks`` runs)."""
         logger.info(f"Creating PIA: {name} ({assessment_type})")
 
         pia = PrivacyImpactAssessment(
@@ -470,6 +221,11 @@ class PIAEngine:
             project_name=project_name,
             assessment_type=assessment_type,
             status=PIAStatus.DRAFT.value,
+            data_types_processed=json.dumps(data_types_processed) if data_types_processed else None,
+            processing_purposes=json.dumps(processing_purposes) if processing_purposes else None,
+            legal_basis=legal_basis,
+            data_subjects_affected=data_subjects_affected,
+            risk_level="not_assessed",
         )
 
         self.db.add(pia)
@@ -669,38 +425,9 @@ class PIAEngine:
         logger.info(f"Risk assessment complete: {risk_level}")
         return risk_assessment
 
-    async def recommend_mitigations(self, pia_id: str) -> List[str]:
-        """
-        Recommend technical and organizational mitigations.
-        """
-        logger.info(f"Recommending mitigations for PIA {pia_id}")
-
-        stmt = select(PrivacyImpactAssessment).where(
-            and_(
-                PrivacyImpactAssessment.id == pia_id,
-                PrivacyImpactAssessment.organization_id == self.org_id,
-            )
-        )
-        result = await self.db.execute(stmt)
-        pia = result.scalar_one_or_none()
-
-        if not pia:
-            return []
-
-        mitigations = [
-            "Implement encryption at rest and in transit",
-            "Deploy data loss prevention (DLP) controls",
-            "Establish access logging and monitoring",
-            "Conduct regular security assessments",
-            "Implement privacy by design principles",
-            "Train personnel on data handling",
-            "Establish data retention and deletion procedures",
-            "Document processing activities (ROPA)",
-        ]
-
-        pia.mitigations = json.dumps(mitigations)
-        logger.info(f"Mitigations recommended for PIA {pia_id}")
-        return mitigations
+    # recommend_mitigations removed (wave 4): it wrote the same eight
+    # boilerplate mitigations into every PIA, which then lowered its risk
+    # score. Assessors record real mitigations with PATCH /pia/assessments/{id}.
 
     async def calculate_risk_score(self, pia_id: str) -> float:
         """Calculate composite risk score (0-100)."""
@@ -946,9 +673,14 @@ class DataGovernance:
         purpose: str,
         legal_basis: str,
         data_categories: List[str],
+        data_subjects: Optional[List[str]] = None,
+        recipients: Optional[List[str]] = None,
+        retention_period_days: Optional[int] = None,
+        dpo_contact: Optional[str] = None,
     ) -> DataProcessingRecord:
         """
         Create Record of Processing Activities (ROPA) entry per GDPR Article 30.
+        Every Art. 30 field the caller supplies is stored.
         """
         logger.info(f"Creating processing record: {name}")
 
@@ -958,6 +690,10 @@ class DataGovernance:
             purpose=purpose,
             legal_basis=legal_basis,
             data_categories=json.dumps(data_categories),
+            data_subjects=json.dumps(data_subjects) if data_subjects else None,
+            recipients=json.dumps(recipients) if recipients else None,
+            retention_period_days=retention_period_days,
+            dpo_contact=dpo_contact,
         )
 
         self.db.add(record)
@@ -986,33 +722,58 @@ class DataGovernance:
 
     async def check_retention_compliance(self) -> List[Dict[str, Any]]:
         """
-        Check for retention compliance violations.
-        Alerts on data that should be deleted.
+        Retention-review findings over the stored ROPA records.
+
+        A ROPA record describes a processing activity, not a table, so the
+        platform cannot see whether data was actually kept past its retention
+        period. What it can check from stored rows is whether each activity
+        with a retention period has been reviewed within that period:
+        ``NOT_REVIEWED`` (never reviewed) or ``REVIEW_OVERDUE``. (This used to
+        report ``RETENTION_EXCEEDED`` from the review date.)
         """
         logger.info(f"Checking retention compliance for org {self.org_id}")
 
         stmt = select(DataProcessingRecord).where(
             DataProcessingRecord.organization_id == self.org_id
-        )
+        ).limit(1000)
         result = await self.db.execute(stmt)
         records = result.scalars().all()
 
         violations = []
+        now = datetime.now(timezone.utc)
 
         for record in records:
-            if record.retention_period_days:
-                if record.last_reviewed:
-                    last_reviewed_dt = datetime.fromisoformat(record.last_reviewed)
-                    age_days = (datetime.now(timezone.utc) - last_reviewed_dt).days
-                    if age_days > record.retention_period_days:
-                        violations.append(
-                            {
-                                "record_id": record.id,
-                                "name": record.name,
-                                "status": "RETENTION_EXCEEDED",
-                                "days_overdue": age_days - record.retention_period_days,
-                            }
-                        )
+            if not record.retention_period_days:
+                continue
+            if not record.last_reviewed:
+                created = record.created_at
+                if created is not None and created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                age_days = (now - created).days if created else 0
+                violations.append(
+                    {
+                        "record_id": record.id,
+                        "name": record.name,
+                        "status": "NOT_REVIEWED",
+                        "days_overdue": max(0, age_days - record.retention_period_days),
+                        "detail": "retention period set but the activity has never been reviewed",
+                    }
+                )
+                continue
+            last_reviewed_dt = datetime.fromisoformat(record.last_reviewed.replace("Z", "+00:00"))
+            if last_reviewed_dt.tzinfo is None:
+                last_reviewed_dt = last_reviewed_dt.replace(tzinfo=timezone.utc)
+            age_days = (now - last_reviewed_dt).days
+            if age_days > record.retention_period_days:
+                violations.append(
+                    {
+                        "record_id": record.id,
+                        "name": record.name,
+                        "status": "REVIEW_OVERDUE",
+                        "days_overdue": age_days - record.retention_period_days,
+                        "detail": f"last reviewed {age_days} days ago; retention period {record.retention_period_days} days",
+                    }
+                )
 
         logger.info(f"Found {len(violations)} retention violations")
         return violations
@@ -1079,7 +840,11 @@ Activity: {record.name}
 Purpose: {record.purpose}
 Legal Basis: {record.legal_basis}
 Data Categories: {record.data_categories}
+Data Subjects: {record.data_subjects or 'not recorded'}
+Recipients: {record.recipients or 'not recorded'}
+Cross-border Transfers: {record.cross_border_transfers or 'none recorded'}
 Retention Period: {record.retention_period_days} days
+DPO Contact: {record.dpo_contact or 'not recorded'}
 Last Reviewed: {record.last_reviewed}
 ---
 """
@@ -1178,6 +943,7 @@ class PrivacyIncidentManager:
         severity: str,
         data_types: List[str],
         subjects_count: int,
+        regulations: Optional[List[str]] = None,
     ) -> PrivacyIncident:
         """
         Report new privacy incident.
@@ -1192,6 +958,7 @@ class PrivacyIncidentManager:
             severity=severity,
             data_types_affected=json.dumps(data_types),
             subjects_affected_count=subjects_count,
+            regulations_implicated=json.dumps([r.lower() for r in regulations]) if regulations else None,
             notification_required=True,
         )
 
@@ -1218,11 +985,15 @@ class PrivacyIncidentManager:
         if not incident:
             return {"status": "error", "message": f"Incident {incident_id} not found"}
 
-        # Severity factors: scope, data sensitivity, likelihood of harm
+        # Severity factors derived from the stored incident only (scale and
+        # whether special-category data types are involved).
+        special = {"health", "medical", "biometric", "genetic", "racial", "ethnic", "political",
+                   "religious", "sexual", "criminal", "ssn", "financial", "credit_card", "password"}
+        data_types = json.loads(incident.data_types_affected) if incident.data_types_affected else []
+        sensitive = any(any(s in str(dt).lower() for s in special) for dt in data_types)
         severity_factors = {
-            "subjects_affected_scale": 0.7 if incident.subjects_affected_count > 1000 else 0.3,
-            "data_sensitivity": 0.9,
-            "likelihood_of_harm": 0.8,
+            "subjects_affected_scale": 0.7 if (incident.subjects_affected_count or 0) > 1000 else 0.3,
+            "data_sensitivity": 0.9 if sensitive else 0.3,
         }
 
         avg_severity = sum(severity_factors.values()) / len(severity_factors)
@@ -1256,17 +1027,24 @@ class PrivacyIncidentManager:
         if not incident:
             return {"status": "error", "message": f"Incident {incident_id} not found"}
 
-        obligations = {
-            "notify_supervisory_authority": True,
-            "notify_subjects": incident.subjects_affected_count > 0,
-            "authority_deadline_hours": 72,  # GDPR: without undue delay, typically 72h
-            "subject_deadline_days": 30,  # CCPA: without unreasonable delay
-            "hipaa_deadline_days": 60,
-            "regulations_implicated": ["gdpr", "ccpa"],
+        # Obligations follow from the regulations recorded on the incident;
+        # nothing is assumed when none were recorded.
+        regulations = json.loads(incident.regulations_implicated) if incident.regulations_implicated else []
+        regulations = [str(r).lower() for r in regulations]
+        obligations: Dict[str, Any] = {
+            "regulations_implicated": regulations,
+            "notify_supervisory_authority": "gdpr" in regulations,
+            "notify_subjects": bool(regulations) and (incident.subjects_affected_count or 0) > 0,
         }
-
-        incident.notification_required = True
-        incident.regulations_implicated = json.dumps(obligations["regulations_implicated"])
+        if "gdpr" in regulations:
+            obligations["authority_deadline_hours"] = 72
+        if "ccpa" in regulations:
+            obligations["subject_deadline_days"] = 30
+        if "hipaa" in regulations or "hipaa_right" in regulations:
+            obligations["hipaa_deadline_days"] = 60
+        if not regulations:
+            obligations["status"] = "not_assessed"
+            obligations["detail"] = "no regulations are recorded on the incident"
 
         return obligations
 
@@ -1296,14 +1074,24 @@ class PrivacyIncidentManager:
         anchor = incident.created_at or datetime.now(timezone.utc)
         if anchor.tzinfo is None:
             anchor = anchor.replace(tzinfo=timezone.utc)
-        deadlines = {
-            "anchored_to_reported_at": anchor.isoformat(),
-            "gdpr_authority": (anchor + timedelta(hours=72)).isoformat(),
-            "ccpa_subjects": (anchor + timedelta(days=30)).isoformat(),
-            "hipaa": (anchor + timedelta(days=60)).isoformat(),
-        }
+        regulations = json.loads(incident.regulations_implicated) if incident.regulations_implicated else []
+        regulations = [str(r).lower() for r in regulations]
+        deadlines: Dict[str, str] = {"anchored_to_reported_at": anchor.isoformat()}
+        if "gdpr" in regulations:
+            deadlines["gdpr_authority"] = (anchor + timedelta(hours=72)).isoformat()
+        if "ccpa" in regulations:
+            deadlines["ccpa_subjects"] = (anchor + timedelta(days=30)).isoformat()
+        if "hipaa" in regulations or "hipaa_right" in regulations:
+            deadlines["hipaa"] = (anchor + timedelta(days=60)).isoformat()
+        if len(deadlines) == 1:
+            deadlines["status"] = "not_assessed"
+            deadlines["detail"] = (
+                "no regulations with a notification deadline are recorded on the incident "
+                "(set regulations_implicated)"
+            )
+            return deadlines
 
-        incident.notification_deadline = deadlines["gdpr_authority"]
+        incident.notification_deadline = min(v for k, v in deadlines.items() if k != "anchored_to_reported_at")
         logger.info(f"Deadlines calculated for incident {incident_id}")
         return deadlines
 

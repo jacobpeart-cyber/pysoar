@@ -393,63 +393,15 @@ class StorageManager:
             raise
 
     def compact_partitions(self, source_id: str) -> Dict[str, Any]:
-        """
-        Compact partitions to optimize storage.
-
-        Args:
-            source_id: Source to compact
-
-        Returns:
-            Compaction results
-        """
-        self.logger.info(f"Compacting partitions for source: {source_id}")
-
-        try:
-            total_before = 0
-            total_after = 0
-            compacted_count = 0
-
-            # Query real DataPartition rows from the database for this source
-            import asyncio
-            from src.core.database import async_session_factory
-            from src.data_lake.models import DataPartition
-
-            async def _compact():
-                async with async_session_factory() as session:
-                    from sqlalchemy import select as _sel
-                    parts = (await session.execute(
-                        _sel(DataPartition).where(DataPartition.source_id == source_id)
-                    )).scalars().all()
-
-                    t_before = 0
-                    t_after = 0
-                    count = 0
-                    for p in parts:
-                        t_before += p.size_bytes or 0
-                        # Estimate: real compaction ratio depends on the file format
-                        # and data distribution. We apply 15% savings as a conservative
-                        # estimate and update the DB record so the dashboard reflects it.
-                        new_size = int((p.size_bytes or 0) * 0.85)
-                        t_after += new_size
-                        p.size_bytes = new_size
-                        count += 1
-                    await session.commit()
-                    return t_before, t_after, count
-
-            total_before, total_after, compacted_count = asyncio.run(_compact())
-
-            savings_gb = (total_before - total_after) / (1024 ** 3)
-
-            return {
-                "source_id": source_id,
-                "partitions_compacted": compacted_count,
-                "storage_saved_gb": round(savings_gb, 2),
-                "compression_ratio": round(total_after / total_before, 3) if total_before > 0 else 1.0,
-            }
-
-        except Exception as e:
-            self.logger.error(f"Compaction error: {str(e)}")
-            raise
+        """Not implemented: partitions are metadata rows over PostgreSQL
+        tables, and nothing compacts them. This used to shrink every
+        partition's stored ``size_bytes`` by an assumed 15% (unscoped) and
+        report the "savings"."""
+        return {
+            "source_id": source_id,
+            "status": "not_implemented",
+            "detail": "partition compaction is not implemented; no storage is rewritten",
+        }
 
     def enforce_retention(self, source_id: str, retention_days: int) -> Dict[str, Any]:
         """

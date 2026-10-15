@@ -45,6 +45,7 @@ __all__ = [
     "cross_border_audit",
     "privacy_incident_escalation",
     "breach_notification_reminder",
+    "privacy_dsr_deadline_sweep",
 ]
 
 
@@ -314,3 +315,55 @@ def breach_notification_reminder(self, org_id: str):
     except Exception as exc:
         logger.error(f"Breach notification reminder failed: {str(exc)}")
         raise self.retry(exc=exc, countdown=60)
+
+
+# ---------------------------------------------------------------------------
+# Wave 4: DSR deadline sweep (beat entry in src/workers/celery_app.py)
+# ---------------------------------------------------------------------------
+MAX_ORGS_PER_DSR_SWEEP = 500
+
+
+async def _dsr_deadline_sweep() -> Dict[str, Any]:
+    from src.core.database import async_session_factory
+    from src.privacy.dsr import OPEN_STATUSES
+
+    async with async_session_factory() as db:
+        org_ids = [
+            o for o in (await db.execute(
+                select(DataSubjectRequest.organization_id)
+                .where(DataSubjectRequest.status.in_(sorted(OPEN_STATUSES)))
+                .distinct()
+                .limit(MAX_ORGS_PER_DSR_SWEEP)
+            )).scalars().all() if o
+        ]
+    breached = critical = 0
+    failures = []
+    for org_id in org_ids:
+        try:
+            async with async_session_factory() as db:
+                alerts = await DSRProcessor(db, org_id).track_deadline_compliance()
+                await db.commit()
+            breached += sum(1 for a in alerts if a["status"] == "BREACHED")
+            critical += sum(1 for a in alerts if a["status"] == "CRITICAL")
+        except Exception as exc:  # one org failing must not stop the sweep
+            logger.error("privacy_dsr_deadline_sweep_org_failed", organization_id=org_id, error=str(exc))
+            failures.append({"organization_id": org_id, "error": str(exc)[:500]})
+    return {"organizations": len(org_ids), "breached": breached, "critical": critical, "failures": failures}
+
+
+@shared_task(bind=True, max_retries=1)
+def privacy_dsr_deadline_sweep(self):
+    """Every org with open DSRs: stamp ``deadline_breached_at`` on requests
+    past their stored deadline and count those within 7 days (<= 500 orgs,
+    <= 5,000 open requests per org per run)."""
+    loop = asyncio.new_event_loop()
+    try:
+        result = loop.run_until_complete(_dsr_deadline_sweep())
+    except Exception as exc:
+        logger.error("privacy_dsr_deadline_sweep_failed", error=str(exc))
+        raise self.retry(exc=exc, countdown=300) from exc
+    finally:
+        loop.close()
+    logger.info("privacy_dsr_deadline_sweep_complete", organizations=result["organizations"],
+                breached=result["breached"], critical=result["critical"])
+    return result

@@ -262,6 +262,11 @@ celery_app.conf.task_annotations = {
     "src.compliance.tasks.compliance_attestation_sweep": dict(_HEAVY_SWEEP_LIMITS),
     "src.audit_evidence.tasks.audit_evidence_daily_sweep": dict(_HEAVY_SWEEP_LIMITS),
     "src.stig.tasks.reconcile_stig_scans": {"soft_time_limit": 240, "time_limit": 290},
+    # Wave 4 (W4-E): DLP content scan (200-row windows, 2,000 rows per source
+    # per org, 500 orgs) and the DSR deadline sweep (500 orgs, 5,000 open
+    # requests each).
+    "src.dlp.tasks.dlp_content_scan_sweep": {"soft_time_limit": 600, "time_limit": 660},
+    "src.privacy.tasks.privacy_dsr_deadline_sweep": {"soft_time_limit": 240, "time_limit": 290},
 }
 
 # Beat schedule for periodic tasks
@@ -562,5 +567,17 @@ celery_app.conf.beat_schedule = {
     "stig-scan-reconcile": {
         "task": "src.stig.tasks.reconcile_stig_scans",
         "schedule": crontab(minute="*/2"),
+    },
+    # --- Wave 4 (W4-E): privacy and DLP ---
+    # Active DLP policies evaluated over newly stored logs, evidence, ticket
+    # comments and incident / case-note text (per-org cursor).
+    "dlp-content-scan": {
+        "task": "src.dlp.tasks.dlp_content_scan_sweep",
+        "schedule": crontab(minute="*/15"),
+    },
+    # Open DSRs past their deadline stamped deadline_breached_at.
+    "privacy-dsr-deadline-sweep": {
+        "task": "src.privacy.tasks.privacy_dsr_deadline_sweep",
+        "schedule": crontab(minute=25),  # Hourly at :25
     },
 }
