@@ -5,6 +5,7 @@ REST endpoints for STIG benchmark scanning, rule management, remediation,
 SCAP operations, and compliance dashboard.
 """
 
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -16,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 
 from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user, OrganizationId, require_role
+from src.models.audit import AuditLog
 from src.models.user import User, UserRole
 from src.core.database import get_db
 from src.core.logging import get_logger
@@ -27,6 +29,7 @@ from src.stig.engine import (
     STIGRemediator,
     STIGScanner,
 )
+from src.stig.agent_scan import reconcile_stig_scan, request_stig_scan
 from src.stig.models import STIGBenchmark, STIGRule, STIGScanResult, SCAPProfile
 from src.schemas.stig import (
     STIGBenchmarkResponse,
@@ -83,15 +86,14 @@ async def list_benchmarks(
     db: DatabaseSession = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
+    platform: Optional[str] = Query(None, description="Substring of the benchmark platform"),
 ):
     """List STIG benchmarks for organization"""
     try:
-        stmt = (
-            select(STIGBenchmark)
-            .where(STIGBenchmark.organization_id == org_id)
-            .offset(skip)
-            .limit(limit)
-        )
+        stmt = select(STIGBenchmark).where(STIGBenchmark.organization_id == org_id)
+        if platform:
+            stmt = stmt.where(STIGBenchmark.platform.ilike(f"%{platform}%"))
+        stmt = stmt.offset(skip).limit(limit)
         benchmarks = await db.scalars(stmt)
         return benchmarks
     except Exception as e:
@@ -218,58 +220,94 @@ async def get_rule(
 # ============================================================================
 
 
+def _dispatch_view(dispatch) -> dict:
+    scan = dispatch.scan
+    return {
+        "scan_id": scan.id,
+        "host": scan.target_host,
+        "benchmark": scan.benchmark_id_ref,
+        "status": dispatch.status,
+        "status_reason": scan.status_reason,
+        "agent_id": scan.agent_id,
+        "command_id": scan.command_id,
+        "checks_executed": 0,
+        "total_checks": scan.total_checks,
+        "compliance_percentage": None,
+        "note": dispatch.detail,
+    }
+
+
+async def _launch_one(db: AsyncSession, org_id: str, user: User, host: str, benchmark_id: str,
+                      scan_type: str, target_ip: Optional[str] = None) -> dict:
+    """``manual`` registers a scan that waits for an uploaded ARF; every other
+    type runs through the host's endpoint agent (``stig_scan``) or is stored
+    as ``not_run`` with the reason."""
+    if scan_type == "manual":
+        return await STIGScanner(db).scan_host(
+            host=host, benchmark_id=benchmark_id, org_id=org_id, scan_type="manual", target_ip=target_ip,
+        )
+    dispatch = await request_stig_scan(
+        db, org_id=org_id, host=host, benchmark_id=benchmark_id,
+        requested_by=str(user.id), target_ip=target_ip,
+    )
+    db.add(AuditLog(
+        user_id=str(user.id),
+        organization_id=org_id,
+        action="stig_scan_launch",
+        resource_type="stig_scan",
+        resource_id=dispatch.scan.id,
+        description=f"STIG scan of {host}: {dispatch.status}"[:4000],
+        new_value=json.dumps({"host": host, "benchmark": benchmark_id, "status": dispatch.status,
+                              "reason": dispatch.scan.status_reason, "command_id": dispatch.scan.command_id}),
+        success=dispatch.status != "not_run",
+        error_message=dispatch.scan.status_reason,
+    ))
+    await db.commit()
+    return _dispatch_view(dispatch)
+
+
 @router.post("/scans/launch", response_model=None, status_code=202)
 async def launch_scan(
     request: ScanRequest,
     org_id: OrganizationId,
-    _user: AdminRoleUser,
+    current_user: AdminRoleUser,
     db: DatabaseSession = None,
 ):
-    """Register a STIG scan of a host (admin only: it targets a live host).
+    """Run a STIG benchmark against a host (admin only: it targets a live host).
 
-    Returns 202 with ``status: "pending_results"``. No checks are executed
-    in-process; results are recorded when the oscap ARF for the host is
-    posted to ``POST /stig/scans/{scan_id}/arf``. (Before 2026-10-08 this
-    stored every scan as completed at 100% compliance.)
+    The scan is queued as a ``stig_scan`` command on the host's endpoint
+    agent (status ``dispatched`` / ``awaiting_approval``; results are parsed
+    from the agent's ARF output) or stored as ``not_run`` with
+    ``status_reason`` when no agent with the capability covers the host.
+    ``scan_type: manual`` registers a ``pending_results`` scan for an ARF
+    upload instead. No scan is scored without results.
     """
     try:
-        scanner = STIGScanner(db)
-        return await scanner.scan_host(
-            host=request.host,
-            benchmark_id=request.benchmark_id,
-            org_id=org_id,
-            scan_type=request.scan_type,
-            target_ip=request.target_ip,
+        return await _launch_one(
+            db, org_id, current_user, request.host, request.benchmark_id,
+            request.scan_type.value if hasattr(request.scan_type, "value") else str(request.scan_type),
+            request.target_ip,
         )
-    except STIGNotFoundError as e:
+    except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
-    except Exception as e:
-        logger.error(f"Error launching scan: {str(e)}")
-        raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
 @router.post("/scans/fleet", response_model=list[dict], status_code=202)
 async def launch_fleet_scan(
     request: ScanFleetRequest,
     org_id: OrganizationId,
-    _user: AdminRoleUser,
+    current_user: AdminRoleUser,
     db: DatabaseSession = None,
 ):
-    """Register STIG scans for several hosts (admin only; each is
-    ``pending_results`` until its ARF is ingested, see /scans/launch)."""
+    """Run a STIG benchmark on several hosts (admin only; each host as in /scans/launch)."""
+    scan_type = request.scan_type.value if hasattr(request.scan_type, "value") else str(request.scan_type)
+    results = []
     try:
-        scanner = STIGScanner(db)
-        return await scanner.scan_fleet(
-            hosts=request.hosts,
-            benchmark_id=request.benchmark_id,
-            org_id=org_id,
-            scan_type=request.scan_type,
-        )
-    except STIGNotFoundError as e:
+        for host in request.hosts[:200]:
+            results.append(await _launch_one(db, org_id, current_user, host, request.benchmark_id, scan_type))
+    except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
-    except Exception as e:
-        logger.error(f"Error launching fleet scan: {str(e)}")
-        raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
+    return results
 
 
 @router.get("/scans", response_model=list[STIGScanResultResponse])
@@ -326,6 +364,11 @@ async def get_scan(
         scan = await db.scalar(stmt)
         if not scan:
             raise HTTPException(status_code=404, detail="Scan not found")
+        # Apply the agent's result if it has arrived (the beat task does the
+        # same for scans nobody opens).
+        if await reconcile_stig_scan(db, scan):
+            await db.commit()
+            await db.refresh(scan)
         return scan
     except HTTPException:
         raise
@@ -661,11 +704,9 @@ async def get_stig_stats(
         high_findings = sum(s.cat2_open for s in scan_list)
         medium_findings = sum(s.cat3_open for s in scan_list)
 
-        last_scan_date = (
-            max(s.completed_at for s in scan_list if s.completed_at)
-            if scan_list
-            else None
-        )
+        # default=None: scans that never completed (not_run / dispatched) have
+        # no completed_at, and max() of nothing used to 500 the dashboard.
+        last_scan_date = max((s.completed_at for s in scan_list if s.completed_at), default=None)
 
         # --- compliance_by_benchmark (real aggregate) ---
         compliance_by_benchmark: list[dict] = []
@@ -702,12 +743,13 @@ async def get_stig_stats(
                     else "unknown"
                 ),
                 "status": s.status,
-                "compliance": float(s.compliance_percentage or 0),
+                "status_reason": s.status_reason,
+                "compliance": float(s.compliance_percentage or 0) if s.status == "completed" else None,
                 "findings": {
-                    "open": (s.cat1_open or 0) + (s.cat2_open or 0) + (s.cat3_open or 0),
-                    "naf": 0,
-                    "na": 0,
-                    "nr": 0,
+                    "open": s.open_findings or 0,
+                    "naf": s.not_a_finding or 0,
+                    "na": s.not_applicable or 0,
+                    "nr": s.not_reviewed or 0,
                 },
                 "date": s.completed_at.isoformat() if s.completed_at else (s.created_at.isoformat() if s.created_at else None),
             }
@@ -751,6 +793,8 @@ async def get_stig_stats(
             compliance_by_benchmark=compliance_by_benchmark,
             findings_by_severity=findings_by_severity,
             recent_scans=recent_scans,
+            scans_not_run=sum(1 for s in scan_list if s.status in ("not_run", "no_agent", "failed")),
+            scans_pending=sum(1 for s in scan_list if s.status in ("dispatched", "awaiting_approval", "pending_results")),
         )
     except Exception as e:
         logger.error(f"Error getting dashboard stats: {str(e)}")

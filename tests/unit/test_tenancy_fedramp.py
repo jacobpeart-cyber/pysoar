@@ -93,7 +93,10 @@ async def test_readiness_is_computed_and_says_what_was_not_assessed(
     assert report["not_assessed_controls"] == report["total_controls"] - 2
     assert report["status_breakdown"]["implemented"] == 1
     assert "AU-2" in {g["control_id"] for g in report["gap_analysis"]["gaps"]}
-    assert report["recommendations_basis"] == "generic_checklist"
+    # Wave 4: recommendations are derived from this tenant's gaps (they were a
+    # fixed checklist); AU-2 is a P1 gap here.
+    assert report["recommendations_basis"] == "computed_from_gaps"
+    assert any("AU-2" in rec["action"] for rec in report["recommendations"])
 
     other = await client.get(f"{BASE}/readiness", headers=org_b_headers)
     assert other.status_code == 200

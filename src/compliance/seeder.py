@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.compliance.models import ComplianceControl, ComplianceFramework
@@ -530,7 +531,7 @@ async def seed_framework_for_org(
         select(ComplianceFramework).where(
             ComplianceFramework.organization_id == organization_id,
             ComplianceFramework.short_name == short_name,
-        )
+        ),
     )
     framework = existing_result.scalar_one_or_none()
 
@@ -561,8 +562,8 @@ async def seed_framework_for_org(
     # Fetch existing control IDs for this framework so we only insert missing ones
     existing_ctrl_result = await db.execute(
         select(ComplianceControl.control_id).where(
-            ComplianceControl.framework_id == framework.id
-        )
+            ComplianceControl.framework_id == framework.id,
+        ),
     )
     existing_ctrl_ids = {row[0] for row in existing_ctrl_result.all()}
 
@@ -588,12 +589,15 @@ async def seed_framework_for_org(
         ))
         controls_added += 1
 
-    # Update framework totals
+    # Update framework totals (flush first so the new controls are counted
+    # once; the count used to add controls_added on top of an autoflushed
+    # select, doubling the total of a newly seeded framework).
+    await db.flush()
     total_ctrls_result = await db.execute(
-        select(ComplianceControl).where(ComplianceControl.framework_id == framework.id)
+        select(ComplianceControl).where(ComplianceControl.framework_id == framework.id),
     )
     all_controls = list(total_ctrls_result.scalars().all())
-    framework.total_controls = len(all_controls) + controls_added  # pre-flush count + new
+    framework.total_controls = len(all_controls)
     implemented = sum(1 for c in all_controls if c.status == "implemented")
     framework.implemented_controls = implemented
     framework.compliance_score = (
@@ -632,7 +636,7 @@ async def seed_all_compliance_frameworks() -> dict:
             async with async_session_factory() as db:
                 try:
                     status, added = await seed_framework_for_org(
-                        db, org.id, framework_def
+                        db, org.id, framework_def,
                     )
                     await db.commit()
                     if status == "created":
@@ -648,7 +652,7 @@ async def seed_all_compliance_frameworks() -> dict:
                     await db.rollback()
                     logger.warning(
                         f"Failed to seed {framework_def['short_name']} "
-                        f"for org {org.id}: {e}"
+                        f"for org {org.id}: {e}",
                     )
                     details.append({
                         "org_id": org.id,
@@ -661,7 +665,7 @@ async def seed_all_compliance_frameworks() -> dict:
         f"Compliance seeding complete: "
         f"{len(organizations)} orgs, "
         f"{total_created} new frameworks, "
-        f"{total_controls_added} new controls"
+        f"{total_controls_added} new controls",
     )
 
     return {
@@ -670,3 +674,38 @@ async def seed_all_compliance_frameworks() -> dict:
         "controls_added": total_controls_added,
         "details": details,
     }
+
+
+async def ensure_framework(db: AsyncSession, organization_id: str, short_name: str) -> Optional[ComplianceFramework]:
+    """Return the organisation's framework ``short_name``, seeding it (and its
+    real control catalogue) first when the organisation does not have it yet.
+
+    Used by the FedRAMP pages and the ConMon cycle so a tenant created after
+    the boot-time seed still reads the real control table. Returns None for a
+    short name with no definition.
+    """
+    existing = (await db.execute(
+        select(ComplianceFramework).where(
+            ComplianceFramework.organization_id == organization_id,
+            ComplianceFramework.short_name == short_name,
+        ),
+    )).scalar_one_or_none()
+    if existing is not None:
+        return existing
+    definition = next((d for d in FRAMEWORK_DEFINITIONS if d["short_name"] == short_name), None)
+    if definition is None:
+        return None
+    try:
+        # Savepoint: a concurrent request seeding the same framework hits the
+        # (organization_id, short_name) unique constraint; re-read instead.
+        async with db.begin_nested():
+            await seed_framework_for_org(db, organization_id, definition)
+    except IntegrityError:
+        logger.info("compliance framework %s was seeded concurrently for org %s", short_name, organization_id)
+    logger.info("compliance framework %s seeded on demand for org %s", short_name, organization_id)
+    return (await db.execute(
+        select(ComplianceFramework).where(
+            ComplianceFramework.organization_id == organization_id,
+            ComplianceFramework.short_name == short_name,
+        ),
+    )).scalar_one_or_none()

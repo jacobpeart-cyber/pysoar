@@ -168,8 +168,8 @@ async def search_audit_trail(
         if request.date_to:
             filters["date_to"] = request.date_to
 
-        results = await audit_logger.search_audit_trail(filters)
-        return results[request.skip : request.skip + request.limit]
+        # Paged in SQL (it used to load every matching row and slice).
+        return await audit_logger.search_audit_trail(filters, offset=request.skip, limit=request.limit)
     except Exception as e:
         logger.error(f"Error searching audit trail: {str(e)}")
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
@@ -403,6 +403,7 @@ async def download_monthly_report(
     try:
         monitor = ContinuousMonitor(db, org_id)
         conmon = await monitor.generate_conmon_report()
+        last_cycle = await monitor.latest_cycle()
     except Exception as exc:
         logger.error(f"Monthly report generation failed: {exc}")
         raise HTTPException(
@@ -422,7 +423,10 @@ async def download_monthly_report(
             "days": 30,
         },
         "organization_id": org_id,
-        "conmon_report": conmon.model_dump() if hasattr(conmon, "model_dump") else conmon,
+        "conmon_report": conmon,
+        "last_stored_cycle": (
+            {k: last_cycle[k] for k in ("assessment_id", "ran_at", "overall_status")} if last_cycle else None
+        ),
     }
 
     content = _json.dumps(document, indent=2, default=str)
@@ -442,20 +446,26 @@ async def collect_evidence(
     db: DatabaseSession = None,
     _user: AnalystUser = None,
 ):
-    """Collect evidence based on rule"""
+    """Run one automated evidence rule.
+
+    ``status`` is the collector's real outcome: ``collected`` (evidence rows
+    written), ``no_matching_controls``, ``awaiting_integration`` (api_query
+    rules) or ``failed`` with the reason. It used to answer "success" around
+    collectors that collected nothing.
+    """
+    rule_id = request.get("rule_id")
+    if not rule_id:
+        raise HTTPException(status_code=422, detail={"error": "rule_id_required", "field": "rule_id"})
     try:
         collector = EvidenceCollector(db, org_id)
-        result = await collector.collect_evidence(request.get("rule_id"))
-        return {
-            "status": "success",
-            "evidence": result,
-            "collected_at": datetime.now(timezone.utc).isoformat(),
-        }
+        result = await collector.collect_evidence(rule_id)
     except LookupError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
-    except Exception as e:
-        logger.error(f"Error collecting evidence: {str(e)}")
-        raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
+        raise HTTPException(status_code=404, detail="Evidence rule not found") from e
+    return {
+        "status": result["status"],
+        "evidence": result,
+        "collected_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @router.post("/evidence/collect-all", response_model=None)
@@ -463,19 +473,34 @@ async def collect_all_automated_evidence(
     org_id: OrganizationId,
     db: DatabaseSession = None,
     _user: AnalystUser = None,
+    request: Optional[dict] = Body(None),
 ):
-    """Collect evidence from all enabled automated rules"""
-    try:
-        collector = EvidenceCollector(db, org_id)
-        results = await collector.collect_all_automated()
-        return {
-            "status": "completed",
-            "results": results,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-    except Exception as e:
-        logger.error(f"Error collecting automated evidence: {str(e)}")
-        raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
+    """Run every enabled automated evidence rule.
+
+    An optional ``{"family": "AC"}`` body limits the run to rules mapped to
+    controls of that family (the FedRAMP page sends it; it used to be
+    ignored). The counts say what was actually collected.
+    """
+    family = (request or {}).get("family") if isinstance(request, dict) else None
+    collector = EvidenceCollector(db, org_id)
+    results = await collector.collect_all_automated(family=family)
+    statuses = [r.get("status") for r in results.values()]
+    return {
+        "status": "completed" if results else "no_rules",
+        "reason": None if results else (
+            "no enabled automated evidence rule" + (f" maps to family {family}" if family else "")
+            + " in this organisation; create one under /audit-evidence/rules/create"
+        ),
+        "family": family,
+        "rules_run": len(results),
+        "collected": statuses.count("collected"),
+        "awaiting_integration": statuses.count("awaiting_integration"),
+        "no_matching_controls": statuses.count("no_matching_controls"),
+        "failed": statuses.count("failed"),
+        "evidence_written": sum(int(r.get("evidence_written") or 0) for r in results.values()),
+        "results": results,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @router.post("/evidence/verify", response_model=None)
@@ -774,6 +799,29 @@ async def get_evidence_package(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
+@router.post("/packages/{package_id}/evidence", response_model=None)
+async def add_evidence_to_package(
+    package_id: str,
+    org_id: OrganizationId,
+    request: dict = Body(...),
+    db: DatabaseSession = None,
+    _user: AnalystUser = None,
+):
+    """Attach evidence items (``{"evidence_ids": [...]}``) of this organisation
+    to a package. Ids outside the organisation are reported as not found."""
+    evidence_ids = request.get("evidence_ids") if isinstance(request, dict) else None
+    if not isinstance(evidence_ids, list) or not evidence_ids or not all(isinstance(e, str) for e in evidence_ids):
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "evidence_ids_required", "field": "evidence_ids",
+                    "detail": "send a non-empty list of evidence ids"},
+        )
+    try:
+        return await EvidenceCollector(db, org_id).add_evidence_to_package(package_id, evidence_ids[:500])
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail="Package not found") from e
+
+
 @router.post("/packages/{package_id}/package", response_model=None)
 async def package_evidence(
     package_id: str,
@@ -781,16 +829,15 @@ async def package_evidence(
     db: DatabaseSession = None,
     _user: AnalystUser = None,
 ):
-    """Package evidence for submission"""
+    """Seal a package (hash of its evidence items) for submission; 409 when empty."""
     try:
         collector = EvidenceCollector(db, org_id)
         result = await collector.package_evidence(package_id)
         return result
     except LookupError as e:
         raise HTTPException(status_code=404, detail="Package not found") from e
-    except Exception as e:
-        logger.error(f"Error packaging evidence: {str(e)}")
-        raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail={"error": "package_empty", "detail": str(e)}) from e
 
 
 @router.post("/packages/{package_id}/submit", response_model=None)
@@ -810,6 +857,12 @@ async def submit_evidence_package(
         package = await db.scalar(query)
         if not package:
             raise HTTPException(status_code=404, detail="Package not found")
+        if not package.evidence_items:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "package_empty",
+                        "detail": "attach evidence (POST /packages/{id}/evidence) before submitting"},
+            )
 
         package.status = "submitted"
         package.submitted_at = datetime.now(timezone.utc)
@@ -855,47 +908,61 @@ async def get_evidence_report(
 async def run_conmon_cycle(
     org_id: OrganizationId,
     db: DatabaseSession = None,
-    _user: AnalystUser = None,
+    current_user: AnalystUser = None,
 ):
-    """Run FedRAMP ConMon cycle"""
+    """Run a ConMon cycle and store it (its time becomes ``lastRun``)."""
+    return await _run_and_record_conmon(db, org_id, current_user)
+
+
+async def _run_and_record_conmon(db: AsyncSession, org_id: str, current_user: User) -> dict:
+    actor = str(getattr(current_user, "id", "") or "system")
+    monitor = ContinuousMonitor(db, org_id)
+    report = await monitor.run_and_persist(assessor=f"user:{actor}")
     try:
-        monitor = ContinuousMonitor(db, org_id)
-        report = await monitor.generate_conmon_report()
-        return report
-    except Exception as e:
-        logger.error(f"Error running ConMon cycle: {str(e)}")
-        raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
+        await AuditLogger(db, org_id).log_event(
+            event_type="system",
+            action="conmon.run",
+            actor_type="user",
+            actor_id=actor,
+            resource_type="ComplianceAssessment",
+            resource_id=str(report.get("assessment_id")),
+            description=f"ConMon cycle run: overall {report.get('overall_status')}",
+            result="success",
+            risk_level="low",
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed: no cycle without its audit row
+        await db.rollback()
+        logger.error("conmon_audit_failed", error=str(exc))
+        raise HTTPException(status_code=503, detail="Audit trail unavailable; ConMon cycle not recorded") from exc
+    await db.commit()
+    return report
 
 
 @router.post("/conmon/run", response_model=None)
 async def run_conmon_alias(
     org_id: OrganizationId,
     db: DatabaseSession = None,
-    _user: AnalystUser = None,
+    current_user: AnalystUser = None,
 ):
     """Alias for /conmon/run-cycle used by the frontend ConMon button."""
-    try:
-        monitor = ContinuousMonitor(db, org_id)
-        report = await monitor.generate_conmon_report()
-        return {"ok": True, "report": report}
-    except Exception as e:
-        logger.error(f"Error running ConMon cycle (alias): {str(e)}")
-        raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
+    report = await _run_and_record_conmon(db, org_id, current_user)
+    return {"ok": True, "report": report}
 
 
-@router.get("/conmon/report", response_model=ConMonReportResponse)
+@router.get("/conmon/report", response_model=None)
 async def get_conmon_report(
     org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
-    """Get latest ConMon report"""
-    try:
-        monitor = ContinuousMonitor(db, org_id)
-        report = await monitor.generate_conmon_report()
-        return report
-    except Exception as e:
-        logger.error(f"Error getting ConMon report: {str(e)}")
-        raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
+    """The latest stored ConMon cycle; when none was ever run, the checks are
+    computed now and returned with ``persisted: false``."""
+    monitor = ContinuousMonitor(db, org_id)
+    latest = await monitor.latest_cycle()
+    if latest and latest.get("report"):
+        return {**latest["report"], "persisted": True, "assessment_id": latest["assessment_id"],
+                "last_run": latest["ran_at"]}
+    report = await monitor.generate_conmon_report()
+    return {**report, "persisted": False, "last_run": None}
 
 
 @router.get("/conmon/status", response_model=None)
@@ -903,42 +970,33 @@ async def get_conmon_status(
     org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
-    """Get ConMon status per control check.
+    """ConMon status per check, computed now from stored rows.
 
-    Returns an ARRAY of ConMonStatus rows (one per control check) so the
-    frontend can render them in a grid. Each row has {id, name, active,
-    lastRun, status, compliance_percentage, details}.
+    Returns an ARRAY of rows {id, name, active, lastRun, status,
+    compliance_percentage, reason, details}. ``lastRun`` is the time of the
+    last stored cycle (null when none ran; it used to be the request time);
+    a check with no data is ``not_assessed`` with a null percentage.
     """
-    try:
-        monitor = ContinuousMonitor(db, org_id)
-        cycle = await monitor.run_conmon_cycle()
-        now_iso = datetime.now(timezone.utc).isoformat()
+    monitor = ContinuousMonitor(db, org_id)
+    cycle = await monitor.run_conmon_cycle()
+    latest = await monitor.latest_cycle()
+    last_run = latest["ran_at"] if latest else None
 
-        label_map = {
-            "vulnerability_scanning": "Vulnerability Scanning (SI-2)",
-            "configuration_baseline": "Configuration Baseline (CM-3)",
-            "incident_reporting": "Incident Reporting (IR-4)",
-            "poam_progress": "POA&M Progress",
-        }
-
-        rows: list[dict] = []
-        for key, label in label_map.items():
-            check = cycle.get(key) or {}
-            check_status = check.get("status", "unknown")
-            is_active = check_status in ("compliant", "on_track")
-            rows.append({
-                "id": key,
-                "name": label,
-                "active": is_active,
-                "status": check_status,
-                "lastRun": now_iso,
-                "compliance_percentage": check.get("compliance_percentage", 0),
-                "details": check,
-            })
-        return rows
-    except Exception as e:
-        logger.error(f"Error getting ConMon status: {str(e)}")
-        raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
+    rows: list[dict] = []
+    for key, label in ContinuousMonitor.LABELS.items():
+        check = cycle.get(key) or {}
+        check_status = check.get("status", "not_assessed")
+        rows.append({
+            "id": key,
+            "name": label,
+            "active": check_status in ContinuousMonitor.PASSING,
+            "status": check_status,
+            "lastRun": last_run,
+            "compliance_percentage": check.get("compliance_percentage"),
+            "reason": check.get("reason"),
+            "details": check,
+        })
+    return rows
 
 
 # ============================================================================
@@ -950,117 +1008,54 @@ async def get_conmon_status(
 async def check_audit_readiness(
     org_id: OrganizationId,
     db: DatabaseSession = None,
-    framework: str = Query(..., description="Compliance framework"),
+    framework: str = Query(..., description="Framework id, short name or name"),
 ):
-    """Check audit readiness for framework"""
-    try:
-        checker = AuditReadinessChecker(db, org_id)
-        result = await checker.check_readiness(framework)
-        return result
-    except Exception as e:
-        logger.error(f"Error checking audit readiness: {str(e)}")
-        raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
+    """Audit readiness of one framework, from its control statuses."""
+    checker = AuditReadinessChecker(db, org_id)
+    return await checker.check_readiness(framework)
 
 
 @router.get("/readiness/coverage", response_model=EvidenceCoverageResponse)
 async def check_evidence_coverage(
     org_id: OrganizationId,
     db: DatabaseSession = None,
-    framework_id: str = Query(...),
+    framework_id: str = Query(..., description="Framework id or short name"),
 ):
-    """Check evidence coverage for framework.
+    """Evidence coverage per control, from the stored evidence rows.
 
-    Each control that came back without sufficient evidence fires
-    ``automation.on_fedramp_evidence_gap``, which creates a POAM and
-    runs the full compliance automation chain. Previously the
-    coverage check returned a gap list to the UI but those gaps
-    never produced any POAMs or alerts, so an assessor preparing a
-    FedRAMP package would see "covered: no" on a control and nothing
-    actionable would happen downstream.
-
-    Capped at 25 gap events per call so a completely uncovered
-    framework (191 controls for FedRAMP Moderate) can't fan out 191
-    alerts in one API hit.
+    Read-only: it used to fire an evidence-gap automation (and POA&M
+    creation) for up to 25 controls on every GET.
     """
     try:
-        checker = AuditReadinessChecker(db, org_id)
-        result = await checker.check_evidence_coverage(framework_id)
-
-        # Fan out the gaps to the compliance automation pipeline
-        try:
-            gaps = []
-            if isinstance(result, dict):
-                gaps = result.get("uncovered_controls") or result.get("gaps") or []
-            elif hasattr(result, "uncovered_controls"):
-                gaps = result.uncovered_controls or []
-            elif hasattr(result, "gaps"):
-                gaps = result.gaps or []
-
-            if gaps:
-                from src.services.automation import AutomationService
-                automation = AutomationService(db)
-                fired = 0
-                for gap in gaps[:25]:
-                    # gap may be a dict or a scalar control_id string
-                    if isinstance(gap, dict):
-                        control_id = gap.get("control_id") or gap.get("id") or "unknown"
-                        control_title = gap.get("title") or gap.get("control_title") or f"Uncovered control {control_id}"
-                    else:
-                        control_id = str(gap)
-                        control_title = f"Uncovered control {control_id}"
-                    try:
-                        await automation.on_fedramp_evidence_gap(
-                            control_id=control_id,
-                            control_title=control_title,
-                            organization_id=org_id,
-                        )
-                        fired += 1
-                    except Exception as inner_exc:  # noqa: BLE001
-                        logger.warning(
-                            f"on_fedramp_evidence_gap failed for {control_id}: {inner_exc}"
-                        )
-                logger.info(
-                    f"Fired {fired} evidence-gap events for framework={framework_id}"
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Evidence gap fan-out failed: {exc}")
-
-        return result
-    except Exception as e:
-        logger.error(f"Error checking evidence coverage: {str(e)}")
-        raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
+        return await AuditReadinessChecker(db, org_id).check_evidence_coverage(framework_id)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail="Framework not found") from e
 
 
 @router.get("/readiness/freshness", response_model=EvidenceFreshnessResponse)
 async def check_evidence_freshness(
     org_id: OrganizationId,
     db: DatabaseSession = None,
-    framework_id: str = Query(...),
+    framework_id: str = Query(..., description="Framework id or short name"),
 ):
-    """Check evidence freshness for framework"""
+    """Evidence freshness (collected within a year and unexpired)."""
     try:
-        checker = AuditReadinessChecker(db, org_id)
-        result = await checker.check_evidence_freshness(framework_id)
-        return result
-    except Exception as e:
-        logger.error(f"Error checking evidence freshness: {str(e)}")
-        raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
+        return await AuditReadinessChecker(db, org_id).check_evidence_freshness(framework_id)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail="Framework not found") from e
 
 
 @router.get("/readiness/assessor-package", response_model=AssessorPackageResponse)
 async def generate_assessor_package(
     org_id: OrganizationId,
     db: DatabaseSession = None,
-    framework_id: str = Query(...),
+    framework_id: str = Query(..., description="Framework id or short name"),
 ):
-    """Generate package for external assessors"""
+    """Coverage + freshness summary for external assessors."""
     try:
-        checker = AuditReadinessChecker(db, org_id)
-        result = await checker.generate_assessor_package(framework_id)
-        return result
-    except Exception as e:
-        logger.error(f"Error generating assessor package: {str(e)}")
-        raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
+        return await AuditReadinessChecker(db, org_id).generate_assessor_package(framework_id)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail="Framework not found") from e
 
 
 # ============================================================================
@@ -1127,111 +1122,111 @@ async def get_audit_dashboard_stats(
     org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
-    """Get audit and evidence dashboard statistics.
+    """Audit and evidence dashboard statistics, all counted in SQL.
 
-    Four fields used to be hardcoded (event_types_breakdown = {},
-    risk_distribution = {}, avg_evidence_package_compliance = 92.0,
-    suspicious_activities_detected = 0). Now they are computed from
-    real AuditTrail + ComplianceEvidence data.
+    Wave 4 adds the fields the page reads and could not find
+    (``audit_events_last_24h``, ``total_evidence_items``,
+    ``recent_audit_events``) plus ``readiness_score`` (FedRAMP Moderate
+    readiness from control statuses, null when the framework has no
+    controls) and the real last ConMon run.
     """
     from src.compliance.models import ComplianceEvidence
 
+    now = datetime.now(timezone.utc)
+    this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    in_org = AuditTrail.organization_id == org_id
 
-    try:
-        # Count audit entries
-        audit_query = select(AuditTrail).where(
-            AuditTrail.organization_id == org_id
-        )
-        audits = await db.scalars(audit_query)
-        audit_list = list(audits)
+    async def _count(stmt) -> int:
+        return int((await db.execute(stmt)).scalar() or 0)
 
-        # Count packages
-        pkg_query = select(EvidencePackage).where(
-            EvidencePackage.organization_id == org_id
-        )
-        packages = await db.scalars(pkg_query)
-        pkg_list = list(packages)
+    total_audit = await _count(select(func.count(AuditTrail.id)).where(in_org))
+    month_audits = await _count(select(func.count(AuditTrail.id)).where(in_org, AuditTrail.created_at >= this_month))
+    last_24h = await _count(select(func.count(AuditTrail.id)).where(in_org, AuditTrail.created_at >= now - timedelta(hours=24)))
+    critical = await _count(select(func.count(AuditTrail.id)).where(in_org, AuditTrail.risk_level == "critical"))
+    event_types_breakdown = {
+        str(k or "unknown"): int(n) for k, n in (await db.execute(
+            select(AuditTrail.event_type, func.count(AuditTrail.id)).where(in_org).group_by(AuditTrail.event_type)
+        )).all()
+    }
+    risk_distribution = {
+        str(k or "unknown").lower(): int(n) for k, n in (await db.execute(
+            select(AuditTrail.risk_level, func.count(AuditTrail.id)).where(in_org).group_by(AuditTrail.risk_level)
+        )).all()
+    }
+    recent = list(await db.scalars(select(AuditTrail).where(in_org).order_by(AuditTrail.created_at.desc()).limit(10)))
+    recent_audit_events = [
+        {
+            "id": a.id,
+            "created_at": a.created_at.isoformat() if a.created_at else None,
+            "event_type": a.event_type,
+            "action": a.action,
+            "actor_id": a.actor_id,
+            "resource_type": a.resource_type,
+            "result": a.result,
+            "risk_level": a.risk_level,
+        }
+        for a in recent
+    ]
 
-        this_month = datetime.now(timezone.utc).replace(
-            day=1, hour=0, minute=0, second=0, microsecond=0
-        )
-        month_audits = len(
-            [a for a in audit_list if a.created_at and a.created_at >= this_month]
-        )
-        pkg_in_progress = len([p for p in pkg_list if p.status == "collecting"])
-        pkg_submitted = len([p for p in pkg_list if p.status == "submitted"])
+    pkg_counts = {
+        str(k): int(n) for k, n in (await db.execute(
+            select(EvidencePackage.status, func.count(EvidencePackage.id))
+            .where(EvidencePackage.organization_id == org_id).group_by(EvidencePackage.status)
+        )).all()
+    }
+    ev_in_org = ComplianceEvidence.organization_id == org_id
+    total_evidence = await _count(select(func.count(ComplianceEvidence.id)).where(ev_in_org))
+    approved_evidence = await _count(
+        select(func.count(ComplianceEvidence.id)).where(ev_in_org, ComplianceEvidence.review_status == "approved"))
 
-        # --- Real event_types_breakdown ---
-        event_types_breakdown: dict[str, int] = {}
-        for a in audit_list:
-            key = a.event_type or "unknown"
-            event_types_breakdown[key] = event_types_breakdown.get(key, 0) + 1
+    # Share of packaged evidence items that are approved, averaged over the
+    # packages that hold any (bounded to the 100 newest packages).
+    pkg_scores: list[float] = []
+    for items in (await db.execute(
+        select(EvidencePackage.evidence_items).where(EvidencePackage.organization_id == org_id)
+        .order_by(EvidencePackage.created_at.desc()).limit(100)
+    )).scalars().all():
+        ids = [str(i) for i in (items or {}) if i]
+        if not ids:
+            continue
+        statuses = (await db.execute(
+            select(ComplianceEvidence.review_status).where(ev_in_org, ComplianceEvidence.id.in_(ids))
+        )).scalars().all()
+        if statuses:
+            pkg_scores.append(sum(1 for s in statuses if s == "approved") / len(statuses) * 100.0)
+    avg_pkg_compliance = round(sum(pkg_scores) / len(pkg_scores), 1) if pkg_scores else 0.0
 
-        # --- Real risk_distribution ---
-        risk_distribution: dict[str, int] = {}
-        for a in audit_list:
-            key = (a.risk_level or "unknown").lower()
-            risk_distribution[key] = risk_distribution.get(key, 0) + 1
+    suspicious_count = 0
+    audit_logger = AuditLogger(db, org_id)
+    actor_ids = (await db.execute(
+        select(AuditTrail.actor_id).where(in_org, AuditTrail.created_at >= now - timedelta(days=30))
+        .distinct().limit(25)
+    )).scalars().all()
+    for actor_id in actor_ids:
+        if actor_id and await audit_logger.detect_suspicious_activity(actor_id):
+            suspicious_count += 1
 
-        # --- Real avg_evidence_package_compliance ---
-        # For each package, compute the share of its referenced evidence
-        # items that are in approved status. Average across packages.
-        avg_pkg_compliance = 0.0
-        if pkg_list:
-            pkg_scores: list[float] = []
-            for p in pkg_list:
-                items = p.evidence_items or []
-                if not items:
-                    continue
-                evidence_ids = [str(i) for i in items if i]
-                if not evidence_ids:
-                    continue
-                ev_result = await db.execute(
-                    select(ComplianceEvidence).where(
-                        and_(
-                            ComplianceEvidence.id.in_(evidence_ids),
-                            ComplianceEvidence.organization_id == org_id,
-                        )
-                    )
-                )
-                ev_rows = list(ev_result.scalars().all())
-                if not ev_rows:
-                    continue
-                approved = sum(1 for e in ev_rows if e.review_status == "approved")
-                pkg_scores.append((approved / len(ev_rows)) * 100.0)
-            if pkg_scores:
-                avg_pkg_compliance = round(sum(pkg_scores) / len(pkg_scores), 1)
+    readiness = await AuditReadinessChecker(db, org_id).check_readiness("fedramp_moderate")
+    latest = await ContinuousMonitor(db, org_id).latest_cycle()
 
-        # --- Real suspicious_activities_detected ---
-        # Count distinct actors who had the AuditLogger flag them in the
-        # last 30 days. We reuse the engine's detection rather than
-        # inventing a new heuristic here.
-        suspicious_count = 0
-        try:
-            audit_logger = AuditLogger(db, org_id)
-            # Take distinct actors who have written audit events and
-            # check each one. Cap at 25 actors to bound the work.
-            actor_ids = list({a.actor_id for a in audit_list if a.actor_id})[:25]
-            for actor_id in actor_ids:
-                activities = await audit_logger.detect_suspicious_activity(actor_id)
-                if activities:
-                    suspicious_count += 1
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"suspicious activity detection failed: {exc}")
-
-        return AuditDashboardStats(
-            organization_id=org_id,
-            total_audit_entries=len(audit_list),
-            audit_entries_this_month=month_audits,
-            event_types_breakdown=event_types_breakdown,
-            risk_distribution=risk_distribution,
-            total_evidence_packages=len(pkg_list),
-            evidence_packages_in_progress=pkg_in_progress,
-            evidence_packages_submitted=pkg_submitted,
-            avg_evidence_package_compliance=avg_pkg_compliance,
-            suspicious_activities_detected=suspicious_count,
-            critical_audit_events=len([a for a in audit_list if a.risk_level == "critical"]),
-        )
-    except Exception as e:
-        logger.error(f"Error getting dashboard stats: {str(e)}")
-        raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
+    return AuditDashboardStats(
+        organization_id=org_id,
+        total_audit_entries=total_audit,
+        audit_entries_this_month=month_audits,
+        audit_events_last_24h=last_24h,
+        event_types_breakdown=event_types_breakdown,
+        risk_distribution=risk_distribution,
+        total_evidence_packages=sum(pkg_counts.values()),
+        evidence_packages_in_progress=pkg_counts.get("collecting", 0),
+        evidence_packages_submitted=pkg_counts.get("submitted", 0),
+        avg_evidence_package_compliance=avg_pkg_compliance,
+        suspicious_activities_detected=suspicious_count,
+        critical_audit_events=critical,
+        total_evidence_items=total_evidence,
+        approved_evidence_items=approved_evidence,
+        recent_audit_events=recent_audit_events,
+        readiness_score=readiness["readiness_percentage"] if readiness.get("total_controls") else None,
+        readiness_framework=readiness.get("framework_id"),
+        last_conmon_run=latest["ran_at"] if latest else None,
+        conmon_status=(latest["overall_status"] if latest else "not_run") or "not_run",
+    )

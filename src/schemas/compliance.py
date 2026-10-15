@@ -153,6 +153,9 @@ class ComplianceControlResponse(DBModel):
     remediation_guidance: Optional[str] = None
     poam_id: Optional[str] = None
     tags: List[str] = []
+    # Wave 4: what the last automated check read, and who set ``status``.
+    assessment_basis: Optional[Dict[str, Any]] = None
+    status_source: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -234,6 +237,7 @@ class ComplianceAssessmentResponse(DBModel):
     overall_result: Optional[str] = None
     report_path: Optional[str] = None
     next_steps: List[Dict[str, Any]] = []
+    results: Optional[Dict[str, Any]] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -353,6 +357,15 @@ class SSPGenerationResponse(BaseModel):
     baseline: str = ""
     generated_at: Optional[datetime] = None
     control_families: Dict[str, Any]
+    # Wave 4: the cover-sheet fields the engine already built, and the
+    # stored system facts (placeholders for what is not recorded).
+    framework_name: Optional[str] = None
+    framework_version: Optional[str] = None
+    framework_authority: Optional[str] = None
+    total_controls: int = 0
+    implementation_counts: Dict[str, int] = {}
+    compliance_score: float = 0.0
+    system_facts: Optional[Dict[str, Any]] = None
 
 
 class ConMonReportResponse(BaseModel):
@@ -379,6 +392,8 @@ class ComplianceDashboardStats(BaseModel):
     cui_assets_total: int = 0
     cui_assets_active: int = 0
     last_updated: datetime
+    # Wave 4: stored assessment scores (oldest first) for the trend chart.
+    trends: List[Dict[str, Any]] = []
 
 
 class ControlGapAnalysisResponse(BaseModel):

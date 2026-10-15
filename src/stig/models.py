@@ -152,6 +152,11 @@ class STIGScanResult(BaseModel):
     findings: Mapped[dict[str, Any]] = mapped_column(
         JSON, default=dict
     )  # per-rule results
+    # Wave 4: the endpoint agent and ``stig_scan`` command a scan was run
+    # through, and why a scan did not run (``not_run``) or failed.
+    agent_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    command_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    status_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     organization_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("organizations.id"), nullable=False, index=True
     )

@@ -151,8 +151,12 @@ class STIGScanner:
             status_counts[status] = status_counts.get(status, 0) + 1
 
         total_evaluated = sum(status_counts.values())
-        pass_or_na = status_counts["not_a_finding"] + status_counts["not_applicable"]
-        compliance_percentage = (pass_or_na / total_evaluated * 100.0) if total_evaluated else 0.0
+        if total_evaluated == 0:
+            return {"status": "error", "error": "the ARF report contains no rule results"}
+        # Compliance = passing rules / rules that apply (not-applicable rules
+        # are excluded; not-reviewed rules count against the score).
+        applicable = total_evaluated - status_counts["not_applicable"]
+        compliance_percentage = (status_counts["not_a_finding"] / applicable * 100.0) if applicable else 0.0
 
         scan.findings = findings
         scan.status = "completed"
@@ -166,6 +170,7 @@ class STIGScanner:
         scan.cat3_open = cat_counts["cat_3"]
         scan.compliance_percentage = compliance_percentage
         scan.completed_at = datetime.now(timezone.utc)
+        scan.status_reason = None
         await self.session.commit()
 
         return {
@@ -648,172 +653,14 @@ class STIGLibrary:
 
     async def load_builtin_benchmarks(self, org_id: str) -> int:
         """
-        Load built-in STIG benchmarks for organization
+        No built-in benchmarks ship with the platform.
 
-        Args:
-            org_id: Organization ID
-
-        Returns:
-            Number of benchmarks loaded
+        This used to insert benchmark shells (titles with invented rule
+        counts and no rules). DISA benchmarks are imported from their XCCDF
+        files through ``POST /stig/scap/upload``. Returns 0.
         """
-        logger.info(f"Loading built-in STIG benchmarks for org {org_id}")
-
-        benchmarks = [
-            {
-                "benchmark_id": "Windows_Server_2022_STIG",
-                "title": "Windows Server 2022 STIG",
-                "version": "1.2",
-                "release": "Release 2",
-                "platform": "Windows Server 2022",
-                "description": "Security Technical Implementation Guide for Windows Server 2022",
-                "total_rules": 280,
-                "category_1_count": 45,
-                "category_2_count": 150,
-                "category_3_count": 85,
-            },
-            {
-                "benchmark_id": "Windows_10_STIG",
-                "title": "Windows 10 STIG",
-                "version": "2.1",
-                "release": "Release 3",
-                "platform": "Windows 10",
-                "description": "Security Technical Implementation Guide for Windows 10",
-                "total_rules": 268,
-                "category_1_count": 42,
-                "category_2_count": 145,
-                "category_3_count": 81,
-            },
-            {
-                "benchmark_id": "RHEL_8_STIG",
-                "title": "Red Hat Enterprise Linux 8 STIG",
-                "version": "1.5",
-                "release": "Release 1",
-                "platform": "RHEL 8",
-                "description": "Security Technical Implementation Guide for RHEL 8",
-                "total_rules": 312,
-                "category_1_count": 58,
-                "category_2_count": 180,
-                "category_3_count": 74,
-            },
-            {
-                "benchmark_id": "RHEL_9_STIG",
-                "title": "Red Hat Enterprise Linux 9 STIG",
-                "version": "1.2",
-                "release": "Release 1",
-                "platform": "RHEL 9",
-                "description": "Security Technical Implementation Guide for RHEL 9",
-                "total_rules": 305,
-                "category_1_count": 55,
-                "category_2_count": 175,
-                "category_3_count": 75,
-            },
-            {
-                "benchmark_id": "Ubuntu_22.04_STIG",
-                "title": "Ubuntu 22.04 LTS STIG",
-                "version": "1.0",
-                "release": "Release 1",
-                "platform": "Ubuntu 22.04",
-                "description": "Security Technical Implementation Guide for Ubuntu 22.04 LTS",
-                "total_rules": 298,
-                "category_1_count": 52,
-                "category_2_count": 170,
-                "category_3_count": 76,
-            },
-            {
-                "benchmark_id": "Apache_2.4_STIG",
-                "title": "Apache HTTP Server 2.4 STIG",
-                "version": "1.1",
-                "release": "Release 2",
-                "platform": "Apache",
-                "description": "Security Technical Implementation Guide for Apache HTTP Server 2.4",
-                "total_rules": 156,
-                "category_1_count": 28,
-                "category_2_count": 92,
-                "category_3_count": 36,
-            },
-            {
-                "benchmark_id": "Nginx_STIG",
-                "title": "Nginx Web Server STIG",
-                "version": "1.0",
-                "release": "Release 1",
-                "platform": "Nginx",
-                "description": "Security Technical Implementation Guide for Nginx Web Server",
-                "total_rules": 142,
-                "category_1_count": 24,
-                "category_2_count": 85,
-                "category_3_count": 33,
-            },
-            {
-                "benchmark_id": "PostgreSQL_12_STIG",
-                "title": "PostgreSQL 12 STIG",
-                "version": "1.0",
-                "release": "Release 1",
-                "platform": "PostgreSQL",
-                "description": "Security Technical Implementation Guide for PostgreSQL 12",
-                "total_rules": 128,
-                "category_1_count": 22,
-                "category_2_count": 75,
-                "category_3_count": 31,
-            },
-            {
-                "benchmark_id": "Docker_STIG",
-                "title": "Docker Container Runtime STIG",
-                "version": "1.1",
-                "release": "Release 1",
-                "platform": "Docker",
-                "description": "Security Technical Implementation Guide for Docker",
-                "total_rules": 98,
-                "category_1_count": 18,
-                "category_2_count": 58,
-                "category_3_count": 22,
-            },
-            {
-                "benchmark_id": "Kubernetes_STIG",
-                "title": "Kubernetes STIG",
-                "version": "1.0",
-                "release": "Release 1",
-                "platform": "Kubernetes",
-                "description": "Security Technical Implementation Guide for Kubernetes",
-                "total_rules": 112,
-                "category_1_count": 20,
-                "category_2_count": 68,
-                "category_3_count": 24,
-            },
-        ]
-
-        count = 0
-        for bench_data in benchmarks:
-            try:
-                # Check if already exists
-                stmt = select(STIGBenchmark).where(
-                    STIGBenchmark.benchmark_id == bench_data["benchmark_id"]
-                )
-                existing = await self.session.scalar(stmt)
-
-                if not existing:
-                    benchmark = STIGBenchmark(
-                        benchmark_id=bench_data["benchmark_id"],
-                        title=bench_data["title"],
-                        version=bench_data["version"],
-                        release=bench_data["release"],
-                        platform=bench_data["platform"],
-                        description=bench_data["description"],
-                        total_rules=bench_data["total_rules"],
-                        category_1_count=bench_data["category_1_count"],
-                        category_2_count=bench_data["category_2_count"],
-                        category_3_count=bench_data["category_3_count"],
-                        status="available",
-                        organization_id=org_id,
-                    )
-                    self.session.add(benchmark)
-                    count += 1
-
-            except Exception as e:
-                logger.error(f"Failed to load benchmark {bench_data['benchmark_id']}: {str(e)}")
-
-        await self.session.commit()
-        logger.info(f"Loaded {count} built-in benchmarks")
-        return count
+        logger.info("stig_builtin_benchmarks_not_shipped", org_id=org_id)
+        return 0
 
     async def load_benchmark_rules(self, benchmark_id: str, org_id: str) -> int:
         """
@@ -958,43 +805,30 @@ class SCAPEngine:
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
 
-            # Deterministic categorization based on rule's default_status and
-            # is_automatable. We do NOT randomize or invent pass percentages.
-            passed = 0
-            failed = 0
-            not_applicable = 0
-            not_checked = 0
-            for rule in rules:
-                default_status = (rule.default_status or "not_reviewed").lower()
-                if default_status == "not_a_finding":
-                    passed += 1
-                elif default_status == "open":
-                    failed += 1
-                elif default_status == "not_applicable":
-                    not_applicable += 1
-                else:
-                    not_checked += 1
-
+            # Nothing runs against the target here, so no pass / fail counts
+            # are reported (they used to come from the imported rules'
+            # default_status). Scans run through POST /stig/scans/launch.
             result = {
                 "profile_id": profile_id,
                 "profile_name": profile.name,
                 "target": target,
                 "benchmark_id": matched_benchmark.benchmark_id if matched_benchmark else None,
-                "checks_evaluated": total,
-                "checks_passed": passed,
-                "checks_failed": failed,
-                "checks_notapplicable": not_applicable,
-                "checks_notchecked": not_checked,
-                # Not "completed": nothing ran against the target (2026-10-08 audit).
-                "status": "not_executed",
+                "rules_in_profile": total,
+                "checks_evaluated": 0,
+                "checks_passed": 0,
+                "checks_failed": 0,
+                "checks_notapplicable": 0,
+                "checks_notchecked": total,
+                "status": "not_run",
                 "note": (
-                    "Metrics are derived from imported STIGRule default_status "
-                    "fields, not from a live oscap execution."
+                    "No checks were executed. Run the benchmark on the host through an "
+                    "endpoint agent with POST /stig/scans/launch (stig_scan capability), or "
+                    "upload an oscap ARF to POST /stig/scans/{scan_id}/arf."
                 ),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
-            logger.info(f"SCAP scan completed for {target}")
+            logger.info(f"SCAP scan request for {target} not run in-process")
             return result
 
         except Exception as e:

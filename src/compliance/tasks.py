@@ -48,6 +48,7 @@ __all__ = [
     "generate_compliance_reports",
     "cross_reference_controls",
     "validate_cui_markings",
+    "compliance_attestation_sweep",
 ]
 
 
@@ -481,3 +482,67 @@ def validate_cui_markings(self, org_id: str):
     except Exception as exc:
         logger.error(f"CUI validation failed: {str(exc)}")
         raise self.retry(exc=exc, countdown=300)
+
+
+# ---------------------------------------------------------------------------
+# Wave 4: daily attestation + score refresh (beat)
+# ---------------------------------------------------------------------------
+
+#: Organisations per sweep run (frameworks per org are few: one per catalogue).
+MAX_ATTEST_ORGS_PER_RUN = 500
+
+
+async def compliance_attestation_sweep_async(factory: Any = None) -> Dict[str, Any]:
+    """Per organisation: run the control attester over every enabled framework
+    (it records pass / fail / not_assessed with the evidence basis and never
+    overwrites a manual status) and refresh each framework's stored score.
+
+    The score used to be written only by the boot-time seeder, so the
+    dashboard showed a number from the last API restart.
+    """
+    from sqlalchemy import select
+
+    from src.compliance.attester import ControlAutoAttester
+    from src.compliance.engine import refresh_framework_score
+    from src.core.database import async_session_factory
+    from src.models.organization import Organization
+
+    factory = factory or async_session_factory
+    totals: Dict[str, Any] = {"orgs": 0, "frameworks": 0, "controls_attested": 0, "truncated": False}
+    async with factory() as db:
+        org_ids = list((await db.execute(
+            select(Organization.id).where(Organization.is_active.is_(True))
+            .order_by(Organization.id).limit(MAX_ATTEST_ORGS_PER_RUN + 1)
+        )).scalars())
+    if len(org_ids) > MAX_ATTEST_ORGS_PER_RUN:
+        org_ids = org_ids[:MAX_ATTEST_ORGS_PER_RUN]
+        totals["truncated"] = True
+
+    for org_id in org_ids:
+        async with factory() as db:
+            framework_ids = list((await db.execute(
+                select(ComplianceFramework.id).where(
+                    ComplianceFramework.organization_id == org_id,
+                    ComplianceFramework.is_enabled.is_(True),
+                )
+            )).scalars())
+            attester = ControlAutoAttester(db, org_id)
+            for framework_id in framework_ids:
+                summary = await attester.attest_all(framework_id=framework_id)
+                if not summary.get("attested"):
+                    await refresh_framework_score(db, org_id, framework_id)
+                    await db.commit()
+                totals["controls_attested"] += int(summary.get("attested") or 0)
+                totals["frameworks"] += 1
+        totals["orgs"] += 1
+    if totals["truncated"]:
+        logger.warning("compliance_attestation_sweep_capped", cap=MAX_ATTEST_ORGS_PER_RUN)
+    return totals
+
+
+@shared_task(name="src.compliance.tasks.compliance_attestation_sweep")
+def compliance_attestation_sweep() -> Dict[str, Any]:
+    """Daily control attestation and framework score refresh for every organisation."""
+    from src.siem.tasks import run_async
+
+    return run_async(compliance_attestation_sweep_async())

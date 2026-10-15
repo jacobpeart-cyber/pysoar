@@ -21,6 +21,7 @@ from src.compliance.models import (
     ComplianceFramework,
     CUIMarking,
 )
+from src.compliance.system_facts import placeholder
 from src.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -39,6 +40,45 @@ __all__ = [
     "FedRAMPManager",
     "NISTManager",
 ]
+
+
+#: Statuses that take no part in a compliance score.
+_UNSCORED_STATUSES = ("not_applicable",)
+
+
+async def refresh_framework_score(db: AsyncSession, org_id: str, framework_id: str) -> Optional[float]:
+    """Recompute and store a framework's score, totals and status from its
+    control rows (the dashboard reads these columns). Returns the score."""
+    framework = (await db.execute(
+        select(ComplianceFramework).where(
+            ComplianceFramework.id == framework_id,
+            ComplianceFramework.organization_id == org_id,
+        ),
+    )).scalar_one_or_none()
+    if framework is None:
+        return None
+    score = await ComplianceEngine(db, org_id).calculate_compliance_score(framework_id)
+    rows = (await db.execute(
+        select(ComplianceControl.status).where(
+            ComplianceControl.framework_id == framework_id,
+            ComplianceControl.organization_id == org_id,
+        ),
+    )).scalars().all()
+    framework.total_controls = len(rows)
+    framework.implemented_controls = sum(1 for s in rows if s == "implemented")
+    framework.compliance_score = score
+    framework.last_assessment_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    assessed = [s for s in rows if s not in ("not_assessed", "not_implemented", "planned")]
+    if not rows or not assessed:
+        framework.status = "not_started" if not rows else "in_progress"
+    elif score >= 95.0:
+        framework.status = "compliant"
+    elif score >= 50.0:
+        framework.status = "partially_compliant"
+    else:
+        framework.status = "non_compliant"
+    await db.flush()
+    return score
 
 
 @dataclass
@@ -95,8 +135,14 @@ class ComplianceEngine:
 
         implemented = sum(1 for c in controls if c.status in ["implemented", "partially_implemented"])
         satisfied = sum(1 for c in controls if c.last_assessment_result == "satisfied")
+        other = sum(1 for c in controls if c.last_assessment_result == "other_than_satisfied")
+        status_counts: Dict[str, int] = {}
+        for c in controls:
+            status_counts[c.status or "not_implemented"] = status_counts.get(c.status or "not_implemented", 0) + 1
 
-        score = await self.calculate_compliance_score(framework_id)
+        # The stored framework score is refreshed from the control rows here
+        # (it used to be written only by the boot-time seeder).
+        score = await refresh_framework_score(self.db, self.org_id, framework_id) or 0.0
         assessment_result = "compliant" if score >= 95.0 else "non_compliant"
 
         assessment = ComplianceAssessment(
@@ -105,10 +151,17 @@ class ComplianceEngine:
             assessor="system_automated",
             assessment_date=datetime.now(timezone.utc),
             status="completed",
-            findings_count=len(controls) - satisfied,
+            findings_count=other,
             satisfied_count=satisfied,
-            other_than_satisfied_count=len(controls) - satisfied,
+            other_than_satisfied_count=other,
             overall_result=assessment_result,
+            results={
+                "compliance_score": score,
+                "total_controls": len(controls),
+                "status_counts": status_counts,
+                "not_assessed_controls": len(controls) - satisfied - other,
+                "basis": "computed from the stored control statuses and last assessment results",
+            },
             organization_id=self.org_id,
         )
         self.db.add(assessment)
@@ -123,6 +176,8 @@ class ComplianceEngine:
             "compliance_score": score,
             "status": assessment_result,
             "assessment_date": assessment.assessment_date,
+            "other_than_satisfied": other,
+            "not_assessed": len(controls) - satisfied - other,
         }
 
     async def calculate_compliance_score(self, framework_id: str) -> float:
@@ -148,17 +203,19 @@ class ComplianceEngine:
         weighted_score = 0.0
 
         for control in controls:
+            # not_applicable controls take no part in the score.
+            if control.status in _UNSCORED_STATUSES:
+                continue
             # Weight by priority: P1=3, P2=2, P3=1
             weight = {"p1": 3, "p2": 2, "p3": 1}.get(control.priority, 1)
             total_weight += weight
 
-            # Score based on implementation status
+            # Score based on implementation status. A planned, not_assessed
+            # or not_implemented control scores 0 (planned used to earn 10).
             if control.status == "implemented" and control.last_assessment_result == "satisfied":
                 control_score = 100.0
             elif control.status == "partially_implemented":
-                control_score = control.implementation_status
-            elif control.status == "planned":
-                control_score = 10.0
+                control_score = float(control.implementation_status or 0.0)
             else:
                 control_score = 0.0
 
@@ -209,15 +266,19 @@ class ComplianceEngine:
 
         return gap_list
 
-    async def generate_ssp(self, framework_id: str, run_attester: bool = True) -> Dict[str, Any]:
+    async def generate_ssp(self, framework_id: str, run_attester: bool = False) -> Dict[str, Any]:
         """
         Generate a System Security Plan (SSP) for a framework.
 
-        Runs the ControlAutoAttester first (unless disabled) so the SSP
-        reflects live platform evidence rather than stale control rows.
-        The returned structure is the authoritative JSON SSP — a
-        markdown rendering is produced by ``ssp_to_markdown(ssp_doc)``.
+        Built from the stored control rows (status, assessment result and the
+        attester's ``assessment_basis``) and from the organisation's stored
+        system facts (``src.compliance.system_facts``); facts the platform
+        does not record are explicit ``[TO BE COMPLETED: ...]`` placeholders.
+        ``run_attester`` runs the attester first; only POST routes pass it.
+        The markdown rendering is ``ssp_to_markdown(ssp_doc)``.
         """
+        from src.compliance.system_facts import collect_system_facts
+
         framework = (
             await self.db.execute(
                 select(ComplianceFramework).where(
@@ -230,16 +291,9 @@ class ComplianceEngine:
             raise ValueError(f"Framework {framework_id} not found")
 
         if run_attester:
-            # Refresh control implementation narratives from live platform
-            # state before we serialize the SSP. Idempotent; safe to run
-            # on every /ssp request.
-            try:
-                from src.compliance.attester import ControlAutoAttester
+            from src.compliance.attester import ControlAutoAttester
 
-                attester = ControlAutoAttester(self.db, self.org_id)
-                await attester.attest_all(framework_id=framework_id)
-            except Exception as exc:
-                logger.warning(f"SSP auto-attester failed: {exc}")
+            await ControlAutoAttester(self.db, self.org_id).attest_all(framework_id=framework_id)
 
         stmt = select(ComplianceControl).where(
             and_(
@@ -251,10 +305,14 @@ class ComplianceEngine:
         controls = result.scalars().all()
 
         # Aggregate implementation counts for the SSP cover sheet.
-        counts = {"implemented": 0, "partially_implemented": 0, "planned": 0, "not_implemented": 0, "not_applicable": 0}
+        counts = {
+            "implemented": 0, "partially_implemented": 0, "planned": 0,
+            "not_implemented": 0, "not_assessed": 0, "not_applicable": 0,
+        }
         for c in controls:
             s = c.status or "not_implemented"
             counts[s] = counts.get(s, 0) + 1
+        scored = len(controls) - counts.get("not_applicable", 0)
 
         ssp_doc = {
             "framework": framework.short_name,
@@ -267,10 +325,11 @@ class ComplianceEngine:
             "total_controls": len(controls),
             "implementation_counts": counts,
             "compliance_score": (
-                (counts["implemented"] + 0.5 * counts["partially_implemented"]) / len(controls) * 100
-                if controls
+                (counts["implemented"] + 0.5 * counts["partially_implemented"]) / scored * 100
+                if scored
                 else 0.0
             ),
+            "system_facts": await collect_system_facts(self.db, self.org_id),
             "control_families": {},
         }
 
@@ -303,10 +362,12 @@ class ComplianceEngine:
                         "title": c.title,
                         "description": (c.description or "")[:2000],
                         "status": c.status,
+                        "status_source": c.status_source,
                         "implementation_status_pct": float(c.implementation_status or 0),
                         "implementation_details": c.implementation_details or "",
-                        "responsible_party": c.responsible_party or "Provider",
+                        "responsible_party": c.responsible_party or "",
                         "assessment_result": c.last_assessment_result or "not_assessed",
+                        "assessment_basis": c.assessment_basis,
                         "last_assessed_at": c.last_assessed_at.isoformat() if c.last_assessed_at else None,
                         "baseline": c.baseline,
                         "priority": c.priority,
@@ -562,39 +623,77 @@ class ComplianceEngine:
 
 
 def ssp_to_markdown(ssp_doc: Dict[str, Any]) -> str:
-    """Render an SSP JSON document as a FedRAMP-style markdown narrative.
+    """Render an SSP JSON document as a markdown narrative.
 
-    Produces a document a 3PAO can read cover-to-cover: title page,
-    system-identification summary, control-implementation summary, and
-    per-control narrative organized by NIST family.
+    Sections: title, system identification (from the stored system facts,
+    with ``[TO BE COMPLETED: ...]`` placeholders for what the platform does
+    not record), control-implementation summary, and per-control status with
+    the automated assessment basis where one exists.
     """
     lines: list[str] = []
     push = lines.append
+    facts = ssp_doc.get("system_facts") or {}
+    org = facts.get("organization") or {}
+    deployment = facts.get("deployment") or {}
+    hosting = facts.get("hosting") or {}
+    roles = facts.get("roles") or {}
+    policies = facts.get("policies") or {}
 
     push(f"# System Security Plan — {ssp_doc.get('framework_name') or ssp_doc.get('framework', '')}")
     push("")
-    push(f"**Baseline**: {ssp_doc.get('baseline', 'moderate').title()}  ")
+    push(f"**Organisation**: {org.get('name', '')}  ")
+    push(f"**Baseline**: {str(ssp_doc.get('baseline', 'moderate')).title()}  ")
     push(f"**Framework version**: {ssp_doc.get('framework_version', 'n/a')}  ")
     push(f"**Authority**: {ssp_doc.get('framework_authority', 'n/a')}  ")
     push(f"**Generated**: {ssp_doc.get('generated_at', '')}  ")
-    push("**Generator**: PySOAR Control Auto-Attester")
+    push("**Document status**: Draft generated from stored platform records")
     push("")
     push("---")
     push("")
     push("## 1. System Identification")
     push("")
+    push(f"- **Organisation description**: {org.get('description', '')}")
+    push(f"- **Address**: {org.get('address', '')}")
+    push(f"- **Contact**: {org.get('contact_email', '')}")
+    push(f"- **System owner**: {roles.get('system_owner', '')}")
+    push(f"- **Authorising official**: {roles.get('authorizing_official', '')}")
+    push(f"- **ISSO**: {roles.get('isso', '')}")
+    push(f"- **Application**: {deployment.get('application', '')} ({deployment.get('environment', '')})")
+    push(f"- **Database engine**: {deployment.get('database_engine') or 'not recorded'}")
+    push(f"- **Cache / queue**: {deployment.get('cache_and_queue') or 'not recorded'}")
+    push(f"- **Hosting**: {hosting.get('provider', '')}")
+    push(f"- **Network architecture**: {hosting.get('network_architecture', '')}")
+    push(f"- **Authorisation boundary**: {hosting.get('authorization_boundary', '')}")
+    push("")
+    integrations = facts.get("installed_integrations") or []
+    push("### 1.1 Installed integrations (external interconnections)")
+    push("")
+    if integrations:
+        for item in integrations:
+            push(f"- {item.get('name')} ({item.get('connector_id')}), status {item.get('status')}")
+    else:
+        push("_No integrations are installed._")
+    push("")
+    push("### 1.2 Components recorded by the platform")
+    push("")
+    agents = facts.get("endpoint_agents") or []
+    push(f"- Assets by type: {facts.get('assets_by_type') or 'none recorded'}")
+    push(f"- Endpoint agents: {agents or 'none enrolled'}")
+    push(f"- Active users by role: {(facts.get('users') or {}).get('active_by_role') or 'none'}")
     push(
-        "PySOAR is a multi-tenant Security Orchestration, Automation, and "
-        "Response platform providing log ingestion (SIEM), behavioral "
-        "analytics (UEBA), threat intelligence, autonomous SOC investigation, "
-        "compliance tracking, vulnerability management, and endpoint "
-        "response. The system boundary includes the PySOAR API, async "
-        "workers, PostgreSQL database, Redis cache, SIEM pipeline, and "
-        "enrolled endpoint agents. External interfaces: authenticated REST "
-        "API over TLS 1.2+, WebSocket updates, and outbound webhooks to "
-        "ITSM/notification providers.",
+        f"- Zero-trust policies: {len(policies.get('zero_trust_policies') or [])}, "
+        f"segments: {policies.get('micro_segments', 0)}, "
+        f"enabled playbooks: {policies.get('enabled_playbooks', 0)}, "
+        f"enabled remediation policies: {policies.get('enabled_remediation_policies', 0)}",
     )
     push("")
+    missing = facts.get("missing_facts") or []
+    if missing:
+        push("### 1.3 Facts to be completed")
+        push("")
+        for item in missing:
+            push(f"- {item}")
+        push("")
     push("## 2. Control Implementation Summary")
     push("")
     counts = ssp_doc.get("implementation_counts") or {}
@@ -603,7 +702,7 @@ def ssp_to_markdown(ssp_doc: Dict[str, Any]) -> str:
     push("")
     push("| Status | Count | % |")
     push("|---|---|---|")
-    for status_key in ("implemented", "partially_implemented", "planned", "not_implemented", "not_applicable"):
+    for status_key in ("implemented", "partially_implemented", "planned", "not_implemented", "not_assessed", "not_applicable"):
         n = counts.get(status_key, 0)
         pct = (n / total * 100) if total else 0
         push(f"| {status_key.replace('_', ' ').title()} | {n} | {pct:.1f}% |")
@@ -623,39 +722,37 @@ def ssp_to_markdown(ssp_doc: Dict[str, Any]) -> str:
         for ctrl in fam.get("controls", []):
             status = (ctrl.get("status") or "").replace("_", " ")
             narrative = ctrl.get("implementation_details") or ""
+            basis = ctrl.get("assessment_basis") or {}
             push(f"#### {ctrl.get('id')} — {ctrl.get('title', '')}")
             push("")
             push(f"- **Status**: {status.title()}")
-            push(f"- **Implementation**: {ctrl.get('implementation_status_pct', 0):.0f}%")
-            push(f"- **Responsible**: {ctrl.get('responsible_party', 'Provider')}")
+            push(f"- **Assessment result**: {ctrl.get('assessment_result') or 'not_assessed'}")
+            if ctrl.get("responsible_party"):
+                push(f"- **Responsible**: {ctrl['responsible_party']}")
             if ctrl.get("last_assessed_at"):
                 push(f"- **Last Assessed**: {ctrl['last_assessed_at']}")
-            if ctrl.get("baseline"):
-                push(f"- **Baseline**: {ctrl['baseline']}")
             push("")
-            if narrative:
-                push("**Implementation narrative**:")
+            if basis:
+                push(f"**Automated check** ({basis.get('result')}): {basis.get('summary', '')}".replace("|", "\\|"))
+                for fact in basis.get("basis") or []:
+                    push(f"- {fact.get('kind')}: {fact.get('source')} = {fact.get('value')}".replace("|", "\\|"))
                 push("")
-                # Markdown-escape any stray pipes in the narrative that
-                # would otherwise collide with a later table cell.
+            if narrative:
+                push("**Implementation narrative** (recorded by the organisation):")
+                push("")
                 push(narrative.replace("|", "\\|"))
             else:
-                push(
-                    "_No implementation narrative recorded. This control is "
-                    "tracked as " + status + " in the compliance register. A "
-                    "POAM must be opened if this control is required by the "
-                    "baseline._",
-                )
+                push(placeholder("implementation narrative for this control"))
             push("")
         push("---")
         push("")
 
     push(
-        "*This SSP was generated by the PySOAR Control Auto-Attester, "
-        "which inspects live platform state (code paths, database rows, "
-        "middleware registrations, scan results) to populate each "
-        "control's implementation narrative. Claims marked 'implemented' "
-        "are evidence-backed and verifiable by a 3PAO auditor.*",
+        "*Generated from stored platform records. Automated checks state only "
+        "what they read (counts, configuration values, evidence rows, test "
+        "results); a control is shown as implemented only when its check "
+        "passed and approved evidence covers it, or when the organisation set "
+        "the status itself.*",
     )
     return "\n".join(lines)
 
@@ -802,10 +899,18 @@ class FedRAMPManager:
         Returns:
             Control counts per baseline level
         """
+        from src.fedramp.controls import FAMILY_CODES, FEDRAMP_MODERATE_CONTROLS
+
+        # Only the Moderate catalogue ships with the platform; Low and High
+        # are reported as not loaded instead of quoting invented totals.
         return {
-            "low": {"total_controls": 108, "families": 17},
-            "moderate": {"total_controls": 325, "families": 17},
-            "high": {"total_controls": 420, "families": 17},
+            "low": {"total_controls": None, "loaded": False},
+            "moderate": {
+                "total_controls": len(FEDRAMP_MODERATE_CONTROLS),
+                "families": len(FAMILY_CODES),
+                "loaded": True,
+            },
+            "high": {"total_controls": None, "loaded": False},
         }
 
     async def _run_automated_control_check(self, control: ComplianceControl) -> Dict[str, Any]:
@@ -883,8 +988,9 @@ class NISTManager:
         Returns:
             Count of loaded controls
         """
-        self.logger.info("Loading NIST 800-171 Rev 2 controls")
-        return 110
+        from src.compliance.seeder import NIST_800_171_CONTROLS
+
+        return len(NIST_800_171_CONTROLS)
 
     async def assess_control_family(self, framework_id: str, family: str) -> Dict[str, Any]:
         """
@@ -922,13 +1028,16 @@ class NISTManager:
         self, control_id: str, framework_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Run automated check for a specific control.
+        Run the automated check for one control and record its outcome.
 
-        Supports built-in checks for common controls (AC-2, IA-2, SC-28, etc.)
-
-        Returns:
-            Automated check result
+        The checks are the attester's rules (``src.compliance.attester``), so
+        one code path decides every automated result. The outcome is
+        ``pass`` / ``fail`` / ``not_assessed`` with the facts it read; the
+        control row's ``assessment_basis`` and ``last_assessment_result`` are
+        updated (its status is left to the attester and to people).
         """
+        from src.compliance.attester import outcome_dict, run_check
+
         # A control code (AC-2) is seeded once per framework for every tenant,
         # so the lookup is scoped to the tenant and, when given, the framework.
         stmt = select(ComplianceControl).where(
@@ -943,431 +1052,34 @@ class NISTManager:
         if not control:
             return {"error": f"Control {control_id} not found"}
 
-        # Dispatch to specific check handlers
-        check_handlers = {
-            "AC-2": self._check_account_management,
-            "AC-7": self._check_failed_login_attempts,
-            "AU-2": self._check_audit_events,
-            "IA-2": self._check_mfa,
-            "IA-5": self._check_password_policy,
-            "RA-5": self._check_vulnerability_scanning,
-            "SC-7": self._check_boundary_protection,
-            "SC-28": self._check_data_encryption,
-            "SI-2": self._check_patch_management,
-            "SI-4": self._check_system_monitoring,
-        }
+        checked_at = datetime.now(timezone.utc)
+        outcome = await run_check(self.db, self.org_id, control_id)
+        if outcome is None:
+            return {
+                "control_id": control_id,
+                "status": "no_automated_check",
+                "result": "not_assessed",
+                "reason": "the platform has no automated check for this control",
+                "check_timestamp": checked_at.isoformat(),
+            }
 
-        handler = check_handlers.get(control_id)
-        if handler:
-            return await handler()
-
+        record = outcome_dict(control_id, outcome, checked_at)
+        control.assessment_basis = record
+        control.last_assessed_at = checked_at.replace(tzinfo=None)
+        control.last_assessment_result = {
+            "pass": "satisfied", "fail": "other_than_satisfied",
+        }.get(outcome.result, "not_assessed")
+        await self.db.commit()
         return {
             "control_id": control_id,
-            "status": "no_automated_check",
-            "check_timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-    # ------------------------------------------------------------------
-    # Real automated NIST 800-53 / 800-171 control checks.
-    #
-    # Previously every method here returned ``{"check_passed": True}``
-    # unconditionally, which turned compliance reporting into theater —
-    # an auditor would run a single check and walk away from the sale.
-    # These now query the actual PySOAR data model and return real
-    # findings with failure counts and remediation guidance.
-    # ------------------------------------------------------------------
-
-    async def _check_account_management(self) -> Dict[str, Any]:
-        """AC-2: Account management — inactive accounts, orphaned users (tenant-scoped)."""
-        from sqlalchemy import func as _func
-
-        from src.models.user import User
-
-        findings: list[str] = []
-        total_q = await self.db.execute(select(_func.count(User.id)).where(User.organization_id == self.org_id))
-        total = total_q.scalar() or 0
-        inactive_q = await self.db.execute(
-            select(_func.count(User.id)).where(
-                and_(
-                    User.organization_id == self.org_id,
-                    User.is_active == False,  # noqa: E712
-                ),
-            ),
-        )
-        inactive = inactive_q.scalar() or 0
-
-        if total == 0:
-            findings.append("No user accounts found — AC-2 cannot be assessed.")
-        # AC-2 expects inactive/dormant accounts to be disabled, not deleted.
-        # Having some is fine; having zero means no dormant-account discipline.
-        # A red flag is a large proportion of inactive accounts relative to total.
-        if total > 0 and inactive / max(total, 1) > 0.5:
-            findings.append(
-                f"{inactive}/{total} users are inactive ({(inactive/total)*100:.0f}%). "
-                "Review for accounts that should be disabled or deleted.",
-            )
-
-        return {
-            "control_id": "AC-2",
-            "check_name": "Account Management",
-            "check_passed": len(findings) == 0,
-            "findings": findings,
-            "evidence": {"total_users": total, "inactive_users": inactive},
-            "check_timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-    async def _check_failed_login_attempts(self) -> Dict[str, Any]:
-        """AC-7: Unsuccessful login attempts — look at recent failed auth in audit trail."""
-        from importlib import import_module
-
-        from sqlalchemy import func as _func
-
-        try:
-            audit_log_model = import_module("src.models.audit_log").AuditLog
-        except Exception:
-            audit_log_model = None
-
-        findings: list[str] = []
-        failed_logins_7d = 0
-        if audit_log_model is not None:
-            cutoff = datetime.now(timezone.utc) - timedelta(days=7)
-            # AuditLog is typically scoped via users.organization_id through
-            # the user_id FK. Scope by subquery to avoid leaking login
-            # failures across tenants.
-            user_model = import_module("src.models.user").User
-
-            try:
-                org_user_ids = select(user_model.id).where(user_model.organization_id == self.org_id)
-                q = await self.db.execute(
-                    select(_func.count(audit_log_model.id)).where(
-                        and_(
-                            audit_log_model.action == "login_failed",
-                            audit_log_model.created_at >= cutoff,
-                            audit_log_model.user_id.in_(org_user_ids),
-                        ),
-                    ),
-                )
-                failed_logins_7d = q.scalar() or 0
-            except Exception:
-                failed_logins_7d = -1  # table exists but column mismatch — record unknown
-
-        if failed_logins_7d == -1:
-            findings.append(
-                "Audit log schema did not expose a ``login_failed`` action; "
-                "AC-7 cannot be assessed automatically. Verify audit middleware records login failures.",
-            )
-        elif failed_logins_7d > 100:
-            findings.append(
-                f"{failed_logins_7d} failed login attempts in last 7 days — "
-                "possible brute-force attempts; verify lockout policy is enforced.",
-            )
-
-        return {
-            "control_id": "AC-7",
-            "check_name": "Unsuccessful Login Attempts",
-            "check_passed": len(findings) == 0,
-            "findings": findings,
-            "evidence": {"failed_logins_last_7d": failed_logins_7d},
-            "check_timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-    async def _check_audit_events(self) -> Dict[str, Any]:
-        """AU-2: Audit events — audit log is populated and actively recording."""
-        from importlib import import_module
-
-        from sqlalchemy import func as _func
-
-        try:
-            audit_log_model = import_module("src.models.audit_log").AuditLog
-        except Exception:
-            audit_log_model = None
-
-        findings: list[str] = []
-        count_24h = 0
-        if audit_log_model is not None:
-            user_model = import_module("src.models.user").User
-
-            cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-            try:
-                org_user_ids = select(user_model.id).where(user_model.organization_id == self.org_id)
-                q = await self.db.execute(
-                    select(_func.count(audit_log_model.id)).where(
-                        and_(
-                            audit_log_model.created_at >= cutoff,
-                            audit_log_model.user_id.in_(org_user_ids),
-                        ),
-                    ),
-                )
-                count_24h = q.scalar() or 0
-            except Exception as exc:
-                self.logger.debug("audit event count check failed", error=str(exc))
-
-        if audit_log_model is None:
-            findings.append("No audit_log model found — AU-2 cannot be satisfied.")
-        elif count_24h == 0:
-            findings.append("Zero audit events recorded in last 24h. Audit middleware may be disabled.")
-
-        return {
-            "control_id": "AU-2",
-            "check_name": "Audit Events",
-            "check_passed": len(findings) == 0,
-            "findings": findings,
-            "evidence": {"audit_events_last_24h": count_24h},
-            "check_timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-    async def _check_mfa(self) -> Dict[str, Any]:
-        """IA-2: MFA — every active user should have mfa_enabled=True."""
-        from sqlalchemy import func as _func
-
-        from src.models.user import User
-
-        findings: list[str] = []
-        active_q = await self.db.execute(
-            select(_func.count(User.id)).where(
-                and_(
-                    User.organization_id == self.org_id,
-                    User.is_active == True,  # noqa: E712
-                ),
-            ),
-        )
-        active_total = active_q.scalar() or 0
-
-        mfa_q = await self.db.execute(
-            select(_func.count(User.id)).where(
-                and_(
-                    User.organization_id == self.org_id,
-                    User.is_active == True,  # noqa: E712
-                    User.mfa_enabled == True,  # noqa: E712
-                ),
-            ),
-        )
-        mfa_enrolled = mfa_q.scalar() or 0
-
-        if active_total == 0:
-            findings.append("No active users — IA-2 cannot be assessed.")
-        elif mfa_enrolled < active_total:
-            missing = active_total - mfa_enrolled
-            findings.append(
-                f"{missing}/{active_total} active users do not have MFA enabled. "
-                "FedRAMP Moderate and NIST 800-171 both require MFA for all privileged "
-                "and non-local access.",
-            )
-
-        return {
-            "control_id": "IA-2",
-            "check_name": "Identification and Authentication (MFA)",
-            "check_passed": len(findings) == 0,
-            "findings": findings,
-            "evidence": {
-                "active_users": active_total,
-                "mfa_enrolled": mfa_enrolled,
-                "mfa_percentage": round((mfa_enrolled / active_total) * 100, 1) if active_total else 0.0,
-            },
-            "check_timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-    async def _check_password_policy(self) -> Dict[str, Any]:
-        """IA-5: Authenticator management — password policy strength."""
-        from src.core.config import settings as _settings
-
-        findings: list[str] = []
-        min_length = getattr(_settings, "password_min_length", 0)
-        # NIST SP 800-63B minimum for memorized secrets is 8; FedRAMP
-        # Moderate typically requires 12 for privileged accounts. We use 12.
-        if min_length < 12:
-            findings.append(f"password_min_length is {min_length}; FedRAMP Moderate expects ≥12 characters.")
-
-        return {
-            "control_id": "IA-5",
-            "check_name": "Authenticator Management",
-            "check_passed": len(findings) == 0,
-            "findings": findings,
-            "evidence": {"password_min_length": min_length},
-            "check_timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-    async def _check_vulnerability_scanning(self) -> Dict[str, Any]:
-        """RA-5: Vulnerability scanning — scan frequency and open vulns."""
-        from sqlalchemy import func as _func
-
-        findings: list[str] = []
-        scans_30d = 0
-        open_vulns = 0
-        try:
-            from src.vulnmgmt.models import Vulnerability, VulnScan
-
-            cutoff = datetime.now(timezone.utc) - timedelta(days=30)
-            scans_q = await self.db.execute(
-                select(_func.count(VulnScan.id)).where(
-                    and_(
-                        VulnScan.organization_id == self.org_id,
-                        VulnScan.created_at >= cutoff,
-                    ),
-                ),
-            )
-            scans_30d = scans_q.scalar() or 0
-            vulns_q = await self.db.execute(
-                select(_func.count(Vulnerability.id)).where(Vulnerability.organization_id == self.org_id),
-            )
-            open_vulns = vulns_q.scalar() or 0
-        except Exception:
-            findings.append("Vulnerability management module not reachable — RA-5 cannot be verified.")
-
-        if scans_30d == 0:
-            findings.append("No vulnerability scans recorded in last 30 days. RA-5 requires at least monthly scanning.")
-
-        return {
-            "control_id": "RA-5",
-            "check_name": "Vulnerability Scanning",
-            "check_passed": len(findings) == 0,
-            "findings": findings,
-            "evidence": {"scans_last_30d": scans_30d, "total_vulnerabilities": open_vulns},
-            "check_timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-    async def _check_boundary_protection(self) -> Dict[str, Any]:
-        """SC-7: Boundary protection — zero trust policies, segmentation coverage."""
-        from sqlalchemy import func as _func
-
-        findings: list[str] = []
-        zt_policy_count = 0
-        try:
-            from src.zerotrust.models import ZeroTrustPolicy
-
-            q = await self.db.execute(
-                select(_func.count(ZeroTrustPolicy.id)).where(ZeroTrustPolicy.organization_id == self.org_id),
-            )
-            zt_policy_count = q.scalar() or 0
-        except Exception as exc:
-            self.logger.debug("zero-trust policy count check failed", error=str(exc))
-
-        if zt_policy_count == 0:
-            findings.append(
-                "No zero-trust policies defined. SC-7 requires managed interfaces and "
-                "boundary enforcement between security zones.",
-            )
-
-        return {
-            "control_id": "SC-7",
-            "check_name": "Boundary Protection",
-            "check_passed": len(findings) == 0,
-            "findings": findings,
-            "evidence": {"zero_trust_policies": zt_policy_count},
-            "check_timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-    async def _check_data_encryption(self) -> Dict[str, Any]:
-        """SC-28: Data at rest encryption — encryption service initialized."""
-        findings: list[str] = []
-        encryption_initialized = False
-        try:
-            from src.core.encryption import get_encryption_service
-
-            svc = get_encryption_service()
-            encryption_initialized = svc is not None
-        except Exception:
-            encryption_initialized = False
-
-        if not encryption_initialized:
-            findings.append(
-                "Encryption service not initialized. SC-28 requires AES-256 (or equivalent) "
-                "encryption at rest for CUI and PII.",
-            )
-
-        return {
-            "control_id": "SC-28",
-            "check_name": "Protection of Information at Rest",
-            "check_passed": len(findings) == 0,
-            "findings": findings,
-            "evidence": {"encryption_initialized": encryption_initialized},
-            "check_timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-    async def _check_patch_management(self) -> Dict[str, Any]:
-        """SI-2: Flaw remediation — recent patch operations."""
-        from sqlalchemy import func as _func
-
-        findings: list[str] = []
-        patches_30d = 0
-        try:
-            from src.vulnmgmt.models import PatchOperation
-
-            cutoff = datetime.now(timezone.utc) - timedelta(days=30)
-            q = await self.db.execute(
-                select(_func.count(PatchOperation.id)).where(
-                    and_(
-                        PatchOperation.organization_id == self.org_id,
-                        PatchOperation.created_at >= cutoff,
-                    ),
-                ),
-            )
-            patches_30d = q.scalar() or 0
-        except Exception as exc:
-            self.logger.debug("patch operation count check failed", error=str(exc))
-
-        if patches_30d == 0:
-            findings.append(
-                "No patch operations recorded in last 30 days. SI-2 expects flaws to be "
-                "identified, reported, and corrected per a documented timeline.",
-            )
-
-        return {
-            "control_id": "SI-2",
-            "check_name": "Flaw Remediation",
-            "check_passed": len(findings) == 0,
-            "findings": findings,
-            "evidence": {"patches_last_30d": patches_30d},
-            "check_timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-    async def _check_system_monitoring(self) -> Dict[str, Any]:
-        """SI-4: System monitoring — SIEM rules + log ingestion activity."""
-        from sqlalchemy import func as _func
-
-        findings: list[str] = []
-        active_rules = 0
-        logs_24h = 0
-        try:
-            from src.siem.models import DetectionRule, LogEntry, RuleStatus
-
-            rules_q = await self.db.execute(
-                select(_func.count(DetectionRule.id)).where(
-                    and_(
-                        DetectionRule.organization_id == self.org_id,
-                        DetectionRule.status == RuleStatus.ACTIVE.value,
-                    ),
-                ),
-            )
-            active_rules = rules_q.scalar() or 0
-            cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-            logs_q = await self.db.execute(
-                select(_func.count(LogEntry.id)).where(
-                    and_(
-                        LogEntry.organization_id == self.org_id,
-                        LogEntry.created_at >= cutoff,
-                    ),
-                ),
-            )
-            logs_24h = logs_q.scalar() or 0
-        except Exception as exc:
-            self.logger.debug("log ingestion count check failed", error=str(exc))
-
-        if active_rules == 0:
-            findings.append("No active SIEM detection rules. SI-4 requires monitoring for unauthorized activity.")
-        if logs_24h == 0:
-            findings.append("Zero log entries ingested in last 24h — log pipeline may be broken.")
-
-        return {
-            "control_id": "SI-4",
-            "check_name": "System Monitoring",
-            "check_passed": len(findings) == 0,
-            "findings": findings,
-            "evidence": {
-                "active_detection_rules": active_rules,
-                "log_entries_last_24h": logs_24h,
-            },
-            "check_timestamp": datetime.now(timezone.utc).isoformat(),
+            "check_name": control.title,
+            "check_passed": outcome.result == "pass" if outcome.result != "not_assessed" else None,
+            "result": outcome.result,
+            "findings": [outcome.reason] if outcome.reason else [],
+            "evidence": {fact["source"]: fact["value"] for fact in outcome.basis},
+            "basis": outcome.basis,
+            "summary": outcome.summary,
+            "check_timestamp": checked_at.isoformat(),
         }
 
 
@@ -1417,8 +1129,9 @@ class CMMCManager:
         Returns:
             Count of loaded practices
         """
-        self.logger.info("Loading CMMC 2.0 practices")
-        return 110
+        from src.compliance.seeder import CONTROL_CATALOGS
+
+        return len(CONTROL_CATALOGS.get("cmmc_level_2", []))
 
     async def map_cmmc_to_nist(self) -> Dict[str, Any]:
         """
@@ -1519,13 +1232,12 @@ class CISAComplianceManager:
 
     async def check_bod_compliance(self, directive_id: str) -> Dict[str, Any]:
         """
-        Check compliance with specific CISA BOD.
+        Check compliance with a CISA BOD.
 
-        Args:
-            directive_id: BOD ID (e.g., "BOD 22-01")
-
-        Returns:
-            Compliance status and findings
+        BOD 22-01 is computed from the organisation's vulnerability findings
+        against the KEV due dates (``check_kev_compliance``). For any other
+        directive the platform has no automated check: the stored status is
+        returned with ``assessed: false``.
         """
         stmt = select(CISADirective).where(
             and_(
@@ -1539,28 +1251,70 @@ class CISAComplianceManager:
         if not directive:
             return {"error": f"Directive {directive_id} not found"}
 
-        return {
+        response = {
             "directive_id": directive_id,
             "compliance_status": directive.compliance_status,
-            "deadline": directive.compliance_deadline.isoformat(),
-            "actions_taken": len(directive.actions_taken),
+            "deadline": directive.compliance_deadline.isoformat() if directive.compliance_deadline else None,
+            "actions_taken": len(directive.actions_taken or []),
+            "assessed": False,
+            "basis": "status recorded by the organisation; no automated check exists for this directive",
         }
+        if directive_id.replace(" ", "").upper() == "BOD22-01":
+            kev = await self.check_kev_compliance()
+            response.update({
+                "compliance_status": kev["compliance_status"],
+                "assessed": kev["compliance_status"] != "not_assessed",
+                "basis": kev["detail"],
+                "kev": kev,
+            })
+        return response
 
     async def check_kev_compliance(self) -> Dict[str, Any]:
         """
-        Check BOD 22-01 KEV (Known Exploited Vulnerabilities) patch compliance.
+        BOD 22-01: open findings of KEV-listed CVEs past their KEV due date.
 
-        Returns:
-            KEV patching status
+        Computed from ``vulnerability_instances`` joined to ``vulnerabilities``
+        (``kev_listed`` / ``kev_due_date`` set by the KEV catalogue sync).
+        ``not_assessed`` when the organisation has no vulnerability findings.
         """
-        # No KEV-vs-inventory comparison runs here; report that honestly
-        # instead of the constant "compliant" this used to return.
+        from sqlalchemy import func
+
+        from src.vulnmgmt.models import Vulnerability, VulnerabilityInstance
+
+        open_states = ("open", "in_progress", "deferred")
+        total = int(await self.db.scalar(
+            select(func.count(VulnerabilityInstance.id)).where(
+                VulnerabilityInstance.organization_id == self.org_id),
+        ) or 0)
+        rows = (await self.db.execute(
+            select(Vulnerability.cve_id, Vulnerability.kev_due_date)
+            .join(VulnerabilityInstance, VulnerabilityInstance.vulnerability_id == Vulnerability.id)
+            .where(
+                VulnerabilityInstance.organization_id == self.org_id,
+                VulnerabilityInstance.status.in_(open_states),
+                Vulnerability.kev_listed.is_(True),
+            ),
+        )).all()
+        today = datetime.now(timezone.utc).date().isoformat()
+        overdue = [r for r in rows if r.kev_due_date and str(r.kev_due_date)[:10] < today]
+        if total == 0:
+            status_value = "not_assessed"
+            detail = "no vulnerability findings are stored for this organisation"
+        elif overdue:
+            status_value = "non_compliant"
+            detail = f"{len(overdue)} open KEV finding(s) are past their BOD 22-01 due date"
+        else:
+            status_value = "compliant"
+            detail = f"{len(rows)} open KEV finding(s), none past its BOD 22-01 due date"
         return {
             "bod_id": "BOD 22-01",
             "title": "Binding Operational Directive 22-01: Reducing the Significant Risk of Known Exploited Vulnerabilities",
-            "required_patching_deadline": "30 days from publication",
-            "compliance_status": "not_assessed",
-            "detail": "KEV patch compliance is not computed by the compliance engine",
+            "compliance_status": status_value,
+            "detail": detail,
+            "vulnerability_findings": total,
+            "open_kev_findings": len(rows),
+            "overdue_kev_findings": len(overdue),
+            "overdue_cves": sorted({r.cve_id for r in overdue if r.cve_id})[:50],
         }
 
     async def check_ed_compliance(self, directive_id: str) -> Dict[str, Any]:
@@ -1595,9 +1349,12 @@ class CISAComplianceManager:
 
 class BuiltinFrameworks:
     """
-    Built-in Framework Loader
+    Built-in framework catalogue sizes.
 
-    Loads all supported compliance frameworks with their controls.
+    Reports how many controls each catalogue that ships with the platform
+    (``src.compliance.seeder.CONTROL_CATALOGS``) holds; seeding into an
+    organisation is ``seed_framework_for_org``. Catalogues that do not ship
+    report 0 (they used to report invented totals such as 420 or 1000).
     """
 
     def __init__(self, db: AsyncSession, org_id: str):
@@ -1605,69 +1362,64 @@ class BuiltinFrameworks:
         self.org_id = org_id
         self.logger = logger
 
+    @staticmethod
+    def _catalog_size(short_name: str) -> int:
+        from src.compliance.seeder import CONTROL_CATALOGS
+
+        return len(CONTROL_CATALOGS.get(short_name, []))
+
     async def register_all_frameworks(self) -> Dict[str, int]:
-        """
-        Register all supported frameworks.
-
-        Returns:
-            Count of loaded controls per framework
-        """
-        results = {}
-
-        results["fedramp"] = await self.load_fedramp_controls()
-        results["nist_800_53"] = await self.load_nist_800_53_rev5()
-        results["nist_800_171"] = await self.load_nist_800_171_rev2()
-        results["cmmc"] = await self.load_cmmc_20()
-        results["soc2"] = await self.load_soc2_criteria()
-        results["hipaa"] = await self.load_hipaa_safeguards()
-        results["pci_dss"] = await self.load_pci_dss_v4()
-        results["cisa"] = await self.load_cisa_directives()
-
-        return results
+        """Catalogue size per framework (stored CISA directives for "cisa")."""
+        return {
+            "fedramp": await self.load_fedramp_controls(),
+            "nist_800_53": await self.load_nist_800_53_rev5(),
+            "nist_800_171": await self.load_nist_800_171_rev2(),
+            "cmmc": await self.load_cmmc_20(),
+            "soc2": await self.load_soc2_criteria(),
+            "hipaa": await self.load_hipaa_safeguards(),
+            "pci_dss": await self.load_pci_dss_v4(),
+            "cisa": await self.load_cisa_directives(),
+        }
 
     async def load_fedramp_controls(self) -> int:
-        """Load FedRAMP baselines"""
-        low_count = await self.load_fedramp_low_controls()
-        moderate_count = await self.load_fedramp_moderate_controls()
-        high_count = await self.load_fedramp_high_controls()
-        return low_count + moderate_count + high_count
+        return (
+            await self.load_fedramp_low_controls()
+            + await self.load_fedramp_moderate_controls()
+            + await self.load_fedramp_high_controls()
+        )
 
     async def load_fedramp_low_controls(self) -> int:
-        self.logger.info("Loading FedRAMP Low baseline (108 controls)")
-        return 108
+        return 0  # no Low catalogue ships
 
     async def load_fedramp_moderate_controls(self) -> int:
-        self.logger.info("Loading FedRAMP Moderate baseline (325 controls)")
-        return 325
+        return self._catalog_size("fedramp_moderate")
 
     async def load_fedramp_high_controls(self) -> int:
-        self.logger.info("Loading FedRAMP High baseline (420 controls)")
-        return 420
+        return 0  # no High catalogue ships
 
     async def load_nist_800_53_rev5(self) -> int:
-        self.logger.info("Loading NIST 800-53 Rev 5 (1000+ controls)")
-        return 1000
+        # The 800-53 controls that ship are the FedRAMP Moderate selection.
+        return self._catalog_size("fedramp_moderate")
 
     async def load_nist_800_171_rev2(self) -> int:
-        self.logger.info("Loading NIST 800-171 Rev 2 (110 controls)")
-        return 110
+        return self._catalog_size("nist_800_171")
 
     async def load_cmmc_20(self) -> int:
-        self.logger.info("Loading CMMC 2.0 practices")
-        return 110
+        return self._catalog_size("cmmc_level_2")
 
     async def load_soc2_criteria(self) -> int:
-        self.logger.info("Loading SOC 2 Trust Services Criteria")
-        return 76
+        return self._catalog_size("soc2")
 
     async def load_hipaa_safeguards(self) -> int:
-        self.logger.info("Loading HIPAA Safeguards and Rule")
-        return 164
+        return self._catalog_size("hipaa")
 
     async def load_pci_dss_v4(self) -> int:
-        self.logger.info("Loading PCI-DSS v4 requirements")
-        return 93
+        return self._catalog_size("pci_dss")
 
     async def load_cisa_directives(self) -> int:
-        self.logger.info("Loading CISA BODs and EDs")
-        return 20
+        """Directives stored for this organisation (none ship with the platform)."""
+        from sqlalchemy import func
+
+        return int(await self.db.scalar(
+            select(func.count(CISADirective.id)).where(CISADirective.organization_id == self.org_id),
+        ) or 0)

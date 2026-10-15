@@ -233,6 +233,9 @@ class ConMonReportResponse(BaseModel):
     overall_status: str = ""
     checks: dict[str, Any]
     generated_at: Optional[datetime] = None
+    # Wave 4: a run stores the cycle; these identify it.
+    persisted: bool = False
+    assessment_id: Optional[str] = None
 
 
 class AuditReadinessResponse(BaseModel):
@@ -242,6 +245,16 @@ class AuditReadinessResponse(BaseModel):
     readiness_percentage: float = 0.0
     gaps: list[dict[str, Any]]
     recommendations: list[str]
+    # Wave 4 additions.
+    framework_id: Optional[str] = None
+    total_controls: int = 0
+    implemented: int = 0
+    partially_implemented: int = 0
+    planned: int = 0
+    not_implemented: int = 0
+    not_assessed: int = 0
+    not_applicable: int = 0
+    gap_count: int = 0
 
 
 class EvidenceCoverageResponse(BaseModel):
@@ -252,6 +265,8 @@ class EvidenceCoverageResponse(BaseModel):
     controls_without_evidence: int = 0
     coverage_percentage: float = 0.0
     controls_missing_evidence: list[dict[str, Any]]
+    controls_with_approved_evidence: int = 0
+    basis: Optional[str] = None
 
 
 class EvidenceFreshnessResponse(BaseModel):
@@ -262,6 +277,8 @@ class EvidenceFreshnessResponse(BaseModel):
     stale_evidence_count: int = 0
     freshness_percentage: float = 0.0
     stale_controls: list[dict[str, Any]]
+    freshness_window_days: int = 365
+    status: Optional[str] = None
 
 
 class AssessorPackageResponse(BaseModel):
@@ -289,6 +306,13 @@ class AuditDashboardStats(BaseModel):
     critical_audit_events: int = 0
     last_conmon_run: Optional[datetime] = None
     conmon_status: str = "not_run"
+    # Wave 4 additions (fields the page reads).
+    audit_events_last_24h: int = 0
+    total_evidence_items: int = 0
+    approved_evidence_items: int = 0
+    recent_audit_events: list[dict[str, Any]] = []
+    readiness_score: Optional[float] = None
+    readiness_framework: Optional[str] = None
 
 
 class EvidenceCollectionResult(BaseModel):

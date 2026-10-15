@@ -22,6 +22,7 @@ from src.fedramp.controls import (
     CONTROLS_BY_FAMILY,
     FAMILY_CODES,
 )
+from src.compliance.system_facts import collect_system_facts
 from src.fedramp.generator import FedRAMPGenerator
 from src.services.automation import AutomationService
 
@@ -35,6 +36,12 @@ AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANA
 AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
 
 _generator = FedRAMPGenerator()
+
+
+def _org_name(requested: Optional[str], facts: Dict[str, Any]) -> str:
+    """The organisation name for document headers: the caller's value, else
+    the stored name (a placeholder when none is stored)."""
+    return requested or str((facts.get("organization") or {}).get("name") or "")
 
 
 # ============================================================================
@@ -79,10 +86,11 @@ async def list_fedramp_controls(
         if priority:
             controls = [c for c in controls if c.get("priority") == priority]
         if status_filter:
+            wanted = {"partial": "partially_implemented"}.get(status_filter, status_filter)
             controls = [
                 c
                 for c in controls
-                if c.get("implementation_status") == status_filter
+                if c.get("implementation_status") == wanted
             ]
 
         total = len(controls)
@@ -143,7 +151,7 @@ async def fedramp_readiness(
 async def generate_ssp(
     org_id: OrganizationId,
     db: DatabaseSession = None,
-    org_name: str = Query("PySOAR Inc.", description="Organization name"),
+    org_name: Optional[str] = Query(None, description="Organization name (defaults to the stored organisation name)"),
     system_name: str = Query("PySOAR", description="System name"),
 ) -> Dict[str, Any]:
     """Generate a FedRAMP System Security Plan (SSP) as a JSON structure.
@@ -155,7 +163,8 @@ async def generate_ssp(
         controls = await _generator.get_control_implementation_status(
             db, organization_id=org_id
         )
-        ssp = _generator.generate_ssp(org_name, system_name, controls)
+        facts = await collect_system_facts(db, org_id)
+        ssp = _generator.generate_ssp(_org_name(org_name, facts), system_name, controls, facts)
         return ssp
     except Exception as exc:
         logger.error(f"Error generating SSP: {exc}")
@@ -169,20 +178,21 @@ async def generate_ssp(
 async def export_ssp(
     org_id: OrganizationId,
     db: DatabaseSession = None,
-    org_name: str = Query("PySOAR Inc.", description="Organization name"),
+    org_name: Optional[str] = Query(None, description="Organization name (defaults to the stored organisation name)"),
     system_name: str = Query("PySOAR", description="System name"),
     format: str = Query("json", description="Export format: json"),
 ) -> Dict[str, Any]:
     """Export the SSP as a downloadable document.
 
-    Currently supports JSON export.  The response includes a
-    ``download_url`` placeholder and the full SSP payload.
+    JSON only: the full SSP is in ``document`` (``download_url`` is null;
+    it used to name a route that does not exist).
     """
     try:
         controls = await _generator.get_control_implementation_status(
             db, organization_id=org_id
         )
-        ssp = _generator.generate_ssp(org_name, system_name, controls)
+        facts = await collect_system_facts(db, org_id)
+        ssp = _generator.generate_ssp(_org_name(org_name, facts), system_name, controls, facts)
 
         timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         filename = f"SSP_{system_name.replace(' ', '_')}_{timestamp}.json"
@@ -192,7 +202,8 @@ async def export_ssp(
             "format": format,
             "generated_at": datetime.utcnow().isoformat() + "Z",
             "size_estimate_kb": round(len(str(ssp)) / 1024, 1),
-            "download_url": f"/api/v1/fedramp/ssp/download/{filename}",
+            # No download route exists; the document is in the response.
+            "download_url": None,
             "document": ssp,
         }
     except Exception as exc:
@@ -212,7 +223,7 @@ async def export_ssp(
 async def generate_irp(
     org_id: OrganizationId,
     db: DatabaseSession = None,
-    org_name: str = Query("PySOAR Inc.", description="Organization name"),
+    org_name: Optional[str] = Query(None, description="Organization name (defaults to the stored organisation name)"),
     system_name: str = Query("PySOAR", description="System name"),
 ) -> Dict[str, Any]:
     """Generate a FedRAMP Incident Response Plan (IR control family).
@@ -225,7 +236,9 @@ async def generate_irp(
         controls = await _generator.get_control_implementation_status(
             db, organization_id=org_id
         )
-        doc = _generator.generate_irp(org_name, system_name, controls)
+        facts = await collect_system_facts(db, org_id)
+        inputs = await _generator.collect_plan_inputs(db, org_id)
+        doc = _generator.generate_irp(_org_name(org_name, facts), system_name, controls, facts, inputs)
         return doc
     except Exception as exc:
         logger.error(f"Error generating IRP: {exc}")
@@ -239,7 +252,7 @@ async def generate_irp(
 async def generate_cmp(
     org_id: OrganizationId,
     db: DatabaseSession = None,
-    org_name: str = Query("PySOAR Inc.", description="Organization name"),
+    org_name: Optional[str] = Query(None, description="Organization name (defaults to the stored organisation name)"),
     system_name: str = Query("PySOAR", description="System name"),
 ) -> Dict[str, Any]:
     """Generate a FedRAMP Configuration Management Plan (CM control family)."""
@@ -247,7 +260,9 @@ async def generate_cmp(
         controls = await _generator.get_control_implementation_status(
             db, organization_id=org_id
         )
-        doc = _generator.generate_cmp(org_name, system_name, controls)
+        facts = await collect_system_facts(db, org_id)
+        inputs = await _generator.collect_plan_inputs(db, org_id)
+        doc = _generator.generate_cmp(_org_name(org_name, facts), system_name, controls, facts, inputs)
         return doc
     except Exception as exc:
         logger.error(f"Error generating CMP: {exc}")
@@ -261,7 +276,7 @@ async def generate_cmp(
 async def generate_conmon_plan(
     org_id: OrganizationId,
     db: DatabaseSession = None,
-    org_name: str = Query("PySOAR Inc.", description="Organization name"),
+    org_name: Optional[str] = Query(None, description="Organization name (defaults to the stored organisation name)"),
     system_name: str = Query("PySOAR", description="System name"),
 ) -> Dict[str, Any]:
     """Generate a FedRAMP Continuous Monitoring Plan (CA and SI control families)."""
@@ -269,7 +284,9 @@ async def generate_conmon_plan(
         controls = await _generator.get_control_implementation_status(
             db, organization_id=org_id
         )
-        doc = _generator.generate_conmon_plan(org_name, system_name, controls)
+        facts = await collect_system_facts(db, org_id)
+        inputs = await _generator.collect_plan_inputs(db, org_id)
+        doc = _generator.generate_conmon_plan(_org_name(org_name, facts), system_name, controls, facts, inputs)
         return doc
     except Exception as exc:
         logger.error(f"Error generating ConMon Plan: {exc}")
@@ -512,6 +529,8 @@ async def update_control_status(
         existing = rows[0][0]
 
         existing.status = implementation_status
+        # Set by a person: the attester will not overwrite it.
+        existing.status_source = "manual"
         if implementation_narrative is not None:
             existing.implementation_details = implementation_narrative
         await db.commit()

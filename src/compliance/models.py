@@ -121,6 +121,13 @@ class ComplianceControl(BaseModel):
     last_assessment_result: Mapped[Optional[str]] = mapped_column(
         String(50)
     )  # satisfied, other_than_satisfied, not_assessed
+    # What the last automated assessment actually checked (wave 4): result
+    # (pass / fail / not_assessed), reason, and the evidence basis (counts,
+    # configuration values, evidence rows, test results) with the time.
+    assessment_basis: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    # Who set ``status``: seed, attester or manual. The attester never
+    # overwrites a manual status (it still records its own result).
+    status_source: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
 
     evidence_ids: Mapped[List[str]] = mapped_column(JSON, default=[])
     related_controls: Mapped[Dict[str, Any]] = mapped_column(JSON, default={})
@@ -273,6 +280,9 @@ class ComplianceAssessment(BaseModel):
 
     report_path: Mapped[Optional[str]] = mapped_column(String(500))
     next_steps: Mapped[List[Dict[str, Any]]] = mapped_column(JSON, default=[])
+    # Computed results of the run (wave 4): compliance score, per-check
+    # outcomes for ConMon cycles. NULL on rows written before migration 032.
+    results: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
 
     organization_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("organizations.id"), nullable=False, index=True

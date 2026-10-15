@@ -1,30 +1,45 @@
-"""Control auto-attester.
+"""Control auto-attester (wave 4: asserts only what it checks).
 
-For each NIST 800-53 control the platform actually implements, inspect
-real state and populate `ComplianceControl.implementation_details`,
-`status`, and `last_assessment_result`. Every claim is evidence-backed:
-we cite concrete tables, endpoint paths, middleware classes, or scan
-results a 3PAO can audit.
+Each rule inspects something the platform can actually read for the
+organisation (row counts, configuration values, evidence rows, the result
+of an integrity test) and returns one of three outcomes:
 
-Federal-honesty policy: we ONLY mark a control `implemented` when:
-1. The platform code is present AND running in this deployment, AND
-2. The corresponding database/runtime state confirms it.
+* ``pass``: the check ran and the stored state meets the rule's test;
+* ``fail``: the check ran and the stored state does not meet it;
+* ``not_assessed``: nothing the platform can read decides the control (a
+  procedural control, an infrastructure setting outside the application,
+  or no data yet). The reason is recorded.
 
-Controls with no platform implementation stay `planned` (and drive
-POAM creation). We never fabricate narratives — if a control is
-"implemented by policy" rather than by code, the attester leaves it
-alone for a human SSP author to document.
+Every outcome carries its ``basis``: the list of facts the rule read, each
+``{"kind": "count" | "config" | "evidence" | "test", "source", "value"}``.
 
-The attester is idempotent: running it twice produces the same output.
+Status written to ``compliance_controls`` (only when the status was not set
+by a person, ``status_source != "manual"``):
+
+* ``pass`` with at least one approved, valid, unexpired, non-automated
+  evidence row for the control -> ``implemented`` / ``satisfied``;
+* ``pass`` without such evidence -> ``partially_implemented`` / ``satisfied``
+  (the technical check passed; the procedural part has no approved evidence);
+* ``fail`` -> ``not_implemented`` / ``other_than_satisfied``;
+* ``not_assessed`` -> ``not_assessed`` / ``not_assessed``.
+
+The previous attester returned ``implemented`` for 22 controls with no check
+at all and for 7 more whatever their counts were, overwrote human-set status,
+and inserted a new ``is_valid=True`` evidence row on every run. None of that
+remains: the attester keeps one automated evidence row per control (updated
+in place, valid only when the check passed) and a manual status is never
+overwritten (its automated result is still recorded in ``assessment_basis``).
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
-from datetime import datetime, timezone
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Any, Awaitable, Callable, Optional
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.compliance.models import ComplianceControl, ComplianceEvidence
@@ -32,1261 +47,689 @@ from src.core.logging import get_logger
 
 logger = get_logger(__name__)
 
+#: ``source_system`` of the one automated evidence row kept per control.
+ATTESTER_SOURCE = "pysoar:auto-attester"
 
-# One attestation rule per supported control id. Each rule is a callable
-# that receives the db session + org_id and returns a dict with:
-#   status: "implemented" | "partially_implemented" | "planned"
-#   narrative: str (the implementation description for the SSP)
-#   evidence_refs: list[str] (pointers to the concrete evidence)
-# or None if the rule couldn't confirm platform implementation.
+PASS = "pass"
+FAIL = "fail"
+NOT_ASSESSED = "not_assessed"
 
-
-async def _check_au2_event_logging(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """AU-2: Event Logging — every agent tool invocation is persisted."""
-    from src.tickethub.models import TicketActivity
-    count = await db.scalar(
-        select(func.count(TicketActivity.id)).where(
-            TicketActivity.organization_id == org_id,
-            TicketActivity.activity_type.in_(["tool_invocation", "tool_blocked", "action_approved"]),
-        )
-    )
-    count = int(count or 0)
-    if count == 0:
-        # Code path exists but no activity yet — partial (the hooks are wired,
-        # they just haven't fired for this org).
-        return {
-            "status": "partially_implemented",
-            "narrative": (
-                "PySOAR logs every security-relevant event to the ticket_activities "
-                "table before the event is executed. Agent tool invocations, "
-                "approval decisions, and blocked destructive actions are captured "
-                "via src.api.v1.endpoints.agentic.chat_with_agent "
-                "and src.agentic.investigator._persist_step. No events have been "
-                "recorded for this organization yet; status will flip to implemented "
-                "on first agent activity."
-            ),
-            "evidence_refs": [
-                "table:ticket_activities",
-                "code:src/api/v1/endpoints/agentic.py#chat_with_agent",
-                "code:src/agentic/investigator.py#_persist_step",
-            ],
-        }
-    return {
-        "status": "implemented",
-        "narrative": (
-            f"PySOAR logs every security-relevant event in the ticket_activities "
-            f"table immediately before or after the event occurs ({count:,} events "
-            f"recorded for this organization). Logged event types: tool_invocation "
-            f"(every agent tool call with actor, action, target, args), tool_blocked "
-            f"(AC-3 denials for unauthorized destructive actions), action_approved "
-            f"(every human approval of a state-changing remediation). Emission is "
-            f"synchronous with the request path so a platform crash cannot erase "
-            f"the record."
-        ),
-        "evidence_refs": [
-            f"table:ticket_activities (count={count})",
-            "code:src/api/v1/endpoints/agentic.py#chat_with_agent (lines ~815-832)",
-            "code:src/agentic/investigator.py#_persist_step",
-            "code:src/api/v1/endpoints/agentic.py#approve_action",
-        ],
-    }
+#: Thresholds the rules test against (FedRAMP Moderate parameter values
+#: where the baseline defines one).
+AC7_MAX_ATTEMPTS = 3              # AC-7: 3 consecutive invalid attempts
+AC7_MIN_LOCKOUT_SECONDS = 30 * 60  # AC-7: account locked 30 minutes
+AC2_DORMANT_DAYS = 90             # AC-2(3): disable after 90 days inactivity
+AC12_MAX_SESSION_MINUTES = 60      # access-token lifetime that ends a session
+AU11_RETENTION_DAYS = 365         # AU-11: 12 months online
+RECENT_DAYS = 30
+CM6_MIN_COMPLIANCE = 90.0
+MAX_USERS_INSPECTED = 5_000
+MAX_AGENT_CHAINS_VERIFIED = 50
 
 
-async def _check_au3_content_of_audit_records(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """AU-3: Content of Audit Records — what information is captured."""
-    from src.tickethub.models import TicketActivity
-    sample = (await db.execute(
-        select(TicketActivity).where(
-            TicketActivity.organization_id == org_id,
-        ).order_by(TicketActivity.created_at.desc()).limit(1)
-    )).scalar_one_or_none()
-    if not sample:
-        return {
-            "status": "partially_implemented",
-            "narrative": (
-                "Audit records include activity_type, source_type, source_id, "
-                "description (human-readable event + actor + target), "
-                "organization_id, created_at UTC timestamp, and optional "
-                "structured metadata. Content conforms to NIST 800-53 AU-3 "
-                "requirements: type of event, when it occurred, where, source "
-                "(user or agent), outcome, identity of the subject. Awaiting "
-                "first audit event for this organization."
-            ),
-            "evidence_refs": ["table:ticket_activities", "model:src/tickethub/models.py:TicketActivity"],
-        }
-    return {
-        "status": "implemented",
-        "narrative": (
-            "Audit records in ticket_activities contain: activity_type (what "
-            "happened), source_type + source_id (where), description (who did "
-            "it, to what, with what outcome), organization_id (tenant scope), "
-            "and created_at (UTC timestamp). This satisfies the AU-3 baseline: "
-            "event type, when, where, source, outcome, identity of subject. "
-            f"Most recent record: type={sample.activity_type} at "
-            f"{sample.created_at.isoformat() if sample.created_at else 'n/a'}."
-        ),
-        "evidence_refs": [
-            "table:ticket_activities",
-            "model:src/tickethub/models.py:TicketActivity",
-        ],
-    }
+@dataclass
+class CheckOutcome:
+    result: str
+    summary: str
+    basis: list[dict[str, Any]] = field(default_factory=list)
+    reason: Optional[str] = None
 
 
-async def _check_au8_time_stamps(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """AU-8: Time Stamps — UTC, sub-second."""
-    return {
-        "status": "implemented",
-        "narrative": (
-            "All audit records use UTC timestamps (TIMESTAMP WITH TIME ZONE) "
-            "generated server-side at the moment of event emission. The "
-            "database enforces monotonic created_at via defaults in "
-            "src.models.base.TimestampMixin. Server clocks are synchronized "
-            "via NTP as part of the host OS configuration (verified by STIG "
-            "scans against RHEL-09-411010 where applicable)."
-        ),
-        "evidence_refs": [
-            "model:src/models/base.py:TimestampMixin",
-            "table_column:ticket_activities.created_at",
-        ],
-    }
+def _fact(kind: str, source: str, value: Any) -> dict[str, Any]:
+    return {"kind": kind, "source": source, "value": value}
 
 
-async def _check_au11_audit_record_retention(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """AU-11: Audit Record Retention."""
-    from src.tickethub.models import TicketActivity
-    oldest = (await db.execute(
-        select(func.min(TicketActivity.created_at)).where(
-            TicketActivity.organization_id == org_id,
-        )
-    )).scalar_one_or_none()
-    if oldest:
-        # Normalize to aware UTC before subtracting — asyncpg can return
-        # naive datetimes depending on column type.
-        if oldest.tzinfo is None:
-            oldest = oldest.replace(tzinfo=timezone.utc)
-        age_days = (datetime.now(timezone.utc) - oldest).days
-        return {
-            "status": "implemented",
-            "narrative": (
-                f"Audit records are persisted in PostgreSQL with no default "
-                f"TTL; retention is unbounded absent an explicit data-lifecycle "
-                f"policy. Current retention depth for this organization: "
-                f"{age_days} days (oldest event: "
-                f"{oldest.isoformat()}). FedRAMP Moderate baseline requires "
-                f"12 months of audit history; PySOAR exceeds this through "
-                f"unconstrained retention."
-            ),
-            "evidence_refs": [
-                "table:ticket_activities",
-                f"metric:oldest_audit_record={oldest.isoformat()}",
-            ],
-        }
-    return None
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-async def _check_ac3_access_enforcement(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """AC-3: Access Enforcement — Zero Trust session gate."""
-    return {
-        "status": "implemented",
-        "narrative": (
-            "Access enforcement is implemented by two layered controls: (1) "
-            "JWT authentication with jti-based session identification in "
-            "src.api.deps.get_current_user (fail-closed on invalid/expired "
-            "tokens), and (2) the Zero Trust session gate middleware in "
-            "src.zerotrust.session_gate.ZeroTrustSessionMiddleware which "
-            "consults the AccessDecision record for each session on every "
-            "/api/* request. A session whose most recent AccessDecision is "
-            "'deny' or 'isolate' receives HTTP 403 within ~1 ms (Redis-"
-            "cached, 30 s TTL for allows, 24 h for denies). Revocation "
-            "propagates instantly via cache push when the PDP emits a new "
-            "deny. This satisfies AC-3's requirement that the system "
-            "enforce approved authorizations on every access attempt."
-        ),
-        "evidence_refs": [
-            "code:src/zerotrust/session_gate.py:ZeroTrustSessionMiddleware",
-            "code:src/zerotrust/engine.py:PolicyDecisionPoint.evaluate_access_request",
-            "code:src/api/deps.py:get_current_user",
-            "table:access_decisions",
-        ],
-    }
+def _aware(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
-async def _check_ac6_least_privilege(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """AC-6: Least Privilege — RBAC + per-agent capability enforcement."""
-    return {
-        "status": "implemented",
-        "narrative": (
-            "Least privilege is enforced at two layers: (1) User-level RBAC "
-            "via the UserRole enum (admin, analyst, viewer) checked by "
-            "src.api.deps.get_current_active_user, admin-only dependencies "
-            "(AdminUser / get_current_superuser) on configuration endpoints, "
-            "and - for the agentic SOC - the PolicyEngine's per-tool min_role "
-            "gate (viewers are read-only; destructive tools are proposals that "
-            "an analyst or admin must approve). (2) Agent-level capability enforcement in "
-            "src.agents.capabilities.AgentCapability (bas, ir, purple, "
-            "compliance): an endpoint agent enrolled for BAS cannot execute "
-            "IR actions (kill_process, isolate_host) even if the server "
-            "queues such a command — the agent binary's action dispatch "
-            "table only contains handlers for its enrolled capabilities. "
-            "Destructive actions in the agentic SOC are never executed "
-            "inline: PolicyEngine (src.agentic.policy) turns them into "
-            "hash-bound AgentAction proposals that require human approval, "
-            "and autonomous investigations may only call the read-only "
-            "evidence allow-list (src.agentic.investigator.evidence_allowlist; "
-            "reason code autonomous_mode_readonly)."
-        ),
-        "evidence_refs": [
-            "code:src/agents/capabilities.py:AgentCapability",
-            "code:src/agents/capabilities.py:capability_allows",
-            "code:src/agentic/policy.py:PolicyEngine",
-            "code:src/agentic/investigator.py:evidence_allowlist",
-            "code:src/api/v1/endpoints/agentic.py:approve_action",
-            "code:agent/pysoar_agent.py:build_action_handlers",
-        ],
-    }
+def _parse_ts(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return _aware(value)
+    if not value:
+        return None
+    try:
+        return _aware(datetime.fromisoformat(str(value).replace("Z", "+00:00")))
+    except ValueError:
+        return None
 
 
-async def _check_ac7_unsuccessful_logon(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """AC-7: Unsuccessful Logon Attempts — rate limit + lockout."""
-    return {
-        "status": "implemented",
-        "narrative": (
-            "Failed authentication attempts are rate-limited at the IP "
-            "level (600 requests/minute enforced by "
-            "src.main.RateLimitMiddleware) and audited into the "
-            "audit_logs table via src.services.user_service.UserService."
-            "authenticate (each failed login records a structured event "
-            "with source IP, username, and timestamp). A SIEM detection "
-            "rule correlates repeat failures into an alert. Progressive "
-            "account lockout is implemented in "
-            "src.services.user_service:_record_failed_login."
-        ),
-        "evidence_refs": [
-            "code:src/main.py:RateLimitMiddleware",
-            "code:src/services/user_service.py:UserService.authenticate",
-            "table:audit_logs",
-        ],
-    }
+async def _count(db: AsyncSession, stmt: Any) -> int:
+    return int((await db.scalar(stmt)) or 0)
 
 
-async def _check_ac12_session_termination(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """AC-12: Session Termination — 8-hour cap + explicit revocation."""
-    return {
-        "status": "implemented",
-        "narrative": (
-            "User sessions terminate automatically in three ways: (1) the "
-            "JWT's exp claim (access token 60 min, refresh 7 days), (2) "
-            "the Zero Trust continuous-auth engine in "
-            "src.zerotrust.engine.ContinuousAuthEngine.check_session_validity "
-            "invalidates any session whose last AccessDecision is older "
-            "than 8 hours, and (3) the session_gate middleware returns "
-            "HTTP 401 'Zero Trust session expired' when the server clock "
-            "exceeds the 8-hour window. Explicit logout revokes the JWT "
-            "jti via the Redis blacklist in src.api.deps.get_current_user."
-        ),
-        "evidence_refs": [
-            "code:src/zerotrust/engine.py:ContinuousAuthEngine.check_session_validity",
-            "code:src/zerotrust/session_gate.py (8h expiry check)",
-            "code:src/api/deps.py (jti blacklist check)",
-        ],
-    }
+def _not_assessed(reason: str, basis: Optional[list[dict[str, Any]]] = None) -> CheckOutcome:
+    return CheckOutcome(NOT_ASSESSED, reason, basis or [], reason)
 
 
-async def _check_au9_protection_of_audit_info(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """AU-9: Protection of Audit Information."""
-    return {
-        "status": "implemented",
-        "narrative": (
-            "Audit records in ticket_activities are protected by: (1) "
-            "PostgreSQL role-based permissions limiting DELETE/UPDATE to "
-            "the application service account only; (2) no endpoint exposes "
-            "delete on ticket_activities — the data is append-only from the "
-            "API surface; (3) TLS 1.2+ protecting records in transit from "
-            "app → database. AU-9(3) cryptographic protection of audit "
-            "information at rest is provided by the platform's AES-256-GCM "
-            "database encryption (SC-13)."
-        ),
-        "evidence_refs": [
-            "db_privileges:ticket_activities",
-            "code:src/core/encryption.py (AES-256-GCM)",
-            "api_endpoints (no delete surface)",
-        ],
-    }
+# ---------------------------------------------------------------------------
+# Rules
+# ---------------------------------------------------------------------------
 
 
-async def _check_ia2_identification_and_authentication(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """IA-2: Identification and Authentication."""
+async def _ac2_account_management(db: AsyncSession, org_id: str) -> CheckOutcome:
     from src.models.user import User
-    user_count = await db.scalar(
-        select(func.count(User.id)).where(User.organization_id == org_id)
-    )
-    return {
-        "status": "implemented",
-        "narrative": (
-            f"Users authenticate via email + bcrypt-hashed password "
-            f"(src.core.security.verify_password enforces "
-            f"$2b$12$-cost bcrypt). Successful authentication mints a JWT "
-            f"signed HS256 with org_id, role, and jti claims "
-            f"(src.core.security.create_access_token). MFA is enabled "
-            f"per-user via the User.mfa_secret column and verified on "
-            f"login in src.services.user_service (TOTP RFC 6238). "
-            f"Current user count in this organization: {user_count or 0}."
-        ),
-        "evidence_refs": [
-            "code:src/core/security.py:verify_password",
-            "code:src/core/security.py:create_access_token",
-            "code:src/services/user_service.py (MFA verification)",
-            "table:users",
-        ],
-    }
 
-
-async def _check_ia5_authenticator_management(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """IA-5: Authenticator Management."""
-    return {
-        "status": "implemented",
-        "narrative": (
-            "Passwords are stored ONLY as bcrypt hashes with cost 12 via "
-            "src.core.security.get_password_hash; plaintext never persists. "
-            "MFA secrets are stored encrypted via the platform's AES-256-GCM "
-            "encryption service (src.core.encryption). API keys use "
-            "SHA-256 hashed storage with prefix-based lookup (src.models."
-            "api_key.APIKey). Agent enrollment tokens are SHA-256 hashed; "
-            "the plaintext token is shown to the operator exactly once at "
-            "enrollment, then exchanged for a long-lived token also stored "
-            "as a hash (src.agents.service.AgentService.exchange_enrollment_token)."
-        ),
-        "evidence_refs": [
-            "code:src/core/security.py:get_password_hash (bcrypt cost=12)",
-            "code:src/core/encryption.py (AES-256-GCM)",
-            "code:src/agents/service.py:exchange_enrollment_token",
-            "code:src/models/api_key.py",
-        ],
-    }
-
-
-async def _check_sc8_transmission_confidentiality(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """SC-8: Transmission Confidentiality and Integrity."""
-    return {
-        "status": "implemented",
-        "narrative": (
-            "All external traffic terminates on nginx configured for TLS "
-            "1.2+ with ECDHE-RSA-AES256-GCM-SHA384 as the default cipher "
-            "suite (nginx/nginx.conf). HTTP connections are redirected to "
-            "HTTPS. The Cloudflare front door enforces TLS 1.3 where "
-            "supported. Internal service-to-service traffic within the "
-            "Docker network uses unencrypted HTTP on a private subnet, "
-            "which is acceptable for FedRAMP Moderate on a single-host "
-            "deployment but must be upgraded to mTLS for multi-host "
-            "production — noted as a POAM."
-        ),
-        "evidence_refs": [
-            "config:nginx/nginx.conf (TLS ciphers)",
-            "cloudflare:TLS 1.3 at edge",
-        ],
-    }
-
-
-async def _check_sc13_cryptographic_protection(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """SC-13: Cryptographic Protection — AES-256-GCM."""
-    return {
-        "status": "implemented",
-        "narrative": (
-            "Field-level encryption uses AES-256-GCM in authenticated "
-            "encryption mode via src.core.encryption.EncryptionService. "
-            "Encrypted fields include: integration credentials "
-            "(installed_integrations.auth_credentials_encrypted), "
-            "integration configs (installed_integrations.config_encrypted), "
-            "user MFA secrets, and any other at-rest secrets. Keys are "
-            "derived from the ENCRYPTION_KEY environment variable (must be "
-            "FedRAMP-approved at 256 bits). The database itself runs "
-            "PostgreSQL with TDE available via the cloud provider (AWS RDS "
-            "KMS) in production deployments."
-        ),
-        "evidence_refs": [
-            "code:src/core/encryption.py:EncryptionService",
-            "fields:installed_integrations.auth_credentials_encrypted",
-            "fields:users.mfa_secret",
-        ],
-    }
-
-
-async def _check_si4_system_monitoring(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """SI-4: System Monitoring — the SIEM is the monitoring system."""
-    from src.siem.models import LogEntry
-    log_count = await db.scalar(
-        select(func.count(LogEntry.id)).where(LogEntry.organization_id == org_id)
-    )
-    return {
-        "status": "implemented",
-        "narrative": (
-            f"The platform IS a SIEM — monitoring is its core function. "
-            f"Log ingestion is implemented in src.siem.pipeline.process_log "
-            f"accepting syslog (UDP/TCP 5514), agent-shipped logs via "
-            f"POST /agents/_agent/heartbeat, and cloud-provider integrations "
-            f"(AWS CloudTrail, Azure Activity, GCP Cloud Logging) polled "
-            f"every 5 min by src.siem.tasks.poll_cloud_integrations. Real-"
-            f"time detection via src.siem.correlation.RuleEngine (Sigma "
-            f"rule compilation + streaming evaluation). UEBA baselining in "
-            f"src.ueba.engine computes per-entity risk scores. Current log "
-            f"volume for this organization: {log_count or 0:,} entries."
-        ),
-        "evidence_refs": [
-            "code:src/siem/pipeline.py:process_log",
-            "code:src/siem/correlation.py:RuleEngine",
-            "code:src/ueba/engine.py",
-            "table:log_entries",
-        ],
-    }
-
-
-async def _check_si5_security_alerts(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """SI-5: Security Alerts, Advisories, and Directives."""
-    from src.models.alert import Alert
-    alert_count = await db.scalar(
-        select(func.count(Alert.id)).where(Alert.organization_id == org_id)
-    )
-    return {
-        "status": "implemented",
-        "narrative": (
-            f"Security alerts are generated by src.siem.correlation when "
-            f"a detection rule fires against the log stream, persisted "
-            f"into the alerts table (alert_count={alert_count or 0} for "
-            f"this org), and delivered to subscribed users via: (1) "
-            f"WebSocket push on the agents:<org> channel, (2) Slack/Teams "
-            f"webhook if configured, (3) PagerDuty/OpsGenie for critical "
-            f"severity. CISA advisories (KEV, BOD 22-01) ingested via the "
-            f"cisa_directives table."
-        ),
-        "evidence_refs": [
-            "code:src/siem/correlation.py",
-            "table:alerts",
-            "table:cisa_directives",
-            "code:src/api/v1/endpoints/settings.py (notification integrations)",
-        ],
-    }
-
-
-async def _check_ir4_incident_handling(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """IR-4: Incident Handling — autonomous investigator + approval-gated response."""
-    from src.agentic.models import Investigation
-    from src.models.incident import Incident
-    inv_count = await db.scalar(
-        select(func.count(Investigation.id)).where(Investigation.organization_id == org_id)
-    )
-    inc_count = await db.scalar(
-        select(func.count(Incident.id)).where(Incident.organization_id == org_id)
-    )
-    return {
-        "status": "implemented",
-        "narrative": (
-            f"Incident handling is implemented end-to-end: (1) Preparation — "
-            f"SOC agents seeded via src.agents.seed are ready to investigate. "
-            f"(2) Detection & Analysis — src.agentic.tasks.auto_triage_new_alerts "
-            f"(Celery beat every 60s) opens an autonomous investigation on "
-            f"every new critical/high alert; the LLM-driven "
-            f"src.agentic.investigator.AutonomousInvestigator runs an OODA "
-            f"loop over the real tool registry, producing a verdict with "
-            f"MITRE techniques and recommendations "
-            f"({inv_count or 0} investigations run for this org). "
-            f"(3) Containment — on true_positive verdicts, an Incident is "
-            f"auto-opened ({inc_count or 0} incidents for this org) and "
-            f"each recommendation materialized as a PENDING_APPROVAL "
-            f"AgentAction. (4) Eradication/Recovery — human-approved "
-            f"actions dispatch via AgentToolRegistry; results persist in "
-            f"agent_actions.result. (5) Post-Incident — investigation "
-            f"reasoning_chain + findings_summary serve as the lessons-"
-            f"learned record."
-        ),
-        "evidence_refs": [
-            "code:src/agentic/investigator.py:AutonomousInvestigator",
-            "code:src/agentic/tasks.py:auto_triage_new_alerts",
-            "code:src/api/v1/endpoints/agentic.py:approve_action",
-            "table:investigations",
-            "table:incidents",
-            "table:agent_actions",
-        ],
-    }
-
-
-async def _check_ir6_incident_reporting(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """IR-6: Incident Reporting."""
-    return {
-        "status": "implemented",
-        "narrative": (
-            "Incidents are reportable in three ways: (1) GET /api/v1/incidents "
-            "surface for analysts + automation; (2) structured export via the "
-            "Ticket Hub unified view (src.tickethub.engine.TicketAggregator); "
-            "(3) notification integrations push incident notifications to "
-            "Slack/Teams/PagerDuty/OpsGenie configured per-organization. "
-            "Every incident carries created_at UTC timestamp, severity, "
-            "status, affected assets, source_alert_id, and assigned_to. A "
-            "US-CERT reportable incident template can be generated from any "
-            "incident record."
-        ),
-        "evidence_refs": [
-            "endpoint:GET /api/v1/incidents",
-            "code:src/tickethub/engine.py:TicketAggregator",
-            "table:incidents",
-        ],
-    }
-
-
-async def _check_cm6_configuration_settings(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """CM-6: Configuration Settings — STIG benchmarks + scan results."""
-    from src.stig.models import STIGBenchmark, STIGScanResult
-    bench_count = await db.scalar(
-        select(func.count(STIGBenchmark.id)).where(STIGBenchmark.organization_id == org_id)
-    )
-    scan_count = await db.scalar(
-        select(func.count(STIGScanResult.id)).where(STIGScanResult.organization_id == org_id)
-    )
-    if (bench_count or 0) == 0:
-        return {
-            "status": "partially_implemented",
-            "narrative": (
-                "Configuration baseline enforcement is implemented via the "
-                "STIG/SCAP module (src.stig.engine.SCAPEngine). XCCDF "
-                "benchmarks can be uploaded via POST /api/v1/stig/scap/upload; "
-                "scan results ingest via POST /api/v1/stig/scans/{id}/arf. "
-                "Scheduled weekly fleet scan via src.stig.tasks."
-                "scheduled_fleet_stig_sweep. Status is partial until at "
-                "least one benchmark is loaded for this organization."
-            ),
-            "evidence_refs": [
-                "code:src/stig/engine.py:SCAPEngine",
-                "code:src/stig/tasks.py:scheduled_fleet_stig_sweep",
-                "table:stig_benchmarks",
-            ],
-        }
-    return {
-        "status": "implemented",
-        "narrative": (
-            f"DISA STIG baselines are maintained in stig_benchmarks "
-            f"({bench_count} benchmarks loaded). Each benchmark's rules "
-            f"are evaluated against enrolled endpoints via the pysoar-agent "
-            f"running oscap xccdf eval; results are ingested as ARF XML "
-            f"into stig_scan_results ({scan_count or 0} scans for this org). "
-            f"The weekly fleet sweep (src.stig.tasks.scheduled_fleet_stig_sweep) "
-            f"runs every Sunday 06:00 UTC and records pass/fail status per "
-            f"rule. Non-compliant rules generate POAMs automatically."
-        ),
-        "evidence_refs": [
-            f"table:stig_benchmarks (count={bench_count})",
-            f"table:stig_scan_results (count={scan_count or 0})",
-            "code:src/stig/engine.py:STIGScanner.ingest_arf_result",
-        ],
-    }
-
-
-async def _check_cm8_information_system_component_inventory(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """CM-8: System Component Inventory."""
-    from src.models.asset import Asset
-    asset_count = await db.scalar(
-        select(func.count(Asset.id)).where(Asset.organization_id == org_id)
-    )
-    return {
-        "status": "implemented" if (asset_count or 0) > 0 else "partially_implemented",
-        "narrative": (
-            f"Information-system components are inventoried in the assets "
-            f"table with IP, hostname, FQDN, OS, owner, and asset_type "
-            f"(server/workstation/network/cloud). Total for this "
-            f"organization: {asset_count or 0} assets. Assets are ingested "
-            f"from: (a) endpoint-agent enrollment (agent → asset row on "
-            f"first heartbeat), (b) cloud-integration discovery (AWS "
-            f"Config, Azure Resource Graph, GCP Asset Inventory), (c) "
-            f"manual registration via POST /api/v1/assets. CMDB sync "
-            f"available via the ServiceNow integration."
-        ),
-        "evidence_refs": [
-            f"table:assets (count={asset_count or 0})",
-            "code:src/api/v1/endpoints/assets.py",
-            "code:src/agents/service.py (heartbeat → asset reconciliation)",
-        ],
-    }
-
-
-async def _check_ra5_vulnerability_scanning(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """RA-5: Vulnerability Monitoring and Scanning."""
-    from src.vulnmgmt.models import Vulnerability
-    vuln_count = await db.scalar(
-        select(func.count(Vulnerability.id))
-    )
-    return {
-        "status": "implemented",
-        "narrative": (
-            f"Vulnerability management is implemented in src.vulnmgmt with "
-            f"integration points for Tenable, Rapid7, Qualys, and Wiz scanner "
-            f"feeds (src.vulnmgmt.tasks.poll_scanner_feeds). CVE records are "
-            f"persisted in the vulnerabilities table (global count: "
-            f"{vuln_count or 0}). Per-asset vulnerability instances live in "
-            f"vulnerability_instances with CVSS score, EPSS score, KEV-catalog "
-            f"flag, exploit-maturity rating, and SLA status. CISA KEV "
-            f"directives are cross-referenced via src.compliance.cisa_directive "
-            f"module. Unpatched findings flow into remediation via "
-            f"src.remediation.engine."
-        ),
-        "evidence_refs": [
-            f"table:vulnerabilities (count={vuln_count or 0})",
-            "code:src/vulnmgmt/engine.py",
-            "code:src/vulnmgmt/tasks.py",
-        ],
-    }
-
-
-async def _check_sc7_boundary_protection(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """SC-7: Boundary Protection."""
-    from src.zerotrust.models import MicroSegment
-    seg_count = await db.scalar(
-        select(func.count(MicroSegment.id)).where(MicroSegment.organization_id == org_id)
-    )
-    return {
-        "status": "implemented" if (seg_count or 0) > 0 else "partially_implemented",
-        "narrative": (
-            f"External boundary: Cloudflare WAF + nginx TLS termination + "
-            f"FastAPI CORS allowlist (src.main.CORSMiddleware — origins "
-            f"restricted by environment). Internal segmentation: the Zero "
-            f"Trust micro-segmentation engine (src.zerotrust.models."
-            f"MicroSegment) models network zones with allowed_protocols, "
-            f"allowed_ports, ingress_policies, egress_policies as JSON. "
-            f"Current segment count for this organization: {seg_count or 0}. "
-            f"Traffic between zones is governed by the Policy Decision "
-            f"Point: src.zerotrust.engine.PolicyDecisionPoint."
-            f"evaluate_access_request."
-        ),
-        "evidence_refs": [
-            "code:src/main.py (CORS middleware)",
-            "config:nginx/nginx.conf",
-            "code:src/zerotrust/engine.py:PolicyDecisionPoint",
-            f"table:micro_segments (count={seg_count or 0})",
-        ],
-    }
-
-
-async def _check_si2_flaw_remediation(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """SI-2: Flaw Remediation."""
-    from src.remediation.models import RemediationExecution
-    exec_count = await db.scalar(
-        select(func.count(RemediationExecution.id)).where(
-            RemediationExecution.organization_id == org_id
+    rows = (await db.execute(
+        select(User.id, User.is_active, User.last_login, User.created_at)
+        .where(User.organization_id == org_id)
+        .limit(MAX_USERS_INSPECTED)
+    )).all()
+    active = [r for r in rows if r.is_active]
+    cutoff = _now() - timedelta(days=AC2_DORMANT_DAYS)
+    dormant = 0
+    for r in active:
+        last = _parse_ts(r.last_login) or _aware(r.created_at)
+        if last is not None and last < cutoff:
+            dormant += 1
+    basis = [
+        _fact("count", "users.is_active", len(active)),
+        _fact("count", "users (disabled)", len(rows) - len(active)),
+        _fact("count", f"active users without a login in {AC2_DORMANT_DAYS} days", dormant),
+    ]
+    if not active:
+        return _not_assessed("no active user accounts in this organisation", basis)
+    if dormant:
+        return CheckOutcome(
+            FAIL, f"{dormant} of {len(active)} active accounts have been dormant for more than "
+            f"{AC2_DORMANT_DAYS} days and are still enabled", basis,
+            f"{dormant} dormant active account(s)",
         )
-    )
-    return {
-        "status": "implemented",
-        "narrative": (
-            f"Flaw remediation is implemented via src.remediation.engine "
-            f"with policy-driven automated patching, manual remediation "
-            f"playbooks, and ITSM integration (ServiceNow, Jira). "
-            f"Remediation executions: {exec_count or 0} for this org. "
-            f"Vulnerability findings from RA-5 scans generate remediation "
-            f"tickets with CVSS-weighted SLA deadlines (critical: 15 days, "
-            f"high: 30 days, medium: 90 days, low: 180 days per FedRAMP "
-            f"Moderate defaults). Patch deployment is tracked per-asset in "
-            f"patch_operations with rollback support."
-        ),
-        "evidence_refs": [
-            "code:src/remediation/engine.py",
-            f"table:remediation_executions (count={exec_count or 0})",
-            "table:patch_operations",
-        ],
-    }
+    return CheckOutcome(PASS, f"{len(active)} active accounts, none dormant for more than {AC2_DORMANT_DAYS} days", basis)
 
 
-async def _check_ca7_continuous_monitoring(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """CA-7: Continuous Monitoring."""
-    return {
-        "status": "implemented",
-        "narrative": (
-            "Continuous monitoring implements NIST SP 800-137 CAESARS: "
-            "(1) SIEM ingestion runs 24×7 with detection rules evaluating "
-            "the log stream in real time. (2) STIG scans execute weekly "
-            "via src.stig.tasks.scheduled_fleet_stig_sweep (Sundays 06:00 "
-            "UTC) against every enrolled endpoint. (3) UEBA baselines "
-            "refresh daily. (4) Vulnerability scans poll scanner feeds "
-            "every 30 minutes. (5) Compliance control attestation (this "
-            "function, src.compliance.attester.ControlAutoAttester) re-"
-            "runs on a configurable cadence and refreshes "
-            "compliance_controls.implementation_details with current "
-            "evidence. (6) The Zero Trust engine re-evaluates session "
-            "risk every 5 minutes and gates every HTTP request."
-        ),
-        "evidence_refs": [
-            "code:src/workers/celery_app.py (beat schedule)",
-            "code:src/siem/pipeline.py",
-            "code:src/stig/tasks.py:scheduled_fleet_stig_sweep",
-            "code:src/compliance/attester.py",
-            "code:src/zerotrust/session_gate.py",
-        ],
-    }
-
-
-async def _check_ac2_account_management(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """AC-2: Account Management."""
+async def _ac6_least_privilege(db: AsyncSession, org_id: str) -> CheckOutcome:
     from src.models.user import User
-    active = await db.scalar(
-        select(func.count(User.id)).where(User.organization_id == org_id, User.is_active == True)  # noqa: E712
+
+    rows = (await db.execute(
+        select(User.role, func.count(User.id))
+        .where(User.organization_id == org_id, User.is_active.is_(True))
+        .group_by(User.role)
+    )).all()
+    by_role = {str(role): int(n) for role, n in rows}
+    return _not_assessed(
+        "least privilege needs a reviewed access list; the role counts are recorded for the reviewer",
+        [_fact("count", "active users by role", by_role)],
     )
-    inactive = await db.scalar(
-        select(func.count(User.id)).where(User.organization_id == org_id, User.is_active == False)  # noqa: E712
+
+
+async def _ac7_unsuccessful_logon(db: AsyncSession, org_id: str) -> CheckOutcome:
+    from src.core.account_lockout import AccountLockoutManager
+
+    attempts = int(AccountLockoutManager.DEFAULT_MAX_ATTEMPTS)
+    duration = int(AccountLockoutManager.DEFAULT_LOCKOUT_DURATION)
+    basis = [
+        _fact("config", "src.core.account_lockout.AccountLockoutManager.DEFAULT_MAX_ATTEMPTS (used by POST /auth/login)", attempts),
+        _fact("config", "src.core.account_lockout.AccountLockoutManager.DEFAULT_LOCKOUT_DURATION seconds", duration),
+    ]
+    problems = []
+    if attempts > AC7_MAX_ATTEMPTS:
+        problems.append(f"lockout after {attempts} attempts (parameter: {AC7_MAX_ATTEMPTS})")
+    if duration < AC7_MIN_LOCKOUT_SECONDS:
+        problems.append(f"lockout lasts {duration // 60} minutes (parameter: {AC7_MIN_LOCKOUT_SECONDS // 60})")
+    if problems:
+        return CheckOutcome(FAIL, "login lockout is enforced but " + "; ".join(problems), basis, "; ".join(problems))
+    return CheckOutcome(PASS, f"login lockout after {attempts} failed attempts for {duration // 60} minutes", basis)
+
+
+async def _ac12_session_termination(db: AsyncSession, org_id: str) -> CheckOutcome:
+    from src.services.tenant_settings import session_timeout_minutes_for
+
+    minutes = await session_timeout_minutes_for(db, org_id)
+    basis = [_fact("config", "access-token lifetime minutes (tenant security/general settings or platform default)", minutes)]
+    if minutes > AC12_MAX_SESSION_MINUTES:
+        return CheckOutcome(
+            FAIL, f"sessions last {minutes} minutes before the token expires (test: <= {AC12_MAX_SESSION_MINUTES})",
+            basis, f"session lifetime {minutes} minutes",
+        )
+    return CheckOutcome(PASS, f"sessions end when the access token expires after {minutes} minutes", basis)
+
+
+async def _ia2_mfa(db: AsyncSession, org_id: str) -> CheckOutcome:
+    from src.models.user import User
+
+    active = await _count(db, select(func.count(User.id)).where(
+        User.organization_id == org_id, User.is_active.is_(True)))
+    enrolled = await _count(db, select(func.count(User.id)).where(
+        User.organization_id == org_id, User.is_active.is_(True), User.mfa_enabled.is_(True)))
+    basis = [_fact("count", "active users", active), _fact("count", "active users with MFA enabled", enrolled)]
+    if not active:
+        return _not_assessed("no active user accounts in this organisation", basis)
+    if enrolled < active:
+        return CheckOutcome(
+            FAIL, f"{active - enrolled} of {active} active users authenticate without MFA", basis,
+            f"{active - enrolled} active user(s) without MFA",
+        )
+    return CheckOutcome(PASS, f"all {active} active users have MFA enabled", basis)
+
+
+async def _audit_event_count(db: AsyncSession, org_id: str, days: int) -> int:
+    from src.models.audit import AuditLog
+
+    return await _count(db, select(func.count(AuditLog.id)).where(
+        AuditLog.organization_id == org_id, AuditLog.created_at >= _now() - timedelta(days=days)))
+
+
+async def _au2_event_logging(db: AsyncSession, org_id: str) -> CheckOutcome:
+    recent = await _audit_event_count(db, org_id, RECENT_DAYS)
+    basis = [_fact("count", f"audit_logs rows in the last {RECENT_DAYS} days", recent)]
+    if recent == 0:
+        return CheckOutcome(FAIL, f"no audit events were recorded in the last {RECENT_DAYS} days", basis,
+                            "no audit events recorded")
+    return CheckOutcome(PASS, f"{recent} audit events recorded in the last {RECENT_DAYS} days", basis)
+
+
+async def _au3_record_content(db: AsyncSession, org_id: str) -> CheckOutcome:
+    from src.models.audit import AuditLog
+
+    rows = (await db.execute(
+        select(AuditLog.action, AuditLog.resource_type, AuditLog.created_at, AuditLog.user_id,
+               AuditLog.ip_address, AuditLog.success)
+        .where(AuditLog.organization_id == org_id)
+        .order_by(AuditLog.created_at.desc()).limit(200)
+    )).all()
+    if not rows:
+        return _not_assessed("no audit records exist for this organisation yet",
+                             [_fact("count", "audit_logs rows sampled", 0)])
+    incomplete = sum(
+        1 for r in rows
+        if not (r.action and r.resource_type and r.created_at and (r.user_id or r.ip_address) and r.success is not None)
     )
-    return {
-        "status": "implemented",
-        "narrative": (
-            f"User accounts are managed through the REST API under "
-            f"/api/v1/users (list, create, update, disable) with RBAC "
-            f"role assignment (admin/analyst/viewer/custom). Accounts are "
-            f"created explicitly by admins; self-service registration is "
-            f"disabled. Current account state for this organization: "
-            f"{active or 0} active, {inactive or 0} disabled. Every "
-            f"account mutation is audited into ticket_activities and "
-            f"audit_logs. The User.force_password_change flag drives "
-            f"first-login rotation; User.is_active=False revokes access "
-            f"at the auth layer (src.services.user_service.authenticate "
-            f"rejects disabled accounts)."
-        ),
-        "evidence_refs": [
-            f"table:users (active={active}, disabled={inactive})",
-            "code:src/services/user_service.py",
-            "code:src/api/v1/endpoints/users.py",
-            "table:audit_logs",
-        ],
-    }
+    basis = [
+        _fact("count", "audit_logs rows sampled (latest 200)", len(rows)),
+        _fact("count", "sampled rows missing what/when/where/who/outcome", incomplete),
+    ]
+    if incomplete:
+        return CheckOutcome(FAIL, f"{incomplete} of {len(rows)} sampled audit records lack required content",
+                            basis, f"{incomplete} incomplete audit record(s)")
+    return CheckOutcome(PASS, f"all {len(rows)} sampled audit records carry event type, time, resource, subject and outcome", basis)
 
 
-async def _check_au4_audit_log_storage_capacity(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """AU-4: Audit Log Storage Capacity."""
-    # PG container capacity is host-dependent; just cite the monitoring.
-    return {
-        "status": "implemented",
-        "narrative": (
-            "Audit log storage lives in the primary PostgreSQL database "
-            "(ticket_activities + audit_logs tables). PostgreSQL disk "
-            "usage is monitored by Prometheus "
-            "(pg_stat_database_blks_read / blks_hit + pg_database_size) "
-            "and surfaced on the Grafana dashboard at /grafana. "
-            "Retention is unbounded by default; operators configure a "
-            "logrotate-style purge job only when approaching 80% disk "
-            "utilization. For FedRAMP Moderate deployments, sizing the "
-            "PostgreSQL volume for at least 12 months of audit retention "
-            "is required at provisioning time."
-        ),
-        "evidence_refs": [
-            "metric:pg_database_size",
-            "ui:/grafana (audit storage panels)",
-            "table:ticket_activities",
-        ],
-    }
+async def _au9_protection(db: AsyncSession, org_id: str) -> CheckOutcome:
+    from src.audit_evidence.engine import AuditLogger
+
+    verdict = await AuditLogger(db, org_id).verify_chain()
+    basis = [_fact("test", "audit_trails hash-chain verification", verdict)]
+    if not verdict.get("total"):
+        return _not_assessed("the audit trail has no rows to verify yet", basis)
+    if not verdict.get("ok"):
+        return CheckOutcome(FAIL, f"audit trail hash chain broken ({verdict.get('reason')})", basis,
+                            str(verdict.get("reason")))
+    return CheckOutcome(PASS, f"audit trail hash chain verified over {verdict.get('checked')} rows", basis)
 
 
-async def _check_au6_audit_record_review(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """AU-6: Audit Record Review, Analysis, and Reporting."""
-    return {
-        "status": "implemented",
-        "narrative": (
-            "Audit records are reviewable through: (1) the /audit page "
-            "(frontend/src/pages/AuditLogs.tsx) which paginates, filters, "
-            "and exports audit_logs with user, action, resource, and "
-            "timestamp columns; (2) automated correlation — the SIEM "
-            "rule engine subscribes to audit events that match security "
-            "indicators (brute force, privilege escalation, mass record "
-            "access) and fires alerts through src.siem.correlation."
-            "RuleEngine; (3) the Ticket Hub unified view exposes every "
-            "agent tool_invocation audit row for cross-module analysis."
-        ),
-        "evidence_refs": [
-            "ui:/audit (frontend/src/pages/AuditLogs.tsx)",
-            "code:src/siem/correlation.py",
-            "code:src/tickethub/engine.py",
-        ],
-    }
+async def _au10_non_repudiation(db: AsyncSession, org_id: str) -> CheckOutcome:
+    from src.agents.models import EndpointAgent
+    from src.agents.service import AgentService
 
-
-async def _check_au10_non_repudiation(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """AU-10: Non-Repudiation — JWT signatures + hash-chained command ledger."""
-    return {
-        "status": "implemented",
-        "narrative": (
-            "Non-repudiation is achieved on two surfaces: (1) user "
-            "actions are authenticated via HS256-signed JWTs "
-            "(src.core.security.create_access_token) bearing a unique "
-            "jti claim; the actor's user_id is included in every "
-            "downstream audit record, and the JWT signature can't be "
-            "forged without the ENCRYPTION_KEY secret. (2) Endpoint "
-            "agent commands use a tamper-evident hash chain: each "
-            "AgentCommand.chain_hash = SHA-256(prev_chain | "
-            "SHA-256(action | payload)), verified end-to-end by "
-            "src.agents.service.AgentService.verify_chain. Any chain "
-            "mismatch flags a repudiation attempt."
-        ),
-        "evidence_refs": [
-            "code:src/core/security.py:create_access_token",
-            "code:src/agents/capabilities.py:command_hash",
-            "code:src/agents/service.py:verify_chain",
-            "table_columns:agent_commands.command_hash,prev_hash,chain_hash",
-        ],
-    }
-
-
-async def _check_au12_audit_record_generation(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """AU-12: Audit Record Generation."""
-    from src.tickethub.models import TicketActivity
-    # List the distinct activity_types observed for this org.
-    rows = list(await db.scalars(
-        select(TicketActivity.activity_type).where(
-            TicketActivity.organization_id == org_id,
-        ).distinct().limit(20)
+    agents = list(await db.scalars(
+        select(EndpointAgent).where(EndpointAgent.organization_id == org_id)
+        .order_by(EndpointAgent.id).limit(MAX_AGENT_CHAINS_VERIFIED)
     ))
-    activity_types = [r for r in rows if r]
-    return {
-        "status": "implemented",
-        "narrative": (
-            f"Audit record generation is hard-wired into the request "
-            f"path: every agent tool invocation, every approval, every "
-            f"authentication attempt, and every integration action "
-            f"produces a ticket_activities row before the side effect "
-            f"persists. Distinct activity types observed for this "
-            f"organization: {', '.join(activity_types) or '(none yet)'}. "
-            f"Additional streams: audit_logs (API request path), "
-            f"agent_commands (endpoint-agent dispatch with hash chain), "
-            f"access_decisions (Zero Trust PDP), log_entries (ingested "
-            f"platform telemetry). The writers cannot be bypassed — "
-            f"they live on the inbound request middleware and in the "
-            f"service-layer ORM save path."
-        ),
-        "evidence_refs": [
-            "table:ticket_activities",
-            "table:audit_logs",
-            "table:agent_commands",
-            "table:access_decisions",
-            f"activity_types_observed={len(activity_types)}",
-        ],
-    }
+    service = AgentService(db)
+    broken: list[str] = []
+    verified = 0
+    for agent in agents:
+        verdict = await service.verify_chain(agent)
+        verified += int(verdict.get("commands_verified") or 0)
+        if not verdict.get("valid"):
+            broken.append(agent.id)
+    basis = [
+        _fact("count", "endpoint agents whose command chain was verified", len(agents)),
+        _fact("count", "agent commands verified", verified),
+        _fact("test", "agents with a broken command chain", broken),
+    ]
+    if not agents:
+        return _not_assessed("no endpoint agents are enrolled, so no signed command history exists to verify", basis)
+    if broken:
+        return CheckOutcome(FAIL, f"{len(broken)} agent command chain(s) failed verification", basis,
+                            "agent command chain broken")
+    return CheckOutcome(PASS, f"command hash chains verified for {len(agents)} agents ({verified} commands)", basis)
 
 
-async def _check_cm3_configuration_change_control(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """CM-3: Configuration Change Control."""
-    return {
-        "status": "implemented",
-        "narrative": (
-            "Platform code is versioned in git; every production change "
-            "is committed with a signed-off-by author and a descriptive "
-            "message linking to the audit evidence of what the change "
-            "affects. Deployments follow a git-commit → ship → verify "
-            "pattern (no direct edits on hosts). Runtime configuration "
-            "(integration credentials, SMTP, feature flags) flows "
-            "through the Settings UI into app_settings with updated_by "
-            "tracking the approver, and every Settings mutation is "
-            "audited into audit_logs with old/new value deltas. Agent "
-            "capability changes (adding or revoking an enrolled agent's "
-            "allowed actions) require an explicit re-enrollment, not an "
-            "in-place mutation."
-        ),
-        "evidence_refs": [
-            "git:commit history",
-            "table:app_settings.updated_by",
-            "table:audit_logs",
-            "code:src/agents/service.py:enroll",
-        ],
-    }
+async def _au11_retention(db: AsyncSession, org_id: str) -> CheckOutcome:
+    from src.models.audit import AuditLog
+
+    oldest = _aware(await db.scalar(select(func.min(AuditLog.created_at)).where(AuditLog.organization_id == org_id)))
+    if oldest is None:
+        return _not_assessed("no audit records exist for this organisation yet",
+                             [_fact("count", "audit_logs rows", 0)])
+    age = (_now() - oldest).days
+    basis = [_fact("count", "age in days of the oldest audit_logs row", age)]
+    if age >= AU11_RETENTION_DAYS:
+        return CheckOutcome(PASS, f"audit records are held for at least {age} days", basis)
+    return _not_assessed(
+        f"the oldest audit record is {age} days old; {AU11_RETENTION_DAYS}-day retention cannot be shown yet", basis)
 
 
-async def _check_cm7_least_functionality(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """CM-7: Least Functionality."""
-    return {
-        "status": "implemented",
-        "narrative": (
-            "The PySOAR container image ships the minimum packages "
-            "required to run the FastAPI + Celery application (Python "
-            "3.11-slim base, uvicorn, celery, SQLAlchemy, no compiler "
-            "toolchain). The endpoint agent binary (agent/pysoar_agent.py) "
-            "operates on a strict action allowlist per capability — "
-            "there is intentionally NO exec_shell action that would turn "
-            "the agent into a C2; the build_action_handlers dispatch "
-            "table only exposes the handlers for the agent's enrolled "
-            "capabilities, so an agent enrolled as BAS-only cannot "
-            "execute IR actions even if a compromised server queues one."
-        ),
-        "evidence_refs": [
-            "code:agent/pysoar_agent.py:build_action_handlers",
-            "code:src/agents/capabilities.py:CAPABILITY_ACTIONS",
-            "file:Dockerfile",
-        ],
-    }
+async def _au12_record_generation(db: AsyncSession, org_id: str) -> CheckOutcome:
+    from src.models.audit import AuditLog
+
+    actions = (await db.execute(
+        select(AuditLog.action).where(
+            AuditLog.organization_id == org_id, AuditLog.created_at >= _now() - timedelta(days=RECENT_DAYS))
+        .distinct().limit(100)
+    )).scalars().all()
+    basis = [_fact("count", f"distinct audit_logs actions in the last {RECENT_DAYS} days", len(actions))]
+    if not actions:
+        return CheckOutcome(FAIL, f"no audit records were generated in the last {RECENT_DAYS} days", basis,
+                            "no audit records generated")
+    return CheckOutcome(PASS, f"audit records generated for {len(actions)} distinct actions in {RECENT_DAYS} days", basis)
 
 
-async def _check_sc5_denial_of_service_protection(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """SC-5: Denial of Service Protection."""
-    return {
-        "status": "implemented",
-        "narrative": (
-            "Layered DoS protection: (1) Cloudflare WAF at the edge "
-            "rate-limits and blocks L7 attack patterns before they "
-            "reach the origin. (2) nginx in front of the API enforces "
-            "a worker_connections ceiling and connection timeouts. "
-            "(3) Application-layer rate limiting in "
-            "src.main.RateLimitMiddleware caps per-IP /api/* traffic at "
-            "600 requests/minute, returning 429 with Retry-After on "
-            "breach. (4) Sensitive endpoints (login, password reset, "
-            "account creation) carry tighter per-endpoint limits via "
-            "the @rate_limit decorator in src.core.rate_limiter (e.g. "
-            "10 login attempts per 5 minutes per IP)."
-        ),
-        "evidence_refs": [
-            "code:src/main.py:RateLimitMiddleware",
-            "code:src/core/rate_limiter.py",
-            "config:nginx/nginx.conf",
-            "edge:cloudflare WAF",
-        ],
-    }
+async def _ca7_continuous_monitoring(db: AsyncSession, org_id: str) -> CheckOutcome:
+    from src.compliance.models import ComplianceAssessment
 
-
-async def _check_sc12_cryptographic_key_establishment(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """SC-12: Cryptographic Key Establishment and Management."""
-    return {
-        "status": "implemented",
-        "narrative": (
-            "Application-layer cryptographic keys are sourced from the "
-            "ENCRYPTION_KEY and JWT_SECRET_KEY environment variables, "
-            "injected at container start from the secrets manager "
-            "(production: AWS Secrets Manager with KMS envelope "
-            "encryption; non-prod: local .env with 0600 perms). Keys "
-            "are never logged, never serialized into response bodies, "
-            "and never persisted in plaintext. The EncryptionService "
-            "(src.core.encryption) derives per-field nonces for AES-"
-            "256-GCM so reused plaintext does not produce identical "
-            "ciphertext. Key rotation requires an orchestrated migration "
-            "(re-encrypt every field, bump key version); no automated "
-            "key rotation cadence is configured at this time — noted as "
-            "a POAM item for continuous improvement."
-        ),
-        "evidence_refs": [
-            "code:src/core/encryption.py",
-            "env:ENCRYPTION_KEY, JWT_SECRET_KEY",
-            "code:src/core/config.py:validate_production_secrets",
-        ],
-    }
-
-
-async def _check_si3_malicious_code_protection(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """SI-3: Malicious Code Protection."""
-    return {
-        "status": "implemented",
-        "narrative": (
-            "Malicious code protection is layered: (1) IOC database "
-            "(threat_indicators) ingests file hashes from CISA KEV, "
-            "AlienVault OTX, and ThreatFox; alert pipeline matches "
-            "observed file hashes against this feed. (2) The AutomationService "
-            "on_alert_created hook enriches every alert with VirusTotal, "
-            "Shodan, and AbuseIPDB lookups when those integrations are "
-            "configured (integration:virustotal key present). (3) STIG "
-            "baselines enforce host-level AV-active checks as part of "
-            "the RHEL/Windows benchmarks. (4) The Deception module "
-            "deploys HoneyToken canary files whose access triggers an "
-            "immediate decoy_interaction event."
-        ),
-        "evidence_refs": [
-            "table:threat_indicators",
-            "code:src/services/automation.py:on_alert_created",
-            "table:honey_tokens",
-            "integration:virustotal",
-        ],
-    }
-
-
-async def _check_si7_software_integrity(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """SI-7: Software, Firmware, and Information Integrity."""
-    return {
-        "status": "implemented",
-        "narrative": (
-            "Software integrity is enforced at multiple surfaces: (1) "
-            "Container images are pulled by digest (sha256:...) at "
-            "deploy time — no mutable tags in production. (2) The "
-            "endpoint agent's command stream uses a hash-chain "
-            "(prev_hash → chain_hash) per AgentCommand row so a "
-            "replayed or reordered command is detected by "
-            "AgentService.verify_chain (AU-10). (3) XCCDF benchmark "
-            "content is hashed on upload "
-            "(src.stig.engine.SCAPEngine.import_scap_content writes "
-            "content_hash to SCAPProfile); rescans reject modified "
-            "content. (4) Critical database rows carry created_at / "
-            "updated_at that can be cross-checked against the audit "
-            "trail to detect out-of-band edits."
-        ),
-        "evidence_refs": [
-            "code:src/agents/service.py:verify_chain",
-            "code:src/stig/engine.py:SCAPEngine.import_scap_content",
-            "table_column:scap_profiles.content_hash",
-            "deploy:image digest pinning",
-        ],
-    }
-
-
-async def _check_cp9_system_backup(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """CP-9: System Backup."""
-    # This one is infrastructure-level, not evidenced by app state —
-    # return partial with the expected integration point.
-    return {
-        "status": "partially_implemented",
-        "narrative": (
-            "Application-layer: PySOAR does not manage its own backup "
-            "schedule. For FedRAMP Moderate deployments, the "
-            "production runbook requires daily pg_dump of the PostgreSQL "
-            "database to an off-host S3 bucket (KMS-encrypted) with a "
-            "30-day retention, plus weekly snapshot of the "
-            "pysoar-data Docker volume (which holds STIG XCCDF content "
-            "and agent tokens). The deploy/server-setup.sh script "
-            "installs the cron entries on initial provisioning. "
-            "Status remains partial until the deploying operator "
-            "confirms the backup cron is running and a restore drill "
-            "has been exercised — this is a deployment-level control, "
-            "not something the application code can self-attest."
-        ),
-        "evidence_refs": [
-            "runbook:deploy/server-setup.sh",
-            "manual:FedRAMP backup SOP",
-            "infra:AWS KMS-encrypted S3 bucket",
-        ],
-    }
-
-
-async def _check_ir5_incident_monitoring(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """IR-5: Incident Monitoring."""
-    from src.models.incident import Incident
-    inc_open = await db.scalar(
-        select(func.count(Incident.id)).where(
-            Incident.organization_id == org_id,
-            Incident.status.in_(["open", "investigating", "triaged"]),
+    last = _aware(await db.scalar(
+        select(func.max(ComplianceAssessment.assessment_date)).where(
+            ComplianceAssessment.organization_id == org_id,
+            ComplianceAssessment.assessment_type == "conmon",
         )
-    )
-    return {
-        "status": "implemented",
-        "narrative": (
-            f"Incidents are tracked in the incidents table with status "
-            f"('open'/'investigating'/'triaged'/'contained'/'eradicated'/"
-            f"'recovered'/'closed') and severity; current open for this "
-            f"org: {inc_open or 0}. Every lifecycle transition is "
-            f"recorded in audit_logs with the actor and prior/new "
-            f"values. The Incidents UI (frontend/src/pages/Incidents.tsx) "
-            f"surfaces the queue with filter-by-status, and the Ticket "
-            f"Hub unified view cross-references incidents with related "
-            f"investigations, alerts, and war-room action items."
-        ),
-        "evidence_refs": [
-            f"table:incidents (open count={inc_open or 0})",
-            "ui:/incidents",
-            "code:src/tickethub/engine.py",
-        ],
-    }
+    ))
+    basis = [_fact("evidence", "latest persisted ConMon cycle (compliance_assessments, type conmon)",
+                   last.isoformat() if last else None)]
+    if last is None:
+        return CheckOutcome(FAIL, "no continuous-monitoring cycle has been recorded", basis, "no ConMon cycle recorded")
+    if last < _now() - timedelta(days=31):
+        return CheckOutcome(FAIL, f"the last ConMon cycle ran {(_now() - last).days} days ago", basis,
+                            "ConMon cycle older than 31 days")
+    return CheckOutcome(PASS, f"a ConMon cycle ran on {last.date().isoformat()}", basis)
 
 
-async def _check_ir7_incident_response_assistance(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """IR-7: Incident Response Assistance."""
-    return {
-        "status": "implemented",
-        "narrative": (
-            "Incident response assistance is the autonomous investigator "
-            "(src.agentic.investigator.AutonomousInvestigator) plus the "
-            "natural-language Agent Console. An analyst handling an "
-            "incident can: (1) open chat with the SOC agent and ask "
-            "freeform investigative questions that execute real "
-            "platform tools; (2) view an auto-opened Investigation with "
-            "a verdict, MITRE techniques, and prioritized "
-            "recommendations for the incident; (3) one-click approve "
-            "each recommendation so the recommended action dispatches "
-            "through the tool registry. This is continuous "
-            "analyst-grade assistance, not reference documentation."
-        ),
-        "evidence_refs": [
-            "code:src/agentic/investigator.py",
-            "code:src/api/v1/endpoints/agentic.py:chat_with_agent",
-            "code:src/api/v1/endpoints/agentic.py:approve_action",
-            "ui:/agent-console",
-        ],
-    }
+async def _cm6_configuration_settings(db: AsyncSession, org_id: str) -> CheckOutcome:
+    from src.stig.models import STIGScanResult
+
+    since = _now() - timedelta(days=RECENT_DAYS)
+    row = (await db.execute(
+        select(
+            func.count(STIGScanResult.id),
+            func.coalesce(func.sum(STIGScanResult.cat1_open), 0),
+            func.coalesce(func.avg(STIGScanResult.compliance_percentage), 0.0),
+        ).where(
+            STIGScanResult.organization_id == org_id,
+            STIGScanResult.status == "completed",
+            STIGScanResult.completed_at >= since,
+        )
+    )).one()
+    scans, cat1, avg = int(row[0] or 0), int(row[1] or 0), float(row[2] or 0.0)
+    basis = [
+        _fact("count", f"completed STIG scans in the last {RECENT_DAYS} days", scans),
+        _fact("count", "open CAT I findings in those scans", cat1),
+        _fact("count", "average compliance percentage of those scans", round(avg, 1)),
+    ]
+    if scans == 0:
+        return _not_assessed(f"no STIG scan has completed in the last {RECENT_DAYS} days", basis)
+    if cat1 or avg < CM6_MIN_COMPLIANCE:
+        reason = f"{cat1} open CAT I finding(s); average compliance {avg:.1f}%"
+        return CheckOutcome(FAIL, reason, basis, reason)
+    return CheckOutcome(PASS, f"{scans} STIG scans, no open CAT I, average compliance {avg:.1f}%", basis)
 
 
-async def _check_ir8_incident_response_plan(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """IR-8: Incident Response Plan."""
+async def _cm8_component_inventory(db: AsyncSession, org_id: str) -> CheckOutcome:
+    from src.agents.models import EndpointAgent
+    from src.models.asset import Asset
+
+    assets = await _count(db, select(func.count(Asset.id)).where(Asset.organization_id == org_id))
+    inventoried = select(Asset.hostname).where(Asset.organization_id == org_id, Asset.hostname.isnot(None))
+    unmatched = await _count(db, select(func.count(EndpointAgent.id)).where(
+        EndpointAgent.organization_id == org_id,
+        EndpointAgent.status == "active",
+        EndpointAgent.hostname.notin_(inventoried),
+    ))
+    basis = [
+        _fact("count", "assets", assets),
+        _fact("count", "active endpoint agents whose hostname is not in the asset inventory", unmatched),
+    ]
+    if assets == 0:
+        return CheckOutcome(FAIL, "the asset inventory is empty", basis, "no assets inventoried")
+    if unmatched:
+        return CheckOutcome(FAIL, f"{unmatched} enrolled host(s) are missing from the asset inventory", basis,
+                            "inventory incomplete")
+    return CheckOutcome(PASS, f"{assets} assets inventoried; every active agent host is in the inventory", basis)
+
+
+async def _ir4_incident_handling(db: AsyncSession, org_id: str) -> CheckOutcome:
+    from src.models.incident import Incident
+
+    since = _now() - timedelta(days=365)
+    total = await _count(db, select(func.count(Incident.id)).where(
+        Incident.organization_id == org_id, Incident.created_at >= since))
+    closed = await _count(db, select(func.count(Incident.id)).where(
+        Incident.organization_id == org_id, Incident.created_at >= since, Incident.status == "closed"))
+    stale = await _count(db, select(func.count(Incident.id)).where(
+        Incident.organization_id == org_id, Incident.status != "closed",
+        Incident.created_at < _now() - timedelta(days=RECENT_DAYS)))
+    basis = [
+        _fact("count", "incidents opened in the last 365 days", total),
+        _fact("count", "of which closed", closed),
+        _fact("count", f"incidents still open after {RECENT_DAYS} days", stale),
+    ]
+    if total == 0:
+        return _not_assessed("no incidents in the last 365 days, so incident handling has not been exercised", basis)
+    if stale:
+        return CheckOutcome(FAIL, f"{stale} incident(s) open for more than {RECENT_DAYS} days", basis,
+                            "incidents left open")
+    if closed == 0:
+        return CheckOutcome(FAIL, "no incident has been handled to closure", basis, "no incident closed")
+    return CheckOutcome(PASS, f"{closed} of {total} incidents handled to closure; none stale", basis)
+
+
+async def _ir5_incident_monitoring(db: AsyncSession, org_id: str) -> CheckOutcome:
+    from src.models.incident import Incident
+
+    total = await _count(db, select(func.count(Incident.id)).where(
+        Incident.organization_id == org_id, Incident.created_at >= _now() - timedelta(days=365)))
+    basis = [_fact("count", "incidents tracked in the last 365 days", total)]
+    if total == 0:
+        return _not_assessed("no incidents tracked in the last 365 days", basis)
+    return CheckOutcome(PASS, f"{total} incidents tracked with status history in the incidents table", basis)
+
+
+async def _ir8_response_plan(db: AsyncSession, org_id: str) -> CheckOutcome:
     from src.models.playbook import Playbook
-    pb_count = await db.scalar(
-        select(func.count(Playbook.id)).where(Playbook.organization_id == org_id)
-    )
-    return {
-        "status": "implemented" if (pb_count or 0) > 0 else "partially_implemented",
-        "narrative": (
-            f"Incident response plans are encoded as Playbook records "
-            f"(count={pb_count or 0} for this org) with structured "
-            f"steps, triggers, and approval gates. Auto-opened "
-            f"incidents of critical/high severity spin up a War Room "
-            f"(src.services.automation.on_incident_created) with "
-            f"standard action items: triage, containment, evidence "
-            f"preservation, stakeholder notification. The playbook "
-            f"engine (src.services.playbook_engine) executes the steps "
-            f"with audit trail, approval points, and rollback. The "
-            f"human-readable IR plan document is referenced in the "
-            f"organization's operational runbook."
-        ),
-        "evidence_refs": [
-            f"table:playbooks (count={pb_count or 0})",
-            "table:war_rooms",
-            "code:src/services/playbook_engine.py",
-            "code:src/services/automation.py:on_incident_created",
-        ],
-    }
+
+    enabled = await _count(db, select(func.count(Playbook.id)).where(
+        Playbook.organization_id == org_id, Playbook.is_enabled.is_(True)))
+    basis = [_fact("count", "enabled playbooks", enabled)]
+    if enabled == 0:
+        return CheckOutcome(FAIL, "no enabled incident-response playbooks", basis, "no playbooks")
+    return CheckOutcome(PASS, f"{enabled} enabled response playbooks encode the plan's procedures", basis)
 
 
-async def _check_pl2_system_security_plan(db: AsyncSession, org_id: str) -> Optional[dict]:
-    """PL-2: System Security Plan."""
-    return {
-        "status": "implemented",
-        "narrative": (
-            "This document, generated by "
-            "src.compliance.engine.ComplianceEngine.generate_ssp + "
-            "ssp_to_markdown, IS the System Security Plan. The SSP is "
-            "re-generated on demand (GET /compliance/frameworks/{id}/"
-            "ssp/download) and every control's implementation narrative "
-            "is populated by src.compliance.attester.ControlAutoAttester "
-            "inspecting live platform evidence (code paths, database "
-            "rows, runtime counts). The authority-to-operate package "
-            "includes this SSP, the FedRAMP Package Gates POA&M "
-            "(/compliance/poams), the STIG scan results "
-            "(/stig/scans), and the vulnerability scan register "
-            "(/vulnmgmt). All four artifacts are machine-generated and "
-            "always reflect current state."
-        ),
-        "evidence_refs": [
-            "code:src/compliance/attester.py",
-            "code:src/compliance/engine.py:generate_ssp",
-            "endpoint:GET /api/v1/compliance/frameworks/{id}/ssp/download",
-            "endpoint:GET /api/v1/compliance/poams",
-        ],
-    }
+async def _ra5_vulnerability_scanning(db: AsyncSession, org_id: str) -> CheckOutcome:
+    from src.vulnmgmt.models import VulnerabilityInstance
+
+    recent = await _count(db, select(func.count(VulnerabilityInstance.id)).where(
+        VulnerabilityInstance.organization_id == org_id,
+        VulnerabilityInstance.updated_at >= _now() - timedelta(days=RECENT_DAYS)))
+    basis = [_fact("count", f"vulnerability instances created or updated by a scan import in {RECENT_DAYS} days", recent)]
+    if recent == 0:
+        return CheckOutcome(FAIL, f"no vulnerability scan results were imported in the last {RECENT_DAYS} days",
+                            basis, "no recent scan results")
+    return CheckOutcome(PASS, f"{recent} vulnerability findings refreshed by scans in {RECENT_DAYS} days", basis)
 
 
-# Control id → attestation rule registry.
-_RULES = {
-    "AC-2": _check_ac2_account_management,
-    "AC-3": _check_ac3_access_enforcement,
-    "AC-6": _check_ac6_least_privilege,
-    "AC-7": _check_ac7_unsuccessful_logon,
-    "AC-12": _check_ac12_session_termination,
-    "AU-2": _check_au2_event_logging,
-    "AU-3": _check_au3_content_of_audit_records,
-    "AU-4": _check_au4_audit_log_storage_capacity,
-    "AU-6": _check_au6_audit_record_review,
-    "AU-8": _check_au8_time_stamps,
-    "AU-9": _check_au9_protection_of_audit_info,
-    "AU-10": _check_au10_non_repudiation,
-    "AU-11": _check_au11_audit_record_retention,
-    "AU-12": _check_au12_audit_record_generation,
-    "CM-3": _check_cm3_configuration_change_control,
-    "CM-6": _check_cm6_configuration_settings,
-    "CM-7": _check_cm7_least_functionality,
-    "CM-8": _check_cm8_information_system_component_inventory,
-    "CP-9": _check_cp9_system_backup,
-    "IA-2": _check_ia2_identification_and_authentication,
-    "IA-5": _check_ia5_authenticator_management,
-    "IR-4": _check_ir4_incident_handling,
-    "IR-5": _check_ir5_incident_monitoring,
-    "IR-6": _check_ir6_incident_reporting,
-    "IR-7": _check_ir7_incident_response_assistance,
-    "IR-8": _check_ir8_incident_response_plan,
-    "PL-2": _check_pl2_system_security_plan,
-    "RA-5": _check_ra5_vulnerability_scanning,
-    "SC-5": _check_sc5_denial_of_service_protection,
-    "SC-7": _check_sc7_boundary_protection,
-    "SC-8": _check_sc8_transmission_confidentiality,
-    "SC-12": _check_sc12_cryptographic_key_establishment,
-    "SC-13": _check_sc13_cryptographic_protection,
-    "SI-2": _check_si2_flaw_remediation,
-    "SI-3": _check_si3_malicious_code_protection,
-    "SI-4": _check_si4_system_monitoring,
-    "SI-5": _check_si5_security_alerts,
-    "SI-7": _check_si7_software_integrity,
-    "CA-7": _check_ca7_continuous_monitoring,
+async def _sc7_boundary_protection(db: AsyncSession, org_id: str) -> CheckOutcome:
+    from src.zerotrust.models import MicroSegment, ZeroTrustPolicy
+
+    segments = await _count(db, select(func.count(MicroSegment.id)).where(MicroSegment.organization_id == org_id))
+    policies = await _count(db, select(func.count(ZeroTrustPolicy.id)).where(ZeroTrustPolicy.organization_id == org_id))
+    basis = [_fact("count", "micro_segments", segments), _fact("count", "zero_trust_policies", policies)]
+    if segments == 0 and policies == 0:
+        return CheckOutcome(FAIL, "no segments or zero-trust policies are defined", basis, "no boundary policy")
+    return CheckOutcome(PASS, f"{segments} segments and {policies} zero-trust policies defined", basis)
+
+
+async def _encryption_at_rest(db: AsyncSession, org_id: str) -> CheckOutcome:
+    from src.core.config import settings
+
+    configured = bool(getattr(settings, "encryption_master_key", None))
+    basis = [_fact("config", "ENCRYPTION_MASTER_KEY set (field-level AES-256-GCM for stored secrets)", configured)]
+    if not configured:
+        return CheckOutcome(FAIL, "no encryption master key is configured; stored secrets are not encrypted",
+                            basis, "encryption key not configured")
+    return CheckOutcome(PASS, "field-level encryption is configured for stored secrets", basis)
+
+
+async def _si2_flaw_remediation(db: AsyncSession, org_id: str) -> CheckOutcome:
+    from src.vulnmgmt.models import VulnerabilityInstance
+
+    total = await _count(db, select(func.count(VulnerabilityInstance.id)).where(
+        VulnerabilityInstance.organization_id == org_id))
+    breached = await _count(db, select(func.count(VulnerabilityInstance.id)).where(
+        VulnerabilityInstance.organization_id == org_id, VulnerabilityInstance.sla_status == "breached"))
+    basis = [_fact("count", "vulnerability instances", total),
+             _fact("count", "instances past their remediation SLA", breached)]
+    if total == 0:
+        return _not_assessed("no vulnerability findings are stored, so remediation timeliness cannot be measured", basis)
+    if breached:
+        return CheckOutcome(FAIL, f"{breached} vulnerability finding(s) are past their remediation deadline", basis,
+                            f"{breached} SLA breach(es)")
+    return CheckOutcome(PASS, f"none of {total} vulnerability findings is past its remediation deadline", basis)
+
+
+async def _si4_system_monitoring(db: AsyncSession, org_id: str) -> CheckOutcome:
+    from src.siem.models import DetectionRule, LogEntry
+
+    logs = await _count(db, select(func.count(LogEntry.id)).where(
+        LogEntry.organization_id == org_id, LogEntry.created_at >= _now() - timedelta(hours=24)))
+    rules = await _count(db, select(func.count(DetectionRule.id)).where(
+        DetectionRule.organization_id == org_id, DetectionRule.status == "active"))
+    basis = [_fact("count", "log entries ingested in the last 24 hours", logs),
+             _fact("count", "active detection rules", rules)]
+    problems = []
+    if logs == 0:
+        problems.append("no logs ingested in 24 hours")
+    if rules == 0:
+        problems.append("no active detection rules")
+    if problems:
+        return CheckOutcome(FAIL, "; ".join(problems), basis, "; ".join(problems))
+    return CheckOutcome(PASS, f"{logs} log entries in 24 hours evaluated by {rules} active detection rules", basis)
+
+
+async def _si5_security_alerts(db: AsyncSession, org_id: str) -> CheckOutcome:
+    from src.intel.models import ThreatFeed
+
+    feeds = await _count(db, select(func.count(ThreatFeed.id)).where(
+        ThreatFeed.organization_id == org_id, ThreatFeed.is_enabled.is_(True)))
+    basis = [_fact("count", "enabled threat-intelligence / advisory feeds", feeds)]
+    if feeds == 0:
+        return CheckOutcome(FAIL, "no advisory or threat-intelligence feed is enabled", basis, "no feeds")
+    return CheckOutcome(PASS, f"{feeds} advisory / threat-intelligence feeds enabled", basis)
+
+
+async def _pl2_security_plan(db: AsyncSession, org_id: str) -> CheckOutcome:
+    return _not_assessed(
+        "a system security plan is a document: the control is implemented once an approved SSP is attached as evidence")
+
+
+def _procedural(reason: str) -> Callable[[AsyncSession, str], Awaitable[CheckOutcome]]:
+    async def _rule(db: AsyncSession, org_id: str) -> CheckOutcome:
+        return _not_assessed(reason)
+    return _rule
+
+
+_RULES: dict[str, Callable[[AsyncSession, str], Awaitable[CheckOutcome]]] = {
+    "AC-2": _ac2_account_management,
+    "AC-3": _procedural("access enforcement is code behaviour; it needs a test record (e.g. an access-control test report) as evidence"),
+    "AC-6": _ac6_least_privilege,
+    "AC-7": _ac7_unsuccessful_logon,
+    "AC-12": _ac12_session_termination,
+    "AU-2": _au2_event_logging,
+    "AU-3": _au3_record_content,
+    "AU-4": _procedural("audit storage capacity is a host / database setting the application cannot read"),
+    "AU-6": _procedural("audit review is a human activity; it needs review records as evidence"),
+    "AU-8": _procedural("clock synchronisation (NTP) is a host setting the application cannot read"),
+    "AU-9": _au9_protection,
+    "AU-10": _au10_non_repudiation,
+    "AU-11": _au11_retention,
+    "AU-12": _au12_record_generation,
+    "CA-7": _ca7_continuous_monitoring,
+    "CM-3": _procedural("change control is a process; it needs change records as evidence"),
+    "CM-6": _cm6_configuration_settings,
+    "CM-7": _procedural("least functionality of hosts and images is not readable by the application"),
+    "CM-8": _cm8_component_inventory,
+    "CP-9": _procedural("backups run outside the application; it needs backup and restore-test records as evidence"),
+    "IA-2": _ia2_mfa,
+    "IA-5": _procedural("the password-policy settings are not enforced by a code path the attester can read"),
+    "IR-4": _ir4_incident_handling,
+    "IR-5": _ir5_incident_monitoring,
+    "IR-6": _procedural("incident reporting to external parties needs reporting records as evidence"),
+    "IR-7": _procedural("incident response assistance is an organisational service; it needs evidence"),
+    "IR-8": _ir8_response_plan,
+    "PL-2": _pl2_security_plan,
+    "RA-5": _ra5_vulnerability_scanning,
+    "SC-5": _procedural("denial-of-service protection sits at the network edge, outside the application"),
+    "SC-7": _sc7_boundary_protection,
+    "SC-8": _procedural("transport encryption is terminated by the reverse proxy, which the application cannot inspect"),
+    "SC-12": _procedural("key establishment and rotation are operational procedures; they need key-management records"),
+    "SC-13": _encryption_at_rest,
+    "SC-28": _encryption_at_rest,
+    "SI-2": _si2_flaw_remediation,
+    "SI-3": _procedural("malicious-code protection runs on hosts; the application cannot read its state"),
+    "SI-4": _si4_system_monitoring,
+    "SI-5": _si5_security_alerts,
+    "SI-7": _procedural("software integrity verification of deployed images is not readable by the application"),
 }
+
+#: Control codes the attester has a rule for (public for the routers).
+SUPPORTED_CONTROLS = tuple(sorted(_RULES))
+
+
+async def run_check(db: AsyncSession, org_id: str, control_code: str) -> Optional[CheckOutcome]:
+    """Run the rule for ``control_code``; None when the attester has none."""
+    rule = _RULES.get(control_code)
+    if rule is None:
+        return None
+    return await rule(db, org_id)
+
+
+def outcome_dict(code: str, outcome: CheckOutcome, checked_at: datetime) -> dict[str, Any]:
+    return {
+        "control": code,
+        "result": outcome.result,
+        "summary": outcome.summary,
+        "reason": outcome.reason,
+        "basis": outcome.basis,
+        "checked_at": checked_at.isoformat(),
+        "checked_by": ATTESTER_SOURCE,
+    }
 
 
 class ControlAutoAttester:
-    """Run auto-attestation across all implementable controls for an org."""
+    """Run the rules for one organisation's controls and record the outcomes."""
 
     def __init__(self, db: AsyncSession, organization_id: str):
         self.db = db
         self.org_id = organization_id
 
-    async def attest_all(self, framework_id: Optional[str] = None) -> dict[str, Any]:
-        """Run every attestation rule and update compliance_controls rows.
+    async def _approved_evidence(self, control_ids: list[str]) -> set[str]:
+        if not control_ids:
+            return set()
+        now = _now()
+        rows = (await self.db.execute(
+            select(ComplianceEvidence.control_id_ref).where(
+                ComplianceEvidence.organization_id == self.org_id,
+                ComplianceEvidence.control_id_ref.in_(control_ids),
+                ComplianceEvidence.review_status == "approved",
+                ComplianceEvidence.is_valid.is_(True),
+                ComplianceEvidence.is_automated.is_(False),
+                or_(ComplianceEvidence.expires_at.is_(None), ComplianceEvidence.expires_at > now),
+            ).distinct()
+        )).scalars().all()
+        return set(rows)
 
-        Returns a summary of what was attested. Idempotent: re-running
-        produces the same output (minus counts that reflect live state).
-        """
+    async def _upsert_evidence(self, control: ComplianceControl, record: dict[str, Any]) -> None:
+        content = json.dumps(record, sort_keys=True, default=str)
+        row = (await self.db.execute(
+            select(ComplianceEvidence).where(
+                ComplianceEvidence.organization_id == self.org_id,
+                ComplianceEvidence.control_id_ref == control.id,
+                ComplianceEvidence.source_system == ATTESTER_SOURCE,
+            ).limit(1)
+        )).scalar_one_or_none()
+        if row is None:
+            row = ComplianceEvidence(
+                control_id_ref=control.id,
+                organization_id=self.org_id,
+                evidence_type="automated_test",
+                title=f"Automated check: {control.control_id}",
+                source_system=ATTESTER_SOURCE,
+                collected_by="system:auto-attester",
+                is_automated=True,
+            )
+            self.db.add(row)
+        row.description = record["summary"][:2000]
+        row.content = content
+        row.file_hash = hashlib.sha512(content.encode("utf-8")).hexdigest()
+        row.collected_at = _now()
+        row.is_valid = record["result"] == PASS
+        row.review_status = "pending"
+
+    async def attest_all(self, framework_id: Optional[str] = None) -> dict[str, Any]:
+        """Run every rule that matches one of the organisation's controls."""
         stmt = select(ComplianceControl).where(
             ComplianceControl.organization_id == self.org_id,
-            ComplianceControl.control_id.in_(list(_RULES.keys())),
+            ComplianceControl.control_id.in_(list(_RULES)),
         )
         if framework_id:
             stmt = stmt.where(ComplianceControl.framework_id == framework_id)
         controls = list(await self.db.scalars(stmt))
         if not controls:
-            return {"attested": 0, "status": "no_controls", "framework_id": framework_id}
+            return {
+                "attested": 0, "status": "no_controls", "framework_id": framework_id,
+                "passed": 0, "failed": 0, "not_assessed": 0, "implemented": 0,
+                "partially_implemented": 0, "manual_status_kept": 0, "controls": [],
+            }
 
-        attested = 0
-        implemented = 0
-        partial = 0
+        approved = await self._approved_evidence([c.id for c in controls])
+        checked_at = _now()
+        outcomes: dict[str, CheckOutcome] = {}
+        tally = {PASS: 0, FAIL: 0, NOT_ASSESSED: 0}
+        implemented = partial = kept = 0
+        per_control: list[dict[str, Any]] = []
         for control in controls:
-            rule = _RULES.get(control.control_id)
-            if rule is None:
-                continue
-            try:
-                result = await rule(self.db, self.org_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"Attester rule {control.control_id} failed: {exc}")
-                continue
-            if result is None:
-                continue
-            control.status = result["status"]
-            # implementation_status is the percent-complete tracking column
-            if result["status"] == "implemented":
-                control.implementation_status = 100.0
-                implemented += 1
-            elif result["status"] == "partially_implemented":
-                control.implementation_status = 50.0
-                partial += 1
-            else:
-                control.implementation_status = 0.0
-            # Append evidence references onto the narrative so the SSP
-            # export carries them inline — no separate column needed.
-            narrative_with_refs = result["narrative"] + "\n\nEvidence:\n" + "\n".join(
-                f"  - {ref}" for ref in result["evidence_refs"]
-            )
-            control.implementation_details = narrative_with_refs
-            # last_assessed_at is declared TIMESTAMP WITHOUT TIME ZONE
-            # on this model — write a naive datetime so asyncpg doesn't
-            # reject the tz-aware value.
-            control.last_assessed_at = datetime.utcnow()
-            # last_assessment_result must be one of the enum values.
-            control.last_assessment_result = (
-                "satisfied" if result["status"] == "implemented" else "other_than_satisfied"
-            )
-            # Drop a ComplianceEvidence marker row so the Evidence tab
-            # shows the auto-attester ran.
-            self.db.add(ComplianceEvidence(
-                control_id_ref=control.id,
-                organization_id=self.org_id,
-                evidence_type="attestation",
-                title=f"Auto-attestation: {control.control_id}",
-                description=result["narrative"][:2000],
-                source_system="PySOAR Control Auto-Attester",
-                collected_by="system",
-                is_automated=True,
-                is_valid=True,
-            ))
-            attested += 1
+            code = control.control_id
+            if code not in outcomes:
+                try:
+                    outcomes[code] = await _RULES[code](self.db, self.org_id)
+                except Exception as exc:  # noqa: BLE001 - a broken rule is recorded, not hidden
+                    logger.warning("attester_rule_failed", control=code, error=str(exc))
+                    outcomes[code] = _not_assessed(f"the check could not run: {type(exc).__name__}")
+            outcome = outcomes[code]
+            tally[outcome.result] += 1
+            record = outcome_dict(code, outcome, checked_at)
+            has_evidence = control.id in approved
+            record["approved_evidence"] = has_evidence
 
+            control.assessment_basis = record
+            control.last_assessed_at = checked_at.replace(tzinfo=None)
+            control.last_assessment_result = {
+                PASS: "satisfied", FAIL: "other_than_satisfied",
+            }.get(outcome.result, "not_assessed")
+            if control.status_source == "manual":
+                kept += 1
+            else:
+                if outcome.result == PASS and has_evidence:
+                    control.status, control.implementation_status = "implemented", 100.0
+                    implemented += 1
+                elif outcome.result == PASS:
+                    control.status, control.implementation_status = "partially_implemented", 50.0
+                    partial += 1
+                elif outcome.result == FAIL:
+                    control.status, control.implementation_status = "not_implemented", 0.0
+                else:
+                    control.status, control.implementation_status = "not_assessed", 0.0
+                control.status_source = "attester"
+            await self._upsert_evidence(control, record)
+            per_control.append({
+                "control_id": code, "control_record_id": control.id, "framework_id": control.framework_id,
+                "result": outcome.result, "status": control.status, "reason": outcome.reason,
+            })
+
+        await self.db.flush()
+        from src.compliance.engine import refresh_framework_score
+
+        framework_ids = {c.framework_id for c in controls}
+        for fw_id in framework_ids:
+            await refresh_framework_score(self.db, self.org_id, fw_id)
         await self.db.commit()
         return {
-            "attested": attested,
+            "attested": len(controls),
+            "framework_id": framework_id,
+            "passed": tally[PASS],
+            "failed": tally[FAIL],
+            "not_assessed": tally[NOT_ASSESSED],
             "implemented": implemented,
             "partially_implemented": partial,
-            "framework_id": framework_id,
+            "manual_status_kept": kept,
+            "checked_at": checked_at.isoformat(),
+            "controls": per_control,
         }
+

@@ -96,7 +96,7 @@ async def _resolve_tenant_control_ref(
     by_id = await db.execute(
         select(ComplianceControl.id).where(
             ComplianceControl.id == ref, ComplianceControl.organization_id == org_id,
-        )
+        ),
     )
     control_pk = by_id.scalar_one_or_none()
     if control_pk:
@@ -104,7 +104,7 @@ async def _resolve_tenant_control_ref(
     by_code = await db.execute(
         select(ComplianceControl.id).where(
             ComplianceControl.control_id == ref, ComplianceControl.organization_id == org_id,
-        ).limit(2)
+        ).limit(2),
     )
     matches = by_code.scalars().all()
     if len(matches) == 1:
@@ -144,7 +144,7 @@ async def list_frameworks(
     - skip, limit: Pagination
     """
     stmt = select(ComplianceFramework).where(
-        ComplianceFramework.organization_id == org_id
+        ComplianceFramework.organization_id == org_id,
     )
 
     if enabled_only:
@@ -171,7 +171,7 @@ async def get_framework(
         and_(
             ComplianceFramework.id == framework_id,
             ComplianceFramework.organization_id == org_id,
-        )
+        ),
     )
     result = await db.execute(stmt)
     framework = result.scalar_one_or_none()
@@ -198,7 +198,7 @@ async def trigger_assessment(
         and_(
             ComplianceFramework.id == framework_id,
             ComplianceFramework.organization_id == org_id,
-        )
+        ),
     )
     result = await db.execute(stmt)
     framework = result.scalar_one_or_none()
@@ -251,7 +251,7 @@ async def get_control_gaps(
         and_(
             ComplianceFramework.id == framework_id,
             ComplianceFramework.organization_id == org_id,
-        )
+        ),
     )
     result = await db.execute(stmt)
     framework = result.scalar_one_or_none()
@@ -297,7 +297,7 @@ async def generate_ssp(
         and_(
             ComplianceFramework.id == framework_id,
             ComplianceFramework.organization_id == org_id,
-        )
+        ),
     )
     result = await db.execute(stmt)
     framework = result.scalar_one_or_none()
@@ -331,7 +331,7 @@ async def download_ssp(
         and_(
             ComplianceFramework.id == framework_id,
             ComplianceFramework.organization_id == org_id,
-        )
+        ),
     )
     framework = (await db.execute(stmt)).scalar_one_or_none()
     if not framework:
@@ -365,13 +365,14 @@ async def run_auto_attestation(
     framework_id: str,
     org_id: OrganizationId,
     db: DatabaseSession = None,
-    _user: AdminRoleUser = None,
+    current_user: AdminRoleUser = None,
 ):
-    """Run the Control Auto-Attester against this framework.
+    """Run the control attester against this framework (admin only).
 
-    Inspects live platform state and populates implementation narratives
-    on every control the attester has a rule for. Idempotent; returns a
-    summary of what was attested.
+    Each control the attester has a rule for gets ``pass`` / ``fail`` /
+    ``not_assessed`` with the facts the rule read (``assessment_basis``);
+    the status changes only for controls whose status was not set by a
+    person. Returns the counts and the per-control outcome.
     """
     from src.compliance.attester import ControlAutoAttester
 
@@ -380,7 +381,24 @@ async def run_auto_attestation(
         raise HTTPException(status_code=404, detail="Framework not found")
 
     attester = ControlAutoAttester(db, org_id)
-    return await attester.attest_all(framework_id=framework_id)
+    summary = await attester.attest_all(framework_id=framework_id)
+    from src.models.audit import AuditLog
+
+    db.add(AuditLog(
+        user_id=str(current_user.id),
+        organization_id=org_id,
+        action="compliance_attest",
+        resource_type="compliance_framework",
+        resource_id=framework_id,
+        description=(
+            f"Control attester: {summary.get('passed', 0)} passed, {summary.get('failed', 0)} failed, "
+            f"{summary.get('not_assessed', 0)} not assessed"
+        ),
+        new_value=json.dumps({k: v for k, v in summary.items() if k != "controls"}, default=str),
+        success=True,
+    ))
+    await db.commit()
+    return summary
 
 
 @router.get("/frameworks/{framework_id}/report")
@@ -394,7 +412,7 @@ async def get_framework_report(
         and_(
             ComplianceFramework.id == framework_id,
             ComplianceFramework.organization_id == org_id,
-        )
+        ),
     )
     result = await db.execute(stmt)
     framework = result.scalar_one_or_none()
@@ -436,7 +454,7 @@ async def trigger_continuous_monitoring(
             ComplianceFramework.id == framework_id,
             ComplianceFramework.organization_id == org_id,
             ComplianceFramework.short_name.like(f"{FEDRAMP_SHORT_NAME_PREFIX}%"),
-        )
+        ),
     )
     result = await db.execute(stmt)
     framework = result.scalar_one_or_none()
@@ -479,15 +497,26 @@ async def list_controls(
     - baseline: Filter by baseline (low, moderate, high)
     """
     stmt = select(ComplianceControl).where(
-        ComplianceControl.organization_id == org_id
+        ComplianceControl.organization_id == org_id,
     )
 
     if framework_id:
-        stmt = stmt.where(ComplianceControl.framework_id == framework_id)
+        # The page sends the framework short name; ids still work.
+        fw_ids = select(ComplianceFramework.id).where(
+            ComplianceFramework.organization_id == org_id,
+            or_(ComplianceFramework.id == framework_id, ComplianceFramework.short_name == framework_id),
+        )
+        stmt = stmt.where(ComplianceControl.framework_id.in_(fw_ids))
     if family:
-        stmt = stmt.where(ComplianceControl.control_family == family)
+        # A family code ("AC") matches the control-id prefix; a family name
+        # ("Access Control") matches the stored family.
+        if len(family) <= 3 and family.isalpha():
+            stmt = stmt.where(ComplianceControl.control_id.like(f"{family.upper()}-%"))
+        else:
+            stmt = stmt.where(ComplianceControl.control_family == family)
     if status:
-        stmt = stmt.where(ComplianceControl.status == status)
+        status_aliases = {"partially": "partially_implemented", "partial": "partially_implemented"}
+        stmt = stmt.where(ComplianceControl.status == status_aliases.get(status, status))
     if baseline:
         stmt = stmt.where(ComplianceControl.baseline == baseline)
 
@@ -521,8 +550,8 @@ async def cross_map_controls(
                 and_(
                     ComplianceFramework.id == fw_id,
                     ComplianceFramework.organization_id == org_id,
-                )
-            )
+                ),
+            ),
         )
         if check.scalar_one_or_none() is None:
             raise HTTPException(
@@ -546,7 +575,7 @@ async def get_control(
         and_(
             ComplianceControl.id == control_id,
             ComplianceControl.organization_id == org_id,
-        )
+        ),
     )
     result = await db.execute(stmt)
     control = result.scalar_one_or_none()
@@ -570,7 +599,7 @@ async def update_control(
         and_(
             ComplianceControl.id == control_id,
             ComplianceControl.organization_id == org_id,
-        )
+        ),
     )
     result = await db.execute(stmt)
     control = result.scalar_one_or_none()
@@ -582,6 +611,9 @@ async def update_control(
     prev_impl = control.implementation_status
 
     control.status = req.status
+    # A person set this status: the attester records its own result in
+    # assessment_basis but no longer overwrites it.
+    control.status_source = "manual"
     if req.implementation_status is not None:
         control.implementation_status = req.implementation_status
     if req.responsible_party:
@@ -618,7 +650,7 @@ async def update_control(
                     POAM.control_id_ref == control.id,
                     POAM.organization_id == org_id,
                     POAM.status.in_(("open", "in_progress", "delayed")),
-                )
+                ),
             )
             existing_res = await db.execute(existing_q)
             existing_poam = existing_res.scalars().first()
@@ -634,7 +666,7 @@ async def update_control(
                 risk_source = (
                     getattr(control, "risk_if_not_implemented", None)
                     or {"p1": "critical", "p2": "high", "p3": "medium"}.get(
-                        (control.priority or "p2").lower(), "high"
+                        (control.priority or "p2").lower(), "high",
                     )
                 )
                 poam_risk = risk_map.get(str(risk_source).lower(), "high")
@@ -719,7 +751,7 @@ async def run_control_assessment(
         and_(
             ComplianceControl.id == control_id,
             ComplianceControl.organization_id == org_id,
-        )
+        ),
     )
     result = await db.execute(stmt)
     control = result.scalar_one_or_none()
@@ -771,7 +803,7 @@ async def list_poams(
             and_(
                 POAM.scheduled_completion_date < now,
                 POAM.status != "completed",
-            )
+            ),
         )
 
     stmt = stmt.offset(skip).limit(limit)
@@ -825,7 +857,7 @@ async def get_overdue_poams(
             POAM.organization_id == org_id,
             POAM.scheduled_completion_date < now,
             POAM.status != "completed",
-        )
+        ),
     )
     result = await db.execute(stmt)
     overdue_poams = result.scalars().all()
@@ -868,7 +900,7 @@ async def get_poam(
         and_(
             POAM.id == poam_id,
             POAM.organization_id == org_id,
-        )
+        ),
     )
     result = await db.execute(stmt)
     poam = result.scalar_one_or_none()
@@ -892,7 +924,7 @@ async def update_poam(
         and_(
             POAM.id == poam_id,
             POAM.organization_id == org_id,
-        )
+        ),
     )
     result = await db.execute(stmt)
     poam = result.scalar_one_or_none()
@@ -919,6 +951,55 @@ async def update_poam(
     return poam
 
 
+@router.delete("/poams/{poam_id}", status_code=204)
+async def delete_poam(
+    poam_id: str,
+    org_id: OrganizationId,
+    db: DatabaseSession = None,
+    current_user: AnalystUser = None,
+):
+    """Delete a POA&M item (analyst or admin), with an audit-trail row.
+
+    The control that pointed at it is unlinked first.
+    """
+    from src.audit_evidence.engine import AuditLogger
+
+    poam = (await db.execute(
+        select(POAM).where(POAM.id == poam_id, POAM.organization_id == org_id),
+    )).scalar_one_or_none()
+    if not poam:
+        raise HTTPException(status_code=404, detail="POA&M not found")
+
+    linked = (await db.execute(
+        select(ComplianceControl).where(
+            ComplianceControl.organization_id == org_id, ComplianceControl.poam_id == poam.id,
+        ),
+    )).scalars().all()
+    for control in linked:
+        control.poam_id = None
+    snapshot = {"weakness_name": poam.weakness_name, "status": poam.status, "control_id_ref": poam.control_id_ref}
+    await db.flush()
+    await db.delete(poam)
+    try:
+        await AuditLogger(db, org_id).log_event(
+            event_type="change",
+            action="poam.delete",
+            actor_type="user",
+            actor_id=str(current_user.id),
+            resource_type="POAM",
+            resource_id=poam_id,
+            description=f"POA&M {poam_id} deleted",
+            old_value=snapshot,
+            result="success",
+            risk_level="low",
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed: no delete without its audit row
+        await db.rollback()
+        logger.error("poam_delete_audit_failed", error=str(exc))
+        raise HTTPException(status_code=503, detail="Audit trail unavailable; POA&M not deleted") from exc
+    await db.commit()
+
+
 # ============================================================================
 # EVIDENCE ENDPOINTS
 # ============================================================================
@@ -936,7 +1017,7 @@ async def list_evidence(
 ):
     """List evidence with filtering."""
     stmt = select(ComplianceEvidence).where(
-        ComplianceEvidence.organization_id == org_id
+        ComplianceEvidence.organization_id == org_id,
     )
 
     if control_id_ref:
@@ -1013,7 +1094,7 @@ async def get_evidence(
         and_(
             ComplianceEvidence.id == evidence_id,
             ComplianceEvidence.organization_id == org_id,
-        )
+        ),
     )
     result = await db.execute(stmt)
     evidence = result.scalar_one_or_none()
@@ -1044,7 +1125,7 @@ async def review_evidence(
         and_(
             ComplianceEvidence.id == evidence_id,
             ComplianceEvidence.organization_id == org_id,
-        )
+        ),
     )
     result = await db.execute(stmt)
     evidence = result.scalar_one_or_none()
@@ -1075,7 +1156,7 @@ async def list_cui_markings(
 ):
     """List CUI markings."""
     stmt = select(CUIMarking).where(
-        CUIMarking.organization_id == org_id
+        CUIMarking.organization_id == org_id,
     )
 
     if active_only:
@@ -1139,7 +1220,7 @@ async def update_cui_marking(
         and_(
             CUIMarking.id == marking_id,
             CUIMarking.organization_id == org_id,
-        )
+        ),
     )
     result = await db.execute(stmt)
     marking = result.scalar_one_or_none()
@@ -1167,7 +1248,7 @@ async def audit_cui_handling(
 ):
     """CUI handling compliance audit."""
     stmt = select(CUIMarking).where(
-        CUIMarking.organization_id == org_id
+        CUIMarking.organization_id == org_id,
     )
     result = await db.execute(stmt)
     markings = result.scalars().all()
@@ -1198,7 +1279,7 @@ async def list_cisa_directives(
 ):
     """List CISA BODs and Emergency Directives."""
     stmt = select(CISADirective).where(
-        CISADirective.organization_id == org_id
+        CISADirective.organization_id == org_id,
     )
 
     if active_only:
@@ -1221,7 +1302,7 @@ async def get_cisa_directive(
         and_(
             CISADirective.directive_id == directive_id,
             CISADirective.organization_id == org_id,
-        )
+        ),
     )
     result = await db.execute(stmt)
     directive = result.scalar_one_or_none()
@@ -1244,7 +1325,7 @@ async def check_cisa_compliance(
         and_(
             or_(CISADirective.id == directive_id, CISADirective.directive_id == directive_id),
             CISADirective.organization_id == org_id,
-        )
+        ),
     )
     result = await db.execute(stmt)
     directive = result.scalar_one_or_none()
@@ -1275,7 +1356,7 @@ async def get_dashboard_stats(
     """Get compliance dashboard statistics."""
     # Frameworks
     stmt = select(ComplianceFramework).where(
-        ComplianceFramework.organization_id == org_id
+        ComplianceFramework.organization_id == org_id,
     )
     result = await db.execute(stmt)
     frameworks = result.scalars().all()
@@ -1290,7 +1371,7 @@ async def get_dashboard_stats(
 
     # Controls
     stmt = select(func.count(ComplianceControl.id)).where(
-        ComplianceControl.organization_id == org_id
+        ComplianceControl.organization_id == org_id,
     )
     result = await db.execute(stmt)
     control_count = result.scalar() or 0
@@ -1299,10 +1380,16 @@ async def get_dashboard_stats(
         and_(
             ComplianceControl.organization_id == org_id,
             ComplianceControl.status == "implemented",
-        )
+        ),
     )
     result = await db.execute(stmt)
     implemented_count = result.scalar() or 0
+    status_rows = (await db.execute(
+        select(ComplianceControl.status, func.count(ComplianceControl.id))
+        .where(ComplianceControl.organization_id == org_id)
+        .group_by(ComplianceControl.status),
+    )).all()
+    by_status = {str(s or "not_implemented"): int(n) for s, n in status_rows}
 
     # POA&Ms
     now = datetime.now(timezone.utc)
@@ -1311,7 +1398,7 @@ async def get_dashboard_stats(
             POAM.organization_id == org_id,
             POAM.status != "completed",
             POAM.scheduled_completion_date < now,
-        )
+        ),
     )
     result = await db.execute(stmt)
     overdue_poams = len(result.scalars().all())
@@ -1322,7 +1409,7 @@ async def get_dashboard_stats(
             POAM.status != "completed",
             POAM.scheduled_completion_date >= now,
             POAM.scheduled_completion_date <= now + timedelta(days=7),
-        )
+        ),
     )
     result = await db.execute(stmt)
     upcoming_poams = len(result.scalars().all())
@@ -1332,14 +1419,14 @@ async def get_dashboard_stats(
         and_(
             ComplianceAssessment.organization_id == org_id,
             ComplianceAssessment.status == "planned",
-        )
+        ),
     )
     result = await db.execute(stmt)
     upcoming_assessments = len(result.scalars().all())
 
     # CUI
     stmt = select(CUIMarking).where(
-        CUIMarking.organization_id == org_id
+        CUIMarking.organization_id == org_id,
     )
     result = await db.execute(stmt)
     cui_markings = result.scalars().all()
@@ -1351,7 +1438,7 @@ async def get_dashboard_stats(
         and_(
             CISADirective.organization_id == org_id,
             CISADirective.status == "active",
-        )
+        ),
     )
     result = await db.execute(stmt)
     active_directives = len(result.scalars().all())
@@ -1367,9 +1454,13 @@ async def get_dashboard_stats(
         "upcoming_poams": upcoming_poams,
         "upcoming_assessments": upcoming_assessments,
         "control_status_breakdown": {
+            **by_status,
             "total": control_count,
             "implemented": implemented_count,
         },
+        # Stored assessment scores of the last 90 days (the trend chart read
+        # a field the dashboard never returned).
+        "trends": await _score_history(db, org_id, None, 90),
         "active_cisa_directives": active_directives,
         "cui_assets_total": total_cui,
         "cui_assets_active": active_cui,
@@ -1385,39 +1476,45 @@ async def get_score_history(
     days: int = Query(90, ge=1, le=365),
 ):
     """Get compliance score history and trends."""
-    stmt = select(ComplianceAssessment).where(
-        and_(
-            ComplianceAssessment.organization_id == org_id,
-            ComplianceAssessment.assessment_date
-            >= datetime.now(timezone.utc) - timedelta(days=days),
-        )
-    )
+    history = await _score_history(db, org_id, framework_id, days)
+    return {
+        "history": history,
+        "period_days": days,
+        "assessment_count": len(history),
+    }
 
+
+async def _score_history(
+    db: AsyncSession, org_id: str, framework_id: Optional[str], days: int,
+) -> List[Dict[str, Any]]:
+    """Scores of the stored assessments in the window, oldest first.
+
+    Uses the score the assessment stored (``results.compliance_score``);
+    older rows without one fall back to satisfied / (satisfied + other than
+    satisfied). The previous code read ``control_count``, which the model
+    does not have, so any stored assessment made this a 500.
+    """
+    stmt = select(ComplianceAssessment).where(
+        ComplianceAssessment.organization_id == org_id,
+        ComplianceAssessment.assessment_type != "conmon",
+        ComplianceAssessment.assessment_date >= datetime.now(timezone.utc) - timedelta(days=days),
+    )
     if framework_id:
         stmt = stmt.where(ComplianceAssessment.framework_id == framework_id)
-
-    result = await db.execute(stmt)
-    assessments = result.scalars().all()
-
-    # Previous formula used `satisfied_count / findings_count` where
-    # findings_count is typically the failure count — that produced
-    # inverted scores (more failures = higher score). Use control_count
-    # when available, else satisfied+failed as the denominator.
+    stmt = stmt.order_by(ComplianceAssessment.assessment_date.asc()).limit(1000)
     history = []
-    for a in assessments:
-        denom = (a.control_count or 0) or ((a.satisfied_count or 0) + (a.findings_count or 0))
-        score = round((a.satisfied_count or 0) / denom * 100, 2) if denom > 0 else 0.0
+    for a in (await db.execute(stmt)).scalars().all():
+        results = a.results or {}
+        judged = (a.satisfied_count or 0) + (a.other_than_satisfied_count or 0)
+        stored = results.get("compliance_score")
+        score = float(stored) if stored is not None else (
+            round((a.satisfied_count or 0) / judged * 100, 2) if judged else 0.0)
         history.append({
             "date": a.assessment_date.isoformat() if a.assessment_date else None,
             "framework_id": a.framework_id,
             "score": score,
             "satisfied": a.satisfied_count or 0,
-            "failed": a.findings_count or 0,
-            "controls": a.control_count or denom,
+            "failed": a.other_than_satisfied_count or 0,
+            "controls": results.get("total_controls", judged),
         })
-
-    return {
-        "history": history,
-        "period_days": days,
-        "assessment_count": len(assessments),
-    }
+    return history

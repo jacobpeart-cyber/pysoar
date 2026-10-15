@@ -95,7 +95,10 @@ async def _run_stig_scan_async(
 
     async with async_session_factory() as session:
         benchmark = (await session.execute(
-            select(STIGBenchmark).where(STIGBenchmark.id == benchmark_id),
+            select(STIGBenchmark).where(
+                STIGBenchmark.id == benchmark_id,
+                STIGBenchmark.organization_id == org_id,
+            ),
         )).scalar_one_or_none()
 
         if not benchmark:
@@ -115,7 +118,9 @@ async def _run_stig_scan_async(
         # Platform applicability is decided per benchmark, so either every
         # rule applies or none does: a COUNT replaces loading the rules.
         rule_count = (await session.execute(
-            select(func.count(STIGRule.id)).where(STIGRule.benchmark_id_ref == benchmark_id),
+            select(func.count(STIGRule.id)).where(
+                STIGRule.benchmark_id_ref == benchmark_id, STIGRule.organization_id == org_id,
+            ),
         )).scalar_one()
         platform_ok = _platform_matches(benchmark.platform or "", agent_os)
         applicable_count = rule_count if platform_ok else 0
@@ -578,28 +583,19 @@ def scheduled_fleet_stig_sweep(self):
 
 @shared_task(bind=True, max_retries=2)
 def update_stig_benchmarks(self, org_id: str):
-    """Load built-in STIG benchmarks into the database for the given org."""
-    from src.core.database import async_session_factory
-    from src.stig.engine import STIGLibrary
+    """No built-in benchmark catalogue ships with the platform.
 
-    async def _update():
-        async with async_session_factory() as session:
-            library = STIGLibrary(session)
-            added = await library.load_builtin_benchmarks(org_id)
-            await session.commit()
-            return {
-                "task_id": self.request.id,
-                "org_id": org_id,
-                "status": "completed",
-                "benchmarks_added": added,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-
-    try:
-        return _run_async(_update())
-    except Exception as exc:
-        logger.error(f"Benchmark update task failed: {exc}")
-        raise self.retry(exc=exc, countdown=120)
+    This used to insert benchmark shells with invented rule counts. DISA
+    benchmarks are imported from their XCCDF files (POST /stig/scap/upload).
+    """
+    return {
+        "task_id": self.request.id,
+        "org_id": org_id,
+        "status": "not_implemented",
+        "reason": "no built-in STIG catalogue ships; upload DISA XCCDF content through POST /stig/scap/upload",
+        "benchmarks_added": 0,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @shared_task(bind=True, max_retries=3)
@@ -688,3 +684,69 @@ def compare_scan_baselines(self, scan_id_1: str, scan_id_2: str, org_id: str):
     except Exception as exc:
         logger.error(f"Baseline comparison task failed: {exc}")
         raise self.retry(exc=exc, countdown=60)
+
+
+# ---------------------------------------------------------------------------
+# Wave 4: results of agent ``stig_scan`` commands (beat)
+# ---------------------------------------------------------------------------
+
+STIG_RECONCILE_BATCH = 100
+MAX_STIG_RECONCILE_PER_RUN = 2_000
+
+
+async def reconcile_stig_scans_async(factory: Any = None) -> dict[str, Any]:
+    """Apply agent results to dispatched STIG scans (keyset windows, per-run cap)."""
+    from src.agents.models import AgentCommand, AgentResult
+    from src.core.database import async_session_factory
+    from src.stig.agent_scan import PENDING_STATES, reconcile_stig_scan
+    from src.stig.models import STIGScanResult
+
+    factory = factory or async_session_factory
+    totals: dict[str, Any] = {"scanned": 0, "changed": 0, "truncated": False}
+    last_id: Optional[str] = None
+    async with factory() as db:
+        while True:
+            if totals["scanned"] >= MAX_STIG_RECONCILE_PER_RUN:
+                totals["truncated"] = True
+                break
+            window = min(STIG_RECONCILE_BATCH, MAX_STIG_RECONCILE_PER_RUN - totals["scanned"])
+            stmt = select(STIGScanResult).where(
+                STIGScanResult.status.in_(PENDING_STATES),
+                STIGScanResult.command_id.is_not(None),
+            )
+            if last_id is not None:
+                stmt = stmt.where(STIGScanResult.id > last_id)
+            scans = list((await db.execute(stmt.order_by(STIGScanResult.id).limit(window))).scalars())
+            if not scans:
+                break
+            last_id = scans[-1].id
+            totals["scanned"] += len(scans)
+            command_ids = sorted({s.command_id for s in scans if s.command_id})
+            results: dict[str, Any] = {}
+            for result in (await db.execute(
+                select(AgentResult).where(AgentResult.command_id.in_(command_ids))
+                .order_by(AgentResult.reported_at.desc()),
+            )).scalars():
+                results.setdefault(result.command_id, result)
+            statuses = dict((await db.execute(
+                select(AgentCommand.id, AgentCommand.status).where(AgentCommand.id.in_(command_ids)),
+            )).all())
+            for scan in scans:
+                if await reconcile_stig_scan(
+                    db, scan, command_status=statuses.get(scan.command_id),
+                    result=results.get(scan.command_id), loaded=True,
+                ):
+                    totals["changed"] += 1
+            await db.commit()
+            db.expunge_all()
+            if len(scans) < window:
+                break
+    if totals["truncated"]:
+        logger.warning("stig_scan_reconcile_capped", cap=MAX_STIG_RECONCILE_PER_RUN)
+    return totals
+
+
+@shared_task(name="src.stig.tasks.reconcile_stig_scans")
+def reconcile_stig_scans() -> dict[str, Any]:
+    """Apply endpoint-agent ``stig_scan`` results to their scans."""
+    return _run_async(reconcile_stig_scans_async())

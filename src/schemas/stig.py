@@ -24,6 +24,7 @@ class ScanTypeEnum(str, Enum):
     SCAP = "scap"
     AUTOMATED = "automated"
     HYBRID = "hybrid"
+    AGENT = "agent"  # wave 4: whole-benchmark oscap run by an endpoint agent
 
 
 class ScanStatusEnum(str, Enum):
@@ -31,6 +32,14 @@ class ScanStatusEnum(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    # Statuses the scan code stores (they made the list response fail
+    # validation before wave 4).
+    PENDING_RESULTS = "pending_results"  # registered; awaiting an uploaded ARF
+    DISPATCHED = "dispatched"  # stig_scan command queued on an agent
+    AWAITING_APPROVAL = "awaiting_approval"
+    NOT_RUN = "not_run"  # no agent could run it; see status_reason
+    NO_AGENT = "no_agent"
+    NO_AUTOMATABLE_RULES = "no_automatable_rules"
 
 
 class BenchmarkStatusEnum(str, Enum):
@@ -116,6 +125,10 @@ class STIGScanResultBase(BaseModel):
     cat1_open: int = 0
     cat2_open: int = 0
     cat3_open: int = 0
+    # Wave 4: the agent / command a scan ran through and why it did not run.
+    agent_id: Optional[str] = None
+    command_id: Optional[str] = None
+    status_reason: Optional[str] = None
 
 
 class STIGScanResultResponse(STIGScanResultBase):
@@ -300,6 +313,9 @@ class STIGDashboardStats(BaseModel):
     compliance_by_benchmark: list[dict[str, Any]] = []
     findings_by_severity: dict[str, int] = {}
     recent_scans: list[dict[str, Any]] = []
+    # Wave 4: scans that executed nothing, by status.
+    scans_not_run: int = 0
+    scans_pending: int = 0
 
 
 class RuleSearchResponse(BaseModel):
