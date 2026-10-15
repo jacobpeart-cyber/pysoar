@@ -77,7 +77,9 @@ async def test_controls_read_the_tenants_rows(
 
     other = await client.get(f"{BASE}/controls", params={"family": "AC", "limit": 500}, headers=org_b_headers)
     assert other.status_code == 200
-    assert {c["implementation_status"] for c in other.json()["controls"]} == {"not_assessed"}
+    # Org B has no catalogue: an honest empty state (wave 5: reads never seed).
+    assert other.json()["controls"] == [] and other.json()["catalog_seeded"] is False
+    assert own.json()["catalog_seeded"] is True
 
 
 async def test_readiness_is_computed_and_says_what_was_not_assessed(

@@ -225,9 +225,6 @@ celery_app.conf.task_annotations = {
     # src/tickethub/rules.py); the short wall clock keeps one wedged run
     # (e.g. a hung notification webhook) from overlapping many successors.
     "tickethub.evaluate_automation_rules": {"soft_time_limit": 240, "time_limit": 300},
-    "src.exposure.tasks.run_vuln_scan": dict(_HEAVY_SWEEP_LIMITS),
-    "src.exposure.tasks.import_scanner_results": dict(_HEAVY_SWEEP_LIMITS),
-    "src.exposure.tasks.calculate_risk_scores": dict(_HEAVY_SWEEP_LIMITS),
     "src.exposure.tasks.check_sla_breaches": dict(_HEAVY_SWEEP_LIMITS),
     "src.exposure.tasks.sync_kev_database": dict(_HEAVY_SWEEP_LIMITS),
     # All-org retention purge of llm_call_logs / agent_run_transcripts:
@@ -267,6 +264,8 @@ celery_app.conf.task_annotations = {
     # requests each).
     "src.dlp.tasks.dlp_content_scan_sweep": {"soft_time_limit": 600, "time_limit": 660},
     "src.privacy.tasks.privacy_dsr_deadline_sweep": {"soft_time_limit": 240, "time_limit": 290},
+    # Wave 5 (W5-C): every 5 minutes, 500 orgs x 2,000 sessions at most.
+    "src.zerotrust.tasks.continuous_session_evaluation": {"soft_time_limit": 240, "time_limit": 290},
 }
 
 # Beat schedule for periodic tasks
@@ -579,5 +578,12 @@ celery_app.conf.beat_schedule = {
     "privacy-dsr-deadline-sweep": {
         "task": "src.privacy.tasks.privacy_dsr_deadline_sweep",
         "schedule": crontab(minute=25),  # Hourly at :25
+    },
+    # --- Wave 5 (W5-C): Zero Trust continuous verification ---
+    # Sessions allowed in the last 8 h re-scored; a material risk increase
+    # records a new decision and pushes it into the session-gate cache.
+    "zerotrust-continuous-session-evaluation": {
+        "task": "src.zerotrust.tasks.continuous_session_evaluation",
+        "schedule": crontab(minute="*/5"),
     },
 }

@@ -518,8 +518,18 @@ async def compliance_attestation_sweep_async(factory: Any = None) -> Dict[str, A
         org_ids = org_ids[:MAX_ATTEST_ORGS_PER_RUN]
         totals["truncated"] = True
 
+    from src.fedramp.generator import FedRAMPGenerator
+
+    fedramp = FedRAMPGenerator()
+    totals["fedramp_catalogs_seeded"] = 0
     for org_id in org_ids:
         async with factory() as db:
+            # The FedRAMP catalogue is seeded here (or by the admin action
+            # POST /fedramp/catalog/seed), never by a page read.
+            seeded = await fedramp.seed_catalog(db, org_id)
+            if seeded["seeded"]:
+                await db.commit()
+                totals["fedramp_catalogs_seeded"] += 1
             framework_ids = list((await db.execute(
                 select(ComplianceFramework.id).where(
                     ComplianceFramework.organization_id == org_id,

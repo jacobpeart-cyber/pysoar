@@ -55,7 +55,9 @@ class OTAsset(BaseModel):
 
     ip_address: Mapped[Optional[str]] = mapped_column(String(45), index=True)
     mac_address: Mapped[Optional[str]] = mapped_column(String(17))
-    serial_number: Mapped[Optional[str]] = mapped_column(String(255), unique=True)
+    # Unique per organisation (uq_org_serial below; migration 035 dropped
+    # the platform-wide uniqueness).
+    serial_number: Mapped[Optional[str]] = mapped_column(String(255))
 
     purdue_level: Mapped[str] = mapped_column(
         String(50), nullable=False, index=True

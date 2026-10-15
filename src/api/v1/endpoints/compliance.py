@@ -1133,6 +1133,12 @@ async def review_evidence(
     if not evidence:
         raise HTTPException(status_code=404, detail="Evidence not found")
 
+    if review_status == "approved":
+        # Separation of duties: the uploader cannot approve their own evidence.
+        from src.compliance.separation_of_duties import ensure_not_uploader
+
+        ensure_not_uploader(evidence, current_user)
+
     evidence.review_status = review_status
     evidence.reviewed_by = str(current_user.id)
     evidence.reviewed_at = datetime.now(timezone.utc)

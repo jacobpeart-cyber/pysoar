@@ -1,7 +1,7 @@
 """Wave 4 (W4-D): FedRAMP pages, ConMon, readiness and evidence collection.
 
-FedRAMP reads the real control table (seeded on demand from the Moderate
-catalogue); recommendations come from the tenant's gaps; the SSP and the
+FedRAMP reads the real control table (seeded from the Moderate catalogue by
+the admin action or the attestation sweep, never by a read); recommendations come from the tenant's gaps; the SSP and the
 IRP / CMP / ConMon plan are built from stored facts with placeholders and no
 invented architecture; ConMon checks are computed (no data = not_assessed),
 a run is stored with an audit row and its time is ``lastRun``; readiness
@@ -65,13 +65,45 @@ async def _framework(db: AsyncSession, org_id: str, codes: dict[str, str], short
 # ---------------------------------------------------------------------------
 
 
-async def test_controls_seed_the_real_catalogue_when_missing(
-    client: AsyncClient, db_session: AsyncSession, org_a, org_a_headers,
+async def test_reads_never_seed_and_the_admin_action_seeds_the_real_catalogue(
+    client: AsyncClient, db_session: AsyncSession, org_a, org_a_headers, org_a_admin_headers,
 ) -> None:
+    """Wave 5: GETs used to seed the catalogue on read. Now a read of an
+    unseeded organisation is an honest empty state (``catalog_seeded: false``
+    with a hint) and writes nothing; the admin action seeds (audited)."""
     org_id = org_a.id
+
+    async def _frameworks() -> int:
+        return (await db_session.execute(select(func.count(ComplianceFramework.id)).where(
+            ComplianceFramework.organization_id == org_id))).scalar()
+
+    for path in ("controls", "readiness", "evidence/status", "ssp/generate", "irp/generate"):
+        empty = await client.get(f"{FED}/{path}", headers=org_a_headers)
+        assert empty.status_code == 200, (path, empty.text)
+        assert empty.json()["catalog_seeded"] is False, path
+        assert "catalog/seed" in empty.json()["catalog_hint"], path
+    controls_body = (await client.get(f"{FED}/controls", headers=org_a_headers)).json()
+    assert controls_body["total"] == 0 and controls_body["controls"] == []
+    readiness = (await client.get(f"{FED}/readiness", headers=org_a_headers)).json()
+    assert readiness["assessment_status"] == "not_assessed"
+    assert await _frameworks() == 0
+
+    refused = await client.post(f"{FED}/catalog/seed", headers=org_a_headers)
+    assert refused.status_code == 403, refused.text
+    seeded = await client.post(f"{FED}/catalog/seed", headers=org_a_admin_headers)
+    assert seeded.status_code == 200, seeded.text
+    assert seeded.json()["seeded"] is True
+    assert seeded.json()["controls"] == len(FEDRAMP_MODERATE_CONTROLS)
+    again = (await client.post(f"{FED}/catalog/seed", headers=org_a_admin_headers)).json()
+    assert again["seeded"] is False and again["already_seeded"] is True
+    audit = (await db_session.execute(select(func.count(AuditLog.id)).where(
+        AuditLog.organization_id == org_id, AuditLog.action == "fedramp_catalog_seed"))).scalar()
+    assert audit == 2
+
     resp = await client.get(f"{FED}/controls", params={"limit": 500}, headers=org_a_headers)
     assert resp.status_code == 200, resp.text
     body = resp.json()
+    assert body["catalog_seeded"] is True
     assert body["total"] == len(FEDRAMP_MODERATE_CONTROLS)
     # Seeded rows are not an assessment.
     assert {c["implementation_status"] for c in body["controls"]} == {"not_assessed"}

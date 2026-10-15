@@ -2,8 +2,10 @@
 FedRAMP document and report generator (wave 4).
 
 Control status comes from the organisation's ``compliance_controls`` rows of
-its ``fedramp_moderate`` framework (seeded on demand from the real Moderate
-catalogue when missing). The SSP, IRP, CMP and ConMon plan are built from the
+its ``fedramp_moderate`` framework. Reads never seed it: the catalogue is
+seeded by the admin action ``POST /fedramp/catalog/seed`` or the daily
+compliance attestation sweep, and until then the routes report
+``catalog_seeded: false``. The SSP, IRP, CMP and ConMon plan are built from the
 organisation's stored system facts (``src.compliance.system_facts``) and
 plan inputs read from its rows (playbooks, incidents, STIG benchmarks and
 scans, the beat schedule, the last ConMon cycle). What the platform does not
@@ -50,17 +52,62 @@ class FedRAMPGenerator:
     #: Stored statuses that count as a gap in the readiness report.
     GAP_STATUSES = ("planned", "partially_implemented", "not_implemented", "non_compliant")
 
+    # ------------------------------------------------ Catalogue seeding
+    async def catalog_seeded(self, db: Any, organization_id: str) -> bool:
+        """Whether the organisation has a FedRAMP framework (any baseline)."""
+        from sqlalchemy import select as sa_select
+
+        from src.compliance.engine import FEDRAMP_SHORT_NAME_PREFIX
+        from src.compliance.models import ComplianceFramework
+
+        existing = (await db.execute(
+            sa_select(ComplianceFramework.id).where(
+                ComplianceFramework.organization_id == organization_id,
+                ComplianceFramework.short_name.like(f"{FEDRAMP_SHORT_NAME_PREFIX}%"),
+            ).limit(1),
+        )).scalar_one_or_none()
+        return existing is not None
+
+    async def seed_catalog(self, db: Any, organization_id: str) -> Dict[str, Any]:
+        """Seed the organisation's ``fedramp_moderate`` framework from the real
+        Moderate catalogue when it has none (idempotent; caller commits).
+
+        Seeded rows are not an assessment: they read as ``not_assessed``
+        until a person or the attester sets a status.
+        """
+        from sqlalchemy import func as sa_func
+        from sqlalchemy import select as sa_select
+
+        from src.compliance.models import ComplianceControl
+        from src.compliance.seeder import ensure_framework
+
+        already = await self.catalog_seeded(db, organization_id)
+        framework = None if already else await ensure_framework(db, organization_id, FEDRAMP_FRAMEWORK)
+        controls = 0
+        if framework is not None:
+            controls = int((await db.execute(
+                sa_select(sa_func.count(ComplianceControl.id)).where(
+                    ComplianceControl.framework_id == framework.id,
+                    ComplianceControl.organization_id == organization_id,
+                )
+            )).scalar() or 0)
+        return {
+            "seeded": framework is not None,
+            "already_seeded": already,
+            "framework_id": framework.id if framework is not None else None,
+            "controls": controls,
+        }
+
     # ------------------------------------------------ Control Status Query
     async def get_control_implementation_status(
         self,
         db: Any,
         organization_id: Optional[str] = None,
-        seed_if_missing: bool = True,
     ) -> List[Dict[str, Any]]:
         """The Moderate baseline enriched with the organisation's control rows.
 
-        The organisation's ``fedramp_moderate`` framework is seeded from the
-        real catalogue when it does not exist yet (``seed_if_missing``).
+        Read-only: nothing is seeded here (see ``seed_catalog``). Baseline
+        controls without a row of the organisation are ``not_assessed``.
         """
         from sqlalchemy import select as sa_select
 
@@ -70,18 +117,6 @@ class FedRAMPGenerator:
             ComplianceEvidence,
             ComplianceFramework,
         )
-        from src.compliance.seeder import ensure_framework
-
-        if seed_if_missing and organization_id:
-            existing = (await db.execute(
-                sa_select(ComplianceFramework.id).where(
-                    ComplianceFramework.organization_id == organization_id,
-                    ComplianceFramework.short_name.like(f"{FEDRAMP_SHORT_NAME_PREFIX}%"),
-                ).limit(1)
-            )).scalar_one_or_none()
-            if existing is None:
-                await ensure_framework(db, organization_id, FEDRAMP_FRAMEWORK)
-                await db.commit()
 
         rows = (
             await db.execute(

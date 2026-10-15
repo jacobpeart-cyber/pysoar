@@ -6,6 +6,7 @@ Plan (SSP) generation, readiness assessments, POA&M reporting, and
 evidence tracking.
 """
 
+import json
 from datetime import datetime
 from typing import Annotated, Any, Dict, List, Optional
 
@@ -44,6 +45,60 @@ def _org_name(requested: Optional[str], facts: Dict[str, Any]) -> str:
     return requested or str((facts.get("organization") or {}).get("name") or "")
 
 
+#: Shown by every read while the organisation has no FedRAMP catalogue.
+CATALOG_NOT_SEEDED_HINT = (
+    "The FedRAMP Moderate control catalogue is not seeded for this organisation. An admin can seed it "
+    "with POST /fedramp/catalog/seed; the daily compliance attestation sweep also seeds it."
+)
+
+
+async def _controls_if_seeded(db: AsyncSession, org_id: str) -> tuple[List[Dict[str, Any]], bool]:
+    """The organisation's control status, or ``([], False)`` when its catalogue
+    is not seeded. Reads never seed (wave 5: GETs used to write rows)."""
+    if not await _generator.catalog_seeded(db, org_id):
+        return [], False
+    return await _generator.get_control_implementation_status(db, organization_id=org_id), True
+
+
+def _with_seed_state(body: Dict[str, Any], seeded: bool) -> Dict[str, Any]:
+    body["catalog_seeded"] = seeded
+    if not seeded:
+        body["catalog_hint"] = CATALOG_NOT_SEEDED_HINT
+    return body
+
+
+@router.post("/catalog/seed")
+async def seed_fedramp_catalog(
+    org_id: OrganizationId,
+    current_user: AdminRoleUser,
+    db: DatabaseSession = None,
+) -> Dict[str, Any]:
+    """Seed the organisation's FedRAMP Moderate control catalogue (admin only).
+
+    Idempotent: an organisation that already has a FedRAMP framework gets
+    ``seeded: false, already_seeded: true``. Seeded controls read as
+    ``not_assessed`` until a person or the attester sets a status. Audited.
+    """
+    from src.models.audit import AuditLog
+
+    result = await _generator.seed_catalog(db, org_id)
+    db.add(AuditLog(
+        user_id=str(current_user.id),
+        organization_id=org_id,
+        action="fedramp_catalog_seed",
+        resource_type="compliance_framework",
+        resource_id=result.get("framework_id"),
+        description=(
+            f"FedRAMP Moderate catalogue seeded ({result['controls']} controls)"
+            if result["seeded"] else "FedRAMP catalogue already seeded; nothing changed"
+        ),
+        new_value=json.dumps(result),
+        success=True,
+    ))
+    await db.commit()
+    return _with_seed_state(dict(result), True)
+
+
 # ============================================================================
 # Controls
 # ============================================================================
@@ -73,9 +128,7 @@ async def list_fedramp_controls(
     status from the database when available.
     """
     try:
-        controls = await _generator.get_control_implementation_status(
-            db, organization_id=org_id
-        )
+        controls, seeded = await _controls_if_seeded(db, org_id)
 
         # Apply filters
         if family:
@@ -96,14 +149,14 @@ async def list_fedramp_controls(
         total = len(controls)
         paginated = controls[skip : skip + limit]
 
-        return {
+        return _with_seed_state({
             "total": total,
             "skip": skip,
             "limit": limit,
             "baseline": "FedRAMP Moderate",
             "families": list(FAMILY_CODES.keys()),
             "controls": paginated,
-        }
+        }, seeded)
     except Exception as exc:
         logger.error(f"Error listing FedRAMP controls: {exc}")
         raise HTTPException(
@@ -129,11 +182,12 @@ async def fedramp_readiness(
     achieving FedRAMP Moderate authorization.
     """
     try:
-        controls = await _generator.get_control_implementation_status(
-            db, organization_id=org_id
-        )
+        controls, seeded = await _controls_if_seeded(db, org_id)
         report = _generator.generate_readiness_report(controls)
-        return report
+        if not seeded:
+            # Nothing to assess yet: no score is claimed from an empty table.
+            report["assessment_status"] = "not_assessed"
+        return _with_seed_state(report, seeded)
     except Exception as exc:
         logger.error(f"Error generating readiness report: {exc}")
         raise HTTPException(
@@ -160,12 +214,10 @@ async def generate_ssp(
     and includes all control family sections with implementation narratives.
     """
     try:
-        controls = await _generator.get_control_implementation_status(
-            db, organization_id=org_id
-        )
+        controls, seeded = await _controls_if_seeded(db, org_id)
         facts = await collect_system_facts(db, org_id)
         ssp = _generator.generate_ssp(_org_name(org_name, facts), system_name, controls, facts)
-        return ssp
+        return _with_seed_state(ssp, seeded)
     except Exception as exc:
         logger.error(f"Error generating SSP: {exc}")
         raise HTTPException(
@@ -188,11 +240,11 @@ async def export_ssp(
     it used to name a route that does not exist).
     """
     try:
-        controls = await _generator.get_control_implementation_status(
-            db, organization_id=org_id
-        )
+        controls, seeded = await _controls_if_seeded(db, org_id)
         facts = await collect_system_facts(db, org_id)
-        ssp = _generator.generate_ssp(_org_name(org_name, facts), system_name, controls, facts)
+        ssp = _with_seed_state(
+            _generator.generate_ssp(_org_name(org_name, facts), system_name, controls, facts), seeded,
+        )
 
         timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         filename = f"SSP_{system_name.replace(' ', '_')}_{timestamp}.json"
@@ -205,6 +257,7 @@ async def export_ssp(
             # No download route exists; the document is in the response.
             "download_url": None,
             "document": ssp,
+            "catalog_seeded": seeded,
         }
     except Exception as exc:
         logger.error(f"Error exporting SSP: {exc}")
@@ -233,13 +286,11 @@ async def generate_irp(
     Moderate baseline with per-tenant implementation status.
     """
     try:
-        controls = await _generator.get_control_implementation_status(
-            db, organization_id=org_id
-        )
+        controls, seeded = await _controls_if_seeded(db, org_id)
         facts = await collect_system_facts(db, org_id)
         inputs = await _generator.collect_plan_inputs(db, org_id)
         doc = _generator.generate_irp(_org_name(org_name, facts), system_name, controls, facts, inputs)
-        return doc
+        return _with_seed_state(doc, seeded)
     except Exception as exc:
         logger.error(f"Error generating IRP: {exc}")
         raise HTTPException(
@@ -257,13 +308,11 @@ async def generate_cmp(
 ) -> Dict[str, Any]:
     """Generate a FedRAMP Configuration Management Plan (CM control family)."""
     try:
-        controls = await _generator.get_control_implementation_status(
-            db, organization_id=org_id
-        )
+        controls, seeded = await _controls_if_seeded(db, org_id)
         facts = await collect_system_facts(db, org_id)
         inputs = await _generator.collect_plan_inputs(db, org_id)
         doc = _generator.generate_cmp(_org_name(org_name, facts), system_name, controls, facts, inputs)
-        return doc
+        return _with_seed_state(doc, seeded)
     except Exception as exc:
         logger.error(f"Error generating CMP: {exc}")
         raise HTTPException(
@@ -281,13 +330,11 @@ async def generate_conmon_plan(
 ) -> Dict[str, Any]:
     """Generate a FedRAMP Continuous Monitoring Plan (CA and SI control families)."""
     try:
-        controls = await _generator.get_control_implementation_status(
-            db, organization_id=org_id
-        )
+        controls, seeded = await _controls_if_seeded(db, org_id)
         facts = await collect_system_facts(db, org_id)
         inputs = await _generator.collect_plan_inputs(db, org_id)
         doc = _generator.generate_conmon_plan(_org_name(org_name, facts), system_name, controls, facts, inputs)
-        return doc
+        return _with_seed_state(doc, seeded)
     except Exception as exc:
         logger.error(f"Error generating ConMon Plan: {exc}")
         raise HTTPException(
@@ -382,9 +429,7 @@ async def evidence_status(
     an overall evidence-collection percentage.
     """
     try:
-        controls = await _generator.get_control_implementation_status(
-            db, organization_id=org_id
-        )
+        controls, seeded = await _controls_if_seeded(db, org_id)
 
         family_evidence: Dict[str, Dict[str, Any]] = {}
         for ctrl in controls:
@@ -420,13 +465,13 @@ async def evidence_status(
             else 0.0
         )
 
-        return {
+        return _with_seed_state({
             "generated_at": datetime.utcnow().isoformat() + "Z",
             "overall_evidence_coverage_pct": overall_pct,
             "total_controls": total_controls,
             "controls_with_evidence": total_with_evidence,
             "families": list(family_evidence.values()),
-        }
+        }, seeded)
     except Exception as exc:
         logger.error(f"Error generating evidence status: {exc}")
         raise HTTPException(

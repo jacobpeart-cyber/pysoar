@@ -17,8 +17,9 @@ committed once at the very end:
   daily ``supplychain_cross_org_sweep``.
 * deception: ``reconcile_honeypot_dispatches``.
 * playbooks: the every-minute ``check_scheduled_playbooks`` sweep.
-* exposure: ``run_vuln_scan``, ``import_scanner_results``,
-  ``calculate_risk_scores``, ``check_sla_breaches``, ``sync_kev_database``.
+* exposure: ``check_sla_breaches``, ``sync_kev_database`` (wave 5 deleted
+  ``run_vuln_scan``, ``import_scanner_results`` and
+  ``calculate_risk_scores``, which wrote without scanning).
 
 Each test seeds tens of thousands of synthetic rows (synthetic rows live
 only here, never in the repo) with Core executemany, runs the real task
@@ -129,88 +130,6 @@ async def _count(db: AsyncSession, stmt: Any) -> int:
 
 
 # ---------------------------------------------------------------------------
-# exposure: calculate_risk_scores
-# ---------------------------------------------------------------------------
-SEEDED_VULNS = 12_000
-
-
-@pytest.mark.asyncio
-async def test_calculate_risk_scores_windows_vulns_and_never_loads_instances(
-    db_session: AsyncSession, recorder: StatementRecorder, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    await _seed_orgs(db_session, ORG)
-    now = _now()
-    severities = ["critical", "high", "medium", "low"]
-    maturities = ["none", "poc"]
-    vulns = [
-        {
-            "id": f"v-{i:06d}",
-            "cve_id": f"CVE-2026-{i:05d}",
-            "title": f"synthetic vuln {i}",
-            "organization_id": ORG,
-            "severity": severities[i % 4],
-            "exploit_maturity": maturities[i % 2],
-            "kev_listed": i % 5 == 0,
-            "created_at": now,
-            "updated_at": now,
-        }
-        for i in range(SEEDED_VULNS)
-    ]
-    await _bulk_insert(db_session, Vulnerability, vulns)
-    await _bulk_insert(
-        db_session,
-        VulnerabilityInstance,
-        [
-            {
-                "id": _uid(),
-                "vulnerability_id": v["id"],
-                "organization_id": ORG,
-                "status": "open",
-                "created_at": now,
-                "updated_at": now,
-            }
-            for v in vulns
-            for _ in range(2)
-        ],
-    )
-    _reset(recorder)
-
-    result, peak = await _measure(exposure_tasks._calculate_risk_scores_async(ORG))
-
-    assert result == {"scored": 2 * SEEDED_VULNS, "truncated": False}
-    assert peak < PEAK_LIMIT_BYTES
-    _assert_bounded(recorder, "vulnerabilities", exposure_tasks.VULN_BATCH_SIZE)
-    # Instances are only ever UPDATEd in bulk, never SELECTed.
-    assert recorder.for_table("vulnerability_instances") == []
-    assert recorder.commits >= math.ceil(SEEDED_VULNS / exposure_tasks.VULN_BATCH_SIZE)
-
-    # v-000000: critical (100) + none (0) + KEV (15)
-    db_session.expire_all()
-    scores = (
-        await db_session.execute(
-            select(VulnerabilityInstance.risk_score).where(
-                VulnerabilityInstance.vulnerability_id == "v-000000",
-            ),
-        )
-    ).scalars().all()
-    assert [float(s) for s in scores] == [115.0, 115.0]
-    # v-000001: high (75) + poc (5)
-    s1 = (
-        await db_session.execute(
-            select(VulnerabilityInstance.risk_score)
-            .where(VulnerabilityInstance.vulnerability_id == "v-000001")
-            .limit(1),
-        )
-    ).scalar_one()
-    assert float(s1) == 80.0
-
-    # Per-run cap: compared against the window actually requested.
-    monkeypatch.setattr(exposure_tasks, "MAX_RISK_SCORE_VULNS_PER_RUN", 2_500)
-    capped = await exposure_tasks._calculate_risk_scores_async(ORG)
-    assert capped == {"scored": 5_000, "truncated": True}
-
-
-# ---------------------------------------------------------------------------
 # exposure: check_sla_breaches
 # ---------------------------------------------------------------------------
 SEEDED_INSTANCES = 20_000
@@ -275,68 +194,6 @@ async def test_check_sla_breaches_is_windowed_and_bulk_updates(
     monkeypatch.setattr(exposure_tasks, "MAX_SLA_INSTANCES_PER_RUN", 1_500)
     again = await exposure_tasks._check_sla_breaches_async(ORG)
     assert again == {"breached_count": 0, "breached_instances": [], "truncated": True}
-
-
-# ---------------------------------------------------------------------------
-# exposure: run_vuln_scan + import_scanner_results
-# ---------------------------------------------------------------------------
-@pytest.mark.asyncio
-async def test_run_vuln_scan_and_import_scanner_results_are_windowed(
-    db_session: AsyncSession, recorder: StatementRecorder, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    await _seed_orgs(db_session, ORG)
-    now = _now()
-    past = (now - timedelta(hours=1)).isoformat()
-    future = (now + timedelta(days=2)).isoformat()
-    profiles = [
-        {
-            "id": _uid(),
-            "name": f"profile {i}",
-            "scanner_type": "nessus",
-            "organization_id": ORG,
-            "enabled": i < 20_000,
-            "next_scan_date": None if i % 4 == 0 else (past if i % 2 == 0 else future),
-            "created_at": now,
-            "updated_at": now,
-        }
-        for i in range(21_000)
-    ]
-    await _bulk_insert(db_session, ScanProfile, profiles)
-    scans = [
-        {
-            "id": _uid(),
-            "scan_type": "vulnerability",
-            "scan_name": f"scan {i}",
-            "organization_id": ORG,
-            "status": "pending" if i < 15_000 else "completed",
-            "created_at": now,
-            "updated_at": now,
-        }
-        for i in range(17_000)
-    ]
-    await _bulk_insert(db_session, ExposureScan, scans)
-    _reset(recorder)
-
-    vs = await exposure_tasks._run_vuln_scan_async(ORG)
-    assert vs == {"processed": 10_000, "truncated": False}
-    _assert_bounded(recorder, "scan_profiles", exposure_tasks.VULN_BATCH_SIZE)
-    assert recorder.commits >= 20
-
-    # Second run: everything was pushed a day out.
-    assert await exposure_tasks._run_vuln_scan_async(ORG) == {"processed": 0, "truncated": False}
-    monkeypatch.setattr(exposure_tasks, "MAX_SCAN_PROFILES_PER_RUN", 3_000)
-    assert (await exposure_tasks._run_vuln_scan_async(ORG))["truncated"] is True
-
-    _reset(recorder)
-    imp = await exposure_tasks._import_scanner_results_async(ORG)
-    assert imp == {"processed": 15_000, "errors": 0, "truncated": False}
-    _assert_bounded(recorder, "exposure_scans", exposure_tasks.VULN_BATCH_SIZE)
-    assert recorder.commits >= 15
-    db_session.expire_all()
-    assert await _count(
-        db_session,
-        select(func.count(ExposureScan.id)).where(ExposureScan.status == "pending"),
-    ) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1286,9 +1143,6 @@ ROUND2_HEAVY_TASKS = (
     "src.darkweb.tasks.threat_correlation",
     "deception.reconcile_honeypot_dispatches",
     "playbooks.check_scheduled_playbooks",
-    "src.exposure.tasks.run_vuln_scan",
-    "src.exposure.tasks.import_scanner_results",
-    "src.exposure.tasks.calculate_risk_scores",
     "src.exposure.tasks.check_sla_breaches",
     "src.exposure.tasks.sync_kev_database",
 )

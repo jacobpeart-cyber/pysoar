@@ -1199,7 +1199,7 @@ async def create_rule(
             db.add(rule)
             await db.flush()
     except IntegrityError as exc:
-        # detection_rules.name is unique across the platform.
+        # detection_rules.name is unique per organisation (migration 035).
         raise _error(
             status.HTTP_409_CONFLICT, "rule_name_conflict", "a detection rule with this name already exists"
         ) from exc
@@ -1540,7 +1540,7 @@ async def create_source(
             db.add(source)
             await db.flush()
     except IntegrityError as exc:
-        # siem_data_sources.name is unique across the platform.
+        # siem_data_sources.name is unique per organisation (migration 035).
         raise _error(
             status.HTTP_409_CONFLICT, "source_name_conflict", "a data source with this name already exists"
         ) from exc

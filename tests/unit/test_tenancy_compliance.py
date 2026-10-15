@@ -281,9 +281,16 @@ async def test_report_and_ssp_gets_do_not_run_the_attester(
 
 
 async def test_evidence_review_records_the_session_user(
-    client: AsyncClient, db_session: AsyncSession, org_a, org_a_admin, org_a_admin_headers: dict[str, str],
+    client: AsyncClient, db_session: AsyncSession, org_a, org_a_admin_headers: dict[str, str],
 ) -> None:
-    admin_id = org_a_admin.id
+    """The reviewer is the session user, and (wave 5, separation of duties)
+    the admin who uploaded the evidence cannot approve it: a second admin
+    must. The old version of this test had the uploader approve."""
+    from tests.helpers.tenancy import bearer, make_user
+
+    second_admin = await make_user(db_session, role="admin", organization_id=org_a.id, label="admin-a-second")
+    second_admin_id = second_admin.id
+    second_headers = bearer(second_admin)
     _, controls = await _seed_framework(db_session, org_a.id)
     created = await client.post(
         f"{BASE}/evidence",
@@ -291,13 +298,22 @@ async def test_evidence_review_records_the_session_user(
         headers=org_a_admin_headers,
     )
     evidence_id = created.json()["id"]
+    own = await client.put(
+        f"{BASE}/evidence/{evidence_id}/review",
+        params={"review_status": "approved"},
+        headers=org_a_admin_headers,
+    )
+    assert own.status_code == 409, own.text
+    assert own.json()["detail"]["error"] == "separation_of_duties"
+
     resp = await client.put(
         f"{BASE}/evidence/{evidence_id}/review",
         params={"review_status": "approved", "reviewed_by": "someone-else"},
-        headers=org_a_admin_headers,
+        headers=second_headers,
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["reviewed_by"] == str(admin_id)
+    assert resp.json()["reviewed_by"] == str(second_admin_id)
+    assert resp.json()["review_status"] == "approved"
 
 
 async def test_overdue_poams_only_from_own_tenant(

@@ -1,8 +1,10 @@
 """
 Celery tasks for Continuous Threat Exposure Management (CTEM)
 
-Asynchronous background tasks for asset discovery, vulnerability scanning,
-risk calculation, and exposure reporting.
+Background tasks for asset discovery, attack-surface change detection, SLA
+breach tracking, the CISA KEV sync, daily exposure snapshots and exposure
+reporting. Nothing here scans: vulnerability instances arrive by scanner
+import (src/vulnmgmt).
 """
 
 import asyncio
@@ -316,337 +318,30 @@ def run_asset_discovery(self, organization_id: str | None = None, discovery_type
 # --------------------------------------------------------------------------
 # Memory bounds for the on-demand vulnerability-management tasks
 # --------------------------------------------------------------------------
-# run_vuln_scan / import_scanner_results / calculate_risk_scores /
-# check_sla_breaches used to load every matching scan_profiles /
-# exposure_scans / vulnerabilities / vulnerability_instances row as a full
-# ORM object with one `.scalars().all()` and commit once at the end
-# (calculate_risk_scores additionally loaded every instance of every CVE as
-# ORM objects, one SELECT per CVE). sync_kev_database ran one SELECT per KEV
-# entry and held every new indicator in one session.
+# check_sla_breaches used to load every matching vulnerability_instances row
+# as a full ORM object with one `.scalars().all()` and commit once at the
+# end; sync_kev_database ran one SELECT per KEV entry and held every new
+# indicator in one session.
 #
 # Each task now walks its table in keyset windows of VULN_BATCH_SIZE on the
 # primary key, selects only the columns it reads, writes with bulk UPDATEs
 # by id list, and commits + expunges per window. Every per-run cap that
 # fires sets ``truncated`` in the result; the remainder is picked up by the
 # next run.
+#
+# Wave 5 (W5-C) deleted run_vuln_scan, import_scanner_results and
+# calculate_risk_scores: they wrote without scanning (stamped scan profiles
+# as executed, flipped pending scans to completed, and overwrote instance
+# risk scores from a severity table). Vulnerability instances come from
+# scanner imports (src/vulnmgmt) and are rescored by
+# src.vulnmgmt.tasks.refresh_instance_scores; exposure risk by
+# snapshot_exposure_daily.
 VULN_BATCH_SIZE = 1_000
-MAX_SCAN_PROFILES_PER_RUN = 50_000
-MAX_SCANNER_IMPORTS_PER_RUN = 50_000
-MAX_RISK_SCORE_VULNS_PER_RUN = 100_000
 MAX_SLA_INSTANCES_PER_RUN = 200_000
 MAX_KEV_ENTRIES_PER_RUN = 50_000
 
 # How many breached instance ids the SLA result carries (unchanged: 100).
 _SLA_BREACHED_IDS_IN_RESULT = 100
-
-_SEVERITY_BASE = {
-    "critical": 100.0,
-    "high": 75.0,
-    "medium": 50.0,
-    "low": 25.0,
-    "informational": 10.0,
-}
-_EXPLOIT_BONUS = {
-    "none": 0.0,
-    "poc": 5.0,
-    "functional": 10.0,
-    "weaponized": 20.0,
-}
-
-
-def _scan_profile_due(next_scan_date: str | None, now: datetime) -> bool:
-    """Same due rule as before: missing or unparseable dates are due."""
-    if not next_scan_date:
-        return True
-    try:
-        nsd = datetime.fromisoformat(next_scan_date)
-    except ValueError:
-        return True
-    if nsd.tzinfo is None:
-        nsd = nsd.replace(tzinfo=timezone.utc)
-    return nsd <= now
-
-
-def _vuln_risk_score(
-    severity: str | None, exploit_maturity: str | None, kev_listed: bool | None,
-) -> float:
-    """Severity baseline + exploit-maturity bonus (+15 for KEV), capped at 150."""
-    base = _SEVERITY_BASE.get((severity or "").lower(), 25.0)
-    bonus = _EXPLOIT_BONUS.get((exploit_maturity or "none").lower(), 0.0)
-    if kev_listed:
-        bonus += 15.0
-    return min(base + bonus, 150.0)
-
-
-async def _run_vuln_scan_async(organization_id: str | None = None) -> dict[str, Any]:
-    """Mark every due, enabled ScanProfile as executed (windowed)."""
-    from src.vulnmgmt.models import ScanProfile
-
-    now = datetime.now(timezone.utc)
-    now_iso = now.isoformat()
-    next_iso = (now + timedelta(days=1)).isoformat()
-    processed = 0
-    scanned = 0
-    cap_hit = False
-    last_id: str | None = None
-
-    async with async_session_factory() as session:
-        while scanned < MAX_SCAN_PROFILES_PER_RUN:
-            window = min(VULN_BATCH_SIZE, MAX_SCAN_PROFILES_PER_RUN - scanned)
-            stmt = select(ScanProfile.id, ScanProfile.next_scan_date).where(
-                ScanProfile.enabled == True,  # noqa: E712
-            )
-            if organization_id:
-                stmt = stmt.where(ScanProfile.organization_id == organization_id)
-            if last_id is not None:
-                stmt = stmt.where(ScanProfile.id > last_id)
-            rows = (await session.execute(stmt.order_by(ScanProfile.id).limit(window))).all()
-            if not rows:
-                break
-            last_id = rows[-1].id
-            scanned += len(rows)
-
-            due_ids = [r.id for r in rows if _scan_profile_due(r.next_scan_date, now)]
-            if due_ids:
-                await session.execute(
-                    update(ScanProfile)
-                    .where(ScanProfile.id.in_(due_ids))
-                    .values(last_scan_date=now_iso, next_scan_date=next_iso)
-                    .execution_options(synchronize_session=False),
-                )
-                processed += len(due_ids)
-            await session.commit()
-            session.expunge_all()
-
-            # Compare against the window actually requested: a short read on
-            # the last window before the cap means "exhausted", not "capped".
-            if len(rows) < window:
-                break
-        else:
-            cap_hit = True
-
-    if cap_hit:
-        logger.warning(
-            "run_vuln_scan hit per-run cap; remainder deferred to the next run",
-            cap=MAX_SCAN_PROFILES_PER_RUN,
-        )
-    return {"processed": processed, "truncated": cap_hit}
-
-
-@shared_task(bind=True, max_retries=3)
-def run_vuln_scan(self, organization_id: str | None = None) -> dict:
-    """
-    Dispatch scheduled vulnerability scans by iterating enabled ScanProfiles.
-
-    For each profile whose next_scan_date is due (or missing), updates its
-    last_scan_date/next_scan_date to mark it as executed.
-
-    Args:
-        self: Celery task instance
-        organization_id: Optional org filter
-
-    Returns:
-        Dictionary with dispatch summary
-    """
-    try:
-        summary = _run_async(_run_vuln_scan_async(organization_id))
-
-        result = {
-            "organization_id": organization_id,
-            "profiles_processed": summary["processed"],
-            "truncated": summary["truncated"],
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        logger.info("Vulnerability scan dispatch complete", **result)
-        return result
-
-    except Exception as exc:
-        logger.error("run_vuln_scan failed", error=str(exc), exc_info=True)
-        raise self.retry(exc=exc, countdown=min(2 ** self.request.retries, 600))
-
-
-# Backward-compatible alias used by existing callers
-run_vulnerability_scan = run_vuln_scan
-
-
-async def _import_scanner_results_async(
-    organization_id: str | None = None, scan_id: str | None = None,
-) -> dict[str, Any]:
-    """Flip pending ExposureScan rows to completed, in id windows."""
-    from src.exposure.models import ExposureScan
-
-    processed = 0
-    cap_hit = False
-    last_id: str | None = None
-
-    async with async_session_factory() as session:
-        while processed < MAX_SCANNER_IMPORTS_PER_RUN:
-            window = min(VULN_BATCH_SIZE, MAX_SCANNER_IMPORTS_PER_RUN - processed)
-            stmt = select(ExposureScan.id).where(ExposureScan.status == "pending")
-            if organization_id:
-                stmt = stmt.where(ExposureScan.organization_id == organization_id)
-            if scan_id:
-                stmt = stmt.where(ExposureScan.id == scan_id)
-            if last_id is not None:
-                stmt = stmt.where(ExposureScan.id > last_id)
-            ids = list(
-                (await session.execute(stmt.order_by(ExposureScan.id).limit(window))).scalars(),
-            )
-            if not ids:
-                break
-            last_id = ids[-1]
-
-            await session.execute(
-                update(ExposureScan)
-                .where(ExposureScan.id.in_(ids))
-                .values(status="completed", completed_at=datetime.now(timezone.utc))
-                .execution_options(synchronize_session=False),
-            )
-            processed += len(ids)
-            await session.commit()
-            session.expunge_all()
-
-            if len(ids) < window:
-                break
-        else:
-            cap_hit = True
-
-    if cap_hit:
-        logger.warning(
-            "import_scanner_results hit per-run cap; remainder deferred to the next run",
-            cap=MAX_SCANNER_IMPORTS_PER_RUN,
-        )
-    # The status flip is one UPDATE per window, so there is no per-row
-    # failure to count; errors stays 0 as it always was in practice.
-    return {"processed": processed, "errors": 0, "truncated": cap_hit}
-
-
-@shared_task(bind=True, max_retries=3)
-def import_scanner_results(
-    self,
-    organization_id: str | None = None,
-    scan_id: str | None = None,
-    scanner: str | None = None,
-    results: list[dict] | None = None,
-) -> dict:
-    """
-    Import pending vulnerability scan results from the database.
-
-    Queries ExposureScan records in the "pending" state and transitions them
-    to "completed" (or filters by a specific scan_id).
-
-    Returns:
-        Dictionary with import summary
-    """
-    try:
-        summary = _run_async(_import_scanner_results_async(organization_id, scan_id))
-
-        result = {
-            "scan_id": scan_id,
-            "scanner": scanner,
-            "scans_processed": summary["processed"],
-            "errors": summary["errors"],
-            "truncated": summary["truncated"],
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-        logger.info("Scanner results import complete", **result)
-        return result
-
-    except Exception as exc:
-        logger.error("Scanner import failed", error=str(exc), exc_info=True)
-        raise self.retry(exc=exc, countdown=min(2 ** self.request.retries, 600))
-
-
-async def _calculate_risk_scores_async(organization_id: str | None = None) -> dict[str, Any]:
-    """Write each Vulnerability's computed score onto its instances.
-
-    Vulnerabilities are read in id windows (four columns, not ORM rows).
-    Instances are never loaded at all: one bulk UPDATE per distinct score in
-    the window sets ``risk_score`` on every instance of those CVEs, and the
-    UPDATE's matched-row count is the same "instances scored" number the
-    per-instance loop used to produce.
-    """
-    from src.vulnmgmt.models import Vulnerability, VulnerabilityInstance
-
-    scored = 0
-    vulns_seen = 0
-    cap_hit = False
-    last_id: str | None = None
-
-    async with async_session_factory() as session:
-        while vulns_seen < MAX_RISK_SCORE_VULNS_PER_RUN:
-            window = min(VULN_BATCH_SIZE, MAX_RISK_SCORE_VULNS_PER_RUN - vulns_seen)
-            stmt = select(
-                Vulnerability.id,
-                Vulnerability.severity,
-                Vulnerability.exploit_maturity,
-                Vulnerability.kev_listed,
-            )
-            if organization_id:
-                stmt = stmt.where(Vulnerability.organization_id == organization_id)
-            if last_id is not None:
-                stmt = stmt.where(Vulnerability.id > last_id)
-            rows = (await session.execute(stmt.order_by(Vulnerability.id).limit(window))).all()
-            if not rows:
-                break
-            last_id = rows[-1].id
-            vulns_seen += len(rows)
-
-            ids_by_score: dict[float, list[str]] = {}
-            for r in rows:
-                score = _vuln_risk_score(r.severity, r.exploit_maturity, r.kev_listed)
-                ids_by_score.setdefault(score, []).append(r.id)
-
-            for score, vuln_ids in ids_by_score.items():
-                res = await session.execute(
-                    update(VulnerabilityInstance)
-                    .where(VulnerabilityInstance.vulnerability_id.in_(vuln_ids))
-                    .values(risk_score=score)
-                    .execution_options(synchronize_session=False),
-                )
-                scored += res.rowcount or 0
-            await session.commit()
-            session.expunge_all()
-
-            if len(rows) < window:
-                break
-        else:
-            cap_hit = True
-
-    if cap_hit:
-        logger.warning(
-            "calculate_risk_scores hit per-run cap; remainder deferred to the next run",
-            cap=MAX_RISK_SCORE_VULNS_PER_RUN,
-        )
-    return {"scored": scored, "truncated": cap_hit}
-
-
-@shared_task(bind=True, max_retries=2)
-def calculate_risk_scores(self, organization_id: str | None = None) -> dict:
-    """
-    Recalculate risk scores for all Vulnerability records.
-
-    Uses a severity-based baseline plus an exploit-maturity bonus, writing the
-    computed value to each Vulnerability's associated VulnerabilityInstance.risk_score
-    records (Vulnerability rows don't have their own risk_score field).
-    """
-    try:
-        summary = _run_async(_calculate_risk_scores_async(organization_id))
-
-        result = {
-            "organization_id": organization_id,
-            "instances_scored": summary["scored"],
-            "truncated": summary["truncated"],
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-        logger.info("Risk score calculation complete", **result)
-        return result
-
-    except Exception as exc:
-        logger.error("Risk score calculation failed", error=str(exc), exc_info=True)
-        raise self.retry(exc=exc, countdown=300)
 
 
 async def _check_sla_breaches_async(organization_id: str | None = None) -> dict[str, Any]:

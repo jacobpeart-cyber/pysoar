@@ -1304,198 +1304,252 @@ class OTVulnerabilityAssessor:
 
 class ICSComplianceEngine:
     """
-    ICS compliance engine for NERC-CIP, IEC 62443, and NIST SP 800-82.
+    ICS compliance assessment for NERC-CIP, IEC 62443-3-3 and NIST SP 800-82.
 
-    Verifies compliance with grid protection (NERC-CIP), functional safety (IEC 62443),
-    and federal IT security (NIST) standards for operational technology environments.
+    Every requirement is evaluated only from what the platform stores: the OT
+    asset inventory (zone, Purdue level, operator-recorded firmware status,
+    CISA ICS advisory matches written by the advisory sync) and the zones
+    (conduit policy, agent segmentation probe results). A requirement the
+    stored data cannot answer is ``not_assessed`` with the reason; nothing is
+    assumed to pass. A framework is ``compliant`` only when every requirement
+    was assessed and passed, ``False`` when any failed, and ``None`` when no
+    requirement failed but some could not be assessed.
     """
+
+    DMZ_LEVEL = "level3_5_dmz"
 
     def __init__(self, organization_id: str):
         """Initialize compliance engine"""
         self.organization_id = organization_id
 
-    async def check_nerc_cip_compliance(
-        self, assets: List[Dict[str, Any]], zones: List[Dict[str, Any]]
+    @staticmethod
+    def _requirement(
+        requirement_id: str, title: str, status: str, basis: str, **evidence: Any
     ) -> Dict[str, Any]:
-        """
-        Check NERC CIP (Critical Infrastructure Protection) compliance.
-
-        Verifies:
-        - CIP-002: Critical Asset Identification
-        - CIP-005: Electronic Security Perimeter
-        - CIP-007: Incident Recovery Capability
-        - CIP-010: Configuration and Vulnerability Management
-        """
-        compliance = {
-            "framework": "NERC-CIP",
-            "compliant": False,
-            "requirements_met": 0,
-            "requirements_total": 4,
-            "issues": [],
+        return {
+            "id": requirement_id,
+            "title": title,
+            "status": status,
+            "basis": basis,
+            "evidence": evidence,
         }
 
-        try:
-            # CIP-002: Critical Asset Identification
-            critical_assets = [
-                a
-                for a in assets
-                if a.get("criticality") in ["safety_critical", "mission_critical"]
-            ]
-            if len(critical_assets) > 0:
-                compliance["requirements_met"] += 1
+    @staticmethod
+    def _framework(name: str, requirements: List[Dict[str, Any]]) -> Dict[str, Any]:
+        passed = sum(1 for r in requirements if r["status"] == "pass")
+        failed = sum(1 for r in requirements if r["status"] == "fail")
+        not_assessed = sum(1 for r in requirements if r["status"] == "not_assessed")
+        if failed:
+            compliant: Optional[bool] = False
+        elif not_assessed:
+            compliant = None
+        else:
+            compliant = True
+        return {
+            "framework": name,
+            "compliant": compliant,
+            "requirements_total": len(requirements),
+            "requirements_met": passed,
+            "requirements_failed": failed,
+            "requirements_not_assessed": not_assessed,
+            "requirements": requirements,
+        }
 
-            # CIP-005: Electronic Security Perimeter
-            dmz_zones = [z for z in zones if "dmz" in z.get("purdue_level", "")]
-            if len(dmz_zones) > 0:
-                compliance["requirements_met"] += 1
+    def _inventory(self, req_id: str, title: str, assets: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not assets:
+            return self._requirement(req_id, title, "not_assessed", "No OT assets are recorded for this organisation.")
+        unzoned = [a.get("name") or a.get("id") for a in assets if not a.get("zone")]
+        if unzoned:
+            return self._requirement(
+                req_id, title, "fail",
+                "Assets in the inventory have no zone assignment, so their security perimeter is unknown.",
+                assets_total=len(assets), assets_without_zone=len(unzoned), examples=unzoned[:20],
+            )
+        return self._requirement(
+            req_id, title, "pass",
+            "Every recorded OT asset has a Purdue level and a zone assignment.",
+            assets_total=len(assets),
+        )
 
-            # CIP-007: Incident Recovery Capability
-            # (Check for backup/recovery procedures - placeholder)
-            compliance["requirements_met"] += 1
+    def _segmentation(
+        self, req_id: str, title: str, zones: List[Dict[str, Any]], require_dmz: bool
+    ) -> Dict[str, Any]:
+        if not zones:
+            return self._requirement(req_id, title, "not_assessed", "No OT zones are defined.")
+        violations = [z.get("name") for z in zones if z.get("segmentation_audit_status") == "violations_found"]
+        if violations:
+            return self._requirement(
+                req_id, title, "fail",
+                "The agent segmentation probe found reachable flows outside the zone policy.",
+                zones_total=len(zones), zones_with_violations=violations[:50],
+            )
+        if require_dmz and not any(z.get("purdue_level") == self.DMZ_LEVEL for z in zones):
+            return self._requirement(
+                req_id, title, "fail",
+                "No DMZ zone (level3_5_dmz) separates the enterprise levels from the control levels.",
+                zones_total=len(zones),
+            )
+        unverified = [z.get("name") for z in zones if not z.get("segmentation_verified")]
+        if unverified:
+            return self._requirement(
+                req_id, title, "not_assessed",
+                "Segmentation of these zones has not been verified by an agent segmentation probe.",
+                zones_total=len(zones), zones_unverified=unverified[:50],
+            )
+        return self._requirement(
+            req_id, title, "pass",
+            "Every zone passed its most recent agent segmentation probe.",
+            zones_total=len(zones),
+        )
 
-            # CIP-010: Configuration Management
-            # (Check firmware versions are current)
-            current_assets = [a for a in assets if a.get("firmware_current", False)]
-            if len(current_assets) / len(assets) > 0.9 if assets else False:
-                compliance["requirements_met"] += 1
+    def _vulnerabilities(
+        self, req_id: str, title: str, assets: List[Dict[str, Any]], advisories_cached: int
+    ) -> Dict[str, Any]:
+        if not assets:
+            return self._requirement(req_id, title, "not_assessed", "No OT assets are recorded for this organisation.")
+        if advisories_cached <= 0:
+            return self._requirement(
+                req_id, title, "not_assessed",
+                "The CISA ICS advisory feed has not been synchronised, so no asset was matched against it.",
+                assets_total=len(assets),
+            )
+        matchable = [a for a in assets if a.get("vendor") and a.get("model")]
+        if not matchable:
+            return self._requirement(
+                req_id, title, "not_assessed",
+                "No asset records a vendor and model, so none can be matched to an advisory.",
+                assets_total=len(assets),
+            )
+        affected = [
+            a.get("name") or a.get("id") for a in matchable if (a.get("known_vulnerabilities_count") or 0) > 0
+        ]
+        evidence = {
+            "assets_total": len(assets),
+            "assets_matched_against_feed": len(matchable),
+            "assets_without_vendor_or_model": len(assets) - len(matchable),
+            "advisories_cached": advisories_cached,
+        }
+        if affected:
+            return self._requirement(
+                req_id, title, "fail",
+                "Assets match published CISA ICS advisories for their vendor and model.",
+                assets_with_advisories=affected[:50], **evidence,
+            )
+        return self._requirement(
+            req_id, title, "pass",
+            "No asset with a recorded vendor and model matches a published CISA ICS advisory.",
+            **evidence,
+        )
 
-            compliance["compliant"] = (
-                compliance["requirements_met"] >= 3
-            )  # Require 75%
+    def _firmware(self, req_id: str, title: str, assets: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not assets:
+            return self._requirement(req_id, title, "not_assessed", "No OT assets are recorded for this organisation.")
+        outdated = [a.get("name") or a.get("id") for a in assets if not a.get("firmware_current")]
+        if outdated:
+            return self._requirement(
+                req_id, title, "fail",
+                "Assets are not recorded as running current firmware (operator-recorded firmware status).",
+                assets_total=len(assets), assets_not_current=len(outdated), examples=outdated[:20],
+            )
+        return self._requirement(
+            req_id, title, "pass",
+            "Every asset is recorded as running current firmware (operator-recorded firmware status).",
+            assets_total=len(assets),
+        )
 
-            return compliance
+    def _conduit_policy(self, req_id: str, title: str, zones: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not zones:
+            return self._requirement(req_id, title, "not_assessed", "No OT zones are defined.")
+        missing = [
+            z.get("name") for z in zones
+            if not z.get("allowed_protocols") and not z.get("allowed_communications")
+        ]
+        if missing:
+            return self._requirement(
+                req_id, title, "fail",
+                "Zones have no conduit policy (no allowed protocols or communications recorded).",
+                zones_total=len(zones), zones_without_policy=missing[:50],
+            )
+        return self._requirement(
+            req_id, title, "pass",
+            "Every zone records the protocols or zone-to-zone communications it allows.",
+            zones_total=len(zones),
+        )
 
-        except Exception as e:
-            logger.error(f"NERC-CIP compliance check failed: {str(e)}")
-            return compliance
+    def _not_stored(self, req_id: str, title: str, what: str) -> Dict[str, Any]:
+        return self._requirement(req_id, title, "not_assessed", f"The platform stores no {what}.")
+
+    async def check_nerc_cip_compliance(
+        self, assets: List[Dict[str, Any]], zones: List[Dict[str, Any]], advisories_cached: int = 0
+    ) -> Dict[str, Any]:
+        """NERC CIP requirements answerable from the stored inventory and zones."""
+        return self._framework("NERC-CIP", [
+            self._inventory("CIP-002", "BES Cyber System identification and categorisation", assets),
+            self._segmentation("CIP-005", "Electronic Security Perimeter", zones, require_dmz=True),
+            self._firmware("CIP-007 R2", "Security patch management", assets),
+            self._not_stored("CIP-009", "Recovery plans", "recovery plans or backup verification records"),
+            self._vulnerabilities("CIP-010 R3", "Vulnerability assessment", assets, advisories_cached),
+        ])
 
     async def check_iec62443_compliance(
-        self, assets: List[Dict[str, Any]]
+        self, assets: List[Dict[str, Any]], zones: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
-        """
-        Check IEC 62443 (Industrial Automation and Control Systems Security) compliance.
+        """IEC 62443-3-3 system requirements answerable from stored zones and assets."""
+        zones = zones or []
+        return self._framework("IEC 62443-3-3", [
+            self._segmentation("SR 5.1", "Network segmentation", zones, require_dmz=False),
+            self._conduit_policy("SR 5.2", "Zone boundary protection", zones),
+            self._inventory("SR 7.8", "Control system component inventory", assets),
+            self._not_stored(
+                "SL-A", "Achieved security level",
+                "per-foundational-requirement capability assessment, so no achieved security level is claimed",
+            ),
+        ])
 
-        Verifies security levels:
-        - SL1 (Unauthorized access potential)
-        - SL2 (Specific attack with enhanced authentication)
-        - SL3 (Sophisticated attack with defense-in-depth)
-        - SL4 (Most sophisticated attack with complete isolation)
-        """
-        compliance = {
-            "framework": "IEC 62443",
-            "security_levels": {
-                "sl1": {"met": False, "assets": 0},
-                "sl2": {"met": False, "assets": 0},
-                "sl3": {"met": False, "assets": 0},
-                "sl4": {"met": False, "assets": 0},
-            },
-            "overall_level": "SL1",
-            "issues": [],
-        }
-
-        try:
-            for asset in assets:
-                # Assess based on criticality and exposure
-                if asset.get("criticality") == "safety_critical":
-                    if asset.get("purdue_level") in [
-                        "level0_process",
-                        "level1_control",
-                    ]:
-                        compliance["security_levels"]["sl4"]["assets"] += 1
-                    else:
-                        compliance["security_levels"]["sl3"]["assets"] += 1
-                elif asset.get("criticality") == "mission_critical":
-                    compliance["security_levels"]["sl3"]["assets"] += 1
-                else:
-                    compliance["security_levels"]["sl2"]["assets"] += 1
-
-            # Determine overall level
-            if compliance["security_levels"]["sl4"]["assets"] > 0:
-                compliance["overall_level"] = "SL4"
-            elif compliance["security_levels"]["sl3"]["assets"] > 0:
-                compliance["overall_level"] = "SL3"
-            else:
-                compliance["overall_level"] = "SL2"
-
-            return compliance
-
-        except Exception as e:
-            logger.error(f"IEC 62443 compliance check failed: {str(e)}")
-            return compliance
-
-    async def check_nist_sp800_82(self, zones: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Check NIST SP 800-82 (Guide to Industrial Control Systems Security) compliance.
-
-        Verifies:
-        - Network segmentation (Purdue model)
-        - Defense-in-depth
-        - Secure design principles
-        - Operational security controls
-        """
-        compliance = {
-            "framework": "NIST SP 800-82",
-            "compliant": False,
-            "checks": {
-                "network_segmentation": False,
-                "defense_in_depth": False,
-                "secure_design": False,
-                "operational_controls": False,
-            },
-        }
-
-        try:
-            # Network segmentation
-            covered_levels = {z.get("purdue_level") for z in zones}
-            if len(covered_levels) >= 4:
-                compliance["checks"]["network_segmentation"] = True
-
-            # Defense-in-depth (multiple security layers)
-            if len(zones) >= 3:
-                compliance["checks"]["defense_in_depth"] = True
-
-            # Secure design (no direct level crossing without intermediaries)
-            compliance["checks"]["secure_design"] = True
-
-            # Operational controls (monitoring, logging, etc.)
-            compliance["checks"]["operational_controls"] = True
-
-            compliance["compliant"] = all(compliance["checks"].values())
-
-            return compliance
-
-        except Exception as e:
-            logger.error(f"NIST SP 800-82 compliance check failed: {str(e)}")
-            return compliance
+    async def check_nist_sp800_82(
+        self,
+        zones: List[Dict[str, Any]],
+        assets: Optional[List[Dict[str, Any]]] = None,
+        advisories_cached: int = 0,
+    ) -> Dict[str, Any]:
+        """NIST SP 800-82 Rev. 3 practices answerable from stored zones and assets."""
+        assets = assets or []
+        return self._framework("NIST SP 800-82", [
+            self._inventory("ID.AM", "OT asset inventory", assets),
+            self._segmentation("PR.AC-5", "Network segmentation and boundary protection", zones, require_dmz=True),
+            self._vulnerabilities("ID.RA-1", "Asset vulnerabilities identified", assets, advisories_cached),
+            self._not_stored("DE.CM", "Continuous security monitoring", "OT network monitoring coverage records"),
+        ])
 
     async def generate_compliance_report(
         self, org_data: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Generate comprehensive ICS compliance report"""
+        """ICS compliance report computed from stored assets and zones.
+
+        ``org_data``: ``assets`` and ``zones`` as ``to_dict()`` rows of this
+        organisation and ``advisories_cached`` (rows in the CISA ICS advisory
+        cache; 0 means the feed was never synchronised).
+        """
         assets = org_data.get("assets", [])
         zones = org_data.get("zones", [])
+        advisories_cached = int(org_data.get("advisories_cached") or 0)
 
-        nerc = await self.check_nerc_cip_compliance(assets, zones)
-        iec = await self.check_iec62443_compliance(assets)
-        nist = await self.check_nist_sp800_82(zones)
+        nerc = await self.check_nerc_cip_compliance(assets, zones, advisories_cached)
+        iec = await self.check_iec62443_compliance(assets, zones)
+        nist = await self.check_nist_sp800_82(zones, assets, advisories_cached)
 
+        frameworks = (nerc, iec, nist)
+        remediation_actions = [
+            f"{fw['framework']} {req['id']}: {req['basis']}"
+            for fw in frameworks for req in fw["requirements"] if req["status"] == "fail"
+        ]
         return {
             "timestamp": datetime.now(timezone.utc),
             "nerc_cip": nerc,
             "iec_62443": iec,
             "nist_sp_800_82": nist,
-            "overall_compliance": all(
-                [nerc.get("compliant", False), nist.get("compliant", False)]
-            ),
-        }
-
-    async def track_remediation(
-        self, issue_id: str, remediation_plan: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Track compliance remediation efforts"""
-        return {
-            "issue_id": issue_id,
-            "plan": remediation_plan,
-            "status": "tracking",
-            "start_date": datetime.now(timezone.utc),
+            # True only when every requirement of every framework was assessed
+            # and passed; a not_assessed requirement never counts as a pass.
+            "overall_compliance": all(fw["compliant"] is True for fw in frameworks),
+            "remediation_actions": remediation_actions,
         }

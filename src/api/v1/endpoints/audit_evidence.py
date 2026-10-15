@@ -300,7 +300,8 @@ async def upload_evidence_file(
             file_path=dest_path,
             file_hash=hasher.hexdigest(),
             collected_at=datetime.now(timezone.utc),
-            collected_by=getattr(current_user, "full_name", None) or getattr(current_user, "email", "unknown"),
+            # The uploader's id (separation of duties compares it with the approver).
+            collected_by=str(current_user.id),
             is_automated=False,
             is_valid=True,
             review_status="pending",
@@ -619,6 +620,11 @@ async def approve_evidence_item(
     evidence = result.scalar_one_or_none()
     if evidence is None:
         raise HTTPException(status_code=404, detail="Evidence not found")
+
+    # Separation of duties: the uploader cannot approve their own evidence.
+    from src.compliance.separation_of_duties import ensure_not_uploader
+
+    ensure_not_uploader(evidence, current_user)
 
     evidence.review_status = "approved"
     evidence.reviewed_by = str(getattr(current_user, "id", ""))

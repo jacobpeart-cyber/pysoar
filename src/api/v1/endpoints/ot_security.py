@@ -207,6 +207,28 @@ async def list_assets(
     )
 
 
+async def _refuse_duplicate_serial(
+    db: AsyncSession, org_id: str, serial_number: Optional[str], exclude_id: Optional[str] = None,
+) -> None:
+    """Serial numbers are unique per organisation (migration 035): 409 instead
+    of an IntegrityError 500. Another tenant may hold the same serial."""
+    if not serial_number:
+        return
+    query = select(OTAsset.id).where(
+        OTAsset.organization_id == org_id, OTAsset.serial_number == serial_number,
+    )
+    if exclude_id:
+        query = query.where(OTAsset.id != exclude_id)
+    if (await db.execute(query.limit(1))).scalar_one_or_none() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "serial_number_conflict",
+                "detail": "an OT asset with this serial number already exists in this organisation",
+            },
+        )
+
+
 @router.post("/assets", response_model=OTAssetResponse, status_code=status.HTTP_201_CREATED)
 async def create_asset(
     asset_data: OTAssetCreate,
@@ -215,6 +237,7 @@ async def create_asset(
     db: DatabaseSession = None,
 ):
     """Create a new OT asset"""
+    await _refuse_duplicate_serial(db, org_id, asset_data.serial_number)
     asset = OTAsset(
         organization_id=org_id,
         name=asset_data.name,
@@ -258,6 +281,8 @@ async def update_asset(
     asset = await get_asset_or_404(db, asset_id, org_id)
 
     update_data = asset_data.model_dump(exclude_unset=True)
+    if update_data.get("serial_number"):
+        await _refuse_duplicate_serial(db, org_id, update_data["serial_number"], exclude_id=asset.id)
     for key, value in update_data.items():
         setattr(asset, key, value)
 
@@ -1360,7 +1385,15 @@ async def get_purdue_map(org_id: OrganizationId, db: DatabaseSession = None):
 
 @router.get("/compliance/report", response_model=ComplianceReportResponse)
 async def get_compliance_report(org_id: OrganizationId, db: DatabaseSession = None):
-    """Get comprehensive ICS compliance report"""
+    """ICS compliance report computed from the stored assets and zones.
+
+    Each requirement is pass / fail / not_assessed with its basis (zone
+    segmentation probes, conduit policy, operator-recorded firmware status,
+    CISA ICS advisory matches); nothing the platform does not store is
+    assumed to pass, so ``overall_compliant`` is true only when every
+    requirement was assessed and passed.
+    """
+    from src.ot_security.models import OTICSAdvisory
 
     # Fetch assets and zones
     assets_result = await db.execute(
@@ -1373,9 +1406,15 @@ async def get_compliance_report(org_id: OrganizationId, db: DatabaseSession = No
     )
     zones = [z.to_dict() for z in zones_result.scalars().all()]
 
+    # The advisory cache is platform-wide (public CISA feed); its size only
+    # tells whether the vulnerability requirement can be assessed at all.
+    advisories_cached = (await db.execute(
+        select(func.count()).select_from(OTICSAdvisory),
+    )).scalar_one()
+
     compliance = ICSComplianceEngine(org_id)
     report = await compliance.generate_compliance_report(
-        {"assets": assets, "zones": zones}
+        {"assets": assets, "zones": zones, "advisories_cached": advisories_cached}
     )
 
     return ComplianceReportResponse(
@@ -1384,6 +1423,7 @@ async def get_compliance_report(org_id: OrganizationId, db: DatabaseSession = No
         iec_62443=report.get("iec_62443", {}),
         nist_sp_800_82=report.get("nist_sp_800_82", {}),
         overall_compliant=report.get("overall_compliance", False),
+        remediation_actions=report.get("remediation_actions", []),
     )
 
 

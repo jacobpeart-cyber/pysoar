@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import Any, Optional
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import JSON
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -161,9 +161,19 @@ class DetectionRule(BaseModel):
     """Sigma-inspired detection rules for security event detection"""
 
     __tablename__ = "detection_rules"
+    # Names are unique per organisation, and among platform rows (NULL
+    # organisation) through a partial index (migration 035).
+    __table_args__ = (
+        Index("uq_detection_rules_org_name", "organization_id", "name", unique=True),
+        Index(
+            "uq_detection_rules_platform_name", "name", unique=True,
+            postgresql_where=text("organization_id IS NULL"),
+            sqlite_where=text("organization_id IS NULL"),
+        ),
+    )
 
     # Core rule information
-    name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     author: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
@@ -303,9 +313,19 @@ class SIEMDataSource(BaseModel):
     """Configured log sources for SIEM data collection"""
 
     __tablename__ = "siem_data_sources"
+    # Names are unique per organisation, and among platform rows (NULL
+    # organisation) through a partial index (migration 035).
+    __table_args__ = (
+        Index("uq_siem_data_sources_org_name", "organization_id", "name", unique=True),
+        Index(
+            "uq_siem_data_sources_platform_name", "name", unique=True,
+            postgresql_where=text("organization_id IS NULL"),
+            sqlite_where=text("organization_id IS NULL"),
+        ),
+    )
 
     # Source identification
-    name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     source_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
 

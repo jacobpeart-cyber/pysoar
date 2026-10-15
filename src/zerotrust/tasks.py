@@ -1,394 +1,152 @@
-"""Celery tasks for Zero Trust operations"""
+"""Celery tasks for Zero Trust operations.
 
+One task does real work on a schedule: the continuous session evaluation
+sweep (NIST SP 800-207 continuous verification). For every session that
+received an ``allow`` decision inside the session lifetime window it asks
+the policy decision point to re-score the subject; a material risk increase
+records a new ``AccessDecision`` and pushes the verdict into the session
+gate cache (``src/zerotrust/session_gate.py``), so the next request on that
+session is challenged or refused.
+
+Wave 5 removed the other tasks that used to live here. They were declared
+``async def`` under ``@shared_task`` (Celery never awaits them, so none of
+them could ever run) and none was scheduled. On inspection they did no work
+worth keeping: the device "fleet assessment" re-derived trust scores that
+are already recomputed whenever posture is reported, the micro-segment
+"update" only touched ``updated_at``, the violation detector and maturity
+calculation only logged values the API computes on demand, the report task
+returned a report location that never existed, and the "token rotation"
+rewrote historical allow decisions to ``challenge`` (falsifying the audit
+trail without revoking anything).
+"""
+
+import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Optional
 
 from celery import shared_task
-from sqlalchemy import and_, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import func, select
 
-from src.core.config import settings
-from src.core.database import async_session_factory
 from src.core.logging import get_logger
-from src.zerotrust.engine import (
-    ContinuousAuthEngine,
-    DeviceTrustAssessor,
-    MicroSegmentationEngine,
-    PolicyDecisionPoint,
-    ZeroTrustScorer,
-)
-from src.zerotrust.models import AccessDecision, DeviceTrustProfile
+from src.zerotrust.engine import PolicyDecisionPoint
+from src.zerotrust.models import AccessDecision
 
 logger = get_logger(__name__)
 
+#: Sessions older than this are expired by the session gate anyway.
+SESSION_WINDOW_HOURS = 8
+#: Organisations one sweep walks (those with recent allow decisions only).
+MAX_ORGS_PER_SWEEP = 500
+#: Sessions re-evaluated per organisation per run (most recent first).
+MAX_SESSIONS_PER_ORG = 2_000
 
-@shared_task(bind=True, max_retries=3)
-async def continuous_session_evaluation(self: Any, organization_id: str) -> dict[str, Any]:
-    """Re-evaluate active sessions periodically for ongoing risk changes
 
-    Runs every 5 minutes to detect session anomalies and enforce
-    continuous authentication policies.
+def _run_async(coro):
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def _fresh_session_factory():
+    """Per-task NullPool engine (same pattern as src.itdr.tasks): the shared
+    module-level engine is bound to another event loop in a prefork child."""
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import NullPool
+
+    from src.core.config import settings
+
+    engine = create_async_engine(settings.database_url, echo=False, poolclass=NullPool)
+    return engine, sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+
+async def evaluate_active_sessions(
+    db: Any,
+    organization_id: str,
+    *,
+    now: Optional[datetime] = None,
+    limit: int = MAX_SESSIONS_PER_ORG,
+) -> dict[str, Any]:
+    """Re-evaluate one organisation's sessions allowed within the window.
+
+    Returns the counts; a session whose re-evaluation produced a non-allow
+    decision is counted as escalated (the PDP has already recorded it and
+    pushed it to the session gate).
     """
-    logger.info("task_starting", task="continuous_session_evaluation")
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=SESSION_WINDOW_HOURS)
+    session_ids = list((await db.execute(
+        select(AccessDecision.session_id)
+        .where(
+            AccessDecision.organization_id == organization_id,
+            AccessDecision.session_id.isnot(None),
+            AccessDecision.decision == "allow",
+            AccessDecision.created_at >= cutoff,
+        )
+        .group_by(AccessDecision.session_id)
+        .order_by(func.max(AccessDecision.created_at).desc())
+        .limit(limit)
+    )).scalars().all())
 
-    async with async_session_factory() as db:
-        try:
-            pdp = PolicyDecisionPoint(db, organization_id)
-
-            # Get active sessions (last access within 5 minutes)
-            result = await db.execute(
-                select(AccessDecision)
-                .where(
-                    and_(
-                        AccessDecision.organization_id == organization_id,
-                        AccessDecision.session_id.isnot(None),
-                        AccessDecision.decision == "allow",
-                    )
-                )
-                .distinct(AccessDecision.session_id)
-            )
-            decisions = result.scalars().all()
-
-            evaluated = 0
-            escalated = 0
-
-            for decision in decisions:
-                if decision.session_id:
-                    new_decision = await pdp.continuous_evaluation(
-                        decision.session_id
-                    )
-                    evaluated += 1
-
-                    if new_decision and new_decision.decision != "allow":
-                        escalated += 1
-                        logger.info(
-                            "session_escalated",
-                            session_id=decision.session_id,
-                            new_decision=new_decision.decision,
-                        )
-
-            await db.commit()
-
-            result_data = {
-                "evaluated_sessions": evaluated,
-                "escalated": escalated,
-                "organization_id": organization_id,
-            }
-
-            logger.info("task_complete", task="continuous_session_evaluation", **result_data)
-            return result_data
-
-        except Exception as exc:
-            logger.error("task_failed", task="continuous_session_evaluation", error=str(exc))
-            raise self.retry(exc=exc, countdown=60)
-
-
-@shared_task(bind=True, max_retries=3)
-async def assess_device_fleet(self: Any, organization_id: str) -> dict[str, Any]:
-    """Scan all devices for compliance and trust assessment
-
-    Runs every hour to evaluate device posture and update trust scores.
-    """
-    logger.info("task_starting", task="assess_device_fleet")
-
-    async with async_session_factory() as db:
-        try:
-            assessor = DeviceTrustAssessor(db, organization_id)
-
-            # Get all devices
-            result = await db.execute(
-                select(DeviceTrustProfile).where(
-                    DeviceTrustProfile.organization_id == organization_id
-                )
-            )
-            devices = result.scalars().all()
-
-            assessed = 0
-            non_compliant = 0
-
-            for device in devices:
-                assessed_device = await assessor.assess_device(device.device_id)
-
-                assessed += 1
-                if assessed_device.trust_level in ["untrusted", "blocked"]:
-                    non_compliant += 1
-                    logger.warning(
-                        "device_non_compliant",
-                        device_id=device.device_id,
-                        trust_level=assessed_device.trust_level,
-                    )
-
-            result_data = {
-                "assessed_devices": assessed,
-                "non_compliant": non_compliant,
-                "organization_id": organization_id,
-            }
-
-            logger.info("task_complete", task="assess_device_fleet", **result_data)
-            return result_data
-
-        except Exception as exc:
-            logger.error("task_failed", task="assess_device_fleet", error=str(exc))
-            raise self.retry(exc=exc, countdown=60)
-
-
-@shared_task(bind=True, max_retries=3)
-async def update_micro_segments(self: Any, organization_id: str) -> dict[str, Any]:
-    """Refresh micro-segment policies and traffic rules
-
-    Runs every 2 hours to update segment policies based on
-    organizational changes and threat intelligence.
-    """
-    logger.info("task_starting", task="update_micro_segments")
-
-    async with async_session_factory() as db:
-        try:
-            from src.zerotrust.models import MicroSegment
-
-            segmentation = MicroSegmentationEngine(db, organization_id)
-
-            # Fetch all active segments for the organization
-            result = await db.execute(
-                select(MicroSegment).where(
-                    and_(
-                        MicroSegment.organization_id == organization_id,
-                        MicroSegment.is_active == True,
-                    )
-                )
-            )
-            segments = result.scalars().all()
-
-            updated_count = 0
-            conflicts_detected = 0
-
-            for segment in segments:
-                import json
-
-                # Parse existing policies
-                ingress = json.loads(segment.ingress_policies) if segment.ingress_policies else []
-                egress = json.loads(segment.egress_policies) if segment.egress_policies else []
-
-                # Check for policy conflicts (overlapping allow/deny rules)
-                allowed_ports = set(json.loads(segment.allowed_ports) if segment.allowed_ports else [])
-                for rule in ingress:
-                    port = rule.get("port")
-                    if port and rule.get("action") == "deny" and port in allowed_ports:
-                        conflicts_detected += 1
-
-                # Mark segment as updated
-                segment.updated_at = datetime.now(timezone.utc)
-                updated_count += 1
-
-            await db.commit()
-
-            result_data = {
-                "updated_segments": updated_count,
-                "conflicts_detected": conflicts_detected,
-                "organization_id": organization_id,
-            }
-
-            logger.info("task_complete", task="update_micro_segments", **result_data)
-            return result_data
-
-        except Exception as exc:
-            logger.error("task_failed", task="update_micro_segments", error=str(exc))
-            raise self.retry(exc=exc, countdown=60)
-
-
-@shared_task(bind=True, max_retries=3)
-async def detect_policy_violations(self: Any, organization_id: str) -> dict[str, Any]:
-    """Detect unauthorized access patterns and policy violations
-
-    Runs every 15 minutes to identify anomalous access patterns
-    and potential security incidents.
-    """
-    logger.info("task_starting", task="detect_policy_violations")
-
-    async with async_session_factory() as db:
-        try:
-            # Get recent deny decisions
-            result = await db.execute(
-                select(AccessDecision)
-                .where(
-                    and_(
-                        AccessDecision.organization_id == organization_id,
-                        AccessDecision.decision == "deny",
-                    )
-                )
-                .order_by(AccessDecision.created_at.desc())
-                .limit(100)
-            )
-            violations = result.scalars().all()
-
-            # Analyze patterns
-            violation_count = len(violations)
-
-            # Check for brute force attempts (same subject multiple denies)
-            subject_denies = {}
-            for violation in violations:
-                key = violation.subject_id
-                subject_denies[key] = subject_denies.get(key, 0) + 1
-
-            brute_force_attempts = {
-                k: v for k, v in subject_denies.items() if v >= 5
-            }
-
-            result_data = {
-                "violations_detected": violation_count,
-                "brute_force_attempts": len(brute_force_attempts),
-                "organization_id": organization_id,
-            }
-
-            if brute_force_attempts:
-                logger.warning(
-                    "potential_brute_force",
-                    attempts=brute_force_attempts,
-                )
-
-            logger.info("task_complete", task="detect_policy_violations", **result_data)
-            return result_data
-
-        except Exception as exc:
-            logger.error("task_failed", task="detect_policy_violations", error=str(exc))
-            raise self.retry(exc=exc, countdown=60)
-
-
-@shared_task(bind=True, max_retries=3)
-async def calculate_zero_trust_maturity(self: Any, organization_id: str) -> dict[str, Any]:
-    """Update Zero Trust maturity score and recommendations
-
-    Runs daily to assess overall Zero Trust implementation
-    maturity and generate improvement recommendations.
-    """
-    logger.info("task_starting", task="calculate_zero_trust_maturity")
-
-    async with async_session_factory() as db:
-        try:
-            scorer = ZeroTrustScorer(db, organization_id)
-
-            maturity_data = await scorer.calculate_maturity_score()
-
-            result_data = {
-                "overall_score": maturity_data["overall_score"],
-                "maturity_level": maturity_data["maturity_level"],
-                "pillars": maturity_data["pillars"],
-                "organization_id": organization_id,
-            }
-
+    pdp = PolicyDecisionPoint(db, organization_id)
+    evaluated = 0
+    escalated = 0
+    for session_id in session_ids:
+        new_decision = await pdp.continuous_evaluation(session_id)
+        evaluated += 1
+        if new_decision is not None and new_decision.decision != "allow":
+            escalated += 1
             logger.info(
-                "task_complete",
-                task="calculate_zero_trust_maturity",
-                score=maturity_data["overall_score"],
-                level=maturity_data["maturity_level"],
+                "zt_session_escalated",
+                session_id=session_id[:8],
+                decision=new_decision.decision,
+                organization_id=organization_id,
             )
-
-            return result_data
-
-        except Exception as exc:
-            logger.error(
-                "task_failed", task="calculate_zero_trust_maturity", error=str(exc)
-            )
-            raise self.retry(exc=exc, countdown=60)
+    return {"evaluated_sessions": evaluated, "escalated": escalated}
 
 
-@shared_task(bind=True, max_retries=3)
-async def rotate_session_tokens(self: Any, organization_id: str) -> dict[str, Any]:
-    """Force re-authentication for long-lived sessions
-
-    Runs every 4 hours to rotate session tokens and enforce
-    continuous authentication for extended sessions.
-    """
-    logger.info("task_starting", task="rotate_session_tokens")
-
-    async with async_session_factory() as db:
-        try:
-            # Find sessions older than configured TTL
-            max_session_age_hours = 8  # Configurable
-            cutoff = datetime.now(timezone.utc) - timedelta(hours=max_session_age_hours)
-
-            # Query access decisions with active sessions older than the TTL
-            result = await db.execute(
-                select(AccessDecision).where(
-                    and_(
-                        AccessDecision.organization_id == organization_id,
-                        AccessDecision.decision == "allow",
-                        AccessDecision.session_id.isnot(None),
-                        AccessDecision.created_at < cutoff,
-                    )
-                )
-            )
-            old_sessions = result.scalars().all()
-
-            rotated_count = 0
-            notified_users = set()
-
-            for session in old_sessions:
-                # Mark session for re-authentication by changing decision
-                session.decision = "challenge"
-                rotated_count += 1
-                notified_users.add(session.subject_id)
-
-            await db.commit()
-
-            result_data = {
-                "rotated_tokens": rotated_count,
-                "users_notified": len(notified_users),
-                "organization_id": organization_id,
-            }
-
-            logger.info("task_complete", task="rotate_session_tokens", **result_data)
-            return result_data
-
-        except Exception as exc:
-            logger.error("task_failed", task="rotate_session_tokens", error=str(exc))
-            raise self.retry(exc=exc, countdown=60)
-
-
-@shared_task(bind=True, max_retries=3)
-async def generate_zero_trust_report(self: Any, organization_id: str) -> dict[str, Any]:
-    """Generate daily Zero Trust posture report
-
-    Runs daily to create comprehensive report on Zero Trust
-    implementation, policy effectiveness, and recommendations.
-    """
-    logger.info("task_starting", task="generate_zero_trust_report")
-
-    async with async_session_factory() as db:
-        try:
-            # Get maturity score
-            scorer = ZeroTrustScorer(db, organization_id)
-            maturity = await scorer.calculate_maturity_score()
-
-            # Get device compliance
-            assessor = DeviceTrustAssessor(db, organization_id)
-            non_compliant = await assessor.get_non_compliant_devices()
-
-            # Get recent violations
-            result = await db.execute(
-                select(AccessDecision)
+async def _continuous_session_sweep_async(session_factory=None) -> dict[str, Any]:
+    engine = None
+    if session_factory is None:
+        engine, session_factory = _fresh_session_factory()
+    totals = {"organizations": 0, "evaluated_sessions": 0, "escalated": 0, "failed_organizations": 0}
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=SESSION_WINDOW_HOURS)
+        async with session_factory() as db:
+            org_ids = list((await db.execute(
+                select(AccessDecision.organization_id)
                 .where(
-                    and_(
-                        AccessDecision.organization_id == organization_id,
-                        AccessDecision.decision.in_(["deny", "step_up", "challenge"]),
-                    )
+                    AccessDecision.session_id.isnot(None),
+                    AccessDecision.decision == "allow",
+                    AccessDecision.created_at >= cutoff,
                 )
-                .order_by(AccessDecision.created_at.desc())
-                .limit(100)
-            )
-            violations = result.scalars().all()
+                .group_by(AccessDecision.organization_id)
+                .order_by(AccessDecision.organization_id)
+                .limit(MAX_ORGS_PER_SWEEP)
+            )).scalars().all())
+        for org_id in org_ids:
+            try:
+                async with session_factory() as db:
+                    result = await evaluate_active_sessions(db, org_id)
+                    await db.commit()
+            except Exception as exc:  # noqa: BLE001 - one tenant must not stop the sweep
+                totals["failed_organizations"] += 1
+                logger.warning("zt_session_sweep_org_failed", organization_id=org_id, error=str(exc)[:200])
+                continue
+            totals["organizations"] += 1
+            totals["evaluated_sessions"] += result["evaluated_sessions"]
+            totals["escalated"] += result["escalated"]
+    finally:
+        if engine is not None:
+            await engine.dispose()
+    return totals
 
-            report_data = {
-                "generated_at": datetime.now(timezone.utc).isoformat(),
-                "organization_id": organization_id,
-                "maturity": maturity,
-                "non_compliant_devices": len(non_compliant),
-                "recent_violations": len(violations),
-                "report_location": f"/reports/zerotrust/{organization_id}",
-            }
 
-            logger.info("task_complete", task="generate_zero_trust_report", **report_data)
-            return report_data
-
-        except Exception as exc:
-            logger.error("task_failed", task="generate_zero_trust_report", error=str(exc))
-            raise self.retry(exc=exc, countdown=60)
+@shared_task(bind=True, max_retries=0, name="src.zerotrust.tasks.continuous_session_evaluation")
+def continuous_session_evaluation(self: Any) -> dict[str, Any]:
+    """Every 5 minutes: re-evaluate active sessions of every organisation."""
+    result = _run_async(_continuous_session_sweep_async())
+    logger.info("zt_continuous_session_sweep_complete", **result)
+    return result

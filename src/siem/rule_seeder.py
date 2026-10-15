@@ -26,8 +26,9 @@ Platform scope convention (wave 1 tenancy):
     update or delete platform rows (the SIEM router answers 403
     ``platform_rule_read_only``); only a platform superuser can. Rules an
     organisation creates or imports are stamped with that organisation and
-    apply to its logs only. Rules are not seeded per organisation because
-    ``detection_rules.name`` is globally unique.
+    apply to its logs only. Rule names are unique per organisation and
+    among platform rows (migration 035), so an organisation rule may share
+    a built-in's name without blocking the platform rule.
 """
 
 from __future__ import annotations
@@ -384,7 +385,9 @@ async def seed_builtin_detection_rules(db: AsyncSession) -> dict[str, int]:
     Never downgrades a user-customized rule.
     """
     names = [spec["name"] for spec in BUILTIN_RULES]
-    existing_res = await db.execute(select(DetectionRule).where(DetectionRule.name.in_(names)))
+    existing_res = await db.execute(
+        select(DetectionRule).where(DetectionRule.name.in_(names), DetectionRule.organization_id.is_(None)),
+    )
     existing: dict[str, DetectionRule] = {r.name: r for r in existing_res.scalars().all()}
 
     inserted = 0
@@ -420,13 +423,6 @@ async def seed_builtin_detection_rules(db: AsyncSession) -> dict[str, int]:
             )
             db.add(new_rule)
             inserted += 1
-        elif row.organization_id is not None:
-            # An organisation owns a rule with a built-in's name (names are
-            # globally unique). Leave the tenant's row alone.
-            logger.warning(
-                "SIEM rule seeder: built-in %s shadowed by an organisation rule; skipped",
-                spec["name"],
-            )
         else:
             # Refill only when empty — don't overwrite user customizations.
             if not row.detection_logic:

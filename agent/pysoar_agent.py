@@ -7,6 +7,9 @@ commands from a PySOAR server. The agent is intentionally minimal:
 - No outbound connections except to PYSOAR_URL over HTTPS
 - Refuses any command whose action is not in the local allowlist
 - Refuses any command whose hostname does not match this host
+- Never runs a command string sent by the server for scans, decoys or OT
+  actions: local scanner binaries with a fixed argv, an operator-configured
+  decoy directory, and operator-configured OT scripts only
 - Logs every command + result to stdout for the local SIEM to collect
 
 Usage:
@@ -28,9 +31,12 @@ import argparse
 import json
 import os
 import platform
+import re
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -970,6 +976,418 @@ def _handle_stop_honeypot(payload: dict[str, Any]) -> dict[str, Any]:
     return HONEYPOTS.stop(payload.get("decoy_id"))
 
 
+# ---------------------------------------------------------------------------
+# Wave 5: decoys, container image scans, STIG scans and OT actions.
+#
+# Every one of these is gated twice: the server only queues the action for an
+# agent enrolled with the matching capability, and this agent only registers
+# the handler when its own enrolled capability list carries it
+# (``build_action_handlers``). Nothing here runs a command string sent by the
+# server:
+#
+# * scanners (trivy / grype / oscap) are local binaries found on PATH, called
+#   with a fixed argv; the server-supplied image reference / benchmark id /
+#   profile is validated against a strict grammar first. A missing binary is
+#   reported as ``tool_missing``;
+# * decoys are planted only inside the operator-configured decoy directory,
+#   under a sanitised file name, and removed only from the agent's own
+#   manifest of what it planted;
+# * OT safe shutdown and segmentation probes run only the operator's own
+#   local script (configured on this host); the server's payload is passed to
+#   it as JSON on stdin, as data. Without a configured script the agent
+#   reports ``not_configured``.
+#
+# Local configuration: ``<token file>.config.json`` (written by the operator,
+# never by the server) and/or environment variables:
+#   decoy_dir                     PYSOAR_DECOY_DIR
+#   ot_safe_shutdown_script       PYSOAR_OT_SAFE_SHUTDOWN_SCRIPT
+#   ot_segmentation_probe_script  PYSOAR_OT_SEGMENTATION_PROBE_SCRIPT
+#   stig_datastreams              {benchmark_id: SCAP datastream path}
+#   stig_datastream               PYSOAR_STIG_DATASTREAM (used when the
+#                                 benchmark id is not mapped)
+# ---------------------------------------------------------------------------
+
+AGENT_CONFIG: dict[str, Any] = {}
+
+_CONFIG_ENV = {
+    "decoy_dir": "PYSOAR_DECOY_DIR",
+    "ot_safe_shutdown_script": "PYSOAR_OT_SAFE_SHUTDOWN_SCRIPT",
+    "ot_segmentation_probe_script": "PYSOAR_OT_SEGMENTATION_PROBE_SCRIPT",
+    "stig_datastream": "PYSOAR_STIG_DATASTREAM",
+}
+
+#: Wall clocks for the long-running handlers (seconds).
+CONTAINER_SCAN_TIMEOUT = 900
+STIG_SCAN_TIMEOUT = 1800
+OT_SAFE_SHUTDOWN_TIMEOUT = 600
+OT_PROBE_MAX_TIMEOUT = 900
+#: Largest report / ARF the agent returns (characters); the server refuses
+#: scanner reports above 20,000,000 characters.
+MAX_REPORT_CHARS = 20_000_000
+MAX_DECOY_CONTENT_BYTES = 256 * 1024
+DECOY_MANIFEST = ".pysoar-decoys.json"
+#: Decoy types the agent plants as a file in the decoy directory.
+FILE_DECOY_TYPES = frozenset({"honeyfile", "canary_file", "honeycred", "breadcrumb", "honeytoken"})
+
+# Same OCI reference grammar the server enforces
+# (src/container_security/scanning.py IMAGE_REFERENCE_RE): no option-looking
+# strings, whitespace or shell metacharacters reach the scanner argv.
+_REF_COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+_REF_REGISTRY = (
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*"
+    r"(?::[0-9]{1,5})?)"
+)
+IMAGE_REFERENCE_RE = re.compile(
+    r"^(?:" + _REF_REGISTRY + r"/)?" + _REF_COMPONENT + r"(?:/" + _REF_COMPONENT + r")*"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?(?:@sha256:[a-f0-9]{64})?$",
+)
+#: XCCDF benchmark / profile ids: no leading dash, no whitespace.
+_XCCDF_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,254}$")
+_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def load_agent_config(token_file: Path) -> dict[str, Any]:
+    """Operator configuration: ``<token file>.config.json`` then env overrides."""
+    config: dict[str, Any] = {}
+    path = Path(str(token_file) + ".config.json")
+    try:
+        if path.exists():
+            loaded = json.loads(path.read_text())
+            if isinstance(loaded, dict):
+                config.update(loaded)
+    except (OSError, ValueError) as e:
+        print(f"[pysoar-agent] ignoring unreadable config {path}: {e}")
+    for key, env in _CONFIG_ENV.items():
+        if os.environ.get(env):
+            config[key] = os.environ[env]
+    return config
+
+
+def _which(name: str) -> Optional[str]:
+    return shutil.which(name)
+
+
+def _script_argv(path: str) -> list[str]:
+    """argv for a local tool or operator script (``.py`` runs under this
+    interpreter, ``.ps1`` under PowerShell, anything else directly)."""
+    lowered = path.lower()
+    if lowered.endswith(".py"):
+        return [sys.executable, path]
+    if lowered.endswith(".ps1"):
+        return ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path]
+    return [path]
+
+
+def _not_configured(what: str) -> dict[str, Any]:
+    return {
+        "status": "not_configured",
+        "exit_code": 78,
+        "stderr": f"not_configured: {what}",
+        "artifacts": {"error": "not_configured"},
+    }
+
+
+def _tool_missing(what: str) -> dict[str, Any]:
+    return {
+        "status": "tool_missing",
+        "exit_code": 127,
+        "stderr": f"tool_missing: {what}",
+        "artifacts": {"error": "tool_missing"},
+    }
+
+
+def _operator_script(key: str) -> Optional[str]:
+    """The operator's configured script for ``key`` when it is an existing
+    absolute file path, else None."""
+    raw = AGENT_CONFIG.get(key)
+    if not raw or not isinstance(raw, str):
+        return None
+    path = Path(raw)
+    if not path.is_absolute() or not path.is_file():
+        return None
+    return str(path)
+
+
+# --- scan_container_image ---------------------------------------------------
+
+def _handle_scan_container_image(payload: dict[str, Any]) -> dict[str, Any]:
+    """Run trivy (``trivy image --format json``) or grype (``grype -o json``)
+    against the image and return the JSON report on stdout."""
+    ref = str(payload.get("image_ref") or "").strip()
+    if not ref or len(ref) > 512 or not IMAGE_REFERENCE_RE.fullmatch(ref):
+        return {"status": "rejected", "exit_code": 2, "stderr": "invalid image reference"}
+    preferred = str(payload.get("scanner") or "trivy").lower()
+    order = ["grype", "trivy"] if preferred == "grype" else ["trivy", "grype"]
+    scanner = binary = None
+    for name in order:
+        binary = _which(name)
+        if binary:
+            scanner = name
+            break
+    if scanner is None or binary is None:
+        return _tool_missing("neither trivy nor grype is installed on this agent")
+    if scanner == "trivy":
+        argv = [*_script_argv(binary), "image", "--format", "json", "--quiet", ref]
+    else:
+        argv = [*_script_argv(binary), ref, "-o", "json"]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=CONTAINER_SCAN_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "exit_code": 124, "stderr": f"{scanner} timed out"}
+    except OSError as e:
+        return {"status": "error", "exit_code": 1, "stderr": f"{scanner} could not run: {e}"[:512]}
+    if proc.returncode != 0:
+        return {"status": "error", "exit_code": proc.returncode,
+                "stderr": (proc.stderr or proc.stdout or f"{scanner} failed")[-4000:],
+                "artifacts": {"scanner": scanner}}
+    report = proc.stdout or ""
+    if len(report) > MAX_REPORT_CHARS:
+        return {"status": "error", "exit_code": 1,
+                "stderr": f"{scanner} report is {len(report)} characters; the limit is {MAX_REPORT_CHARS}"}
+    try:
+        json.loads(report)
+    except ValueError:
+        return {"status": "error", "exit_code": 1, "stderr": f"{scanner} output is not JSON",
+                "artifacts": {"scanner": scanner}}
+    return {"status": "success", "exit_code": 0, "stdout": report, "stderr": (proc.stderr or "")[-2000:],
+            "artifacts": {"scanner": scanner, "image_ref": ref, "scan_id": payload.get("scan_id")}}
+
+
+# --- stig_scan ----------------------------------------------------------------
+
+def _stig_datastream(benchmark_id: str) -> Optional[str]:
+    mapping = AGENT_CONFIG.get("stig_datastreams")
+    raw = mapping.get(benchmark_id) if isinstance(mapping, dict) else None
+    raw = raw or AGENT_CONFIG.get("stig_datastream")
+    if not raw or not isinstance(raw, str):
+        return None
+    path = Path(raw)
+    return str(path) if path.is_absolute() and path.is_file() else None
+
+
+def _handle_stig_scan(payload: dict[str, Any]) -> dict[str, Any]:
+    """``oscap xccdf eval --results-arf`` over the configured SCAP datastream;
+    the ARF XML is returned in ``artifacts.arf``."""
+    benchmark_id = str(payload.get("benchmark_id") or "")
+    profile = payload.get("profile")
+    if not _XCCDF_ID_RE.fullmatch(benchmark_id):
+        return {"status": "rejected", "exit_code": 2, "stderr": "invalid benchmark_id"}
+    if profile is not None and not _XCCDF_ID_RE.fullmatch(str(profile)):
+        return {"status": "rejected", "exit_code": 2, "stderr": "invalid profile"}
+    oscap = _which("oscap")
+    if not oscap:
+        return _tool_missing("oscap (OpenSCAP) is not installed on this agent")
+    datastream = _stig_datastream(benchmark_id)
+    if not datastream:
+        return _not_configured(
+            f"no SCAP datastream configured for benchmark {benchmark_id} "
+            "(stig_datastreams / stig_datastream in the agent config)",
+        )
+    with tempfile.TemporaryDirectory(prefix="pysoar-stig-") as tmp:
+        arf_path = os.path.join(tmp, "results-arf.xml")
+        argv = [*_script_argv(oscap), "xccdf", "eval", "--benchmark-id", benchmark_id]
+        if profile:
+            argv += ["--profile", str(profile)]
+        argv += ["--results-arf", arf_path, datastream]
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=STIG_SCAN_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return {"status": "timeout", "exit_code": 124, "stderr": "oscap timed out"}
+        except OSError as e:
+            return {"status": "error", "exit_code": 1, "stderr": f"oscap could not run: {e}"[:512]}
+        # oscap: 0 = every rule passed, 2 = at least one rule failed; both
+        # produce results. Anything else is an evaluation error.
+        if proc.returncode not in (0, 2) or not os.path.isfile(arf_path):
+            return {"status": "error", "exit_code": proc.returncode,
+                    "stderr": (proc.stderr or proc.stdout or "oscap produced no ARF")[-4000:]}
+        with open(arf_path, encoding="utf-8", errors="replace") as fh:
+            arf = fh.read(MAX_REPORT_CHARS + 1)
+    if len(arf) > MAX_REPORT_CHARS:
+        return {"status": "error", "exit_code": 1, "stderr": f"ARF exceeds {MAX_REPORT_CHARS} characters"}
+    return {"status": "success", "exit_code": proc.returncode,
+            "stdout": f"oscap xccdf eval exit {proc.returncode}; ARF {len(arf)} characters",
+            "stderr": (proc.stderr or "")[-2000:],
+            "artifacts": {"arf": arf, "benchmark_id": benchmark_id, "scan_id": payload.get("scan_id")}}
+
+
+# --- deploy_decoy / remove_decoy ----------------------------------------------
+
+def _decoy_dir() -> Optional[Path]:
+    raw = AGENT_CONFIG.get("decoy_dir")
+    if not raw or not isinstance(raw, str):
+        return None
+    path = Path(raw)
+    return path if path.is_absolute() and path.is_dir() else None
+
+
+def _read_manifest(directory: Path) -> dict[str, Any]:
+    try:
+        data = json.loads((directory / DECOY_MANIFEST).read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_manifest(directory: Path, manifest: dict[str, Any]) -> None:
+    (directory / DECOY_MANIFEST).write_text(json.dumps(manifest, indent=1))
+
+
+def _decoy_filename(payload: dict[str, Any]) -> Optional[str]:
+    config = payload.get("configuration") if isinstance(payload.get("configuration"), dict) else {}
+    raw = str(config.get("filename") or payload.get("name") or payload.get("decoy_id") or "")
+    name = _SAFE_FILENAME_RE.sub("_", os.path.basename(raw.replace("\\", "/")))[:128]
+    if not name or name in (".", "..") or name == DECOY_MANIFEST:
+        return None
+    return name
+
+
+def _handle_deploy_decoy(payload: dict[str, Any]) -> dict[str, Any]:
+    """Plant a file decoy in the operator's decoy directory."""
+    decoy_id = str(payload.get("decoy_id") or "")
+    decoy_type = str(payload.get("decoy_type") or "").lower()
+    if not decoy_id:
+        return {"status": "error", "exit_code": 2, "stderr": "decoy_id is required"}
+    if decoy_type not in FILE_DECOY_TYPES:
+        return {"status": "rejected", "exit_code": 2,
+                "stderr": f"decoy type '{decoy_type}' cannot be planted by this agent"}
+    directory = _decoy_dir()
+    if directory is None:
+        return _not_configured("no decoy_dir configured on this agent (an existing absolute directory)")
+    name = _decoy_filename(payload)
+    if name is None:
+        return {"status": "error", "exit_code": 2, "stderr": "no usable decoy file name"}
+    config = payload.get("configuration") if isinstance(payload.get("configuration"), dict) else {}
+    content = config.get("content")
+    if content is not None and not isinstance(content, str):
+        return {"status": "error", "exit_code": 2, "stderr": "decoy content must be text"}
+    body = (content or "").encode("utf-8")
+    if len(body) > MAX_DECOY_CONTENT_BYTES:
+        return {"status": "error", "exit_code": 2,
+                "stderr": f"decoy content exceeds {MAX_DECOY_CONTENT_BYTES} bytes"}
+    manifest = _read_manifest(directory)
+    if decoy_id in manifest:
+        return {"status": "error", "exit_code": 2, "stderr": f"decoy {decoy_id} already planted"}
+    target = directory / name
+    if target.exists():
+        return {"status": "error", "exit_code": 17, "stderr": f"{name} already exists in the decoy directory"}
+    import hashlib
+
+    with open(target, "xb") as fh:
+        fh.write(body)
+    digest = hashlib.sha256(body).hexdigest()
+    manifest[decoy_id] = {"path": str(target), "sha256": digest, "decoy_type": decoy_type,
+                          "planted_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())}
+    _write_manifest(directory, manifest)
+    print(f"[pysoar-agent] decoy planted: {target} (decoy={decoy_id})")
+    return {"status": "success", "exit_code": 0,
+            "stdout": json.dumps({"planted": True, "path": str(target), "sha256": digest, "bytes": len(body),
+                                  # Reads of the file are not watched by the agent.
+                                  "access_monitoring": "not_provided_by_agent"}),
+            "artifacts": {"path": str(target), "sha256": digest}}
+
+
+def _handle_remove_decoy(payload: dict[str, Any]) -> dict[str, Any]:
+    """Remove a decoy this agent planted (looked up in its own manifest)."""
+    decoy_id = str(payload.get("decoy_id") or "")
+    directory = _decoy_dir()
+    if directory is None:
+        return _not_configured("no decoy_dir configured on this agent")
+    manifest = _read_manifest(directory)
+    entry = manifest.get(decoy_id)
+    if not isinstance(entry, dict):
+        return {"status": "error", "exit_code": 1, "stderr": f"decoy {decoy_id} was not planted by this agent"}
+    path = Path(str(entry.get("path") or ""))
+    if path.parent != directory:
+        return {"status": "error", "exit_code": 1, "stderr": "manifest entry outside the decoy directory"}
+    existed = path.exists()
+    if existed:
+        path.unlink()
+    manifest.pop(decoy_id, None)
+    _write_manifest(directory, manifest)
+    print(f"[pysoar-agent] decoy removed: {path} (decoy={decoy_id})")
+    return {"status": "success", "exit_code": 0,
+            "stdout": json.dumps({"removed": True, "path": str(path), "file_was_present": existed})}
+
+
+# --- OT: operator scripts ---------------------------------------------------------
+
+def _run_operator_script(script: str, payload: dict[str, Any], action: str, timeout: int) -> Any:
+    env = dict(os.environ)
+    env["PYSOAR_ACTION"] = action
+    return subprocess.run(
+        _script_argv(script), input=json.dumps(payload), capture_output=True, text=True,
+        timeout=timeout, env=env,
+    )
+
+
+def _handle_ot_safe_shutdown(payload: dict[str, Any]) -> dict[str, Any]:
+    """Run the site's own safe-shutdown script with the payload on stdin;
+    success only when it exits 0."""
+    script = _operator_script("ot_safe_shutdown_script")
+    if script is None:
+        return _not_configured("no ot_safe_shutdown_script configured on this agent (an existing absolute path)")
+    try:
+        proc = _run_operator_script(script, payload, "ot_safe_shutdown", OT_SAFE_SHUTDOWN_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "exit_code": 124, "stderr": "safe-shutdown script timed out"}
+    except OSError as e:
+        return {"status": "error", "exit_code": 1, "stderr": f"safe-shutdown script could not run: {e}"[:512]}
+    return {"status": "success" if proc.returncode == 0 else "error", "exit_code": proc.returncode,
+            "stdout": (proc.stdout or "")[-8192:], "stderr": (proc.stderr or "")[-4096:]}
+
+
+def _handle_ot_segmentation_probe(payload: dict[str, Any]) -> dict[str, Any]:
+    """Run the operator's probe script with the probe plan on stdin. It must
+    print ``{"results": [{"target_ip", "port", "reachable"}]}``; the agent
+    keeps only answers for probes the server asked for."""
+    script = _operator_script("ot_segmentation_probe_script")
+    if script is None:
+        return _not_configured(
+            "no ot_segmentation_probe_script configured on this agent (an existing absolute path)",
+        )
+    probes = payload.get("probes") if isinstance(payload.get("probes"), list) else []
+    try:
+        per_probe = float(payload.get("timeout_seconds") or 2)
+    except (TypeError, ValueError):
+        per_probe = 2.0
+    timeout = int(min(OT_PROBE_MAX_TIMEOUT, 30 + per_probe * max(len(probes), 1)))
+    try:
+        proc = _run_operator_script(script, payload, "ot_segmentation_probe", timeout)
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "exit_code": 124, "stderr": "segmentation probe script timed out"}
+    except OSError as e:
+        return {"status": "error", "exit_code": 1, "stderr": f"probe script could not run: {e}"[:512]}
+    if proc.returncode != 0:
+        return {"status": "error", "exit_code": proc.returncode,
+                "stderr": (proc.stderr or proc.stdout or "probe script failed")[-4096:]}
+    try:
+        doc = json.loads(proc.stdout or "")
+    except ValueError:
+        return {"status": "error", "exit_code": 1, "stderr": "probe script output is not JSON"}
+    rows = doc.get("results") if isinstance(doc, dict) else doc
+    if not isinstance(rows, list):
+        return {"status": "error", "exit_code": 1, "stderr": "probe script output has no results list"}
+    asked = set()
+    for p in probes:
+        if isinstance(p, dict):
+            try:
+                asked.add((str(p.get("target_ip")), int(p.get("port") or 0)))
+            except (TypeError, ValueError):
+                continue
+    results = []
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("reachable"), bool):
+            continue
+        try:
+            key = (str(row.get("target_ip")), int(row.get("port") or 0))
+        except (TypeError, ValueError):
+            continue
+        if key in asked:
+            results.append({"target_ip": key[0], "port": key[1], "reachable": row["reachable"]})
+    return {"status": "success", "exit_code": 0, "stdout": json.dumps({"results": results}),
+            "stderr": (proc.stderr or "")[-2000:], "artifacts": {"results": results}}
+
+
 BAS_HANDLERS: dict[str, Any] = {
     "run_atomic_test": _handle_run_atomic_test,
     "collect_process_list": _handle_collect_process_list,
@@ -1000,7 +1418,16 @@ PURPLE_HANDLERS: dict[str, Any] = {
 DECEPTION_HANDLERS: dict[str, Any] = {
     "deploy_honeypot": _handle_deploy_honeypot,
     "stop_honeypot": _handle_stop_honeypot,
+    "deploy_decoy": _handle_deploy_decoy,
+    "remove_decoy": _handle_remove_decoy,
 }
+
+# One capability each, matching src/agents/capabilities.py; "stig_scan" is
+# deliberately not implied by "compliance" (server commit fbf2edf).
+CONTAINER_SCAN_HANDLERS: dict[str, Any] = {"scan_container_image": _handle_scan_container_image}
+STIG_SCAN_HANDLERS: dict[str, Any] = {"stig_scan": _handle_stig_scan}
+OT_SAFE_SHUTDOWN_HANDLERS: dict[str, Any] = {"ot_safe_shutdown": _handle_ot_safe_shutdown}
+OT_SEGMENTATION_PROBE_HANDLERS: dict[str, Any] = {"ot_segmentation_probe": _handle_ot_segmentation_probe}
 
 
 def build_action_handlers(capabilities: list[str]) -> dict[str, Any]:
@@ -1014,6 +1441,14 @@ def build_action_handlers(capabilities: list[str]) -> dict[str, Any]:
         table.update(PURPLE_HANDLERS)
     if "deception" in capabilities:
         table.update(DECEPTION_HANDLERS)
+    if "container_scan" in capabilities:
+        table.update(CONTAINER_SCAN_HANDLERS)
+    if "stig_scan" in capabilities:
+        table.update(STIG_SCAN_HANDLERS)
+    if "ot_safe_shutdown" in capabilities:
+        table.update(OT_SAFE_SHUTDOWN_HANDLERS)
+    if "ot_segmentation_probe" in capabilities:
+        table.update(OT_SEGMENTATION_PROBE_HANDLERS)
     return table
 
 
@@ -1241,6 +1676,10 @@ def cmd_poll(args: argparse.Namespace) -> int:
         pass
     ACTION_HANDLERS = build_action_handlers(caps)
     print(f"[pysoar-agent] capabilities={caps} handlers={sorted(ACTION_HANDLERS.keys())}")
+    # Operator-local configuration (decoy directory, OT scripts, SCAP
+    # content); never taken from the server.
+    AGENT_CONFIG.clear()
+    AGENT_CONFIG.update(load_agent_config(args.token_file))
 
     # Resolve the PySOAR server's IP(s) once at startup so block_ip can
     # refuse to firewall off the management channel.
