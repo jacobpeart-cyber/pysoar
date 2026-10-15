@@ -136,7 +136,7 @@ POLICY_WINDOW_BUDGET_SECONDS = 10.0
 #: of its policies and windows; past it, remaining custom-pattern work is
 #: recorded as scan_incomplete without spawning (a tenant with hundreds of
 #: slow policies cannot multiply the per-policy budget into hours).
-ORG_RUN_BUDGET_SECONDS = 300.0
+ORG_RUN_BUDGET_SECONDS = 60.0
 #: Child-process time one policy may spend per run. Budgets are charged per
 #: policy so a slow (or deliberately slowed) policy only exhausts itself: it is
 #: then marked ``degraded`` (custom matching suspended until the policy is
@@ -691,10 +691,16 @@ async def _evaluate_window(
     # Cheapest policies first: a slow one cannot delay the others' window.
     for plan in sorted(plans, key=_consumed):
         custom = {name: p.pattern for name, p in plan.patterns.items() if name.startswith("custom:")}
-        if not custom or plan.policy.evaluation_status == "degraded":
+        if not custom:
             continue
         todo = [(rid, text) for rid, text in texts.items() if text and (plan.policy.id, rid) not in existing]
         if not todo:
+            continue
+        if plan.policy.evaluation_status == "degraded":
+            # Suspended custom matching is never silent: every record it would
+            # have scanned is recorded as scan_incomplete for review.
+            custom_hits[plan.policy.id] = {}
+            unscanned[plan.policy.id] = {rid for rid, _ in todo}
             continue
         policy_remaining = per_policy.get(plan.policy.id, POLICY_RUN_BUDGET_SECONDS)
         org_remaining = state["remaining"] if state is not None else POLICY_WINDOW_BUDGET_SECONDS
