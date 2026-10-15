@@ -528,50 +528,9 @@ Pages call these through a path built at runtime, which the contract diff's call
 | GET | `/api/v1/ot_security/zones/{zone_id}/segmentation_audit` | OTSecurityDashboard refreshes the audit command state. | any authenticated user | org-scoped |
 | POST | `/api/v1/ot_security/zones/{zone_id}/segmentation_audit` | OTSecurityDashboard action dialog (agent approval queue). | admin | org-scoped |
 
-## EXPOSE (41 routes, handed to W5-A)
+## EXPOSE (0 routes; the 41 handed to W5-A are called by the UI)
 
 Real routes the UI should call. They stay in the contract diff's "never called" list until a page calls them; then delete the row.
 
 | Method | Route | Note | Roles | Tenancy |
 |---|---|---|---|---|
-| POST | `/api/v1/agentic/agents` | Create SOC agent (admin): without one, proposals answer 409 and auto-triage skips the organisation. Disabled-with-reason for non-admins. | admin | org-scoped |
-| GET | `/api/v1/agentic/agents/{agent_id}` | SOC agent detail. | any authenticated user | org-scoped |
-| PUT | `/api/v1/agentic/agents/{agent_id}` | Edit SOC agent (admin). | admin | org-scoped |
-| GET | `/api/v1/agentic/evidence/export` | AgenticSOC evidence export (AU-6/AU-7) download. | admin | org-scoped (in handler) |
-| GET | `/api/v1/agentic/policy-events` | AgenticSOC auditor surface: trust and policy events. | analyst, admin (checked in handler) | org-scoped |
-| GET | `/api/v1/agentic/runs/{run_id}` | AgenticSOC run timeline (steps, transcript summary); link it from the run id shown in chat. | analyst, admin (checked in handler) | org-scoped |
-| POST | `/api/v1/agentic/trust/acknowledge` | The only way out of a trust lockdown short of abandoning the session. | analyst, admin (checked in handler) | org-scoped |
-| GET | `/api/v1/agentic/usage` | AgenticSOC usage panel (token and cost counters for the organisation). | any authenticated user | org-scoped (in handler) |
-| GET | `/api/v1/audit-evidence/evidence/{evidence_id}/download` | AuditEvidence: assessors need the evidence file download. | any authenticated user | org-scoped |
-| GET | `/api/v1/audit-evidence/packages/{package_id}` | AuditEvidence package detail (package building flow). | any authenticated user | org-scoped |
-| POST | `/api/v1/auth/password-reset/consume` | Forgot-password page: set the new password. | public (single-use reset token) | the token's account |
-| POST | `/api/v1/auth/password-reset/validate` | Forgot-password page (none exists). | public (single-use reset token) | the token's account |
-| POST | `/api/v1/auth/revoke-all` | Replaces the hard-coded Active Sessions card on Profile. | any authenticated user | the caller's own account |
-| PATCH | `/api/v1/collaboration/actions/{action_id}` | WarRoom action items: update status and owner. | analyst, admin | org-scoped |
-| GET | `/api/v1/collaboration/rooms/{room_id}/artifacts` | WarRoom artifacts: a metadata registry only (name, hash, size). No bytes are stored, so offer no download. | any authenticated user | org-scoped |
-| POST | `/api/v1/collaboration/rooms/{room_id}/join` | WarRoom join (the page cannot join a room today). | analyst, admin | org-scoped |
-| POST | `/api/v1/collaboration/rooms/{room_id}/leave` | WarRoom leave. | analyst, admin | org-scoped |
-| GET | `/api/v1/collaboration/rooms/{room_id}/timeline` | WarRoom incident timeline. | any authenticated user | org-scoped |
-| POST | `/api/v1/collaboration/rooms/{room_id}/timeline` | WarRoom: add a timeline entry. | analyst, admin | org-scoped |
-| GET | `/api/v1/data-lake/dashboard/pipeline-status` | DataLakeDashboard pipeline statuses (scheduled / registered, with the no-executor note). | any authenticated user | org-scoped |
-| POST | `/api/v1/exposure/assets` | Exposure asset create: the Exposure page has no other way to get assets. | analyst, admin | org-scoped |
-| GET | `/api/v1/integrations/executions` | IntegrationMarketplace Executions tab (hard-codes an empty list today). | any authenticated user | org-scoped (in handler) |
-| POST | `/api/v1/itdr/identities` | ITDR identity create: the only producer of identity profiles besides CSV import and IdP sync. | analyst, admin | org-scoped |
-| POST | `/api/v1/mfa/backup-codes` | Profile MFA: regenerate backup codes. | any authenticated user | the caller's own account |
-| POST | `/api/v1/mfa/disable` | Profile MFA: disable. | any authenticated user | the caller's own account |
-| POST | `/api/v1/mfa/setup` | Profile MFA setup: the Enable button calls /auth/mfa/enable and discards the secret; use setup, verify-setup, backup codes. | any authenticated user | the caller's own account |
-| POST | `/api/v1/mfa/verify` | Login MFA challenge: an MFA-enabled user cannot log in through the UI today. | public (MFA login token from /auth/login) | the user's own account |
-| POST | `/api/v1/mfa/verify-setup` | Profile MFA: confirm the TOTP code and persist the (encrypted) secret. | public (MFA login token from /auth/login) | the caller's own account |
-| PATCH | `/api/v1/phishing_sim/target-groups/{group_id}` | Phishing target group members: the only way to add recipients, so a launch can succeed. | analyst, admin | org-scoped |
-| POST | `/api/v1/phishing_sim/templates` | Phishing template create: without it every campaign sends the placeholder body. | analyst, admin | org-scoped |
-| GET | `/api/v1/remediation/playbooks` | Remediation playbooks list. | any authenticated user | org-scoped |
-| POST | `/api/v1/remediation/playbooks` | Create remediation playbook (admin). | admin | org-scoped |
-| GET | `/api/v1/remediation/playbooks/{playbook_id}` | Remediation playbook detail. | any authenticated user | org-scoped |
-| PUT | `/api/v1/remediation/playbooks/{playbook_id}` | Edit remediation playbook (admin). | admin | org-scoped |
-| POST | `/api/v1/remediation/playbooks/{playbook_id}/execute` | Run a remediation playbook (admin); render per-step awaiting_integration and failed states. | admin | org-scoped |
-| GET | `/api/v1/stig/benchmarks/{benchmark_id}` | STIG benchmark detail (row id or XCCDF id). | any authenticated user | org-scoped |
-| GET | `/api/v1/stig/benchmarks/{benchmark_id}/rules` | STIG rule browser. | any authenticated user | org-scoped |
-| GET | `/api/v1/stig/rules/search` | STIG rule search. | any authenticated user | org-scoped |
-| GET | `/api/v1/stig/rules/{rule_id}` | STIG rule detail (check and fix text). | any authenticated user | org-scoped |
-| POST | `/api/v1/threat-modeling/{model_id}/threats/{threat_id}/mitigations` | ThreatModel mitigations panel is always empty without a create control. | analyst, admin | org-scoped |
-| POST | `/api/v1/vulnmgmt/instances` | Vulnerability instance create: the only creator besides scanner import. | analyst, admin | org-scoped |

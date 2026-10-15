@@ -1,10 +1,14 @@
 """
 Redis-backed token blacklist for JWT revocation.
-Implements token invalidation and user-level revocation tracking.
+
+The client is the application's async Redis client, so every method is a
+coroutine. The keys are the ones ``src.api.deps.get_current_user`` checks on
+every request (``blacklist:<jti>`` and ``revoke:<user_id>``); before wave 5 the
+class wrote different keys and never awaited the client, so logout, revoke-all
+and the post-password-change revocation silently did nothing.
 """
 
 import logging
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -12,8 +16,8 @@ logger = logging.getLogger(__name__)
 class TokenBlacklist:
     """Manages JWT token revocation and user revocation timestamps."""
 
-    REVOKED_TOKEN_PREFIX = "token:revoked:"
-    USER_REVOKED_PREFIX = "user:revoked:"
+    REVOKED_TOKEN_PREFIX = "blacklist:"
+    USER_REVOKED_PREFIX = "revoke:"
     CLOCK_SKEW_BUFFER = 5  # seconds
 
     def __init__(self, redis_client):
@@ -25,7 +29,7 @@ class TokenBlacklist:
         """
         self.redis = redis_client
 
-    def revoke_token(self, jti: str, expires_in: int) -> bool:
+    async def revoke_token(self, jti: str, expires_in: int) -> bool:
         """
         Revoke a specific token by its JTI (JWT ID).
 
@@ -43,14 +47,14 @@ class TokenBlacklist:
         key = f"{self.REVOKED_TOKEN_PREFIX}{jti}"
         try:
             # Store with TTL matching original token expiration
-            self.redis.setex(key, expires_in, "revoked")
+            await self.redis.setex(key, expires_in, "revoked")
             logger.info(f"Token revoked: {jti}")
             return True
         except Exception as e:
             logger.error(f"Failed to revoke token {jti}: {e}")
             return False
 
-    def revoke_all_user_tokens(self, user_id: str) -> bool:
+    async def revoke_all_user_tokens(self, user_id: str) -> bool:
         """
         Revoke all tokens for a user by storing revocation timestamp.
 
@@ -69,14 +73,14 @@ class TokenBlacklist:
             # Store current timestamp (in seconds since epoch)
             import time
             revocation_time = int(time.time())
-            self.redis.set(key, revocation_time)
+            await self.redis.set(key, revocation_time)
             logger.info(f"All tokens revoked for user: {user_id}")
             return True
         except Exception as e:
             logger.error(f"Failed to revoke all tokens for user {user_id}: {e}")
             return False
 
-    def is_revoked(self, jti: str) -> bool:
+    async def is_revoked(self, jti: str) -> bool:
         """
         Check if a specific token (by JTI) has been revoked.
 
@@ -92,14 +96,14 @@ class TokenBlacklist:
 
         key = f"{self.REVOKED_TOKEN_PREFIX}{jti}"
         try:
-            result = self.redis.exists(key)
+            result = await self.redis.exists(key)
             return bool(result)
         except Exception as e:
             logger.error(f"Error checking token revocation for {jti}: {e}")
             # Fail closed: treat as revoked on error
             return True
 
-    def is_user_revoked(self, user_id: str, token_iat: int) -> bool:
+    async def is_user_revoked(self, user_id: str, token_iat: int) -> bool:
         """
         Check if a user was revoked after the token was issued.
 
@@ -116,7 +120,7 @@ class TokenBlacklist:
 
         key = f"{self.USER_REVOKED_PREFIX}{user_id}"
         try:
-            revocation_time_str = self.redis.get(key)
+            revocation_time_str = await self.redis.get(key)
             if revocation_time_str is None:
                 return False
 

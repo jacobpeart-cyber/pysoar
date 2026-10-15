@@ -34,7 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
 from src.core.database import get_db
-from src.core.security import decode_token_full, verify_token
+from src.core.security import decode_token_full
 from src.core.token_blacklist import TokenBlacklist
 from src.models.user import User, UserRole
 from src.services.user_service import UserService
@@ -60,6 +60,14 @@ async def get_tenant_db(
     return db
 
 
+def _not_authenticated() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Not authenticated",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
 async def get_current_user(
     credentials: Annotated[Optional[HTTPAuthorizationCredentials], Depends(security)],
     db: Annotated[AsyncSession, Depends(get_db)],
@@ -67,14 +75,38 @@ async def get_current_user(
 ) -> User:
     """Get the current authenticated user from JWT token with enhanced security"""
     if not credentials:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise _not_authenticated()
+    return await _user_from_token(credentials.credentials, db, redis, allowed=frozenset({"access"}))
 
-    token = credentials.credentials
 
+async def get_password_change_user(
+    credentials: Annotated[Optional[HTTPAuthorizationCredentials], Depends(security)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    redis: Annotated[aioredis.Redis, Depends(get_redis_client)],
+) -> User:
+    """The caller of ``POST /auth/change-password``: a normal access token, or
+    the five-minute *limited* token login issues (``X-Limited-Token``) when a
+    password change is forced (type ``limited``, scope ``password_change``).
+    Every other route refuses the limited token, so a forced change cannot
+    be used to do anything but change the password."""
+    if not credentials:
+        raise _not_authenticated()
+    return await _user_from_token(
+        credentials.credentials, db, redis, allowed=frozenset({"access", "limited"}), scope="password_change",
+    )
+
+
+async def _user_from_token(
+    token: str,
+    db: AsyncSession,
+    redis: aioredis.Redis,
+    *,
+    allowed: frozenset[str],
+    scope: Optional[str] = None,
+) -> User:
+    """Resolve ``token`` to its active user: decode, check the token type
+    (and scope for a limited token), the jti blacklist and user-level
+    revocation (fail closed when Redis is unavailable), then load the user."""
     try:
         # Decode full token payload
         token_payload = decode_token_full(token)
@@ -85,8 +117,12 @@ async def get_current_user(
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
-        # Verify token type is "access"
-        if not verify_token(token, token_type="access"):
+        # Token type: access tokens everywhere; a limited token only where the
+        # caller allows it and only with the scope it was issued for.
+        token_type = token_payload.get("type")
+        if token_type not in allowed or (
+            token_type == "limited" and (scope is None or token_payload.get("scope") != scope)
+        ):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid token type",
@@ -116,7 +152,9 @@ async def get_current_user(
 
             # Check user-level revocation (user_id, iat)
             user_revocation = await redis.get(f"revoke:{user_id}")
-            if user_revocation and int(user_revocation) >= iat:
+            # Tokens issued before the revocation second are dead; one issued in
+            # the same second (a login right after a password change) survives.
+            if user_revocation and int(user_revocation) > iat:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="User tokens have been revoked",

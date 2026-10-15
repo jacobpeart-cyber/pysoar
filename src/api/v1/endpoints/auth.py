@@ -7,16 +7,14 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession, RedisClient
+from src.api.deps import CurrentUser, DatabaseSession, RedisClient, get_password_change_user
 from src.models.user import User
 from src.core.account_lockout import AccountLockoutManager
 from src.core.password_policy import PasswordValidator
 from src.core.security import (
     create_access_token,
     create_refresh_token,
-    decode_token_full,
     get_password_hash,
     verify_token,
 )
@@ -184,7 +182,8 @@ async def get_current_user_info(
 @router.post("/change-password")
 async def change_password(
     request: PasswordChangeRequest,
-    current_user: CurrentUser = None,
+    # A normal access token, or the limited token login issues for a forced change.
+    current_user: Annotated[User, Depends(get_password_change_user)],
     db: DatabaseSession = None,
     redis: RedisClient = None,
 ):
@@ -199,9 +198,15 @@ async def change_password(
 
     if not is_valid:
         logger.warning(f"Password validation failed for user {current_user.id}: {errors}")
+        # The rules the new password broke are about the caller's own input,
+        # not a secret: return them so the form can show which rule failed.
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Password does not meet requirements",
+            detail={
+                "error": "password_policy",
+                "detail": "Password does not meet requirements: " + "; ".join(errors),
+                "errors": list(errors),
+            },
         )
 
     try:
@@ -213,7 +218,7 @@ async def change_password(
 
         # Revoke all user tokens after password change (A2 fix)
         blacklist = TokenBlacklist(redis)
-        blacklist.revoke_all_user_tokens(current_user.id)
+        await blacklist.revoke_all_user_tokens(current_user.id)
 
         # Clear force_password_change flag if it exists
         if hasattr(current_user, "force_password_change"):
@@ -242,7 +247,7 @@ async def logout(
 ):
     """Logout current user by revoking all tokens"""
     blacklist = TokenBlacklist(redis)
-    blacklist.revoke_all_user_tokens(current_user.id)
+    await blacklist.revoke_all_user_tokens(current_user.id)
     logger.info(f"User {current_user.id} logged out")
     return {"message": "Logged out successfully"}
 
@@ -254,51 +259,9 @@ async def revoke_all_tokens(
 ):
     """Revoke all tokens for current user (security incident endpoint)"""
     blacklist = TokenBlacklist(redis)
-    blacklist.revoke_all_user_tokens(current_user.id)
+    await blacklist.revoke_all_user_tokens(current_user.id)
     logger.warning(f"All tokens revoked for user {current_user.id}")
     return {"message": "All tokens have been revoked"}
-
-
-# ---------------------------------------------------------------------------
-# MFA alias routes
-#
-# The Profile page calls POST /auth/mfa/enable; the real MFA implementation is
-# mounted at /mfa/setup and /mfa/verify-setup. The /auth/mfa/verify alias, a
-# duplicate of /mfa/verify-setup, was deleted in wave 5.
-# ---------------------------------------------------------------------------
-
-
-@router.post("/mfa/enable")
-async def mfa_enable_alias(
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
-):
-    """Generate a TOTP secret + provisioning URI for the caller.
-
-    Mirrors /mfa/setup. Returns ``secret``, ``provisioning_uri`` (otpauth URL
-    the frontend renders as a QR code), and a set of plaintext ``backup_codes``
-    shown exactly once. The secret is NOT persisted until the user confirms
-    via POST /mfa/verify-setup with a valid 6-digit code.
-    """
-    from src.core.mfa import MFAManager
-
-    secret = MFAManager.generate_secret()
-    provisioning_uri = MFAManager.get_provisioning_uri(
-        secret=secret,
-        email=current_user.email,
-        issuer="PySOAR",
-    )
-    if not provisioning_uri:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to generate MFA setup",
-        )
-    backup_codes = MFAManager.generate_backup_codes()
-    return {
-        "secret": secret,
-        "provisioning_uri": provisioning_uri,
-        "backup_codes": backup_codes,
-    }
 
 
 class PasswordResetTokenRequest(BaseModel):

@@ -3,12 +3,12 @@
 import logging
 from datetime import timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
 
 from src.api.deps import CurrentUser, DatabaseSession, RedisClient
 from src.core.mfa import MFAManager
-from src.core.security import create_access_token, create_refresh_token, decode_token_full, verify_token
+from src.core.security import create_access_token, create_refresh_token, decode_token_full
 from src.core.token_blacklist import TokenBlacklist
 from src.models.user import User
 from src.schemas.mfa import (
@@ -208,7 +208,7 @@ async def verify_mfa_login(
     blacklist = TokenBlacklist(redis)
     mfa_jti = token_payload.get("jti")
     if mfa_jti:
-        blacklist.revoke_token(mfa_jti, expires_in=300)
+        await blacklist.revoke_token(mfa_jti, expires_in=300)
 
     # Update last login
     await user_service.update_last_login(user_id)
