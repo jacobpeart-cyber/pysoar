@@ -37,6 +37,10 @@ class AgentCapability(str, Enum):
     PURPLE_TEAM = "purple"   # Orchestrated red+blue live correlation
     COMPLIANCE = "compliance"  # DISA STIG / CIS benchmark checks
     DECEPTION = "deception"  # Hosts honeypot listeners, reports interactions
+    CONTAINER_SCAN = "container_scan"  # Runs trivy / grype against a container image (wave 4)
+    OT_SAFE_SHUTDOWN = "ot_safe_shutdown"  # OT gateway: runs the site's safe-shutdown procedure (wave 4)
+    OT_SEGMENTATION_PROBE = "ot_segmentation_probe"  # In-zone TCP reachability probes (wave 4)
+    STIG_SCAN = "stig_scan"  # Runs a whole-benchmark oscap evaluation (wave 4)
 
 
 class AgentAction(str, Enum):
@@ -81,6 +85,29 @@ class AgentAction(str, Enum):
     DEPLOY_DECOY = "deploy_decoy"        # payload = {decoy_id, decoy_type, category, configuration}
     REMOVE_DECOY = "remove_decoy"        # payload = {decoy_id, decoy_type}
 
+    # --- Container scanning (wave 4) ---
+    # payload = {image_ref, scanner: trivy|grype, scan_id}; the agent runs the
+    # scanner with JSON output and returns the report on stdout (or as
+    # artifacts.report). Read-only on the host, so no approval is required.
+    SCAN_CONTAINER_IMAGE = "scan_container_image"
+
+    # --- OT security (wave 4, src/ot_security/actuation.py) ---
+    # payload = {ot_incident_id, affected_zones, assets: [{asset_id, name,
+    # ip_address, protocol, vendor, model, purdue_level, criticality}]}; the
+    # agent runs the site's own shutdown procedure and reports success/failure.
+    OT_SAFE_SHUTDOWN = "ot_safe_shutdown"
+    # payload = {zone_id, zone_cidr, timeout_seconds, probes: [{target_ip, port,
+    # protocol}]}; the agent attempts each TCP connection and returns
+    # {"results": [{target_ip, port, reachable}]} on stdout (or artifacts.results).
+    OT_SEGMENTATION_PROBE = "ot_segmentation_probe"
+
+    # --- STIG scanning (wave 4, src/stig/agent_scan.py) ---
+    # payload = {scan_id, benchmark_id (XCCDF id), profile, benchmark_title};
+    # the agent runs ``oscap xccdf eval --results-arf`` against the benchmark
+    # and returns the ARF XML on stdout (or as artifacts.arf). Read-only on
+    # the host, so no approval is required.
+    STIG_SCAN = "stig_scan"
+
 
 # Which actions each capability unlocks
 CAPABILITY_ACTIONS: dict[AgentCapability, set[AgentAction]] = {
@@ -117,6 +144,9 @@ CAPABILITY_ACTIONS: dict[AgentCapability, set[AgentAction]] = {
         AgentAction.REMOVE_DECOY,
     },
 }
+CAPABILITY_ACTIONS[AgentCapability.CONTAINER_SCAN] = {AgentAction.SCAN_CONTAINER_IMAGE}
+CAPABILITY_ACTIONS[AgentCapability.OT_SAFE_SHUTDOWN] = {AgentAction.OT_SAFE_SHUTDOWN}
+CAPABILITY_ACTIONS[AgentCapability.OT_SEGMENTATION_PROBE] = {AgentAction.OT_SEGMENTATION_PROBE}
 
 
 # Actions that require multi-party approval before execution.
@@ -133,6 +163,12 @@ HIGH_BLAST_ACTIONS: set[AgentAction] = {
     AgentAction.QUARANTINE_FILE,
     AgentAction.UNQUARANTINE_FILE,
 }
+# Wave 4 (OT): shutting down plant equipment and actively probing OT networks
+# both wait for a second administrator in the approval queue.
+HIGH_BLAST_ACTIONS |= {AgentAction.OT_SAFE_SHUTDOWN, AgentAction.OT_SEGMENTATION_PROBE}
+# Wave 4 (STIG): agents enrolled with "stig_scan" or "compliance" may run it.
+CAPABILITY_ACTIONS[AgentCapability.STIG_SCAN] = {AgentAction.STIG_SCAN}
+CAPABILITY_ACTIONS[AgentCapability.COMPLIANCE] = CAPABILITY_ACTIONS[AgentCapability.COMPLIANCE] | {AgentAction.STIG_SCAN}
 
 
 def capability_allows(capabilities: list[str], action: str) -> bool:

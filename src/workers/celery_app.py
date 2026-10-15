@@ -240,6 +240,28 @@ celery_app.conf.task_annotations = {
     # well inside the global hour.
     "src.darkweb.tasks.darkweb_cross_org_sweep": dict(_NETWORK_SWEEP_LIMITS),
     "src.integrations.tasks.health_check_all_integrations": dict(_NETWORK_SWEEP_LIMITS),
+    # Wave 4 (W4-A): per-org sweeps in 500-row (vulnmgmt) / 200-asset
+    # (exposure) windows with per-org caps; one KEV feed fetch per run.
+    "src.vulnmgmt.tasks.refresh_instance_scores": dict(_HEAVY_SWEEP_LIMITS),
+    "src.vulnmgmt.tasks.sync_kev_catalog": dict(_HEAVY_SWEEP_LIMITS),
+    "src.exposure.tasks.snapshot_exposure_daily": dict(_HEAVY_SWEEP_LIMITS),
+    # Wave 4 (W4-B): container scan reconcile (100-scan windows, 2,000 per
+    # run), CIS audits of credentialed clusters (200 per run, pinned API
+    # reads) and OSV / NVD component lookups (500 per org, 5,000 per run).
+    "src.container_security.tasks.reconcile_image_scans": {"soft_time_limit": 240, "time_limit": 290},
+    "src.container_security.tasks.cis_audit_sweep": dict(_NETWORK_SWEEP_LIMITS),
+    "src.supplychain.tasks.supplychain_vulnerability_lookup_sweep": dict(_NETWORK_SWEEP_LIMITS),
+    # Wave 4 (W4-C): one pinned CISA ICS feed fetch, then 200-asset batches
+    # (2,000 per org, 500 orgs); OT command reconcile reads 200 incidents and
+    # 200 zones per run.
+    "src.ot_security.tasks.sync_ics_advisories": dict(_HEAVY_SWEEP_LIMITS),
+    "src.ot_security.tasks.reconcile_ot_agent_commands": {"soft_time_limit": 240, "time_limit": 290},
+    # Wave 4 (W4-D): attester + score refresh (500 orgs per run), evidence
+    # rules due + weekly ConMon cycle (500 orgs, 200 rules each), STIG agent
+    # result reconcile (100-scan windows, 2,000 per run).
+    "src.compliance.tasks.compliance_attestation_sweep": dict(_HEAVY_SWEEP_LIMITS),
+    "src.audit_evidence.tasks.audit_evidence_daily_sweep": dict(_HEAVY_SWEEP_LIMITS),
+    "src.stig.tasks.reconcile_stig_scans": {"soft_time_limit": 240, "time_limit": 290},
 }
 
 # Beat schedule for periodic tasks
@@ -475,5 +497,70 @@ celery_app.conf.beat_schedule = {
     "exposure-attack-surface": {
         "task": "src.exposure.tasks.detect_attack_surface_changes",
         "schedule": crontab(hour=4, minute=0),  # Daily 04:00 UTC — snapshot diff
+    },
+    # --- Wave 4 (W4-A): vulnerability and exposure management ---
+    # Risk / SLA deadline / SLA status recomputed on stored instances, and
+    # instances whose exceptions all expired re-opened.
+    "vulnmgmt-refresh-instance-scores": {
+        "task": "src.vulnmgmt.tasks.refresh_instance_scores",
+        "schedule": crontab(minute=10),  # Hourly at :10
+    },
+    # CISA KEV feed (pinned outbound) flags tracked CVEs; creates nothing.
+    "vulnmgmt-kev-catalog-sync": {
+        "task": "src.vulnmgmt.tasks.sync_kev_catalog",
+        "schedule": crontab(hour=3, minute=30),  # Daily 03:30 UTC
+    },
+    # Asset / link risk rescored, then one exposure_daily_snapshots row per
+    # org per day (the dashboard trend charts read these rows).
+    "exposure-daily-snapshot": {
+        "task": "src.exposure.tasks.snapshot_exposure_daily",
+        "schedule": crontab(hour=23, minute=45),  # Daily 23:45 UTC
+    },
+    # --- Wave 4 (W4-B): container security and supply chain ---
+    # Agent image-scan results (scan_container_image) applied to their scans.
+    "container-image-scan-reconcile": {
+        "task": "src.container_security.tasks.reconcile_image_scans",
+        "schedule": crontab(minute="*/2"),
+    },
+    # CIS checks against the Kubernetes API of clusters with a credential.
+    "container-cis-audit-sweep": {
+        "task": "src.container_security.tasks.cis_audit_sweep",
+        "schedule": crontab(hour=2, minute=40),  # Daily 02:40 UTC
+    },
+    # OSV / NVD lookups of components not looked up in 7 days.
+    "supplychain-vulnerability-lookup": {
+        "task": "src.supplychain.tasks.supplychain_vulnerability_lookup_sweep",
+        "schedule": crontab(hour=5, minute=20),  # Daily 05:20 UTC
+    },
+    # --- Wave 4 (W4-C): OT security ---
+    # CISA ICS advisories (pinned, cached 6 h) matched to stored OT assets by
+    # vendor + model; writes known_vulnerabilities_count / risk_score.
+    "ot-ics-advisory-sync": {
+        "task": "src.ot_security.tasks.sync_ics_advisories",
+        "schedule": crontab(hour=6, minute=10),  # Daily 06:10 UTC
+    },
+    # Agent results (ot_safe_shutdown / ot_segmentation_probe) applied to
+    # their incidents and zones.
+    "ot-agent-command-reconcile": {
+        "task": "src.ot_security.tasks.reconcile_ot_agent_commands",
+        "schedule": crontab(minute="*/2"),
+    },
+    # --- Wave 4 (W4-D): compliance, audit evidence, STIG ---
+    # Control attester (pass / fail / not_assessed with its basis) and the
+    # stored framework scores the compliance dashboard reads.
+    "compliance-attestation-sweep": {
+        "task": "src.compliance.tasks.compliance_attestation_sweep",
+        "schedule": crontab(hour=4, minute=40),  # Daily 04:40 UTC
+    },
+    # Automated evidence rules that are due, and a stored ConMon cycle when
+    # the last one is older than 7 days.
+    "audit-evidence-daily-sweep": {
+        "task": "src.audit_evidence.tasks.audit_evidence_daily_sweep",
+        "schedule": crontab(hour=5, minute=50),  # Daily 05:50 UTC
+    },
+    # Agent stig_scan results (ARF) applied to their scans.
+    "stig-scan-reconcile": {
+        "task": "src.stig.tasks.reconcile_stig_scans",
+        "schedule": crontab(minute="*/2"),
     },
 }
