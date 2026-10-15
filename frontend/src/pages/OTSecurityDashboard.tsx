@@ -13,10 +13,41 @@ import {
   WifiOff,
   Lock,
   Download,
+  Power,
+  BookOpen,
+  RefreshCw,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { otsecurityApi } from '../api/endpoints';
+import { api } from '../lib/api';
 import DetailDrawer, { DetailSection } from '../components/DetailDrawer';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import ActionErrorBanner from '../components/ActionErrorBanner';
+import type { Row } from '../lib/apiRow';
+
+const NA = 'not available';
+
+// Agent capabilities the OT actions are commanded through
+// (src/agents/capabilities.py); both go through the agent approval queue.
+const SAFE_SHUTDOWN_CAPABILITY = 'ot_safe_shutdown';
+const SEGMENTATION_CAPABILITY = 'ot_segmentation_probe';
+
+const actionStatusColor = (status: string | null | undefined) => {
+  switch (status) {
+    case 'completed':
+    case 'verified':
+      return 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-100';
+    case 'failed':
+    case 'violations':
+      return 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-100';
+    case 'pending':
+    case 'awaiting_approval':
+    case 'dispatched':
+      return 'bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-100';
+    default:
+      return 'bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-100';
+  }
+};
 
 const getSeverityColor = (severity: string) => {
   switch (severity?.toLowerCase()) {
@@ -79,48 +110,156 @@ const getPurdueLevel = (level: number) => {
 
 export default function OTSecurityDashboard() {
   const [activeTab, setActiveTab] = useState('assets');
-  const [assets, setAssets] = useState<any[]>([]);
-  const [alerts, setAlerts] = useState<any[]>([]);
-  const [zones, setZones] = useState<any[]>([]);
-  const [purdueMap, setPurdueMap] = useState<any>(null);
+  const [assets, setAssets] = useState<Row[]>([]);
+  const [alerts, setAlerts] = useState<Row[]>([]);
+  const [zones, setZones] = useState<Row[]>([]);
+  const [incidents, setIncidents] = useState<Row[]>([]);
+  const [purdueMap, setPurdueMap] = useState<Row | null>(null);
+  const [advisoryFeed, setAdvisoryFeed] = useState<Row | null>(null);
+  const [advisories, setAdvisories] = useState<Row | null>(null);
+  const [agentsByCapability, setAgentsByCapability] = useState<Record<string, Row[]>>({});
+  const [loadErrors, setLoadErrors] = useState<Record<string, unknown>>({});
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
-  const [detailAsset, setDetailAsset] = useState<any | null>(null);
-  const [detailAlert, setDetailAlert] = useState<any | null>(null);
+  const [detailAsset, setDetailAsset] = useState<Row | null>(null);
+  const [detailAlert, setDetailAlert] = useState<Row | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<{ what: string; error: unknown } | null>(null);
+  const [actionTarget, setActionTarget] = useState<{ kind: 'shutdown' | 'segmentation'; row: Row } | null>(null);
+  const [actionAgent, setActionAgent] = useState('');
+  const [actionViews, setActionViews] = useState<Record<string, Row>>({});
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const loadData = async () => {
+    setLoading(true);
+    try {
+      const results = await Promise.allSettled([
+        otsecurityApi.getAssets(),
+        otsecurityApi.getAlerts(),
+        otsecurityApi.getZones(),
+        otsecurityApi.getPurdueMap(),
+        api.get('/ot_security/incidents').then((r) => r.data),
+        api.get('/ot_security/advisories/status').then((r) => r.data),
+        api.get('/agents', { params: { capability: SAFE_SHUTDOWN_CAPABILITY, status: 'active' } }).then((r) => r.data),
+        api.get('/agents', { params: { capability: SEGMENTATION_CAPABILITY, status: 'active' } }).then((r) => r.data),
+      ]);
+      const keys = ['assets', 'alerts', 'zones', 'purdue', 'incidents', 'feed', 'shutdownAgents', 'probeAgents'];
+      const errs: Record<string, unknown> = {};
+      results.forEach((r, i) => { if (r.status === 'rejected') errs[keys[i]] = r.reason; });
+      setLoadErrors(errs);
+      const value = (i: number): Row | Row[] | null => (results[i].status === 'fulfilled' ? (results[i] as PromiseFulfilledResult<Row>).value : null);
+      const toItems = (d: Row | Row[] | null): Row[] => (Array.isArray(d) ? d : (d?.items || []));
+      setAssets(toItems(value(0)));
+      setAlerts(toItems(value(1)));
+      setZones(toItems(value(2)));
+      setPurdueMap((value(3) as Row | null) || null);
+      setIncidents(toItems(value(4)));
+      setAdvisoryFeed((value(5) as Row | null) || null);
+      setAgentsByCapability({
+        [SAFE_SHUTDOWN_CAPABILITY]: ((value(6) as Row | null)?.agents ?? []) as Row[],
+        [SEGMENTATION_CAPABILITY]: ((value(7) as Row | null)?.agents ?? []) as Row[],
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
-    const loadData = async () => {
-      setLoading(true);
-      try {
-        const [assetsData, alertsData, zonesData, purdueData] = await Promise.all([
-          otsecurityApi.getAssets(),
-          otsecurityApi.getAlerts(),
-          otsecurityApi.getZones(),
-          otsecurityApi.getPurdueMap(),
-        ]);
-        const toItems = (d: any) => Array.isArray(d) ? d : (d?.items || []);
-        setAssets(toItems(assetsData));
-        setAlerts(toItems(alertsData));
-        setZones(toItems(zonesData));
-        setPurdueMap(purdueData || null);
-      } catch (error) {
-        console.error('Error loading OT security data:', error);
-      } finally {
-        setLoading(false);
-      }
-    };
     loadData();
   }, []);
 
-  const totalAssets = assets.length;
-  const onlineAssets = assets.filter((a) => a.is_online === true || a.status === 'online').length;
-  const activeAlerts = alerts.filter((a) => !['resolved', 'contained', 'false_positive'].includes(a.status)).length;
-  const securityZones = zones.length;
+  const loadAdvisories = async () => {
+    setBusy('advisories');
+    setActionError(null);
+    try {
+      const res = await api.get('/ot_security/advisories');
+      setAdvisories(res.data);
+      if (res.data?.advisory_feed) setAdvisoryFeed(res.data.advisory_feed);
+    } catch (error) {
+      setActionError({ what: 'load matched advisories', error });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const refreshAdvisories = async (force: boolean) => {
+    setBusy('refresh');
+    setActionError(null);
+    setNotice(null);
+    try {
+      const res = await api.post('/ot_security/advisories/refresh', null, { params: { force } });
+      setNotice(`Advisory feed ${String(res.data?.status ?? '').replace(/_/g, ' ')}: ${res.data?.entries ?? res.data?.feed?.entries ?? 0} cached advisories.`);
+      if (res.data?.feed) setAdvisoryFeed(res.data.feed);
+      await loadAdvisories();
+    } catch (error) {
+      setActionError({ what: 'refresh the CISA ICS advisory feed', error });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // GET .../safe_shutdown and .../segmentation_audit refresh the state from
+  // the agent command (approval, dispatch, result).
+  const loadActionStatus = async (kind: 'shutdown' | 'segmentation', id: string) => {
+    setActionError(null);
+    try {
+      const url = kind === 'shutdown' ? `/ot_security/incidents/${id}/safe_shutdown` : `/ot_security/zones/${id}/segmentation_audit`;
+      const res = await api.get(url);
+      setActionViews((prev) => ({ ...prev, [`${kind}:${id}`]: res.data }));
+    } catch (error) {
+      setActionError({ what: kind === 'shutdown' ? 'read the safe shutdown status' : 'read the segmentation audit status', error });
+    }
+  };
+
+  const submitAction = async () => {
+    if (!actionTarget) return;
+    const { kind, row } = actionTarget;
+    setBusy('action');
+    setActionError(null);
+    try {
+      const url = kind === 'shutdown' ? `/ot_security/incidents/${row.id}/safe_shutdown` : `/ot_security/zones/${row.id}/segmentation_audit`;
+      const res = await api.post(url, actionAgent ? { agent_id: actionAgent } : {});
+      setActionViews((prev) => ({ ...prev, [`${kind}:${row.id}`]: res.data }));
+      setActionTarget(null);
+      setNotice(
+        kind === 'shutdown'
+          ? `Safe shutdown command queued (${String(res.data?.status ?? '').replace(/_/g, ' ')}). It waits for a second administrator's approval in the agent queue.`
+          : `Segmentation probe queued (${String(res.data?.status ?? '').replace(/_/g, ' ')}, ${res.data?.probes_planned ?? 0} probe(s) planned). It waits for approval in the agent queue.`,
+      );
+      await loadData();
+    } catch (error) {
+      setActionError({ what: kind === 'shutdown' ? 'command a safe shutdown' : 'start the segmentation audit', error });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const exportReport = async (format: 'json' | 'csv') => {
+    setActionError(null);
+    try {
+      const res = await api.get('/ot_security/export', { params: { format }, responseType: 'blob' });
+      const url = URL.createObjectURL(res.data as Blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `ot-security-report.${format}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      setActionError({ what: 'export the OT report', error });
+    }
+  };
+
+  const totalAssets: number | null = loadErrors.assets ? null : assets.length;
+  const onlineAssets: number | null = loadErrors.assets ? null : assets.filter((a) => a.is_online === true || a.status === 'online').length;
+  const activeAlerts: number | null = loadErrors.alerts ? null : alerts.filter((a) => !['resolved', 'contained', 'false_positive'].includes(a.status)).length;
+  const securityZones: number | null = loadErrors.zones ? null : zones.length;
 
   const tabs = [
     { id: 'assets', label: 'Assets', icon: Server },
     { id: 'alerts', label: 'Alerts', icon: AlertTriangle },
+    { id: 'incidents', label: 'Incidents', icon: Power },
     { id: 'zones', label: 'Zones', icon: Shield },
+    { id: 'advisories', label: 'ICS Advisories', icon: BookOpen },
     { id: 'purdue', label: 'Purdue Model', icon: Layers },
   ];
 
@@ -149,32 +288,48 @@ export default function OTSecurityDashboard() {
             <Cpu className="w-8 h-8 text-indigo-600" />
             <h1 className="text-3xl font-bold">OT/ICS Security</h1>
           </div>
-          <button onClick={() => { const exportData = { assets, alerts, zones, purdue_model: purdueMap, dashboard: { total_assets: totalAssets, online_assets: onlineAssets, active_alerts: activeAlerts, security_zones: securityZones }, exported_at: new Date().toISOString() }; const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'ot-security-report.json'; a.click(); URL.revokeObjectURL(url); }} className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
-            <Download className="w-4 h-4" />
-            Export Report
-          </button>
+          <div className="flex gap-2">
+            <button onClick={() => exportReport('json')} className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+              <Download className="w-4 h-4" />
+              Export JSON
+            </button>
+            <button onClick={() => exportReport('csv')} className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+              <Download className="w-4 h-4" />
+              Export CSV
+            </button>
+          </div>
+        </div>
+
+        <div className="space-y-2 mb-4 empty:hidden">
+          {actionError && !actionTarget && <ActionErrorBanner what={actionError.what} error={actionError.error} />}
+          {notice && (
+            <div className="text-sm bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded p-3 flex justify-between gap-4">
+              <span>{notice}</span>
+              <button onClick={() => setNotice(null)} className="text-xs underline">dismiss</button>
+            </div>
+          )}
         </div>
 
         {/* Summary Cards */}
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
           <div className="bg-gradient-to-br from-indigo-50 to-indigo-100 dark:from-indigo-900 dark:to-indigo-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-indigo-600 dark:text-indigo-300">Total OT Assets</p>
-            <p className="text-3xl font-bold text-indigo-900 dark:text-indigo-100 mt-2">{totalAssets}</p>
+            <p className="text-3xl font-bold text-indigo-900 dark:text-indigo-100 mt-2">{totalAssets ?? NA}</p>
             <p className="text-xs text-indigo-600 dark:text-indigo-300 mt-1">across all zones</p>
           </div>
           <div className="bg-gradient-to-br from-green-50 to-green-100 dark:from-green-900 dark:to-green-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-green-600 dark:text-green-300">Online Assets</p>
-            <p className="text-3xl font-bold text-green-900 dark:text-green-100 mt-2">{onlineAssets}</p>
+            <p className="text-3xl font-bold text-green-900 dark:text-green-100 mt-2">{onlineAssets ?? NA}</p>
             <p className="text-xs text-green-600 dark:text-green-300 mt-1">currently communicating</p>
           </div>
           <div className="bg-gradient-to-br from-red-50 to-red-100 dark:from-red-900 dark:to-red-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-red-600 dark:text-red-300">Active Alerts</p>
-            <p className="text-3xl font-bold text-red-900 dark:text-red-100 mt-2">{activeAlerts}</p>
+            <p className="text-3xl font-bold text-red-900 dark:text-red-100 mt-2">{activeAlerts ?? NA}</p>
             <p className="text-xs text-red-600 dark:text-red-300 mt-1">requiring attention</p>
           </div>
           <div className="bg-gradient-to-br from-purple-50 to-purple-100 dark:from-purple-900 dark:to-purple-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-purple-600 dark:text-purple-300">Security Zones</p>
-            <p className="text-3xl font-bold text-purple-900 dark:text-purple-100 mt-2">{securityZones}</p>
+            <p className="text-3xl font-bold text-purple-900 dark:text-purple-100 mt-2">{securityZones ?? NA}</p>
             <p className="text-xs text-purple-600 dark:text-purple-300 mt-1">configured</p>
           </div>
         </div>
@@ -218,6 +373,7 @@ export default function OTSecurityDashboard() {
             {/* Assets Tab */}
             {activeTab === 'assets' && (
               <div className="space-y-6">
+                <LoadErrorBanner what="OT assets" error={loadErrors.assets} />
                 {/* Asset summary cards */}
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
                   <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
@@ -263,20 +419,19 @@ export default function OTSecurityDashboard() {
                     </div>
                   </div>
                   <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
-                    <h3 className="font-semibold mb-3">Firmware Status</h3>
+                    <h3 className="font-semibold mb-3">Firmware &amp; Advisories</h3>
                     <div className="space-y-2 text-sm">
                       <div className="flex justify-between">
-                        <span>Up to Date</span>
+                        <span>Marked current (recorded, not verified)</span>
                         <span className="font-semibold text-green-600">{assets.filter((a) => a.firmware_current === true).length}</span>
                       </div>
                       <div className="flex justify-between">
-                        <span>Update Needed</span>
-                        <span className="font-semibold text-yellow-600">{assets.filter((a) => a.firmware_current === false).length}</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span>Known Vulnerabilities</span>
+                        <span>Assets with matched ICS advisories</span>
                         <span className="font-semibold text-red-600">{assets.filter((a) => (a.known_vulnerabilities_count || 0) > 0).length}</span>
                       </div>
+                      <p className="text-xs text-gray-500">
+                        Advisories are matched by vendor and model; firmware versions are never compared against affected ranges.
+                      </p>
                     </div>
                   </div>
                 </div>
@@ -363,9 +518,131 @@ export default function OTSecurityDashboard() {
               </div>
             )}
 
+            {/* Incidents Tab */}
+            {activeTab === 'incidents' && (
+              <div className="space-y-4">
+                <LoadErrorBanner what="OT incidents" error={loadErrors.incidents} />
+                <LoadErrorBanner what="agents with the ot_safe_shutdown capability" error={loadErrors.shutdownAgents} />
+                <div className="text-sm bg-amber-50 dark:bg-amber-900/30 border border-amber-200 dark:border-amber-700 rounded p-3">
+                  A safe shutdown is commanded through an endpoint agent enrolled with the <span className="font-mono">{SAFE_SHUTDOWN_CAPABILITY}</span> capability
+                  ({(agentsByCapability[SAFE_SHUTDOWN_CAPABILITY] ?? []).length} active) and waits for a second administrator&apos;s approval.
+                  &quot;Initiated&quot; is shown only after the agent reports success.
+                </div>
+                {!loadErrors.incidents && incidents.length === 0 && (
+                  <p className="text-sm text-gray-500 dark:text-gray-400 text-center py-8 border border-dashed border-gray-300 dark:border-gray-700 rounded-lg">No OT incident recorded.</p>
+                )}
+                {incidents.map((inc) => {
+                  const view = actionViews[`shutdown:${inc.id}`];
+                  const status = view?.status ?? inc.safe_shutdown_status ?? 'not_requested';
+                  return (
+                    <div key={inc.id} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 space-y-2">
+                      <div className="flex justify-between items-start gap-4">
+                        <div>
+                          <h3 className="font-semibold">{inc.title}</h3>
+                          <p className="text-sm text-gray-600 dark:text-gray-400">{inc.description}</p>
+                          <p className="text-xs text-gray-500 mt-1">
+                            {String(inc.incident_type || '').replace(/_/g, ' ')} · {inc.status} · {(inc.affected_assets ?? []).length} affected asset(s) · physical impact {inc.physical_impact_risk}
+                          </p>
+                        </div>
+                        <span className={`px-3 py-1 rounded-full text-xs font-medium ${getSeverityColor(inc.severity)}`}>{inc.severity}</span>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2 text-sm">
+                        <span>Safe shutdown:</span>
+                        <span className={`px-2 py-0.5 rounded text-xs ${actionStatusColor(status)}`}>{String(status).replace(/_/g, ' ')}</span>
+                        {(view?.safe_shutdown_initiated ?? inc.safe_shutdown_initiated) && <span className="text-xs text-green-700">initiated (agent reported success)</span>}
+                        {(view?.detail ?? inc.safe_shutdown_detail) && <span className="text-xs text-gray-500">{view?.detail ?? inc.safe_shutdown_detail}</span>}
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => { setActionError(null); setActionAgent(''); setActionTarget({ kind: 'shutdown', row: inc }); }}
+                          className="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-700 text-white rounded"
+                        >
+                          Command Safe Shutdown (admin)
+                        </button>
+                        <button
+                          onClick={() => loadActionStatus('shutdown', inc.id)}
+                          className="flex items-center gap-1 px-3 py-1.5 text-xs border border-gray-300 dark:border-gray-600 rounded"
+                        >
+                          <RefreshCw className="w-3 h-3" /> Refresh Status
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Advisories Tab */}
+            {activeTab === 'advisories' && (
+              <div className="space-y-4">
+                <LoadErrorBanner what="the advisory feed status" error={loadErrors.feed} />
+                <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 text-sm space-y-2">
+                  <div className="flex flex-wrap justify-between gap-2">
+                    <div>
+                      <p className="font-semibold">{advisoryFeed?.source ?? 'CISA ICS advisories'}</p>
+                      <p className="text-gray-600 dark:text-gray-400">
+                        Status: {String(advisoryFeed?.status ?? NA).replace(/_/g, ' ')} · {advisoryFeed?.entries ?? 0} cached ·
+                        last success {advisoryFeed?.last_success_at ? new Date(advisoryFeed.last_success_at).toLocaleString() : 'never'}
+                      </p>
+                      {advisoryFeed?.last_error && <p className="text-red-600 text-xs">Last error: {advisoryFeed.last_error}</p>}
+                    </div>
+                    <div className="flex gap-2 items-start">
+                      <button onClick={loadAdvisories} disabled={busy !== null} className="px-3 py-1.5 text-xs border border-gray-300 dark:border-gray-600 rounded disabled:opacity-50">
+                        {busy === 'advisories' ? 'Matching...' : 'Match Assets'}
+                      </button>
+                      <button onClick={() => refreshAdvisories(false)} disabled={busy !== null} className="px-3 py-1.5 text-xs bg-indigo-600 text-white rounded disabled:opacity-50" title="Admin; served from cache when younger than 6 hours">
+                        {busy === 'refresh' ? 'Refreshing...' : 'Refresh Feed'}
+                      </button>
+                      <button onClick={() => refreshAdvisories(true)} disabled={busy !== null} className="px-3 py-1.5 text-xs border border-indigo-600 text-indigo-700 dark:text-indigo-300 rounded disabled:opacity-50">
+                        Force Refetch
+                      </button>
+                    </div>
+                  </div>
+                  <p className="text-xs text-gray-500">
+                    Advisories are matched to stored assets by vendor and model only; affected firmware versions are not evaluated.
+                  </p>
+                </div>
+                {advisories && (
+                  <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg overflow-x-auto">
+                    <p className="text-xs text-gray-500 p-3">
+                      {advisories.total} match(es) across {advisories.assets_checked} asset(s); {advisories.unmatchable_assets} asset(s) lack a vendor or model and cannot be matched.
+                    </p>
+                    {(advisories.items ?? []).length > 0 && (
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="border-b border-gray-200 dark:border-gray-700 text-left">
+                            <th className="px-4 py-2">Asset</th>
+                            <th className="px-4 py-2">Advisory</th>
+                            <th className="px-4 py-2">CVEs</th>
+                            <th className="px-4 py-2">CVSS</th>
+                            <th className="px-4 py-2">Firmware (not compared)</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {advisories.items.map((m: Row, i: number) => (
+                            <tr key={`${m.asset_id}-${m.advisory_id}-${i}`} className="border-b border-gray-100 dark:border-gray-700">
+                              <td className="px-4 py-2">{assets.find((a) => a.id === m.asset_id)?.name ?? m.asset_id}</td>
+                              <td className="px-4 py-2">
+                                {m.url ? <a href={m.url} target="_blank" rel="noreferrer" className="text-blue-600 hover:underline">{m.advisory_id}</a> : m.advisory_id}
+                                <div className="text-xs text-gray-500">{m.title}</div>
+                              </td>
+                              <td className="px-4 py-2 text-xs font-mono">{(m.cve_ids ?? []).join(', ') || '-'}</td>
+                              <td className="px-4 py-2">{m.cvss_score ?? NA}</td>
+                              <td className="px-4 py-2 font-mono text-xs">{m.firmware_version || '-'}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Alerts Tab */}
             {activeTab === 'alerts' && (
               <div className="space-y-6">
+                <LoadErrorBanner what="OT alerts" error={loadErrors.alerts} />
                 {/* Alert severity breakdown */}
                 <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
                   <div className="bg-white dark:bg-gray-800 border border-red-200 dark:border-red-700 rounded-lg p-4">
@@ -475,12 +752,15 @@ export default function OTSecurityDashboard() {
             {/* Zones Tab */}
             {activeTab === 'zones' && (
               <div className="space-y-6">
+                <LoadErrorBanner what="OT zones" error={loadErrors.zones} />
+                <LoadErrorBanner what="agents with the ot_segmentation_probe capability" error={loadErrors.probeAgents} />
                 <div className="bg-blue-50 dark:bg-blue-900 border border-blue-200 dark:border-blue-700 rounded-lg p-4 mb-6">
                   <div className="flex items-center gap-2">
                     <Network className="w-5 h-5 text-blue-600 dark:text-blue-300" />
                     <p className="text-sm text-blue-800 dark:text-blue-200">
-                      Network segmentation zones define trust boundaries between OT and IT environments.
-                      Each zone enforces access control policies and traffic inspection rules.
+                      Segmentation is verified only by a probe run from an endpoint agent inside the zone
+                      ({SEGMENTATION_CAPABILITY} capability, {(agentsByCapability[SEGMENTATION_CAPABILITY] ?? []).length} active),
+                      approved in the agent queue; a zone is never marked verified without one.
                     </p>
                   </div>
                 </div>
@@ -494,6 +774,7 @@ export default function OTSecurityDashboard() {
                   <div className="grid grid-cols-1 gap-4">
                     {zones.map((zone) => {
                       const compliant = zone.compliance_status === 'compliant';
+                      const segView = actionViews[`segmentation:${zone.id}`];
                       return (
                       <div key={zone.id} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-6 hover:shadow-lg transition">
                         <div className="flex justify-between items-start mb-4">
@@ -513,8 +794,8 @@ export default function OTSecurityDashboard() {
                               <p className="text-sm text-gray-600 dark:text-gray-400">{zone.description}</p>
                             </div>
                           </div>
-                          <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(compliant ? 'secure' : 'warning')}`}>
-                            {zone.compliance_status || 'unknown'}
+                          <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(compliant ? 'secure' : 'warning')}`} title="Stored compliance status">
+                            {zone.compliance_status || 'not assessed'}
                           </span>
                         </div>
                         <div className="grid grid-cols-4 gap-4 text-sm">
@@ -532,9 +813,45 @@ export default function OTSecurityDashboard() {
                           </div>
                           <div>
                             <p className="text-gray-600 dark:text-gray-400">Segmentation</p>
-                            <p className="font-semibold">{zone.segmentation_verified ? 'Verified' : 'Unverified'}</p>
+                            <p className="font-semibold">{(segView?.segmentation_verified ?? zone.segmentation_verified) ? 'Verified by probe' : 'Unverified'}</p>
                           </div>
                         </div>
+                        <div className="mt-3 flex flex-wrap items-center gap-2 text-sm">
+                          <span>Last audit:</span>
+                          <span className={`px-2 py-0.5 rounded text-xs ${actionStatusColor(segView?.status ?? zone.segmentation_audit_status)}`}>
+                            {String(segView?.status ?? zone.segmentation_audit_status ?? 'not_audited').replace(/_/g, ' ')}
+                          </span>
+                          <span className="text-xs text-gray-500">
+                            {(segView?.audited_at ?? zone.segmentation_audited_at) ? new Date(segView?.audited_at ?? zone.segmentation_audited_at).toLocaleString() : 'never'}
+                          </span>
+                          <button
+                            onClick={() => { setActionError(null); setActionAgent(''); setActionTarget({ kind: 'segmentation', row: zone }); }}
+                            className="ml-auto px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded"
+                          >
+                            Run Segmentation Audit (admin)
+                          </button>
+                          <button
+                            onClick={() => loadActionStatus('segmentation', zone.id)}
+                            className="flex items-center gap-1 px-3 py-1.5 text-xs border border-gray-300 dark:border-gray-600 rounded"
+                          >
+                            <RefreshCw className="w-3 h-3" /> Refresh Status
+                          </button>
+                        </div>
+                        {segView && (
+                          <div className="mt-2 text-xs space-y-1 bg-gray-50 dark:bg-gray-900 rounded p-2">
+                            <p>{segView.probes_planned} probe(s) planned{segView.command_id ? ` · command ${segView.command_id}` : ''}</p>
+                            {segView.error && <p className="text-red-600">Error: {segView.error}</p>}
+                            {(segView.violations ?? []).length > 0 && (
+                              <p className="text-red-700">Forbidden paths reachable: {segView.violations.map((v: Row) => `${v.target_ip}:${v.port}`).join(', ')}</p>
+                            )}
+                            {(segView.unexpected_blocked ?? []).length > 0 && (
+                              <p className="text-orange-700">Allowed paths blocked: {segView.unexpected_blocked.map((v: Row) => `${v.target_ip}:${v.port}`).join(', ')}</p>
+                            )}
+                            {(segView.missing ?? []).length > 0 && (
+                              <p className="text-gray-600">Unanswered probes: {segView.missing.length}</p>
+                            )}
+                          </div>
+                        )}
                         {zone.allowed_protocols && zone.allowed_protocols.length > 0 && (
                           <div className="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">
                             <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">Allowed Protocols</p>
@@ -571,6 +888,7 @@ export default function OTSecurityDashboard() {
                   </div>
                 </div>
 
+                <LoadErrorBanner what="the Purdue map" error={loadErrors.purdue} />
                 {purdueDevices.length === 0 && !purdueMap ? (
                   <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-12 text-center">
                     <Layers className="w-12 h-12 text-gray-400 mx-auto mb-4" />
@@ -581,7 +899,7 @@ export default function OTSecurityDashboard() {
                     {/* Purdue level visualization */}
                     {[5, 4, 3, 2, 1, 0].map((level) => {
                       const info = getPurdueLevel(level);
-                      const levelData = purdueDevices.find((l: any) => l.level === level);
+                      const levelData = purdueDevices.find((l: Row) => l.level === level);
                       const deviceCount = levelData?.devices?.length || 0;
                       const displayAssets = levelData?.devices || [];
 
@@ -609,7 +927,7 @@ export default function OTSecurityDashboard() {
                                     </tr>
                                   </thead>
                                   <tbody>
-                                    {displayAssets.map((device: any, idx: number) => (
+                                    {displayAssets.map((device: Row, idx: number) => (
                                       <tr key={device.id || idx} className="border-b border-gray-100 dark:border-gray-700">
                                         <td className="py-2 font-medium">{device.name}</td>
                                         <td className="py-2 uppercase text-gray-600 dark:text-gray-400">{device.type}</td>
@@ -676,9 +994,9 @@ export default function OTSecurityDashboard() {
                   fields: [
                     { label: 'Criticality', value: detailAsset.criticality },
                     { label: 'Online', value: detailAsset.is_online ? 'Yes' : 'No' },
-                    { label: 'Firmware Current', value: detailAsset.firmware_current ? 'Yes' : 'No' },
-                    { label: 'Known Vulnerabilities', value: detailAsset.known_vulnerabilities_count ?? 0 },
-                    { label: 'Risk Score', value: detailAsset.risk_score ?? 0 },
+                    { label: 'Firmware Marked Current (recorded)', value: detailAsset.firmware_current ? 'Yes' : 'No' },
+                    { label: 'Matched ICS Advisories', value: detailAsset.known_vulnerabilities_count ?? 0 },
+                    { label: 'Risk Score (stored)', value: detailAsset.risk_score ?? 0 },
                     { label: 'Last Seen', value: detailAsset.last_seen ? new Date(detailAsset.last_seen).toLocaleString() : null },
                   ],
                 },
@@ -729,6 +1047,42 @@ export default function OTSecurityDashboard() {
             : undefined
         }
       />
+
+      {/* Agent action modal (safe shutdown / segmentation audit) */}
+      {actionTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50" onClick={() => setActionTarget(null)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-md mx-4 p-6 space-y-3" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-lg font-semibold">
+              {actionTarget.kind === 'shutdown' ? `Safe shutdown: ${actionTarget.row.title}` : `Segmentation audit: ${actionTarget.row.name}`}
+            </h2>
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              {actionTarget.kind === 'shutdown'
+                ? 'Queues an ot_safe_shutdown command for the incident\'s affected assets. Nothing runs until a second administrator approves it in the agent queue.'
+                : 'Queues TCP probes from an agent inside this zone\'s CIDR to the assets of the other zones. Nothing runs until it is approved in the agent queue.'}
+            </p>
+            {actionError && <ActionErrorBanner what={actionError.what} error={actionError.error} />}
+            {(() => {
+              const cap = actionTarget.kind === 'shutdown' ? SAFE_SHUTDOWN_CAPABILITY : SEGMENTATION_CAPABILITY;
+              const agents = agentsByCapability[cap] ?? [];
+              return (
+                <label className="block text-sm">Agent ({cap})
+                  <select value={actionAgent} onChange={(e) => setActionAgent(e.target.value)} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-sm">
+                    <option value="">{agents.length > 1 ? 'Choose an agent (required when several are enrolled)' : 'Automatic'}</option>
+                    {agents.map((a) => <option key={a.id} value={a.id}>{a.hostname || a.id}{a.ip_address ? ` (${a.ip_address})` : ''}</option>)}
+                  </select>
+                  {agents.length === 0 && <span className="text-xs text-orange-700">No active agent carries this capability; the server will refuse with no_capable_agent.</span>}
+                </label>
+              );
+            })()}
+            <div className="flex gap-2 pt-2">
+              <button onClick={submitAction} disabled={busy === 'action'} className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg disabled:opacity-50">
+                {busy === 'action' ? 'Queuing...' : 'Queue Command'}
+              </button>
+              <button onClick={() => setActionTarget(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg">Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

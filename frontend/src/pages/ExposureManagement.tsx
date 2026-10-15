@@ -1,10 +1,8 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Search,
-  ShieldAlert,
   AlertTriangle,
-  TrendingUp,
   BarChart3,
   Clock,
   AlertCircle,
@@ -12,81 +10,118 @@ import {
   Loader2,
   RefreshCw,
   Download,
+  Upload,
   Plus,
-  Filter,
-  Eye,
   Zap,
-  Activity,
   Target,
   Shield,
-  TrendingDown,
   Globe,
-  Cloud,
   Package,
+  Share2,
+  Camera,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
 import LoadErrorBanner from '../components/LoadErrorBanner';
-import { describeLoadError } from '../lib/loadError';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, AreaChart, Area, PieChart, Pie, Cell } from 'recharts';
+import ActionErrorBanner from '../components/ActionErrorBanner';
+import type { Row } from '../lib/apiRow';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area, PieChart, Pie, Cell } from 'recharts';
+
+const NA = 'not available';
+
+// Field names follow src/schemas/exposure.py (ExposureDashboardStats).
+interface TrendPoint {
+  date: string;
+  snapshot_date?: string;
+  exposures?: number;
+  open_exposures?: number;
+  critical?: number;
+  high?: number;
+  risk_score?: number | null;
+  compliance?: number | null;
+}
 
 interface DashboardStats {
   total_assets: number;
+  active_assets: number;
+  inactive_assets: number;
   internet_facing_assets: number;
   critical_vulns: number;
+  high_vulns: number;
+  medium_vulns: number;
+  low_vulns: number;
+  info_vulns: number;
+  open_exposures: number;
+  assets_with_open_exposures: number;
+  catalog_vulnerabilities: number;
   overdue_tickets: number;
-  overall_risk_score: number;
-  mean_time_to_remediate_days: number;
-  exposure_trend?: Array<{ date: string; exposures: number }>;
+  overall_risk_score: number | null;
+  risk_score_basis?: string;
+  mean_time_to_remediate_days: number | null;
+  exposure_trend?: TrendPoint[];
+  compliance_trend?: TrendPoint[];
+  trend_source?: string;
 }
 
 interface Asset {
   id: string;
-  hostname: string;
-  ip_address: string;
-  type: string;
-  environment: string;
-  criticality: 'critical' | 'high' | 'medium' | 'low';
+  hostname: string | null;
+  ip_address: string | null;
+  asset_type: string;
+  environment: string | null;
+  network_zone: string | null;
+  criticality: string;
+  is_internet_facing: boolean;
   risk_score: number;
   vulnerability_count: number;
-  last_scan: string;
-  status: 'active' | 'inactive' | 'quarantined';
+  last_scan_at: string | null;
+  last_seen: string | null;
+  status: string | null;
+  owner?: string | null;
+  os_type?: string | null;
+  os_version?: string | null;
+  open_ports?: number[];
 }
 
 interface Vulnerability {
   id: string;
-  cve_id: string;
+  cve_id: string | null;
   title: string;
-  severity: 'critical' | 'high' | 'medium' | 'low';
-  cvss: number;
-  epss: number;
-  has_exploit: boolean;
-  kev_listed: boolean;
-  affected_assets: number;
+  severity: string;
+  cvss_v3_score: number | null;
+  epss_score: number | null;
+  exploit_available: boolean;
+  is_exploited_in_wild: boolean;
+  affected_assets: number | null;
+  total_links: number | null;
   patch_available: boolean;
-  status: 'open' | 'mitigated' | 'patched';
+  status: string | null;
 }
 
 interface RemediationTicket {
   id: string;
   title: string;
-  priority: 'critical' | 'high' | 'medium' | 'low';
-  status: 'open' | 'in_progress' | 'verification' | 'closed';
-  assigned_to: string;
-  affected_assets: number;
-  due_date: string;
-  sla_status: 'on_track' | 'at_risk' | 'overdue';
+  priority: string;
+  status: string;
+  assigned_to: string | null;
+  affected_assets: string[];
+  due_date: string | null;
+  sla_status?: 'on_track' | 'at_risk' | 'overdue';
+  sla_breach?: boolean | null;
+  verification_status?: string | null;
+  resolved_at?: string | null;
 }
 
 interface AttackSurface {
   id: string;
   name: string;
-  type: 'external' | 'internal' | 'cloud' | 'application';
+  type: string | null;
   risk_score: number;
   total_assets: number;
   exposed_assets: number;
   critical_exposures: number;
-  last_assessed: string;
+  last_assessed: string | null;
+  assessed: boolean;
 }
 
 interface ComplianceFramework {
@@ -94,7 +129,52 @@ interface ComplianceFramework {
   name: string;
   pass_percentage: number;
   total_controls: number;
+  passed_checks: number;
+  failed_checks: number;
+  status: string | null;
+  last_assessment_at: string | null;
 }
+
+interface GraphNode {
+  id: string;
+  type: 'entry_point' | 'asset' | 'vulnerability';
+  label: string;
+  criticality?: string;
+  is_internet_facing?: boolean;
+  risk_score?: number;
+  vulnerability_count?: number;
+  severity?: string;
+  exploited_in_wild?: boolean;
+}
+
+interface GraphEdge {
+  source: string;
+  target: string;
+  type: 'exposes' | 'has_vulnerability';
+  status?: string;
+  risk_score?: number;
+}
+
+interface ExposureGraph {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  truncated: boolean;
+  basis: string;
+}
+
+// Formats src/exposure/scan_parser.py SUPPORTED_FORMATS reads.
+const EXPOSURE_SCAN_FORMATS: { value: string; label: string }[] = [
+  { value: 'auto', label: 'Detect from content' },
+  { value: 'nessus', label: 'Nessus (XML / JSON / CSV)' },
+  { value: 'tenable', label: 'Tenable.io (JSON)' },
+  { value: 'openvas', label: 'OpenVAS / GVM (XML / CSV)' },
+  { value: 'qualys', label: 'Qualys (CSV / JSON)' },
+  { value: 'rapid7', label: 'Rapid7 (generic parser)' },
+  { value: 'json', label: 'Generic JSON' },
+  { value: 'csv', label: 'Generic CSV' },
+];
+
+const TICKET_STATUSES = ['open', 'assigned', 'in_progress', 'verification', 'closed', 'reopened'];
 
 const getSeverityColor = (severity: string) => {
   switch (severity) {
@@ -125,16 +205,16 @@ const getRiskColor = (score: number) => {
 // Truth source: status + due_date + today.
 const deriveSlaStatus = (
   ticket: Pick<RemediationTicket, 'status' | 'due_date' | 'sla_status'>,
-): 'on_track' | 'at_risk' | 'overdue' | 'completed' => {
+): 'on_track' | 'at_risk' | 'overdue' | 'completed' | 'no_due_date' => {
   if (ticket.status === 'closed' || ticket.status === 'verification') {
     return 'completed';
   }
   if (!ticket.due_date) {
-    return ticket.sla_status || 'on_track';
+    return ticket.sla_status || 'no_due_date';
   }
   const due = new Date(ticket.due_date);
   if (Number.isNaN(due.getTime())) {
-    return ticket.sla_status || 'on_track';
+    return ticket.sla_status || 'no_due_date';
   }
   const now = Date.now();
   const msToDue = due.getTime() - now;
@@ -146,7 +226,7 @@ const deriveSlaStatus = (
   return 'on_track';
 };
 
-const getStatusColor = (status: string) => {
+const getStatusColor = (status: string | null | undefined) => {
   switch (status) {
     case 'active':
     case 'open':
@@ -172,9 +252,11 @@ const getStatusColor = (status: string) => {
   }
 };
 
+type TabId = 'dashboard' | 'assets' | 'vulnerabilities' | 'remediation' | 'attack-surface' | 'graph' | 'compliance';
+
 export default function ExposureManagement() {
   const queryClient = useQueryClient();
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'assets' | 'vulnerabilities' | 'remediation' | 'attack-surface' | 'compliance'>('dashboard');
+  const [activeTab, setActiveTab] = useState<TabId>('dashboard');
   const [assetSearch, setAssetSearch] = useState('');
   const [assetTypeFilter, setAssetTypeFilter] = useState('all');
   const [environmentFilter, setEnvironmentFilter] = useState('all');
@@ -187,9 +269,32 @@ export default function ExposureManagement() {
   const [showImportModal, setShowImportModal] = useState(false);
   const [showCreateTicketModal, setShowCreateTicketModal] = useState(false);
   const [selectedAsset, setSelectedAsset] = useState<Asset | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
+  const [includeInactive, setIncludeInactive] = useState(false);
+  const [actionError, setActionError] = useState<{ what: string; error: unknown } | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [scanImportResult, setScanImportResult] = useState<Row | null>(null);
+  const [assetImportResult, setAssetImportResult] = useState<Row | null>(null);
+  const [discoveryResult, setDiscoveryResult] = useState<Row | null>(null);
+  const [trendDays, setTrendDays] = useState(30);
+  const [graphMinSeverity, setGraphMinSeverity] = useState('');
+  const assetFileInput = useRef<HTMLInputElement>(null);
 
-  const { data: stats, isLoading: statsLoading, error: statsError } = useQuery<DashboardStats>({
+  const runAction = async (key: string, what: string, fn: () => Promise<void>) => {
+    setBusy(key);
+    setActionError(null);
+    setNotice(null);
+    try {
+      await fn();
+      queryClient.invalidateQueries({ queryKey: ['exposure'] });
+    } catch (error) {
+      setActionError({ what, error });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const { data: stats, error: statsError } = useQuery<DashboardStats>({
     queryKey: ['exposure', 'dashboard'],
     queryFn: async () => {
       const response = await api.get('/exposure/dashboard');
@@ -197,8 +302,8 @@ export default function ExposureManagement() {
     },
   });
 
-  const { data: assetsData, isLoading: assetsLoading, error: assetsError } = useQuery<any>({
-    queryKey: ['exposure', 'assets', assetSearch, assetTypeFilter, environmentFilter, criticalityFilter, internetFacingFilter],
+  const { data: assetsData, isLoading: assetsLoading, error: assetsError } = useQuery<Row>({
+    queryKey: ['exposure', 'assets', assetSearch, assetTypeFilter, environmentFilter, criticalityFilter, internetFacingFilter, includeInactive],
     queryFn: async () => {
       const response = await api.get('/exposure/assets', {
         params: {
@@ -207,6 +312,7 @@ export default function ExposureManagement() {
           environment: environmentFilter !== 'all' ? environmentFilter : undefined,
           criticality: criticalityFilter !== 'all' ? criticalityFilter : undefined,
           is_internet_facing: internetFacingFilter ? true : undefined,
+          include_inactive: includeInactive || undefined,
         },
       });
       return response.data;
@@ -214,7 +320,21 @@ export default function ExposureManagement() {
   });
   const assets: Asset[] = Array.isArray(assetsData) ? assetsData : (assetsData?.items || []);
 
-  const { data: vulnData, isLoading: vulnLoading, error: vulnError } = useQuery<any>({
+  // Stored daily snapshots only (exposure_daily_snapshots); days without a
+  // snapshot are absent, nothing is interpolated.
+  const { data: trendResp, error: trendError } = useQuery<{ points: TrendPoint[]; count: number; source: string }>({
+    queryKey: ['exposure', 'trend', trendDays],
+    queryFn: async () => (await api.get('/exposure/trend', { params: { days: trendDays } })).data,
+  });
+
+  const { data: graph, isLoading: graphLoading, error: graphError } = useQuery<ExposureGraph>({
+    queryKey: ['exposure', 'graph', graphMinSeverity],
+    queryFn: async () =>
+      (await api.get('/exposure/graph', { params: { limit_assets: 100, min_severity: graphMinSeverity || undefined } })).data,
+    enabled: activeTab === 'graph',
+  });
+
+  const { data: vulnData, isLoading: vulnLoading, error: vulnError } = useQuery<Row>({
     queryKey: ['exposure', 'vulnerabilities', severityFilter, exploitFilter],
     queryFn: async () => {
       const response = await api.get('/exposure/vulnerabilities', {
@@ -228,7 +348,7 @@ export default function ExposureManagement() {
   });
   const vulnerabilities: Vulnerability[] = Array.isArray(vulnData) ? vulnData : (vulnData?.items || []);
 
-  const { data: ticketData, isLoading: ticketsLoading, error: ticketsError } = useQuery<any>({
+  const { data: ticketData, isLoading: ticketsLoading, error: ticketsError } = useQuery<Row>({
     queryKey: ['exposure', 'tickets', priorityFilter, ticketStatusFilter],
     queryFn: async () => {
       const response = await api.get('/exposure/tickets', {
@@ -242,7 +362,7 @@ export default function ExposureManagement() {
   });
   const tickets: RemediationTicket[] = Array.isArray(ticketData) ? ticketData : (ticketData?.items || []);
 
-  const { data: surfaceData, error: surfaceError } = useQuery<any>({
+  const { data: surfaceData, error: surfaceError } = useQuery<Row>({
     queryKey: ['exposure', 'attack-surface'],
     queryFn: async () => {
       const response = await api.get('/exposure/attack-surface');
@@ -257,53 +377,71 @@ export default function ExposureManagement() {
       const response = await api.get('/exposure/compliance');
       const data = response.data;
       // Backend returns ComplianceSummary object; transform frameworks map into array
+      // ComplianceSummary.frameworks: {short_name: {...}} from stored controls.
       if (data.frameworks && !Array.isArray(data.frameworks)) {
-        return Object.entries(data.frameworks).map(([key, value]: [string, any]) => ({
+        return Object.entries(data.frameworks as Record<string, Row>).map(([key, value]) => ({
           id: key,
           name: value.name || key,
-          pass_percentage: value.pass_percentage ?? (value.passed_checks && value.total_controls ? Math.round((value.passed_checks / value.total_controls) * 100) : 0),
-          total_controls: value.total_controls || 0,
+          pass_percentage: value.pass_percentage ?? 0,
+          total_controls: value.total_controls ?? 0,
+          passed_checks: value.passed_checks ?? 0,
+          failed_checks: value.failed_checks ?? 0,
+          status: value.status ?? null,
+          last_assessment_at: value.last_assessment_at ?? null,
         }));
       }
-      // If it's already an array, return as-is
-      if (Array.isArray(data)) return data;
       return [];
     },
   });
 
-  const vulnerabilityData = vulnerabilities ? vulnerabilities.reduce((acc, v) => {
-    const existing = acc.find(item => item.severity === v.severity);
-    if (existing) {
-      existing.count += 1;
-    } else {
-      acc.push({ severity: v.severity, count: 1 });
-    }
-    return acc;
-  }, [] as Array<{ severity: string; count: number }>) : [];
+  // Open exposures by severity, counted server-side (dashboard).
+  const vulnerabilityData = stats
+    ? [
+        { severity: 'critical', count: stats.critical_vulns },
+        { severity: 'high', count: stats.high_vulns },
+        { severity: 'medium', count: stats.medium_vulns },
+        { severity: 'low', count: stats.low_vulns },
+      ].filter((d) => d.count > 0)
+    : [];
 
   const topVulnerableAssets = assets
     ?.slice()
     .sort((a, b) => b.risk_score - a.risk_score)
     .slice(0, 10)
-    .map(a => ({ name: a.hostname, risk: a.risk_score })) || [];
+    .map(a => ({ name: a.hostname || a.ip_address || a.id, risk: a.risk_score })) || [];
 
-  // Use the backend-supplied trend series; never fabricate a flatline
-  // from today's critical-vuln count (that misled operators into
-  // reading a real 30-day history where none existed).
-  const trendData = (stats?.exposure_trend && stats.exposure_trend.length > 0)
-    ? stats.exposure_trend
-    : [];
+  // Stored snapshot points only; an empty series renders an empty state.
+  const trendData: TrendPoint[] = trendResp?.points ?? [];
+  const complianceTrend: TrendPoint[] = stats?.compliance_trend ?? [];
 
   const colors = ['#ef4444', '#f97316', '#eab308', '#3b82f6'];
 
-  const tabs = [
+  const tabs: { id: TabId; name: string; icon: typeof BarChart3 }[] = [
     { id: 'dashboard', name: 'Dashboard', icon: BarChart3 },
     { id: 'assets', name: 'Assets', icon: Package },
     { id: 'vulnerabilities', name: 'Vulnerabilities', icon: AlertTriangle },
     { id: 'remediation', name: 'Remediation', icon: Zap },
     { id: 'attack-surface', name: 'Attack Surface', icon: Target },
+    { id: 'graph', name: 'Exposure Graph', icon: Share2 },
     { id: 'compliance', name: 'Compliance', icon: Shield },
   ];
+
+  const importAssetsFile = async (file: File) => {
+    const lower = file.name.toLowerCase();
+    const format = lower.endsWith('.json') ? 'json' : 'csv';
+    setAssetImportResult(null);
+    await runAction('asset-import', `import assets from ${file.name}`, async () => {
+      const data = await file.text();
+      const res = await api.post('/exposure/assets/import', { format, data });
+      setAssetImportResult({ ...res.data, file_name: file.name });
+    });
+  };
+
+  const graphNodes = graph?.nodes ?? [];
+  const graphEdges = graph?.edges ?? [];
+  const nodeById = new Map(graphNodes.map((n) => [n.id, n]));
+  const exposedAssetIds = new Set(graphEdges.filter((e) => e.type === 'exposes').map((e) => e.target));
+  const graphAssets = graphNodes.filter((n) => n.type === 'asset');
 
   return (
     <div className="space-y-6">
@@ -315,13 +453,41 @@ export default function ExposureManagement() {
             Comprehensive cyber risk and threat exposure platform
           </p>
         </div>
-        <button
-          onClick={() => queryClient.invalidateQueries({ queryKey: ['exposure'] })}
-          className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
-        >
-          <RefreshCw className="w-4 h-4" />
-          Refresh
-        </button>
+        <div className="flex flex-wrap gap-2">
+          <button
+            onClick={() => runAction('snapshot', 'capture an exposure snapshot', async () => {
+              const res = await api.post('/exposure/snapshots/capture');
+              const snap = res.data?.snapshot ?? {};
+              setNotice(`Snapshot stored for ${snap.snapshot_date ?? 'today'}: ${snap.open_exposures ?? 0} open exposure(s), ${res.data?.rescored?.assets_scored ?? 0} asset(s) rescored.`);
+            })}
+            disabled={busy !== null}
+            title="Rescore assets and store today's snapshot (the nightly task does the same)"
+            className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50"
+          >
+            <Camera className="w-4 h-4" />
+            {busy === 'snapshot' ? 'Capturing...' : 'Capture Snapshot'}
+          </button>
+          <button
+            onClick={() => runAction('risk', 'recalculate exposure risk', async () => {
+              const res = await api.post('/exposure/risk/recalculate');
+              const r = res.data ?? {};
+              setNotice(`Risk recalculated for ${r.assets_scored ?? 0} asset(s); overall risk ${r.overall_risk_score ?? NA}.`);
+            })}
+            disabled={busy !== null}
+            title="Recompute link and asset risk scores from stored rows"
+            className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50"
+          >
+            <Zap className="w-4 h-4" />
+            {busy === 'risk' ? 'Recalculating...' : 'Recalculate Risk'}
+          </button>
+          <button
+            onClick={() => queryClient.invalidateQueries({ queryKey: ['exposure'] })}
+            className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+          >
+            <RefreshCw className="w-4 h-4" />
+            Refresh
+          </button>
+        </div>
       </div>
 
       {/* Tabs */}
@@ -332,7 +498,7 @@ export default function ExposureManagement() {
             return (
               <button
                 key={tab.id}
-                onClick={() => setActiveTab(tab.id as any)}
+                onClick={() => setActiveTab(tab.id)}
                 className={clsx(
                   'flex items-center gap-2 px-4 py-3 text-sm font-medium border-b-2 transition-colors whitespace-nowrap',
                   activeTab === tab.id
@@ -348,12 +514,17 @@ export default function ExposureManagement() {
         </nav>
       </div>
 
-      {/* Dashboard Tab */}
-      {actionError && (
-        <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
-          {actionError}
+      {actionError && !showImportModal && !showCreateTicketModal && (
+        <ActionErrorBanner what={actionError.what} error={actionError.error} />
+      )}
+      {notice && (
+        <div className="text-sm bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded p-3 flex justify-between gap-4">
+          <span>{notice}</span>
+          <button onClick={() => setNotice(null)} className="text-xs underline">dismiss</button>
         </div>
       )}
+
+      {/* Dashboard Tab */}
 
       {activeTab === 'dashboard' && (
         <div className="space-y-6">
@@ -366,10 +537,13 @@ export default function ExposureManagement() {
                   <Package className="w-5 h-5 text-blue-600 dark:text-blue-400" />
                 </div>
                 <div>
-                  <p className="text-sm text-gray-500 dark:text-gray-400">Total Assets</p>
+                  <p className="text-sm text-gray-500 dark:text-gray-400">Active Assets</p>
                   <p className="text-2xl font-semibold text-gray-900 dark:text-white">
-                    {stats?.total_assets ?? 'not available'}
+                    {stats?.total_assets ?? NA}
                   </p>
+                  {stats && stats.inactive_assets > 0 && (
+                    <p className="text-xs text-gray-500">{stats.inactive_assets} inactive not counted</p>
+                  )}
                 </div>
               </div>
             </div>
@@ -394,10 +568,13 @@ export default function ExposureManagement() {
                   <AlertCircle className="w-5 h-5 text-red-600 dark:text-red-400" />
                 </div>
                 <div>
-                  <p className="text-sm text-gray-500 dark:text-gray-400">Critical Vulns</p>
+                  <p className="text-sm text-gray-500 dark:text-gray-400">Open Exposures (critical)</p>
                   <p className="text-2xl font-semibold text-gray-900 dark:text-white">
-                    {stats?.critical_vulns ?? 'not available'}
+                    {stats ? `${stats.open_exposures} (${stats.critical_vulns})` : NA}
                   </p>
+                  {stats && (
+                    <p className="text-xs text-gray-500">on {stats.assets_with_open_exposures} asset(s); {stats.catalog_vulnerabilities} catalogue rows</p>
+                  )}
                 </div>
               </div>
             </div>
@@ -424,12 +601,17 @@ export default function ExposureManagement() {
                 <div>
                   <p className="text-sm text-gray-500 dark:text-gray-400">Overall Risk Score</p>
                   <p className="text-4xl font-bold text-gray-900 dark:text-white mt-2">
-                    {stats?.overall_risk_score ?? 'not available'}
+                    {stats?.overall_risk_score == null ? NA : stats.overall_risk_score.toFixed(1)}
                   </p>
+                  {stats?.risk_score_basis && (
+                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">{stats.risk_score_basis}</p>
+                  )}
                 </div>
-                <div className={clsx('w-20 h-20 rounded-full flex items-center justify-center text-2xl font-bold', getRiskColor(stats?.overall_risk_score || 0))}>
-                  {stats?.overall_risk_score ?? 'not available'}
-                </div>
+                {stats?.overall_risk_score != null && (
+                  <div className={clsx('w-20 h-20 rounded-full flex items-center justify-center text-2xl font-bold', getRiskColor(stats.overall_risk_score))}>
+                    {Math.round(stats.overall_risk_score)}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -438,9 +620,11 @@ export default function ExposureManagement() {
                 <div>
                   <p className="text-sm text-gray-500 dark:text-gray-400">Mean Time to Remediate</p>
                   <p className="text-4xl font-bold text-gray-900 dark:text-white mt-2">
-                    {stats?.mean_time_to_remediate_days ?? 'not available'}
+                    {stats?.mean_time_to_remediate_days == null ? NA : stats.mean_time_to_remediate_days.toFixed(1)}
                   </p>
-                  <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">days</p>
+                  <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+                    {stats?.mean_time_to_remediate_days == null ? 'no remediation ticket closed yet' : 'days (closed tickets)'}
+                  </p>
                 </div>
                 <Clock className="w-16 h-16 text-gray-400" />
               </div>
@@ -451,7 +635,10 @@ export default function ExposureManagement() {
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             {/* Vulnerabilities by Severity */}
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-              <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Vulnerabilities by Severity</h3>
+              <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Open Exposures by Severity</h3>
+              {vulnerabilityData.length === 0 ? (
+                <p className="text-sm text-gray-500 dark:text-gray-400 py-16 text-center">No open exposure is stored.</p>
+              ) : (
               <ResponsiveContainer width="100%" height={250}>
                 <PieChart>
                   <Pie
@@ -462,18 +649,19 @@ export default function ExposureManagement() {
                     cy="50%"
                     outerRadius={80}
                   >
-                    {colors.map((color, index) => (
-                      <Cell key={`cell-${index}`} fill={color} />
+                    {vulnerabilityData.map((d) => (
+                      <Cell key={d.severity} fill={colors[['critical', 'high', 'medium', 'low'].indexOf(d.severity)]} />
                     ))}
                   </Pie>
                   <Tooltip />
                 </PieChart>
               </ResponsiveContainer>
+              )}
             </div>
 
             {/* Top Vulnerable Assets */}
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-              <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Top 10 Vulnerable Assets</h3>
+              <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Top 10 Assets by Stored Risk</h3>
               <ResponsiveContainer width="100%" height={250}>
                 <BarChart data={topVulnerableAssets}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
@@ -488,16 +676,40 @@ export default function ExposureManagement() {
 
           {/* Exposure Trend */}
           <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-            <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Exposure Trend (30 days)</h3>
-            <ResponsiveContainer width="100%" height={300}>
-              <AreaChart data={trendData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                <XAxis dataKey="date" tick={{ fontSize: 12 }} />
-                <YAxis tick={{ fontSize: 12 }} />
-                <Tooltip />
-                <Area type="monotone" dataKey="exposures" stroke="#f97316" fill="#fed7aa" />
-              </AreaChart>
-            </ResponsiveContainer>
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Open Exposure Trend</h3>
+              <select
+                value={trendDays}
+                onChange={(e) => setTrendDays(Number(e.target.value))}
+                aria-label="Trend window"
+                className="px-3 py-1.5 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-sm"
+              >
+                <option value={7}>7 days</option>
+                <option value={30}>30 days</option>
+                <option value={90}>90 days</option>
+                <option value={365}>365 days</option>
+              </select>
+            </div>
+            <LoadErrorBanner what="the exposure trend" error={trendError} />
+            {!trendError && trendData.length === 0 ? (
+              <p className="text-sm text-gray-500 dark:text-gray-400 py-12 text-center">
+                No daily snapshot is stored for this window. Snapshots are written nightly; use Capture Snapshot to store today's.
+              </p>
+            ) : (
+              <ResponsiveContainer width="100%" height={300}>
+                <AreaChart data={trendData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                  <XAxis dataKey="date" tick={{ fontSize: 12 }} />
+                  <YAxis tick={{ fontSize: 12 }} />
+                  <Tooltip />
+                  <Area type="monotone" dataKey="open_exposures" name="open exposures" stroke="#f97316" fill="#fed7aa" />
+                  <Area type="monotone" dataKey="critical" name="critical" stroke="#ef4444" fill="#fecaca" />
+                </AreaChart>
+              </ResponsiveContainer>
+            )}
+            <p className="text-xs text-gray-500 mt-2">
+              {trendData.length} stored snapshot point(s); days without a snapshot are absent.
+            </p>
           </div>
         </div>
       )}
@@ -561,9 +773,88 @@ export default function ExposureManagement() {
                   />
                   <span className="text-sm text-gray-900 dark:text-white">Internet-Facing Only</span>
                 </label>
+                <label className="flex items-center gap-2 px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={includeInactive}
+                    onChange={(e) => setIncludeInactive(e.target.checked)}
+                    className="w-4 h-4"
+                  />
+                  <span className="text-sm text-gray-900 dark:text-white">Include inactive</span>
+                </label>
               </div>
+              <div className="flex flex-wrap gap-2 pt-2 border-t border-gray-200 dark:border-gray-700">
+                <button
+                  onClick={() => assetFileInput.current?.click()}
+                  disabled={busy !== null}
+                  title="CSV with a header row or a JSON array: hostname, ip_address, asset_type, criticality, environment, ..."
+                  className="flex items-center gap-2 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50"
+                >
+                  <Upload className="w-4 h-4" />
+                  {busy === 'asset-import' ? 'Importing...' : 'Import Assets (CSV / JSON)'}
+                </button>
+                <button
+                  onClick={() => {
+                    setDiscoveryResult(null);
+                    runAction('discover', 'discover assets from ingested logs', async () => {
+                      const res = await api.post('/exposure/assets/discover', { scan_type: 'siem' });
+                      setDiscoveryResult(res.data);
+                    });
+                  }}
+                  disabled={busy !== null}
+                  title="Find hosts in the last 24 hours of ingested log entries (admin)"
+                  className="flex items-center gap-2 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50"
+                >
+                  <Search className="w-4 h-4" />
+                  {busy === 'discover' ? 'Discovering...' : 'Discover from Logs'}
+                </button>
+                <span className="text-xs text-gray-500 dark:text-gray-400 self-center">
+                  Network, cloud, Active Directory and DNS discovery are not available (no scanner or directory integration).
+                </span>
+              </div>
+              <input
+                ref={assetFileInput}
+                type="file"
+                accept=".csv,.json,text/csv,application/json"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  e.target.value = '';
+                  if (file) importAssetsFile(file);
+                }}
+              />
             </div>
           </div>
+
+          {assetImportResult && (
+            <div className="text-sm bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded p-3 space-y-1">
+              <div className="flex justify-between">
+                <span className="font-medium">
+                  {assetImportResult.file_name}: {assetImportResult.rows_read} row(s) read, {assetImportResult.created} created,{' '}
+                  {assetImportResult.updated} updated, {assetImportResult.skipped} skipped, {assetImportResult.failed} failed
+                </span>
+                <button onClick={() => setAssetImportResult(null)} className="text-xs underline">dismiss</button>
+              </div>
+              {Array.isArray(assetImportResult.errors) && assetImportResult.errors.length > 0 && (
+                <ul className="list-disc ml-5">
+                  {assetImportResult.errors.slice(0, 50).map((er: Row, i: number) => (
+                    <li key={i}>Row {er.row ?? '?'}: {er.reason ?? er.error ?? JSON.stringify(er)}</li>
+                  ))}
+                  {assetImportResult.errors.length > 50 && <li>... {assetImportResult.errors.length - 50} more</li>}
+                </ul>
+              )}
+            </div>
+          )}
+          {discoveryResult && (
+            <div className="text-sm bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded p-3 flex justify-between gap-4">
+              <span>
+                Log discovery: {discoveryResult.log_rows_scanned} log row(s) scanned{discoveryResult.truncated ? ' (truncated)' : ''},{' '}
+                {discoveryResult.new_assets} new asset(s), {discoveryResult.updated_assets} known asset(s) seen again.
+                {discoveryResult.detail ? ` ${discoveryResult.detail}` : ''}
+              </span>
+              <button onClick={() => setDiscoveryResult(null)} className="text-xs underline">dismiss</button>
+            </div>
+          )}
 
           {/* Assets Table */}
           <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
@@ -593,10 +884,13 @@ export default function ExposureManagement() {
                   ) : null}
                   {assets?.map((asset) => (
                     <tr key={asset.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
-                      <td className="px-4 py-3 text-sm text-gray-900 dark:text-white font-medium">{asset.hostname}</td>
-                      <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{asset.ip_address}</td>
-                      <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{asset.asset_type || asset.type}</td>
-                      <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{asset.environment || asset.network_zone}</td>
+                      <td className="px-4 py-3 text-sm text-gray-900 dark:text-white font-medium">
+                        {asset.hostname || '-'}
+                        {asset.is_internet_facing && <Globe className="inline w-3 h-3 ml-1 text-orange-500" aria-label="internet-facing" />}
+                      </td>
+                      <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{asset.ip_address || '-'}</td>
+                      <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{asset.asset_type}</td>
+                      <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{asset.environment || asset.network_zone || '-'}</td>
                       <td className="px-4 py-3">
                         <span className={clsx('px-2 py-1 text-xs font-medium rounded-full', getSeverityColor(asset.criticality))}>
                           {asset.criticality}
@@ -613,16 +907,16 @@ export default function ExposureManagement() {
                       </td>
                       <td className="px-4 py-3 text-sm text-gray-900 dark:text-white">{asset.vulnerability_count}</td>
                       <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
-                        {asset.last_scan_at ? new Date(asset.last_scan_at || "").toLocaleDateString() : asset.last_scan ? new Date(asset.last_scan || "").toLocaleDateString() : '-'}
+                        {asset.last_scan_at ? new Date(asset.last_scan_at).toLocaleDateString() : 'never scanned'}
                       </td>
                       <td className="px-4 py-3">
                         <span className={clsx('px-2 py-1 text-xs font-medium rounded-full', getStatusColor(asset.status))}>
-                          {asset.status}
+                          {asset.status ?? NA}
                         </span>
                       </td>
                       <td className="px-4 py-3">
                         <button
-                          onClick={() => setSelectedAsset(asset)}
+                          onClick={() => setSelectedAsset(selectedAsset?.id === asset.id ? null : asset)}
                           className="text-blue-600 dark:text-blue-400 hover:text-blue-700 text-sm font-medium"
                         >
                           View Details
@@ -634,6 +928,19 @@ export default function ExposureManagement() {
               </table>
             </div>
           </div>
+          {selectedAsset && (
+            <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4 text-sm space-y-1">
+              <div className="flex justify-between">
+                <h4 className="font-semibold">{selectedAsset.hostname || selectedAsset.ip_address}</h4>
+                <button onClick={() => setSelectedAsset(null)} className="text-xs underline">close</button>
+              </div>
+              <p>OS: {[selectedAsset.os_type, selectedAsset.os_version].filter(Boolean).join(' ') || NA}</p>
+              <p>Owner: {selectedAsset.owner || NA}</p>
+              <p>Internet-facing: {selectedAsset.is_internet_facing ? 'yes' : 'no'}</p>
+              <p>Open ports: {selectedAsset.open_ports && selectedAsset.open_ports.length > 0 ? selectedAsset.open_ports.join(', ') : NA}</p>
+              <p>Last seen: {selectedAsset.last_seen ? new Date(selectedAsset.last_seen).toLocaleString() : NA}</p>
+            </div>
+          )}
         </div>
       )}
 
@@ -667,7 +974,7 @@ export default function ExposureManagement() {
                   ))}
                 </div>
                 <button
-                  onClick={() => { setActionError(null); setShowImportModal(true); }}
+                  onClick={() => { setActionError(null); setScanImportResult(null); setShowImportModal(true); }}
                   className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm"
                 >
                   <Download className="w-4 h-4" />
@@ -680,11 +987,52 @@ export default function ExposureManagement() {
                 className="px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm max-w-xs"
               >
                 <option value="all">All Vulnerabilities</option>
-                <option value="has_exploit">Has Known Exploit</option>
-                <option value="kev">KEV Listed</option>
+                <option value="true">Has Known Exploit</option>
+                <option value="false">No Known Exploit</option>
+                <option value="kev">Exploited in the Wild (KEV)</option>
               </select>
             </div>
           </div>
+          {scanImportResult && (
+            <div className="text-sm bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded p-3 space-y-2">
+              <div className="flex justify-between gap-4">
+                <span className="font-medium">
+                  Scan import from {scanImportResult.scanner_name}: {scanImportResult.findings_read} finding(s) read ({scanImportResult.status})
+                </span>
+                <button onClick={() => setScanImportResult(null)} className="text-xs underline">dismiss</button>
+              </div>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                <span>Links created: {scanImportResult.links_created}</span>
+                <span>Links updated: {scanImportResult.links_updated}</span>
+                <span>Links reopened: {scanImportResult.links_reopened}</span>
+                <span>Catalogue rows created: {scanImportResult.vulnerabilities_created}</span>
+                <span>Assets matched: {scanImportResult.assets_matched}</span>
+                <span>Assets created: {scanImportResult.assets_created}</span>
+                <span>Assets rescored: {scanImportResult.assets_rescored}</span>
+                <span>Skipped: {scanImportResult.skipped_count}</span>
+              </div>
+              {Array.isArray(scanImportResult.skipped) && scanImportResult.skipped.length > 0 && (
+                <div>
+                  <p className="font-medium">Skipped findings by reason</p>
+                  <ul className="list-disc ml-5">
+                    {scanImportResult.skipped.map((s: Row, i: number) => (
+                      <li key={i}>
+                        {s.reason}: {s.count}
+                        {Array.isArray(s.examples) && s.examples.length > 0 && (
+                          <span className="text-gray-600 dark:text-gray-400"> (e.g. {s.examples.map((x: unknown) => (typeof x === 'string' ? x : JSON.stringify(x))).join('; ')})</span>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {Array.isArray(scanImportResult.errors) && scanImportResult.errors.length > 0 && (
+                <ul className="list-disc ml-5 text-orange-700 dark:text-orange-300">
+                  {scanImportResult.errors.map((m: unknown, i: number) => <li key={i}>{typeof m === 'string' ? m : JSON.stringify(m)}</li>)}
+                </ul>
+              )}
+            </div>
+          )}
 
           {/* Vulnerabilities Table */}
           <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
@@ -713,17 +1061,23 @@ export default function ExposureManagement() {
                   ) : null}
                   {vulnerabilities?.map((vuln) => (
                     <tr key={vuln.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
-                      <td className="px-4 py-3 text-sm font-mono text-gray-900 dark:text-white">{vuln.cve_id}</td>
+                      <td className="px-4 py-3 text-sm font-mono text-gray-900 dark:text-white">{vuln.cve_id || '-'}</td>
                       <td className="px-4 py-3 text-sm text-gray-900 dark:text-white max-w-xs truncate">{vuln.title}</td>
                       <td className="px-4 py-3">
                         <span className={clsx('px-2 py-1 text-xs font-medium rounded-full', getSeverityColor(vuln.severity))}>
                           {vuln.severity}
                         </span>
                       </td>
-                      <td className="px-4 py-3 text-sm font-mono text-gray-900 dark:text-white">{(vuln.cvss_v3_score ?? vuln.cvss ?? 0).toFixed(1)}</td>
-                      <td className="px-4 py-3 text-sm font-mono text-gray-900 dark:text-white">{((vuln.epss_score ?? vuln.epss ?? 0) * 100).toFixed(1)}%</td>
+                      <td className="px-4 py-3 text-sm font-mono text-gray-900 dark:text-white">{vuln.cvss_v3_score == null ? NA : vuln.cvss_v3_score.toFixed(1)}</td>
+                      <td className="px-4 py-3 text-sm font-mono text-gray-900 dark:text-white" title="No EPSS feed is connected; only stored scores are shown">
+                        {vuln.epss_score == null ? NA : `${(vuln.epss_score * 100).toFixed(1)}%`}
+                      </td>
                       <td className="px-4 py-3">
-                        {(vuln.exploit_available ?? vuln.has_exploit) ? (
+                        {vuln.is_exploited_in_wild ? (
+                          <span className="px-2 py-1 text-xs font-medium bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 rounded-full">
+                            In the wild
+                          </span>
+                        ) : vuln.exploit_available ? (
                           <span className="px-2 py-1 text-xs font-medium bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 rounded-full">
                             Yes
                           </span>
@@ -733,7 +1087,10 @@ export default function ExposureManagement() {
                           </span>
                         )}
                       </td>
-                      <td className="px-4 py-3 text-sm text-gray-900 dark:text-white">{vuln.affected_assets ?? vuln.affected_products?.length ?? 0}</td>
+                      <td className="px-4 py-3 text-sm text-gray-900 dark:text-white">
+                        {vuln.affected_assets ?? NA}
+                        {vuln.total_links != null && <span className="text-xs text-gray-500"> / {vuln.total_links} linked</span>}
+                      </td>
                       <td className="px-4 py-3">
                         {vuln.patch_available ? (
                           <CheckCircle className="w-5 h-5 text-green-500" />
@@ -743,7 +1100,7 @@ export default function ExposureManagement() {
                       </td>
                       <td className="px-4 py-3">
                         <span className={clsx('px-2 py-1 text-xs font-medium rounded-full', getStatusColor(vuln.status))}>
-                          {vuln.status}
+                          {vuln.status ?? NA}
                         </span>
                       </td>
                     </tr>
@@ -773,15 +1130,15 @@ export default function ExposureManagement() {
               </p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
-              <p className="text-sm text-gray-500 dark:text-gray-400">Avg SLA Compliance</p>
+              <p className="text-sm text-gray-500 dark:text-gray-400">Not Overdue (listed tickets)</p>
               <p className="text-2xl font-semibold text-gray-900 dark:text-white mt-1">
                 {tickets && tickets.length > 0
-                  ? `${Math.round(tickets.filter(t => deriveSlaStatus(t) !== 'overdue').length / (tickets.length || 1) * 100)}%`
-                  : '0%'}
+                  ? `${Math.round(tickets.filter(t => deriveSlaStatus(t) !== 'overdue').length / tickets.length * 100)}%`
+                  : NA}
               </p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
-              <p className="text-sm text-gray-500 dark:text-gray-400">Closed This Week</p>
+              <p className="text-sm text-gray-500 dark:text-gray-400">Closed (listed tickets)</p>
               <p className="text-2xl font-semibold text-gray-900 dark:text-white mt-1">
                 {tickets?.filter(t => t.status === 'closed').length || 0}
               </p>
@@ -821,7 +1178,7 @@ export default function ExposureManagement() {
                   <div>
                     <p className="text-xs font-medium text-gray-600 dark:text-gray-400 mb-2">Status:</p>
                     <div className="flex flex-wrap gap-2">
-                      {['open', 'in_progress', 'verification', 'closed'].map((stat) => (
+                      {TICKET_STATUSES.map((stat) => (
                         <button
                           key={stat}
                           onClick={() =>
@@ -887,18 +1244,34 @@ export default function ExposureManagement() {
                         </span>
                       </td>
                       <td className="px-4 py-3">
-                        <span className={clsx('px-2 py-1 text-xs font-medium rounded-full', getStatusColor(ticket.status))}>
-                          {(ticket.status || 'open').replace('_', ' ')}
-                        </span>
+                        <select
+                          value={ticket.status}
+                          disabled={busy !== null}
+                          aria-label="Ticket status"
+                          onChange={(e) => {
+                            const next = e.target.value;
+                            runAction(`ticket-${ticket.id}`, `set ticket "${ticket.title}" to ${next}`, async () => {
+                              await api.put(`/exposure/tickets/${ticket.id}`, { status: next });
+                            });
+                          }}
+                          className={clsx('px-2 py-1 text-xs font-medium rounded-full border-0', getStatusColor(ticket.status))}
+                        >
+                          {(TICKET_STATUSES.includes(ticket.status) ? TICKET_STATUSES : [ticket.status, ...TICKET_STATUSES]).map((s) => (
+                            <option key={s} value={s}>{s.replace('_', ' ')}</option>
+                          ))}
+                        </select>
+                        {ticket.verification_status && (
+                          <div className="text-xs text-gray-500 mt-1">verification: {ticket.verification_status}</div>
+                        )}
                       </td>
                       <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{ticket.assigned_to || '-'}</td>
-                      <td className="px-4 py-3 text-sm text-gray-900 dark:text-white">{ticket.affected_assets?.length ?? ticket.affected_assets ?? 0}</td>
+                      <td className="px-4 py-3 text-sm text-gray-900 dark:text-white">{Array.isArray(ticket.affected_assets) ? ticket.affected_assets.length : 0}</td>
                       <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
-                        {ticket.due_date ? new Date(ticket.due_date || "").toLocaleDateString() : '-'}
+                        {ticket.due_date ? new Date(ticket.due_date).toLocaleDateString() : 'no due date'}
                       </td>
                       <td className="px-4 py-3">
                         {(() => {
-                          const sla = deriveSlaStatus(ticket);
+                          const sla = ticket.sla_breach && ticket.status !== 'closed' ? 'overdue' : deriveSlaStatus(ticket);
                           return (
                             <span className={clsx('px-2 py-1 text-xs font-medium rounded-full', getStatusColor(sla))}>
                               {sla.replace('_', ' ')}
@@ -920,13 +1293,21 @@ export default function ExposureManagement() {
         <div className="space-y-6">
           <LoadErrorBanner what="attack surfaces" error={surfaceError} />
           <div className="flex items-center justify-between">
-            <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Overall Attack Surface Score</h3>
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Mean Risk of Assessed Surfaces</h3>
             <div className="text-4xl font-bold text-gray-900 dark:text-white">
-              {attackSurfaces.length > 0
-                ? Math.round(attackSurfaces.reduce((sum, s) => sum + s.risk_score, 0) / attackSurfaces.length)
-                : 'not available'}
+              {(() => {
+                const assessed = attackSurfaces.filter((s) => s.assessed);
+                return assessed.length > 0
+                  ? Math.round(assessed.reduce((sum, s) => sum + s.risk_score, 0) / assessed.length)
+                  : NA;
+              })()}
             </div>
           </div>
+          {!surfaceError && attackSurfaces.length === 0 && (
+            <p className="text-sm text-gray-500 dark:text-gray-400 text-center py-8 border border-dashed border-gray-300 dark:border-gray-700 rounded-lg">
+              No attack surface is defined.
+            </p>
+          )}
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {attackSurfaces?.map((surface) => (
@@ -936,9 +1317,13 @@ export default function ExposureManagement() {
                     <h4 className="font-semibold text-gray-900 dark:text-white">{surface.name}</h4>
                     <p className="text-sm text-gray-500 dark:text-gray-400 capitalize">{surface.type}</p>
                   </div>
-                  <div className="w-12 h-12 rounded-full flex items-center justify-center text-lg font-bold" style={{ background: surface.risk_score >= 70 ? '#fee2e2' : '#fef3c7', color: surface.risk_score >= 70 ? '#dc2626' : '#d97706' }}>
-                    {surface.risk_score}
-                  </div>
+                  {surface.assessed ? (
+                    <div className="w-12 h-12 rounded-full flex items-center justify-center text-lg font-bold" style={{ background: surface.risk_score >= 70 ? '#fee2e2' : '#fef3c7', color: surface.risk_score >= 70 ? '#dc2626' : '#d97706' }}>
+                      {Math.round(surface.risk_score)}
+                    </div>
+                  ) : (
+                    <span className="px-2 py-1 text-xs rounded-full bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300">not assessed</span>
+                  )}
                 </div>
                 <div className="space-y-2">
                   <div className="flex justify-between items-center">
@@ -954,19 +1339,14 @@ export default function ExposureManagement() {
                     <span className="font-semibold text-red-600 dark:text-red-400">{surface.critical_exposures}</span>
                   </div>
                   <div className="text-xs text-gray-500 dark:text-gray-400 pt-2 border-t border-gray-200 dark:border-gray-700">
-                    Last assessed: {new Date(surface.last_assessed || "").toLocaleDateString()}
+                    Last assessed: {surface.last_assessed ? new Date(surface.last_assessed).toLocaleDateString() : 'never'}
                   </div>
                 </div>
                 <button
-                  onClick={async () => {
-                    setActionError(null);
-                    try {
-                      await api.post('/exposure/attack-surface/assess', null, { params: { surface_id: surface.id } });
-                      queryClient.invalidateQueries({ queryKey: ['exposure', 'attack-surface'] });
-                    } catch (err) {
-                      setActionError(`Could not assess attack surface. ${describeLoadError(err)}`);
-                    }
-                  }}
+                  disabled={busy !== null}
+                  onClick={() => runAction(`assess-${surface.id}`, `assess attack surface "${surface.name}"`, async () => {
+                    await api.post('/exposure/attack-surface/assess', null, { params: { surface_id: surface.id } });
+                  })}
                   className="w-full mt-4 px-4 py-2 bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-900/40 text-sm font-medium"
                 >
                   Assess Now
@@ -977,10 +1357,90 @@ export default function ExposureManagement() {
         </div>
       )}
 
+      {/* Exposure Graph Tab */}
+      {activeTab === 'graph' && (
+        <div className="space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="text-sm text-gray-600 dark:text-gray-400">
+              Internet entry point, active assets with open exposures and the vulnerabilities open on them, computed from stored rows.
+              Multi-hop attack paths are not computed: no asset-to-asset reachability (topology, flows, firewall rules) is stored.
+            </p>
+            <select
+              value={graphMinSeverity}
+              onChange={(e) => setGraphMinSeverity(e.target.value)}
+              aria-label="Minimum severity"
+              className="px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-sm"
+            >
+              <option value="">All severities</option>
+              <option value="low">Low and above</option>
+              <option value="medium">Medium and above</option>
+              <option value="high">High and above</option>
+              <option value="critical">Critical only</option>
+            </select>
+          </div>
+          <LoadErrorBanner what="the exposure graph" error={graphError} />
+          {graphLoading && <p className="text-sm text-gray-500"><Loader2 className="inline w-4 h-4 animate-spin mr-1" />Loading graph...</p>}
+          {graph && graphAssets.length === 0 && (
+            <p className="text-sm text-gray-500 dark:text-gray-400 text-center py-8 border border-dashed border-gray-300 dark:border-gray-700 rounded-lg">
+              No active asset has an open exposure{graphMinSeverity ? ` at ${graphMinSeverity} or above` : ''}.
+            </p>
+          )}
+          {graph && graphAssets.length > 0 && (
+            <div className="space-y-2">
+              <p className="text-xs text-gray-500">
+                {graphAssets.length} asset(s), {graphNodes.filter((n) => n.type === 'vulnerability').length} vulnerability node(s), {graphEdges.length} edge(s)
+                {graph.truncated ? ' (asset list truncated at 100, highest risk first)' : ''}. Basis: {graph.basis}.
+              </p>
+              {graphAssets.map((asset) => {
+                const vulnEdges = graphEdges.filter((e) => e.source === asset.id && e.type === 'has_vulnerability');
+                return (
+                  <div key={asset.id} className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-3">
+                    <div className="flex flex-wrap items-center gap-2 text-sm">
+                      {exposedAssetIds.has(asset.id) ? (
+                        <span className="flex items-center gap-1 px-2 py-0.5 rounded bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-300 text-xs">
+                          <Globe className="w-3 h-3" /> Internet &rarr;
+                        </span>
+                      ) : (
+                        <span className="px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 text-xs">internal</span>
+                      )}
+                      <span className="font-semibold">{asset.label}</span>
+                      {asset.criticality && (
+                        <span className={clsx('px-2 py-0.5 text-xs rounded-full', getSeverityColor(asset.criticality))}>{asset.criticality}</span>
+                      )}
+                      <span className="text-xs text-gray-500">risk {asset.risk_score?.toFixed(1) ?? NA}</span>
+                    </div>
+                    <div className="flex flex-wrap gap-1 mt-2 ml-4">
+                      {vulnEdges.map((e) => {
+                        const v = nodeById.get(e.target);
+                        return (
+                          <span
+                            key={`${e.source}-${e.target}`}
+                            title={`link ${e.status ?? ''}, link risk ${e.risk_score ?? NA}`}
+                            className={clsx('px-2 py-0.5 text-xs rounded font-mono', getSeverityColor(v?.severity ?? ''))}
+                          >
+                            {v?.label ?? e.target}
+                            {v?.exploited_in_wild ? ' (exploited)' : ''}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Compliance Tab */}
       {activeTab === 'compliance' && (
         <div className="space-y-6">
           <LoadErrorBanner what="compliance frameworks" error={complianceError} />
+          {!complianceError && compliance && compliance.length === 0 && (
+            <p className="text-sm text-gray-500 dark:text-gray-400 text-center py-8 border border-dashed border-gray-300 dark:border-gray-700 rounded-lg">
+              No compliance framework is enabled for this organisation.
+            </p>
+          )}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {compliance?.map((framework) => (
               <div key={framework.id} className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
@@ -997,7 +1457,9 @@ export default function ExposureManagement() {
                   />
                 </div>
                 <p className="text-xs text-gray-500 dark:text-gray-400">
-                  {Math.round((framework.pass_percentage / 100) * framework.total_controls)} of {framework.total_controls} controls passed
+                  {framework.passed_checks} of {framework.total_controls} controls implemented, {framework.failed_checks} failing;
+                  the rest are planned, not assessed or not applicable.
+                  {' '}Last assessed: {framework.last_assessment_at ? new Date(framework.last_assessment_at).toLocaleDateString() : 'never'}
                 </p>
               </div>
             ))}
@@ -1006,15 +1468,21 @@ export default function ExposureManagement() {
           {/* Compliance Trend Chart */}
           <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
             <h4 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Compliance Trend</h4>
-            <ResponsiveContainer width="100%" height={300}>
-              <AreaChart data={trendData.map(d => ({ ...d, compliance: compliance && compliance.length > 0 ? Math.round(compliance.reduce((sum, f) => sum + f.pass_percentage, 0) / compliance.length) : null }))}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                <XAxis dataKey="date" tick={{ fontSize: 12 }} />
-                <YAxis tick={{ fontSize: 12 }} domain={[0, 100]} />
-                <Tooltip />
-                <Area type="monotone" dataKey="compliance" stroke="#10b981" fill="#d1fae5" />
-              </AreaChart>
-            </ResponsiveContainer>
+            {complianceTrend.length === 0 ? (
+              <p className="text-sm text-gray-500 dark:text-gray-400 py-12 text-center">
+                No stored snapshot carries a compliance figure yet.
+              </p>
+            ) : (
+              <ResponsiveContainer width="100%" height={300}>
+                <AreaChart data={complianceTrend}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                  <XAxis dataKey="date" tick={{ fontSize: 12 }} />
+                  <YAxis tick={{ fontSize: 12 }} domain={[0, 100]} />
+                  <Tooltip />
+                  <Area type="monotone" dataKey="compliance" stroke="#10b981" fill="#d1fae5" />
+                </AreaChart>
+              </ResponsiveContainer>
+            )}
           </div>
         </div>
       )}
@@ -1042,14 +1510,10 @@ export default function ExposureManagement() {
                 setShowCreateTicketModal(false);
                 queryClient.invalidateQueries({ queryKey: ['exposure'] });
               } catch (err) {
-                setActionError(`Could not create ticket. ${describeLoadError(err)}`);
+                setActionError({ what: 'create the ticket', error: err });
               }
             }} className="p-6 space-y-4">
-              {actionError && (
-                <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
-                  {actionError}
-                </div>
-              )}
+              {actionError && <ActionErrorBanner what={actionError.what} error={actionError.error} />}
               <div>
                 <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Title *</label>
                 <input name="title" required className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white" placeholder="Remediation ticket title" />
@@ -1099,26 +1563,33 @@ export default function ExposureManagement() {
               const form = e.target as HTMLFormElement;
               const formData = new FormData(form);
               setActionError(null);
+              setBusy('scan-import');
               try {
-                // Backend ScannerImportRequest expects scanner_name + scan_format,
-                // not scanner_type. scan_format is the parser id (nessus, qualys,
-                // tenable, openvas, custom).
-                await api.post('/exposure/scans/import', {
+                // ExternalScannerImportRequest: scanner_name + scan_format +
+                // scan_data (raw file text). A file, when chosen, wins over
+                // the pasted text.
+                const file = formData.get('scan_file');
+                const pasted = String(formData.get('scan_data') || '');
+                const scanData = file instanceof File && file.size > 0 ? await file.text() : pasted;
+                if (!scanData.trim()) {
+                  setActionError({ what: 'import scan results', error: new Error('Choose a scanner export file or paste its content.') });
+                  return;
+                }
+                const res = await api.post('/exposure/scans/import', {
                   scanner_name: formData.get('scanner_name'),
                   scan_format: formData.get('scan_format'),
-                  scan_data: formData.get('scan_data'),
+                  scan_data: scanData,
                 });
+                setScanImportResult(res.data);
                 setShowImportModal(false);
                 queryClient.invalidateQueries({ queryKey: ['exposure'] });
               } catch (err) {
-                setActionError(`Could not import scan results. ${describeLoadError(err)}`);
+                setActionError({ what: 'import scan results', error: err });
+              } finally {
+                setBusy(null);
               }
             }} className="p-6 space-y-4">
-              {actionError && (
-                <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
-                  {actionError}
-                </div>
-              )}
+              {actionError && <ActionErrorBanner what={actionError.what} error={actionError.error} />}
               <div>
                 <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Scanner Name *</label>
                 <input
@@ -1130,20 +1601,22 @@ export default function ExposureManagement() {
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Scan Format *</label>
-                <select name="scan_format" required defaultValue="nessus" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white">
-                  <option value="nessus">Nessus</option>
-                  <option value="qualys">Qualys</option>
-                  <option value="rapid7">Rapid7</option>
-                  <option value="openvas">OpenVAS</option>
-                  <option value="custom">Custom</option>
+                <select name="scan_format" required defaultValue="auto" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white">
+                  {EXPOSURE_SCAN_FORMATS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
                 </select>
               </div>
               <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Scan Data (JSON) *</label>
-                <textarea name="scan_data" required rows={8} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white font-mono text-sm" placeholder='{"vulnerabilities": [...], "assets": [...]}' />
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Scanner export file</label>
+                <input name="scan_file" type="file" className="w-full text-sm" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">...or paste the export</label>
+                <textarea name="scan_data" rows={6} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white font-mono text-sm" placeholder="XML, CSV or JSON as exported by the scanner" />
               </div>
               <div className="flex gap-3 pt-2">
-                <button type="submit" className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium">Import</button>
+                <button type="submit" disabled={busy === 'scan-import'} className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium disabled:opacity-50">
+                  {busy === 'scan-import' ? 'Importing...' : 'Import'}
+                </button>
                 <button type="button" onClick={() => setShowImportModal(false)} className="flex-1 px-4 py-2 bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-200">Cancel</button>
               </div>
             </form>

@@ -19,6 +19,7 @@ import clsx from 'clsx';
 import { api } from '../api/client';
 import { datalakeApi } from '../api/endpoints';
 import LoadErrorBanner from '../components/LoadErrorBanner';
+import type { Row } from '../lib/apiRow';
 import { describeLoadError } from '../lib/loadError';
 
 const NA = 'not available';
@@ -34,6 +35,11 @@ interface DataSource {
   events: number | null; // total_events_ingested
   lastSync: string | null; // last_event_received
   lastError: string | null;
+  builtin: boolean;
+  builtinTable: string | null;
+  ingestionNote: string | null;
+  // connection_config_encrypted: {configured, keys}; the secret never returns.
+  configKeys: string[] | null;
 }
 
 // Pipeline row from GET /data-lake/pipelines (custom rows + Celery beat
@@ -48,6 +54,9 @@ interface Pipeline {
   duration: string | null;
   schedule: string | null;
   builtin: boolean;
+  // Why there is no run history / executor (built-in: run_history
+  // "not_recorded"; registered rows: no executor).
+  note: string | null;
 }
 
 const fmtTs = (v: string | null | undefined): string => {
@@ -81,6 +90,7 @@ export default function DataLakeDashboard() {
     if (raw === 'error' || raw === 'failed' || raw === 'disabled') return 'Error';
     if (raw === 'paused') return 'Paused';
     if (raw === 'initializing' || raw === 'building') return 'Initializing';
+    if (raw === 'registered') return 'Registered (no ingestion)';
     return raw || 'unknown';
   };
   const normalizeSource = (s: any): DataSource => ({
@@ -92,6 +102,12 @@ export default function DataLakeDashboard() {
     events: typeof s.total_events_ingested === 'number' ? s.total_events_ingested : null,
     lastSync: s.last_event_received ?? null,
     lastError: s.last_error ?? null,
+    builtin: Boolean(s.builtin),
+    builtinTable: s.builtin_table ?? null,
+    ingestionNote: s.ingestion_note ?? null,
+    configKeys: s.connection_config_encrypted && typeof s.connection_config_encrypted === 'object' && s.connection_config_encrypted.configured
+      ? (Array.isArray(s.connection_config_encrypted.keys) ? s.connection_config_encrypted.keys : [])
+      : null,
   });
   const backendStatusToPipelineStatus = (p: any): string => {
     const raw = String(p?.status ?? p?.pipeline_status ?? '').toLowerCase();
@@ -100,6 +116,8 @@ export default function DataLakeDashboard() {
     if (raw === 'failed' || raw === 'error') return 'Failed';
     if (raw === 'completed') return 'Completed';
     if (raw === 'building' || raw === 'initializing') return 'Building';
+    if (raw === 'scheduled') return 'Scheduled (built-in task)';
+    if (raw === 'registered') return 'Registered (no executor)';
     return raw || 'unknown';
   };
   const normalizePipeline = (p: any): Pipeline => {
@@ -120,7 +138,25 @@ export default function DataLakeDashboard() {
       duration: typeof p.avg_processing_time_ms === 'number' ? `${p.avg_processing_time_ms}ms avg` : null,
       schedule: p.schedule_cron ?? null,
       builtin: Boolean(p.builtin),
+      note: p.execution_note
+        ?? (p.run_history === 'not_recorded' ? `Runs as ${p.task ?? 'a scheduled task'}; run history is not recorded` : null),
     };
+  };
+
+  const [sourceDetail, setSourceDetail] = useState<{ lineage?: Row; quality?: Row; lineageError?: unknown; qualityError?: unknown } | null>(null);
+  const openSource = async (source: DataSource) => {
+    setSelectedSource(source);
+    setSourceDetail(null);
+    const [lin, qual] = await Promise.allSettled([
+      api.get(`/data-lake/catalog/lineage/${source.id}`).then((r) => r.data),
+      api.get(`/data-lake/catalog/quality/${source.id}`).then((r) => r.data),
+    ]);
+    setSourceDetail({
+      lineage: lin.status === 'fulfilled' ? lin.value : undefined,
+      lineageError: lin.status === 'rejected' ? lin.reason : undefined,
+      quality: qual.status === 'fulfilled' ? qual.value : undefined,
+      qualityError: qual.status === 'rejected' ? qual.reason : undefined,
+    });
   };
 
   const { data: sourcesRaw = [], error: sourcesError } = useQuery({ queryKey: ['dataSources'], queryFn: () => datalakeApi.getDataSources() });
@@ -211,17 +247,19 @@ export default function DataLakeDashboard() {
         || storageBreakdownRaw;
       if (Array.isArray(tiers)) {
         return tiers.map((t: any) => {
-          const b = t.bytes ?? t.size_bytes ?? t.value ?? 0;
+          const b = t.bytes ?? t.size_bytes ?? t.value ?? null;
+          if (b == null) return null;
           const f = fmtBytes(b);
           return {
             name: t.name ?? t.tier ?? 'tier',
             value: Number(f.gb.toFixed(3)),
             size: f.label,
           };
-        });
+        }).filter((t): t is { name: string; value: number; size: string } => t !== null);
       }
+      // A null tier value means the database cannot measure it (non-PostgreSQL).
       return ['hot', 'warm', 'cold', 'archived']
-        .filter((k) => k in (tiers as any))
+        .filter((k) => k in (tiers as any) && (tiers as any)[k] != null)
         .map((k) => {
           const b = (tiers as any)[k] ?? 0;
           const f = fmtBytes(b);
@@ -234,6 +272,8 @@ export default function DataLakeDashboard() {
     }
     return [];
   }, [storageBreakdownRaw]);
+
+  const storageProbe: Row | null = (storageBreakdownRaw as Row | undefined)?.probe ?? null;
 
   // Real live partitions for the SIEM log table — one row per day,
   // bucketed hot/warm/cold/archived by age. Replaces the static
@@ -411,7 +451,7 @@ export default function DataLakeDashboard() {
                   {sources.map((source: DataSource) => (
                     <tr
                       key={source.id}
-                      onClick={() => setSelectedSource(source)}
+                      onClick={() => openSource(source)}
                       className="border-t border-gray-700 hover:bg-gray-700/50 cursor-pointer"
                     >
                       <td className="px-6 py-4 text-sm font-medium text-white">{source.name}</td>
@@ -485,6 +525,7 @@ export default function DataLakeDashboard() {
                       <span>{pipeline.builtin ? pipeline.schedule ?? NA : `Last run: ${fmtTs(pipeline.lastRun)}`}</span>
                       <span>{pipeline.duration ?? NA}</span>
                     </div>
+                    {pipeline.note && <p className="text-xs text-gray-500 mt-1">{pipeline.note}</p>}
                   </div>
                 ))}
               </div>
@@ -508,7 +549,10 @@ export default function DataLakeDashboard() {
                       onClick={() => setSelectedPipeline(pipeline)}
                       className="border-t border-gray-700 hover:bg-gray-700/50 cursor-pointer"
                     >
-                      <td className="px-6 py-4 text-sm font-medium text-white">{pipeline.name}</td>
+                      <td className="px-6 py-4 text-sm font-medium text-white">
+                        {pipeline.name}
+                        {pipeline.note && <div className="text-xs font-normal text-gray-500">{pipeline.note}</div>}
+                      </td>
                       <td className="px-6 py-4 text-sm">
                         <span
                           className={clsx(
@@ -794,7 +838,21 @@ export default function DataLakeDashboard() {
         {activeTab === 'storage' && storageError && (
           <LoadErrorBanner what="the storage breakdown" error={storageError} />
         )}
-        {activeTab === 'storage' && !storageError && (
+        {activeTab === 'storage' && !storageError && storageProbe && (
+          <div className="mb-4 text-sm bg-gray-800 border border-gray-700 rounded-lg p-3 text-gray-300">
+            Storage probe: {storageProbe.method ?? 'unknown method'}
+            {storageProbe.available ? '' : ' · not available'}
+            {storageProbe.reason ? ` · ${storageProbe.reason}` : ''}
+            {storageProbe.attribution ? ` · ${storageProbe.attribution}` : ''}
+            {Array.isArray(storageProbe.tables_measured) ? ` · tables measured: ${storageProbe.tables_measured.join(', ')}` : ''}
+          </div>
+        )}
+        {activeTab === 'storage' && !storageError && storageBreakdown.length === 0 && (
+          <p className="text-sm text-gray-400 text-center py-10 border border-dashed border-gray-700 rounded-lg">
+            No storage figure is available from this database.
+          </p>
+        )}
+        {activeTab === 'storage' && !storageError && storageBreakdown.length > 0 && (
           <div className="grid grid-cols-2 gap-8">
             <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 dark:bg-gray-800 dark:border-gray-700">
               <h3 className="text-lg font-semibold mb-4">Storage Tier Breakdown</h3>
@@ -977,6 +1035,36 @@ export default function DataLakeDashboard() {
                     <p className="text-red-300 font-medium break-words">{selectedSource.lastError}</p>
                   </div>
                 )}
+                {selectedSource.ingestionNote && <p className="text-sm text-gray-300">{selectedSource.ingestionNote}</p>}
+                <p className="text-xs text-gray-400">
+                  {selectedSource.builtin ? `Built-in source (table ${selectedSource.builtinTable ?? NA})` : 'Registered source'}
+                  {selectedSource.configKeys ? ` · connection config stored encrypted (keys: ${selectedSource.configKeys.join(', ') || 'none'})` : ''}
+                </p>
+                <div className="border-t border-gray-700 pt-3 space-y-2 text-sm">
+                  <p className="text-gray-400">Lineage</p>
+                  {!sourceDetail && <p className="text-gray-500">Loading...</p>}
+                  <LoadErrorBanner what="lineage" error={sourceDetail?.lineageError} />
+                  {sourceDetail?.lineage && (
+                    <ul className="text-xs text-gray-300 list-disc ml-4">
+                      {(sourceDetail.lineage.downstream_consumers ?? []).length === 0 && <li>No downstream consumer recorded.</li>}
+                      {(sourceDetail.lineage.downstream_consumers ?? []).map((c: Row, i: number) => (
+                        <li key={i}>{c.name ?? c.task ?? c.id} ({c.type}{c.basis ? `, ${c.basis}` : ''})</li>
+                      ))}
+                      <li>{(sourceDetail.lineage.partitions ?? []).length} partition(s)</li>
+                    </ul>
+                  )}
+                  <p className="text-gray-400">Quality</p>
+                  <LoadErrorBanner what="quality" error={sourceDetail?.qualityError} />
+                  {sourceDetail?.quality && (
+                    <ul className="text-xs text-gray-300 grid grid-cols-2 gap-x-4">
+                      {Object.entries(sourceDetail.quality as Record<string, unknown>)
+                        .filter(([, v]) => v === null || ['string', 'number', 'boolean'].includes(typeof v))
+                        .map(([k, v]) => (
+                          <li key={k}>{k.replace(/_/g, ' ')}: {v === null ? NA : String(v)}</li>
+                        ))}
+                    </ul>
+                  )}
+                </div>
               </div>
 
               <button

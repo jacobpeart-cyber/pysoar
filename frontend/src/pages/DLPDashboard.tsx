@@ -4,9 +4,7 @@ import {
   FileWarning,
   Eye,
   Lock,
-  AlertTriangle,
   Search,
-  Filter,
   Plus,
   Edit,
   Download,
@@ -17,11 +15,35 @@ import {
   Play,
   Pause,
   Zap,
+  RefreshCw,
+  ScanLine,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { dlpApi } from '../api/endpoints';
 import { api } from '../api/client';
-import { describeLoadError } from '../lib/loadError';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import ActionErrorBanner from '../components/ActionErrorBanner';
+import type { Row } from '../lib/apiRow';
+
+const NA = 'not available';
+
+// Built-in detectors the content scanner knows (src/dlp/scanner.py); any
+// other data_patterns entry is treated as a regex.
+const BUILTIN_PATTERNS = [
+  'ssn', 'credit_card', 'email', 'phone', 'api_key', 'ipv4', 'ipv6', 'aws_key', 'private_key',
+  'medical_diagnosis', 'medical_medication', 'medical_procedure',
+];
+
+// Channels that map to stored data the scanner reads. Other channels (email,
+// web, usb, ...) have no data source in PySOAR and are not scanned.
+const SCANNED_CHANNELS: { value: string; label: string }[] = [
+  { value: 'logs', label: 'Ingested logs' },
+  { value: 'evidence', label: 'Compliance evidence' },
+  { value: 'tickets', label: 'Ticket comments' },
+  { value: 'cases', label: 'Case / incident notes' },
+];
+
+const inputCls = 'w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100';
 
 const getSeverityColor = (severity: string) => {
   switch (severity) {
@@ -41,223 +63,208 @@ const getSeverityColor = (severity: string) => {
 const getStatusColor = (status: string) => {
   switch (status) {
     case 'open':
-    case 'active':
+    case 'new':
       return 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-100';
     case 'investigating':
     case 'in-progress':
       return 'bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-100';
     case 'resolved':
     case 'closed':
+    case 'active':
       return 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-100';
-    case 'enabled':
-      return 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-100';
-    case 'disabled':
+    case 'inactive':
       return 'bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-100';
-    case 'suppressed':
+    case 'false_positive':
       return 'bg-purple-100 dark:bg-purple-900 text-purple-800 dark:text-purple-100';
     default:
       return 'bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-100';
   }
 };
 
+const download = (name: string, content: string, type: string) => {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(url);
+};
+
+// Split a patterns form into built-in names plus one regex per line.
+const patternsFromForm = (fd: FormData): string[] => {
+  const builtins = fd.getAll('builtin').map(String);
+  const custom = String(fd.get('custom_patterns') || '')
+    .split('\n')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return [...builtins, ...custom];
+};
+
+function PolicyPatternFields({ policy }: { policy?: Row | null }) {
+  const current: string[] = Array.isArray(policy?.data_patterns) ? policy.data_patterns : [];
+  const channels: string[] = Array.isArray(policy?.channels_monitored) ? policy.channels_monitored : [];
+  const custom = current.filter((p) => !BUILTIN_PATTERNS.includes(p));
+  return (
+    <>
+      <div>
+        <label className="block text-sm font-medium mb-1">Detectors</label>
+        <div className="grid grid-cols-2 gap-1 text-sm">
+          {BUILTIN_PATTERNS.map((p) => (
+            <label key={p} className="flex items-center gap-1">
+              <input type="checkbox" name="builtin" value={p} defaultChecked={current.includes(p)} /> {p.replace(/_/g, ' ')}
+            </label>
+          ))}
+        </div>
+      </div>
+      <div>
+        <label className="block text-sm font-medium mb-1">Custom regexes (one per line)</label>
+        <textarea name="custom_patterns" rows={2} defaultValue={custom.join('\n')} className={clsx(inputCls, 'font-mono text-xs')} placeholder="e.g. PRJ-[0-9]{6}" />
+      </div>
+      <div>
+        <label className="block text-sm font-medium mb-1">Data to scan (none ticked = all)</label>
+        <div className="grid grid-cols-2 gap-1 text-sm">
+          {SCANNED_CHANNELS.map((c) => (
+            <label key={c.value} className="flex items-center gap-1">
+              <input type="checkbox" name="channel" value={c.value} defaultChecked={channels.includes(c.value)} /> {c.label}
+            </label>
+          ))}
+        </div>
+        <p className="text-xs text-gray-500 mt-1">Email, web and USB channels have no data source in PySOAR and are not scanned.</p>
+      </div>
+    </>
+  );
+}
+
 export default function DLPDashboard() {
   const [activeTab, setActiveTab] = useState('policies');
-  const [policies, setPolicies] = useState<any[]>([]);
-  const [incidents, setIncidents] = useState<any[]>([]);
-  const [classifications, setClassifications] = useState<string[]>([]);
+  const [policies, setPolicies] = useState<Row[]>([]);
+  const [incidents, setIncidents] = useState<Row[]>([]);
+  const [classifications, setClassifications] = useState<Row[]>([]);
+  const [findings, setFindings] = useState<Row[]>([]);
+  const [scanStatus, setScanStatus] = useState<Row | null>(null);
+  const [scanResult, setScanResult] = useState<Row | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [loadErrors, setLoadErrors] = useState<Record<string, unknown>>({});
+  const [actionError, setActionError] = useState<{ what: string; error: unknown } | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
+  const [findingSource, setFindingSource] = useState('');
   const [showNewPolicyModal, setShowNewPolicyModal] = useState(false);
-  const [selectedPolicy, setSelectedPolicy] = useState<any | null>(null);
-  const [editingPolicy, setEditingPolicy] = useState<any | null>(null);
-  const [testingPolicy, setTestingPolicy] = useState<any | null>(null);
+  const [selectedPolicy, setSelectedPolicy] = useState<Row | null>(null);
+  const [editingPolicy, setEditingPolicy] = useState<Row | null>(null);
+  const [testingPolicy, setTestingPolicy] = useState<Row | null>(null);
   const [testSampleText, setTestSampleText] = useState('');
-  const [testResult, setTestResult] = useState<any | null>(null);
-  const [testError, setTestError] = useState<string | null>(null);
-  const [selectedIncident, setSelectedIncident] = useState<any | null>(null);
+  const [testResult, setTestResult] = useState<Row | null>(null);
+  const [testError, setTestError] = useState<unknown>(null);
+  const [selectedIncident, setSelectedIncident] = useState<Row | null>(null);
   const [incidentStatusUpdate, setIncidentStatusUpdate] = useState<string>('');
   const [incidentNotes, setIncidentNotes] = useState<string>('');
-  const [selectedClassification, setSelectedClassification] = useState<string | null>(null);
-  const [showFilter, setShowFilter] = useState(false);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
 
   const refreshPolicies = async () => {
     const policiesData = await dlpApi.getPolicies();
-    setPolicies(Array.isArray(policiesData) ? policiesData : ((policiesData as any)?.items || []));
+    setPolicies(Array.isArray(policiesData) ? (policiesData as Row[]) : []);
   };
 
-  const refreshIncidents = async () => {
-    const incidentsData: any = await dlpApi.getIncidents();
-    setIncidents(Array.isArray(incidentsData) ? incidentsData : (incidentsData?.items || incidentsData?.data || []));
-  };
-
-  const handleEnablePolicy = async (policyId: string) => {
-    setActionBusy(`enable-${policyId}`);
+  const loadFindings = async (source: string) => {
     try {
-      await dlpApi.enablePolicy(policyId);
-      await refreshPolicies();
-      setActionMessage('Policy enabled');
-    } catch (err: any) {
-      setError(`Failed to enable policy: ${describeLoadError(err)}`);
-    } finally {
-      setActionBusy(null);
-    }
-  };
-
-  const handleDisablePolicy = async (policyId: string) => {
-    setActionBusy(`disable-${policyId}`);
-    try {
-      await dlpApi.disablePolicy(policyId);
-      await refreshPolicies();
-      setActionMessage('Policy disabled');
-    } catch (err: any) {
-      setError(`Failed to disable policy: ${describeLoadError(err)}`);
-    } finally {
-      setActionBusy(null);
-    }
-  };
-
-  const openTestPolicy = (policy: any) => {
-    setTestingPolicy(policy);
-    setTestSampleText('');
-    setTestResult(null);
-    setTestError(null);
-  };
-
-  const runTestPolicy = async () => {
-    if (!testingPolicy) return;
-    // DLPPolicyTestRequest requires a non-empty `sample_content`
-    // (src/schemas/dlp.py). dlpApi.testPolicy sends `sample_text`, which
-    // the backend rejects with 422, so the page posts the real field.
-    if (!testSampleText.trim()) {
-      setTestError('Enter sample content to test against this policy.');
-      return;
-    }
-    setActionBusy(`test-${testingPolicy.id}`);
-    setTestError(null);
-    try {
-      const response = await api.post(`/dlp/policies/${testingPolicy.id}/test`, {
-        sample_content: testSampleText,
+      const res = await api.get('/dlp/violations', {
+        params: { size: 100, detected_by: 'content_scan', source_type: source || undefined },
       });
-      setTestResult(response.data);
-    } catch (err: unknown) {
-      setTestError(`Test failed: ${describeLoadError(err)}`);
-    } finally {
-      setActionBusy(null);
+      setFindings(Array.isArray(res.data) ? res.data : (res.data?.items ?? []));
+      setLoadErrors((prev) => ({ ...prev, findings: undefined }));
+    } catch (err) {
+      setLoadErrors((prev) => ({ ...prev, findings: err }));
     }
   };
 
-  const openEditPolicy = (policy: any) => {
-    setEditingPolicy({
-      id: policy.id,
-      name: policy.name || '',
-      description: policy.description || '',
-      severity: policy.severity || 'medium',
-      enabled: policy.enabled !== false,
-    });
-  };
-
-  const submitEditPolicy = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!editingPolicy) return;
-    setActionBusy(`edit-${editingPolicy.id}`);
+  const loadData = async () => {
+    setLoading(true);
     try {
-      await dlpApi.updatePolicy(editingPolicy.id, {
-        name: editingPolicy.name,
-        description: editingPolicy.description || undefined,
-        severity: editingPolicy.severity,
-        enabled: editingPolicy.enabled,
-      });
-      await refreshPolicies();
-      setEditingPolicy(null);
-      setActionMessage('Policy updated');
-    } catch (err: any) {
-      setError(`Failed to update policy: ${describeLoadError(err)}`);
+      const results = await Promise.allSettled([
+        dlpApi.getPolicies(),
+        dlpApi.getIncidents(),
+        dlpApi.getClassifications(),
+        api.get('/dlp/scan/status').then((r) => r.data),
+      ]);
+      const keys = ['policies', 'incidents', 'classifications', 'scan'];
+      const errs: Record<string, unknown> = {};
+      results.forEach((r, i) => { if (r.status === 'rejected') errs[keys[i]] = r.reason; });
+      setLoadErrors(errs);
+      const value = (i: number) => (results[i].status === 'fulfilled' ? (results[i] as PromiseFulfilledResult<unknown>).value : null);
+      const asRows = (v: unknown): Row[] => (Array.isArray(v) ? (v as Row[]) : ((v as Row | null)?.items ?? []));
+      setPolicies(asRows(value(0)));
+      setIncidents(asRows(value(1)));
+      setClassifications(asRows(value(2)));
+      setScanStatus((value(3) as Row | null) ?? null);
     } finally {
-      setActionBusy(null);
+      setLoading(false);
     }
-  };
-
-  const submitIncidentStatus = async () => {
-    if (!selectedIncident) return;
-    setActionBusy(`incident-${selectedIncident.id}`);
-    try {
-      const payload: Record<string, any> = {};
-      if (incidentStatusUpdate) payload.status = incidentStatusUpdate;
-      if (incidentNotes) payload.resolution_notes = incidentNotes;
-      if (Object.keys(payload).length === 0) {
-        setActionMessage('Nothing to update');
-        return;
-      }
-      await dlpApi.updateIncident(selectedIncident.id, payload);
-      await refreshIncidents();
-      setSelectedIncident(null);
-      setIncidentStatusUpdate('');
-      setIncidentNotes('');
-      setActionMessage('Incident updated');
-    } catch (err: any) {
-      setError(`Failed to update incident: ${describeLoadError(err)}`);
-    } finally {
-      setActionBusy(null);
-    }
+    loadFindings(findingSource);
   };
 
   React.useEffect(() => {
-    const loadData = async () => {
-      setLoading(true);
-      setError(null);
-      try {
-        const [policiesData, incidentsData, classificationsData] = await Promise.all([
-          dlpApi.getPolicies(),
-          dlpApi.getIncidents(),
-          dlpApi.getClassifications(),
-        ]);
-        // dlpApi unwraps the paginated `{items}` envelope; anything else is
-        // a contract break and is reported rather than shown as empty.
-        if (!Array.isArray(policiesData) || !Array.isArray(incidentsData) || !Array.isArray(classificationsData)) {
-          throw new Error('Unexpected DLP response shape');
-        }
-        setPolicies(policiesData);
-        setIncidents(incidentsData);
-        setClassifications(classificationsData);
-      } catch (err) {
-        console.error('Error loading DLP data:', err);
-        setError(`Could not load DLP data. ${describeLoadError(err)}`);
-      } finally {
-        setLoading(false);
-      }
-    };
     loadData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const activePolicies = policies.filter(p => p.enabled !== false).length;
-  const openIncidents = incidents.filter(i => i.status === 'open' || i.status === 'investigating').length;
-  const dataClassifications = classifications.length;
-  const violationsThisWeek = incidents.filter(i => {
-    const incDate = new Date(i?.createdAt || i?.created_at || "");
-    const weekAgo = new Date();
-    weekAgo.setDate(weekAgo.getDate() - 7);
-    return incDate >= weekAgo;
-  }).length;
+  const runAction = async (key: string, what: string, fn: () => Promise<string | void>) => {
+    setActionBusy(key);
+    setActionError(null);
+    try {
+      const msg = await fn();
+      if (msg) setActionMessage(msg);
+    } catch (error) {
+      setActionError({ what, error });
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
+  const runScan = (rescan: boolean) => runAction('scan', 'run the DLP content scan', async () => {
+    setScanResult(null);
+    const res = await api.post('/dlp/scan/run', null, { params: { rescan } });
+    setScanResult(res.data);
+    await loadData();
+  });
+
+  const runTestPolicy = async () => {
+    if (!testingPolicy) return;
+    if (!testSampleText.trim()) return;
+    setActionBusy(`test-${testingPolicy.id}`);
+    setTestError(null);
+    try {
+      const response = await api.post(`/dlp/policies/${testingPolicy.id}/test`, { sample_text: testSampleText });
+      setTestResult(response.data);
+    } catch (err: unknown) {
+      setTestError(err);
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
+  const activePolicies = policies.filter((p) => p.enabled !== false).length;
+  const evaluatedPolicies = policies.filter((p) => p.evaluation_status === 'active').length;
+  const openIncidents = incidents.filter((i) => i.status === 'open' || i.status === 'investigating').length;
+  const openFindings = findings.filter((f) => f.status !== 'resolved' && f.status !== 'false_positive').length;
 
   const tabs = [
     { id: 'policies', label: 'Policies', icon: Shield },
+    { id: 'scanning', label: 'Content Scanning', icon: ScanLine },
     { id: 'incidents', label: 'Incidents', icon: FileWarning },
     { id: 'classifications', label: 'Classifications', icon: Lock },
     { id: 'reports', label: 'Reports', icon: FileText },
   ];
 
-  const filteredPolicies = policies.filter(p =>
-    (p.name || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
-    (p.description || '').toLowerCase().includes(searchQuery.toLowerCase())
+  const q = searchQuery.toLowerCase();
+  const filteredPolicies = policies.filter((p) =>
+    (p.name || '').toLowerCase().includes(q) || (p.description || '').toLowerCase().includes(q)
   );
-
-  const filteredIncidents = incidents.filter(i =>
-    (i.user || i.userName || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
-    (i.action || i.description || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
-    (i.policyName || i.policy_name || '').toLowerCase().includes(searchQuery.toLowerCase())
+  const filteredIncidents = incidents.filter((i) =>
+    (i.incident_title || '').toLowerCase().includes(q) ||
+    (i.description || '').toLowerCase().includes(q) ||
+    (i.data_types_involved ?? []).join(' ').toLowerCase().includes(q)
   );
 
   return (
@@ -271,23 +278,16 @@ export default function DLPDashboard() {
           </div>
           <div className="flex items-center gap-3">
             <button
-              onClick={() => {
-                const data = { policies, incidents, classifications };
-                const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = 'dlp-export.json';
-                a.click();
-                URL.revokeObjectURL(url);
-              }}
-              className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+              onClick={() => runScan(false)}
+              disabled={actionBusy !== null}
+              title="Evaluate the active policies over new stored rows now (admin); the sweep also runs every 15 minutes"
+              className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition disabled:opacity-50"
             >
-              <Download className="w-4 h-4" />
-              Export
+              <RefreshCw className={clsx('w-4 h-4', actionBusy === 'scan' && 'animate-spin')} />
+              Run Content Scan
             </button>
             <button
-              onClick={() => setShowNewPolicyModal(true)}
+              onClick={() => { setActionError(null); setShowNewPolicyModal(true); }}
               className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg transition"
             >
               <Plus className="w-4 h-4" />
@@ -299,24 +299,24 @@ export default function DLPDashboard() {
         {/* Summary Cards */}
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
           <div className="bg-gradient-to-br from-indigo-50 to-indigo-100 dark:from-indigo-900 dark:to-indigo-800 p-4 rounded-lg">
-            <p className="text-sm font-medium text-indigo-600 dark:text-indigo-300">Active Policies</p>
-            <p className="text-3xl font-bold text-indigo-900 dark:text-indigo-100 mt-2">{activePolicies}</p>
-            <p className="text-xs text-indigo-600 dark:text-indigo-300 mt-1">enforcing data protection</p>
+            <p className="text-sm font-medium text-indigo-600 dark:text-indigo-300">Enabled Policies</p>
+            <p className="text-3xl font-bold text-indigo-900 dark:text-indigo-100 mt-2">{loadErrors.policies ? NA : activePolicies}</p>
+            <p className="text-xs text-indigo-600 dark:text-indigo-300 mt-1">{evaluatedPolicies} evaluated by the content scanner</p>
           </div>
           <div className="bg-gradient-to-br from-red-50 to-red-100 dark:from-red-900 dark:to-red-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-red-600 dark:text-red-300">Open Incidents</p>
-            <p className="text-3xl font-bold text-red-900 dark:text-red-100 mt-2">{openIncidents}</p>
-            <p className="text-xs text-red-600 dark:text-red-300 mt-1">requiring investigation</p>
+            <p className="text-3xl font-bold text-red-900 dark:text-red-100 mt-2">{loadErrors.incidents ? NA : openIncidents}</p>
+            <p className="text-xs text-red-600 dark:text-red-300 mt-1">open or investigating</p>
           </div>
           <div className="bg-gradient-to-br from-purple-50 to-purple-100 dark:from-purple-900 dark:to-purple-800 p-4 rounded-lg">
-            <p className="text-sm font-medium text-purple-600 dark:text-purple-300">Data Classifications</p>
-            <p className="text-3xl font-bold text-purple-900 dark:text-purple-100 mt-2">{dataClassifications}</p>
-            <p className="text-xs text-purple-600 dark:text-purple-300 mt-1">classification categories</p>
+            <p className="text-sm font-medium text-purple-600 dark:text-purple-300">Scanner Findings (listed)</p>
+            <p className="text-3xl font-bold text-purple-900 dark:text-purple-100 mt-2">{loadErrors.findings ? NA : openFindings}</p>
+            <p className="text-xs text-purple-600 dark:text-purple-300 mt-1">open findings from stored data</p>
           </div>
           <div className="bg-gradient-to-br from-orange-50 to-orange-100 dark:from-orange-900 dark:to-orange-800 p-4 rounded-lg">
-            <p className="text-sm font-medium text-orange-600 dark:text-orange-300">Violations This Week</p>
-            <p className="text-3xl font-bold text-orange-900 dark:text-orange-100 mt-2">{violationsThisWeek}</p>
-            <p className="text-xs text-orange-600 dark:text-orange-300 mt-1">policy violations detected</p>
+            <p className="text-sm font-medium text-orange-600 dark:text-orange-300">Data Classifications</p>
+            <p className="text-3xl font-bold text-orange-900 dark:text-orange-100 mt-2">{loadErrors.classifications ? NA : classifications.length}</p>
+            <p className="text-xs text-orange-600 dark:text-orange-300 mt-1">classification records</p>
           </div>
         </div>
       </div>
@@ -346,147 +346,125 @@ export default function DLPDashboard() {
       </div>
 
       {/* Content */}
-      <div className="p-6">
+      <div className="p-6 space-y-4">
+        {actionError && !showNewPolicyModal && !editingPolicy && <ActionErrorBanner what={actionError.what} error={actionError.error} />}
+        {scanResult && (
+          <div className="text-sm bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded p-3 space-y-1">
+            <div className="flex justify-between gap-4">
+              <span>
+                Content scan: {scanResult.rows_scanned ?? 0} row(s) scanned, {scanResult.findings_created ?? 0} finding(s) created;{' '}
+                {scanResult.policies_active ?? 0} policy(ies) evaluated, {scanResult.policies_inactive ?? 0} inactive.
+              </span>
+              <button onClick={() => setScanResult(null)} className="text-xs underline">dismiss</button>
+            </div>
+            {Object.entries((scanResult.sources ?? {}) as Record<string, Row>).map(([k, s]) => (
+              <p key={k} className="text-xs">{k}: {s.rows_scanned ?? 0} rows, {s.findings_created ?? 0} findings{s.error ? ` · error: ${s.error}` : ''}</p>
+            ))}
+            {(scanResult.inactive_policies ?? []).map((p: Row) => (
+              <p key={p.policy_id} className="text-xs text-orange-700 dark:text-orange-300">Inactive: {p.name} ({p.reason})</p>
+            ))}
+          </div>
+        )}
+
         {loading ? (
           <div className="flex items-center justify-center h-64">
             <p className="text-gray-500 dark:text-gray-400">Loading DLP data...</p>
-          </div>
-        ) : error ? (
-          <div className="flex items-center justify-center h-64">
-            <div className="text-center">
-              <AlertTriangle className="w-12 h-12 text-red-500 mx-auto mb-4" />
-              <p className="text-red-600 dark:text-red-400">{error}</p>
-              <button
-                onClick={() => window.location.reload()}
-                className="mt-4 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition"
-              >
-                Retry
-              </button>
-            </div>
           </div>
         ) : (
           <>
             {/* Policies Tab */}
             {activeTab === 'policies' && (
               <div className="space-y-6">
-                <div className="flex gap-4">
-                  <div className="flex-1 relative">
-                    <Search className="absolute left-3 top-3 w-4 h-4 text-gray-400" />
-                    <input
-                      type="text"
-                      placeholder="Search policies by name or description..."
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
-                      className="w-full pl-10 pr-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
-                    />
-                  </div>
-                  <button
-                    onClick={() => setShowFilter((prev) => !prev)}
-                    className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-                  >
-                    <Filter className="w-4 h-4" />
-                    Filter
-                  </button>
+                <LoadErrorBanner what="DLP policies" error={loadErrors.policies} />
+                <div className="flex-1 relative">
+                  <Search className="absolute left-3 top-3 w-4 h-4 text-gray-400" />
+                  <input
+                    type="text"
+                    placeholder="Search policies by name or description..."
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    className="w-full pl-10 pr-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                  />
                 </div>
 
-                {filteredPolicies.length === 0 ? (
+                {!loadErrors.policies && filteredPolicies.length === 0 ? (
                   <div className="flex flex-col items-center justify-center h-48 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
                     <Shield className="w-12 h-12 text-gray-300 dark:text-gray-600 mb-3" />
                     <p className="text-gray-500 dark:text-gray-400">No DLP policies found</p>
-                    <button
-                      onClick={() => setShowNewPolicyModal(true)}
-                      className="mt-3 text-indigo-600 dark:text-indigo-400 hover:underline text-sm"
-                    >
-                      Create your first policy
-                    </button>
                   </div>
                 ) : (
-                  <div className="bg-white dark:bg-gray-800 rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700">
+                  <div className="bg-white dark:bg-gray-800 rounded-lg overflow-x-auto border border-gray-200 dark:border-gray-700">
                     <table className="w-full">
                       <thead>
                         <tr className="border-b border-gray-200 dark:border-gray-700">
-                          <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Policy Name</th>
-                          <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Status</th>
-                          <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Severity</th>
-                          <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Rules</th>
-                          <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Matches</th>
-                          <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Last Triggered</th>
-                          <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Actions</th>
+                          <th className="px-6 py-4 text-left text-sm font-semibold">Policy Name</th>
+                          <th className="px-6 py-4 text-left text-sm font-semibold">Status</th>
+                          <th className="px-6 py-4 text-left text-sm font-semibold">Evaluation</th>
+                          <th className="px-6 py-4 text-left text-sm font-semibold">Severity</th>
+                          <th className="px-6 py-4 text-left text-sm font-semibold">Patterns</th>
+                          <th className="px-6 py-4 text-left text-sm font-semibold">Matches</th>
+                          <th className="px-6 py-4 text-left text-sm font-semibold">Actions</th>
                         </tr>
                       </thead>
                       <tbody>
                         {filteredPolicies.map((policy) => (
                           <tr key={policy.id} className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 transition">
                             <td className="px-6 py-4">
-                              <div>
-                                <p className="text-sm font-medium">{policy.name}</p>
-                                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">{policy.description || 'No description'}</p>
-                              </div>
+                              <p className="text-sm font-medium">{policy.name}</p>
+                              <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">{policy.description || 'No description'}</p>
                             </td>
                             <td className="px-6 py-4">
                               {policy.enabled !== false ? (
-                                <span className="flex items-center gap-1 text-green-600 dark:text-green-400 text-sm">
-                                  <CheckCircle className="w-4 h-4" />
-                                  Enabled
-                                </span>
+                                <span className="flex items-center gap-1 text-green-600 dark:text-green-400 text-sm"><CheckCircle className="w-4 h-4" />Enabled</span>
                               ) : (
-                                <span className="flex items-center gap-1 text-gray-500 dark:text-gray-400 text-sm">
-                                  <XCircle className="w-4 h-4" />
-                                  Disabled
-                                </span>
+                                <span className="flex items-center gap-1 text-gray-500 dark:text-gray-400 text-sm"><XCircle className="w-4 h-4" />Disabled</span>
                               )}
+                            </td>
+                            <td className="px-6 py-4 text-xs max-w-xs">
+                              <span className={clsx('px-2 py-0.5 rounded-full', getStatusColor(policy.evaluation_status || 'inactive'))}>
+                                {policy.evaluation_status || 'not evaluated'}
+                              </span>
+                              {policy.evaluation_reason && <div className="text-gray-500 mt-1">{policy.evaluation_reason}</div>}
+                              {policy.last_evaluated_at && <div className="text-gray-400 mt-0.5">last {new Date(policy.last_evaluated_at).toLocaleString()}</div>}
                             </td>
                             <td className="px-6 py-4">
                               <span className={`px-3 py-1 rounded-full text-xs font-medium ${getSeverityColor(policy.severity || 'medium')}`}>
                                 {(policy.severity || 'medium').toUpperCase()}
                               </span>
                             </td>
-                            <td className="px-6 py-4 text-sm">{policy.data_patterns?.length ?? 'not available'}</td>
-                            <td className="px-6 py-4 text-sm font-semibold">{policy.trigger_count ?? 'not available'}</td>
-                            <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                              {policy.last_triggered
-                                ? new Date(policy.last_triggered || "").toLocaleDateString()
-                                : 'Never'}
+                            <td className="px-6 py-4 text-xs">
+                              {Array.isArray(policy.data_patterns) && policy.data_patterns.length > 0
+                                ? policy.data_patterns.join(', ')
+                                : <span className="text-orange-600">none (matches nothing)</span>}
                             </td>
+                            <td className="px-6 py-4 text-sm font-semibold">{policy.trigger_count ?? NA}</td>
                             <td className="px-6 py-4 text-sm">
                               <div className="flex gap-2 items-center">
-                                <button
-                                  onClick={() => setSelectedPolicy(policy)}
-                                  title="View details"
-                                  className="text-blue-600 dark:text-blue-400 hover:underline"
-                                >
-                                  <Eye className="w-4 h-4" />
-                                </button>
-                                <button
-                                  onClick={() => openEditPolicy(policy)}
-                                  title="Edit policy"
-                                  className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100"
-                                >
-                                  <Edit className="w-4 h-4" />
-                                </button>
+                                <button onClick={() => setSelectedPolicy(policy)} title="View details" className="text-blue-600 dark:text-blue-400"><Eye className="w-4 h-4" /></button>
+                                <button onClick={() => { setActionError(null); setEditingPolicy(policy); }} title="Edit policy" className="text-gray-600 dark:text-gray-400"><Edit className="w-4 h-4" /></button>
                                 {policy.enabled !== false ? (
                                   <button
-                                    onClick={() => handleDisablePolicy(policy.id)}
-                                    disabled={actionBusy === `disable-${policy.id}`}
+                                    onClick={() => runAction(`disable-${policy.id}`, 'disable the policy', async () => { await dlpApi.disablePolicy(policy.id); await refreshPolicies(); return 'Policy disabled'; })}
+                                    disabled={actionBusy !== null}
                                     title="Disable policy"
-                                    className="text-yellow-600 dark:text-yellow-400 hover:text-yellow-700 disabled:opacity-50"
+                                    className="text-yellow-600 dark:text-yellow-400 disabled:opacity-50"
                                   >
                                     <Pause className="w-4 h-4" />
                                   </button>
                                 ) : (
                                   <button
-                                    onClick={() => handleEnablePolicy(policy.id)}
-                                    disabled={actionBusy === `enable-${policy.id}`}
+                                    onClick={() => runAction(`enable-${policy.id}`, 'enable the policy', async () => { await dlpApi.enablePolicy(policy.id); await refreshPolicies(); return 'Policy enabled'; })}
+                                    disabled={actionBusy !== null}
                                     title="Enable policy"
-                                    className="text-green-600 dark:text-green-400 hover:text-green-700 disabled:opacity-50"
+                                    className="text-green-600 dark:text-green-400 disabled:opacity-50"
                                   >
                                     <Play className="w-4 h-4" />
                                   </button>
                                 )}
                                 <button
-                                  onClick={() => openTestPolicy(policy)}
-                                  title="Test policy"
-                                  className="text-indigo-600 dark:text-indigo-400 hover:text-indigo-700"
+                                  onClick={() => { setTestingPolicy(policy); setTestSampleText(''); setTestResult(null); setTestError(null); }}
+                                  title="Test this policy's patterns on sample text"
+                                  className="text-indigo-600 dark:text-indigo-400"
                                 >
                                   <Zap className="w-4 h-4" />
                                 </button>
@@ -501,112 +479,165 @@ export default function DLPDashboard() {
               </div>
             )}
 
+            {/* Content Scanning Tab */}
+            {activeTab === 'scanning' && (
+              <div className="space-y-6">
+                <LoadErrorBanner what="the content scan status" error={loadErrors.scan} />
+                {scanStatus && (
+                  <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 space-y-3">
+                    <div className="flex flex-wrap justify-between gap-2">
+                      <p className="text-sm text-gray-600 dark:text-gray-400">
+                        Up to {scanStatus.max_rows_per_source_per_run} rows per source per run; first run looks back {scanStatus.initial_lookback_days} day(s).
+                      </p>
+                      <button
+                        onClick={() => runScan(true)}
+                        disabled={actionBusy !== null}
+                        title="Rewind every source and scan the lookback window again (admin)"
+                        className="px-3 py-1.5 text-xs border border-gray-300 dark:border-gray-600 rounded disabled:opacity-50"
+                      >
+                        Rescan From Start
+                      </button>
+                    </div>
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="text-left border-b border-gray-200 dark:border-gray-700">
+                          <th className="py-2">Source</th>
+                          <th className="py-2">Policies covering</th>
+                          <th className="py-2">Last run</th>
+                          <th className="py-2">Rows scanned (total)</th>
+                          <th className="py-2">Findings (total)</th>
+                          <th className="py-2">Last error</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(scanStatus.sources ?? []).map((s: Row) => (
+                          <tr key={s.source_type} className="border-b border-gray-100 dark:border-gray-700">
+                            <td className="py-2">{s.label}</td>
+                            <td className="py-2">{s.policies_covering}</td>
+                            <td className="py-2 text-xs">{s.last_run_at ? `${new Date(s.last_run_at).toLocaleString()} (${s.last_run_rows} rows, ${s.last_run_findings} findings)` : 'never'}</td>
+                            <td className="py-2">{s.rows_scanned_total}</td>
+                            <td className="py-2">{s.findings_total}</td>
+                            <td className="py-2 text-xs text-red-600">{s.last_error || '—'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                <div className="flex items-center gap-2">
+                  <h3 className="font-semibold">Scanner findings</h3>
+                  <select
+                    value={findingSource}
+                    onChange={(e) => { setFindingSource(e.target.value); loadFindings(e.target.value); }}
+                    aria-label="Source"
+                    className="px-3 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700"
+                  >
+                    <option value="">All sources</option>
+                    {(scanStatus?.sources ?? []).map((s: Row) => <option key={s.source_type} value={s.source_type}>{s.label}</option>)}
+                  </select>
+                </div>
+                <LoadErrorBanner what="scanner findings" error={loadErrors.findings} />
+                {!loadErrors.findings && findings.length === 0 ? (
+                  <p className="text-sm text-gray-500 text-center py-8 border border-dashed border-gray-300 dark:border-gray-700 rounded-lg">
+                    No finding from the content scanner{findingSource ? ' for this source' : ''}.
+                  </p>
+                ) : (
+                  <div className="bg-white dark:bg-gray-800 rounded-lg overflow-x-auto border border-gray-200 dark:border-gray-700">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="text-left border-b border-gray-200 dark:border-gray-700">
+                          <th className="px-4 py-2">Severity</th>
+                          <th className="px-4 py-2">Data types</th>
+                          <th className="px-4 py-2">Location</th>
+                          <th className="px-4 py-2">Excerpt (redacted)</th>
+                          <th className="px-4 py-2">Status</th>
+                          <th className="px-4 py-2">Found</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {findings.map((f) => (
+                          <tr key={f.id} className="border-b border-gray-100 dark:border-gray-700">
+                            <td className="px-4 py-2"><span className={`px-2 py-0.5 rounded-full text-xs ${getSeverityColor(f.severity)}`}>{f.severity}</span></td>
+                            <td className="px-4 py-2 text-xs">{(f.sensitive_data_types ?? []).join(', ') || '—'}</td>
+                            <td className="px-4 py-2 text-xs">{f.location || `${f.source_type}:${f.source_id}`}</td>
+                            <td className="px-4 py-2 text-xs font-mono max-w-xs truncate" title={f.redacted_excerpt ?? ''}>{f.redacted_excerpt || '—'}</td>
+                            <td className="px-4 py-2"><span className={`px-2 py-0.5 rounded-full text-xs ${getStatusColor(f.status)}`}>{f.status}</span></td>
+                            <td className="px-4 py-2 text-xs">{f.created_at ? new Date(f.created_at).toLocaleString() : '—'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Incidents Tab */}
             {activeTab === 'incidents' && (
               <div className="space-y-6">
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-                  <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
-                    <h3 className="font-semibold mb-3">Incident Severity Breakdown</h3>
-                    <div className="space-y-2 text-sm">
-                      <div className="flex justify-between"><span>Critical</span><span className="font-semibold text-red-600">{incidents.filter(i => i.severity === 'critical').length}</span></div>
-                      <div className="flex justify-between"><span>High</span><span className="font-semibold text-orange-600">{incidents.filter(i => i.severity === 'high').length}</span></div>
-                      <div className="flex justify-between"><span>Medium</span><span className="font-semibold text-yellow-600">{incidents.filter(i => i.severity === 'medium').length}</span></div>
-                      <div className="flex justify-between"><span>Low</span><span className="font-semibold text-green-600">{incidents.filter(i => i.severity === 'low').length}</span></div>
-                    </div>
-                  </div>
-                  <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
-                    <h3 className="font-semibold mb-3">Top Violation Types</h3>
-                    <div className="space-y-2 text-sm">
-                      <div className="flex justify-between"><span>Email Exfiltration</span><span className="font-semibold">{incidents.filter(i => (i.action || i.description || '').toLowerCase().includes('email')).length}</span></div>
-                      <div className="flex justify-between"><span>USB Transfer</span><span className="font-semibold">{incidents.filter(i => (i.action || i.description || '').toLowerCase().includes('usb')).length}</span></div>
-                      <div className="flex justify-between"><span>Cloud Upload</span><span className="font-semibold">{incidents.filter(i => (i.action || i.description || '').toLowerCase().includes('cloud')).length}</span></div>
-                    </div>
-                  </div>
-                  <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
-                    <h3 className="font-semibold mb-3">Response Status</h3>
-                    <div className="space-y-2 text-sm">
-                      <div className="flex justify-between"><span>Auto-Blocked</span><span className="font-semibold text-green-600">{incidents.filter(i => i.status === 'blocked' || i.status === 'auto-blocked').length}</span></div>
-                      <div className="flex justify-between"><span>Quarantined</span><span className="font-semibold text-yellow-600">{incidents.filter(i => i.status === 'quarantined').length}</span></div>
-                      <div className="flex justify-between"><span>Pending Review</span><span className="font-semibold text-red-600">{incidents.filter(i => i.status === 'open' || i.status === 'investigating').length}</span></div>
-                    </div>
+                <LoadErrorBanner what="DLP incidents" error={loadErrors.incidents} />
+                <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
+                  <h3 className="font-semibold mb-3">Incident Severity Breakdown <span className="text-xs font-normal text-gray-500">(listed incidents)</span></h3>
+                  <div className="grid grid-cols-4 gap-2 text-sm">
+                    {['critical', 'high', 'medium', 'low'].map((s) => (
+                      <div key={s} className="flex justify-between"><span className="capitalize">{s}</span><span className="font-semibold">{incidents.filter((i) => i.severity === s).length}</span></div>
+                    ))}
                   </div>
                 </div>
 
-                <div className="flex gap-4">
-                  <div className="flex-1 relative">
-                    <Search className="absolute left-3 top-3 w-4 h-4 text-gray-400" />
-                    <input
-                      type="text"
-                      placeholder="Search incidents by user, action, or policy..."
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
-                      className="w-full pl-10 pr-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
-                    />
-                  </div>
-                  <button
-                    onClick={() => setShowFilter((prev) => !prev)}
-                    className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-                  >
-                    <Filter className="w-4 h-4" />
-                    Filter
-                  </button>
+                <div className="flex-1 relative">
+                  <Search className="absolute left-3 top-3 w-4 h-4 text-gray-400" />
+                  <input
+                    type="text"
+                    placeholder="Search incidents by title, description or data type..."
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    className="w-full pl-10 pr-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                  />
                 </div>
 
-                {filteredIncidents.length === 0 ? (
+                {!loadErrors.incidents && filteredIncidents.length === 0 ? (
                   <div className="flex flex-col items-center justify-center h-48 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
                     <FileWarning className="w-12 h-12 text-gray-300 dark:text-gray-600 mb-3" />
                     <p className="text-gray-500 dark:text-gray-400">No DLP incidents found</p>
                   </div>
                 ) : (
-                  <div className="bg-white dark:bg-gray-800 rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700">
+                  <div className="bg-white dark:bg-gray-800 rounded-lg overflow-x-auto border border-gray-200 dark:border-gray-700">
                     <table className="w-full">
                       <thead>
                         <tr className="border-b border-gray-200 dark:border-gray-700">
-                          <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Incident ID</th>
-                          <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">User</th>
-                          <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Action</th>
-                          <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Policy</th>
-                          <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Severity</th>
-                          <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Status</th>
-                          <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Date</th>
-                          <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Actions</th>
+                          <th className="px-6 py-4 text-left text-sm font-semibold">Title</th>
+                          <th className="px-6 py-4 text-left text-sm font-semibold">Data types</th>
+                          <th className="px-6 py-4 text-left text-sm font-semibold">Severity</th>
+                          <th className="px-6 py-4 text-left text-sm font-semibold">Status</th>
+                          <th className="px-6 py-4 text-left text-sm font-semibold">Date</th>
+                          <th className="px-6 py-4 text-left text-sm font-semibold">Actions</th>
                         </tr>
                       </thead>
                       <tbody>
                         {filteredIncidents.map((incident) => (
                           <tr key={incident.id} className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 transition">
-                            <td className="px-6 py-4 text-sm font-mono font-medium">{incident.id}</td>
-                            <td className="px-6 py-4 text-sm">{incident.user || incident.userName || 'Unknown'}</td>
-                            <td className="px-6 py-4 text-sm">{incident.action || incident.description || '—'}</td>
-                            <td className="px-6 py-4 text-sm">{incident.policyName || incident.policy_name || '—'}</td>
+                            <td className="px-6 py-4 text-sm">
+                              <div className="font-medium">{incident.incident_title || incident.id}</div>
+                              <div className="text-xs text-gray-500">{incident.description || ''}</div>
+                            </td>
+                            <td className="px-6 py-4 text-sm">{(incident.data_types_involved ?? []).join(', ') || '—'}</td>
                             <td className="px-6 py-4">
-                              <span className={`px-3 py-1 rounded-full text-xs font-medium ${getSeverityColor(incident.severity || 'medium')}`}>
-                                {(incident.severity || 'medium').toUpperCase()}
+                              <span className={`px-3 py-1 rounded-full text-xs font-medium ${getSeverityColor(incident.severity || '')}`}>
+                                {(incident.severity || 'unrated').toUpperCase()}
                               </span>
                             </td>
                             <td className="px-6 py-4">
-                              <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(incident.status || 'open')}`}>
-                                {(incident.status || 'open')}
+                              <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(incident.status || '')}`}>
+                                {incident.status || '—'}
                               </span>
                             </td>
                             <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                              {incident.createdAt || incident.created_at
-                                ? new Date(incident.createdAt || incident.created_at).toLocaleDateString()
-                                : '—'}
+                              {incident.created_at ? new Date(incident.created_at).toLocaleDateString() : '—'}
                             </td>
-                            <td className="px-6 py-4 text-sm flex gap-2">
-                              <button
-                                onClick={() => setSelectedIncident(incident)}
-                                className="text-blue-600 dark:text-blue-400 hover:underline"
-                              >
-                                <Eye className="w-4 h-4" />
-                              </button>
-                              <button
-                                onClick={() => setSelectedIncident(incident)}
-                                className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100"
-                              >
-                                <Edit className="w-4 h-4" />
-                              </button>
+                            <td className="px-6 py-4 text-sm">
+                              <button onClick={() => { setSelectedIncident(incident); setIncidentNotes(incident.resolution_notes ?? ''); }} className="text-blue-600 dark:text-blue-400"><Eye className="w-4 h-4" /></button>
                             </td>
                           </tr>
                         ))}
@@ -620,66 +651,25 @@ export default function DLPDashboard() {
             {/* Classifications Tab */}
             {activeTab === 'classifications' && (
               <div className="space-y-6">
-                <div className="bg-blue-50 dark:bg-blue-900 border border-blue-200 dark:border-blue-700 rounded-lg p-4 mb-6">
-                  <p className="text-sm text-blue-800 dark:text-blue-200">
-                    Data classifications define sensitivity levels for organizational data. Policies reference these classifications to enforce protection rules.
-                  </p>
-                </div>
-
-                {classifications.length === 0 ? (
+                <LoadErrorBanner what="data classifications" error={loadErrors.classifications} />
+                {!loadErrors.classifications && classifications.length === 0 ? (
                   <div className="flex flex-col items-center justify-center h-48 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
                     <Lock className="w-12 h-12 text-gray-300 dark:text-gray-600 mb-3" />
                     <p className="text-gray-500 dark:text-gray-400">No data classifications defined</p>
                   </div>
                 ) : (
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                    {classifications.map((c: any, index) => {
-                      // The backend returns full objects
-                      // {id, name, handling_rules, sensitivity, ...} —
-                      // previously the page rendered them directly as
-                      // strings, producing "[object Object]" headers
-                      // and every usage/incident counter stuck at 0
-                      // because the string compare never matched.
-                      const name = typeof c === 'string' ? c : (c?.name ?? c?.id ?? 'Unknown');
-                      const sensitivity = typeof c === 'object' ? c?.sensitivity ?? c?.level : null;
-                      const key = typeof c === 'object' ? c?.id ?? name : name;
-                      // DLPPolicyResponse / DLPIncidentResponse carry no
-                      // classification link, so these counts are unknown,
-                      // not 0.
-                      const policiesUsing = 'not available';
-                      const relatedIncidents = 'not available';
-                      return (
-                        <div key={String(key) + index} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition">
-                          <div className="flex items-center gap-3 mb-3">
-                            <Lock className="w-5 h-5 text-indigo-600 dark:text-indigo-400" />
-                            <h3 className="font-semibold text-lg">{name}</h3>
-                            {sensitivity && (
-                              <span className="ml-auto text-xs uppercase text-gray-500 dark:text-gray-400">
-                                {sensitivity}
-                              </span>
-                            )}
-                          </div>
-                          <div className="space-y-2 text-sm text-gray-600 dark:text-gray-400">
-                            <div className="flex justify-between">
-                              <span>Policies using</span>
-                              <span className="font-semibold text-gray-900 dark:text-gray-100">{policiesUsing}</span>
-                            </div>
-                            <div className="flex justify-between">
-                              <span>Related incidents</span>
-                              <span className="font-semibold text-gray-900 dark:text-gray-100">{relatedIncidents}</span>
-                            </div>
-                          </div>
-                          <div className="flex gap-2 mt-4">
-                            <button
-                              onClick={() => setSelectedClassification(name)}
-                              className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-                            >
-                              View Details
-                            </button>
-                          </div>
+                    {classifications.map((c, index) => (
+                      <div key={String(c.id ?? index)} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
+                        <div className="flex items-center gap-3 mb-2">
+                          <Lock className="w-5 h-5 text-indigo-600 dark:text-indigo-400" />
+                          <h3 className="font-semibold text-lg">{c.name ?? c.id ?? 'Unnamed'}</h3>
+                          {(c.sensitivity ?? c.level) && <span className="ml-auto text-xs uppercase text-gray-500">{c.sensitivity ?? c.level}</span>}
                         </div>
-                      );
-                    })}
+                        {c.description && <p className="text-sm text-gray-600 dark:text-gray-400">{c.description}</p>}
+                        <p className="text-xs text-gray-500 mt-2">Policies and incidents carry no classification link, so usage counts are not available.</p>
+                      </div>
+                    ))}
                   </div>
                 )}
               </div>
@@ -687,116 +677,45 @@ export default function DLPDashboard() {
 
             {/* Reports Tab */}
             {activeTab === 'reports' && (
-              <div className="space-y-6">
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                  <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-6">
-                    <div className="flex items-center gap-3 mb-4">
-                      <Activity className="w-6 h-6 text-indigo-600" />
-                      <h3 className="font-semibold text-lg">Incident Trend</h3>
-                    </div>
-                    <div className="space-y-3 text-sm">
-                      <div className="flex justify-between items-center">
-                        <span className="text-gray-600 dark:text-gray-400">Total Incidents (30 days)</span>
-                        <span className="font-bold text-lg">{incidents.length}</span>
-                      </div>
-                      <div className="flex justify-between items-center">
-                        <span className="text-gray-600 dark:text-gray-400">Open</span>
-                        <span className="font-semibold text-red-600">{incidents.filter(i => i.status === 'open').length}</span>
-                      </div>
-                      <div className="flex justify-between items-center">
-                        <span className="text-gray-600 dark:text-gray-400">Resolved</span>
-                        <span className="font-semibold text-green-600">{incidents.filter(i => i.status === 'resolved' || i.status === 'closed').length}</span>
-                      </div>
-                    </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-6">
+                  <div className="flex items-center gap-3 mb-4">
+                    <Activity className="w-6 h-6 text-indigo-600" />
+                    <h3 className="font-semibold text-lg">Incidents (listed)</h3>
                   </div>
-
-                  <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-6">
-                    <div className="flex items-center gap-3 mb-4">
-                      <Shield className="w-6 h-6 text-indigo-600" />
-                      <h3 className="font-semibold text-lg">Policy Effectiveness</h3>
-                    </div>
-                    <div className="space-y-3 text-sm">
-                      <div className="flex justify-between items-center">
-                        <span className="text-gray-600 dark:text-gray-400">Active Policies</span>
-                        <span className="font-bold text-lg">{activePolicies}</span>
-                      </div>
-                      <div className="flex justify-between items-center">
-                        <span className="text-gray-600 dark:text-gray-400">Disabled Policies</span>
-                        <span className="font-semibold">{policies.length - activePolicies}</span>
-                      </div>
-                      <div className="flex justify-between items-center">
-                        <span className="text-gray-600 dark:text-gray-400">Classifications Covered</span>
-                        <span className="font-semibold">{dataClassifications}</span>
-                      </div>
-                    </div>
+                  <div className="space-y-2 text-sm">
+                    <div className="flex justify-between"><span>Total</span><span className="font-bold">{incidents.length}</span></div>
+                    <div className="flex justify-between"><span>Open</span><span className="font-semibold text-red-600">{incidents.filter((i) => i.status === 'open').length}</span></div>
+                    <div className="flex justify-between"><span>Resolved</span><span className="font-semibold text-green-600">{incidents.filter((i) => i.status === 'resolved' || i.status === 'closed').length}</span></div>
                   </div>
-
-                  <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-6">
-                    <div className="flex items-center gap-3 mb-4">
-                      <FileWarning className="w-6 h-6 text-orange-600" />
-                      <h3 className="font-semibold text-lg">Top Offenders</h3>
-                    </div>
-                    <div className="space-y-3 text-sm">
-                      {incidents.length === 0 ? (
-                        <p className="text-gray-500 dark:text-gray-400">No incident data available</p>
-                      ) : (
-                        <p className="text-gray-500 dark:text-gray-400">User-level analytics available in full reports</p>
-                      )}
-                    </div>
+                </div>
+                <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-6">
+                  <div className="flex items-center gap-3 mb-4">
+                    <Download className="w-6 h-6 text-green-600" />
+                    <h3 className="font-semibold text-lg">Export</h3>
                   </div>
-
-                  <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-6">
-                    <div className="flex items-center gap-3 mb-4">
-                      <Download className="w-6 h-6 text-green-600" />
-                      <h3 className="font-semibold text-lg">Export Reports</h3>
-                    </div>
-                    <div className="space-y-3">
-                      <button
-                        onClick={() => {
-                          const blob = new Blob([JSON.stringify({ policies, incidents, classifications }, null, 2)], { type: 'application/json' });
-                          const url = URL.createObjectURL(blob);
-                          const a = document.createElement('a');
-                          a.href = url;
-                          a.download = 'dlp-summary-report.json';
-                          a.click();
-                          URL.revokeObjectURL(url);
-                        }}
-                        className="w-full px-4 py-2 text-sm text-left border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-                      >
-                        DLP Summary Report (PDF)
-                      </button>
-                      <button
-                        onClick={() => {
-                          const headers = ['ID', 'User', 'Action', 'Policy', 'Severity', 'Status', 'Date'];
-                          const rows = incidents.map((i) => [i.id, i.user || i.userName || '', i.action || i.description || '', i.policyName || i.policy_name || '', i.severity || '', i.status || '', i.createdAt || i.created_at || ''].join(','));
-                          const csv = [headers.join(','), ...rows].join('\n');
-                          const blob = new Blob([csv], { type: 'text/csv' });
-                          const url = URL.createObjectURL(blob);
-                          const a = document.createElement('a');
-                          a.href = url;
-                          a.download = 'dlp-incident-details.csv';
-                          a.click();
-                          URL.revokeObjectURL(url);
-                        }}
-                        className="w-full px-4 py-2 text-sm text-left border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-                      >
-                        Incident Details (CSV)
-                      </button>
-                      <button
-                        onClick={() => {
-                          const blob = new Blob([JSON.stringify({ policies, classifications }, null, 2)], { type: 'application/json' });
-                          const url = URL.createObjectURL(blob);
-                          const a = document.createElement('a');
-                          a.href = url;
-                          a.download = 'dlp-policy-compliance-report.json';
-                          a.click();
-                          URL.revokeObjectURL(url);
-                        }}
-                        className="w-full px-4 py-2 text-sm text-left border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-                      >
-                        Policy Compliance Report (PDF)
-                      </button>
-                    </div>
+                  <div className="space-y-3">
+                    <button
+                      onClick={() => download('dlp-summary.json', JSON.stringify({ policies, incidents, findings, scan_status: scanStatus }, null, 2), 'application/json')}
+                      className="w-full px-4 py-2 text-sm text-left border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                    >
+                      DLP Summary (JSON)
+                    </button>
+                    <button
+                      onClick={() => {
+                        const esc = (v: unknown) => {
+                          let s = String(v ?? '');
+                          if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+                          return `"${s.replace(/"/g, '""')}"`;
+                        };
+                        const headers = ['ID', 'Title', 'Data types', 'Severity', 'Status', 'Created'];
+                        const rows = incidents.map((i) => [i.id, i.incident_title, (i.data_types_involved ?? []).join(' '), i.severity, i.status, i.created_at].map(esc).join(','));
+                        download('dlp-incidents.csv', [headers.join(','), ...rows].join('\n'), 'text/csv');
+                      }}
+                      className="w-full px-4 py-2 text-sm text-left border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                    >
+                      Incident Details (CSV)
+                    </button>
                   </div>
                 </div>
               </div>
@@ -808,81 +727,58 @@ export default function DLPDashboard() {
       {/* Policy Detail Modal */}
       {selectedPolicy && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => setSelectedPolicy(null)}>
-          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[32rem] max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
-            <h2 className="text-xl font-bold mb-4">Policy Details</h2>
-            <div className="space-y-3 text-sm">
-              <div><span className="font-medium text-gray-600 dark:text-gray-400">Name:</span> <span className="ml-2">{selectedPolicy.name}</span></div>
-              <div><span className="font-medium text-gray-600 dark:text-gray-400">Description:</span> <span className="ml-2">{selectedPolicy.description || 'N/A'}</span></div>
-              <div><span className="font-medium text-gray-600 dark:text-gray-400">Status:</span> <span className="ml-2">{selectedPolicy.enabled !== false ? 'Enabled' : 'Disabled'}</span></div>
-              <div><span className="font-medium text-gray-600 dark:text-gray-400">Severity:</span> <span className="ml-2">{(selectedPolicy.severity || 'medium').toUpperCase()}</span></div>
-              <div><span className="font-medium text-gray-600 dark:text-gray-400">Rules:</span> <span className="ml-2">{selectedPolicy.data_patterns?.length ?? 'not available'}</span></div>
-              <div><span className="font-medium text-gray-600 dark:text-gray-400">Matches:</span> <span className="ml-2">{selectedPolicy.trigger_count ?? 'not available'}</span></div>
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[520px] max-h-screen overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-xl font-bold mb-4">{selectedPolicy.name}</h2>
+            <div className="space-y-2 text-sm">
+              <p>{selectedPolicy.description || 'No description'}</p>
+              <p>Patterns: {(selectedPolicy.data_patterns ?? []).join(', ') || 'none'}</p>
+              <p>Data scanned: {(selectedPolicy.channels_monitored ?? []).join(', ') || 'all sources'}</p>
+              <p>Evaluation: {selectedPolicy.evaluation_status || 'not evaluated'}{selectedPolicy.evaluation_reason ? ` (${selectedPolicy.evaluation_reason})` : ''}</p>
+              <p>Matches: {selectedPolicy.trigger_count ?? NA} · last {selectedPolicy.last_triggered ? new Date(selectedPolicy.last_triggered).toLocaleString() : 'never'}</p>
             </div>
-            <pre className="text-xs bg-gray-100 dark:bg-gray-900 rounded p-4 overflow-auto max-h-48 mt-4">
-              {JSON.stringify(selectedPolicy, null, 2)}
-            </pre>
-            <div className="mt-4 flex justify-end">
-              <button onClick={() => setSelectedPolicy(null)} className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Close</button>
-            </div>
+            <button onClick={() => setSelectedPolicy(null)} className="mt-6 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg">Close</button>
           </div>
         </div>
       )}
 
       {/* Incident Detail Modal */}
       {selectedIncident && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => { setSelectedIncident(null); setIncidentStatusUpdate(''); setIncidentNotes(''); }}>
-          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[32rem] max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
-            <h2 className="text-xl font-bold mb-4">Incident Details</h2>
-            <div className="space-y-3 text-sm">
-              <div><span className="font-medium text-gray-600 dark:text-gray-400">ID:</span> <span className="ml-2 font-mono">{selectedIncident.id}</span></div>
-              <div><span className="font-medium text-gray-600 dark:text-gray-400">User:</span> <span className="ml-2">{selectedIncident.user || selectedIncident.userName || 'Unknown'}</span></div>
-              <div><span className="font-medium text-gray-600 dark:text-gray-400">Action:</span> <span className="ml-2">{selectedIncident.action || selectedIncident.description || 'N/A'}</span></div>
-              <div><span className="font-medium text-gray-600 dark:text-gray-400">Policy:</span> <span className="ml-2">{selectedIncident.policyName || selectedIncident.policy_name || 'N/A'}</span></div>
-              <div><span className="font-medium text-gray-600 dark:text-gray-400">Severity:</span> <span className="ml-2">{(selectedIncident.severity || 'medium').toUpperCase()}</span></div>
-              <div><span className="font-medium text-gray-600 dark:text-gray-400">Status:</span> <span className="ml-2">{selectedIncident.status || 'open'}</span></div>
-            </div>
-            <div className="mt-4 border-t border-gray-200 dark:border-gray-700 pt-4 space-y-3">
-              <h3 className="text-sm font-semibold">Update Status</h3>
-              <div>
-                <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">New Status</label>
-                <select
-                  value={incidentStatusUpdate}
-                  onChange={(e) => setIncidentStatusUpdate(e.target.value)}
-                  className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
-                >
-                  <option value="">— No change —</option>
-                  <option value="open">Open</option>
-                  <option value="investigating">Investigating</option>
-                  <option value="resolved">Resolved</option>
-                  <option value="closed">Closed</option>
-                  <option value="false_positive">False Positive</option>
-                </select>
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Resolution Notes</label>
-                <textarea
-                  value={incidentNotes}
-                  onChange={(e) => setIncidentNotes(e.target.value)}
-                  rows={2}
-                  className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
-                  placeholder="Optional context for the status change"
-                />
-              </div>
-            </div>
-            <pre className="text-xs bg-gray-100 dark:bg-gray-900 rounded p-4 overflow-auto max-h-32 mt-4">
-              {JSON.stringify(selectedIncident, null, 2)}
-            </pre>
-            <div className="mt-4 flex justify-end gap-2">
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => setSelectedIncident(null)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[520px] max-h-screen overflow-y-auto space-y-3" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-xl font-bold">{selectedIncident.incident_title || 'Incident'}</h2>
+            <p className="text-sm">{selectedIncident.description}</p>
+            <p className="text-sm">Status: {selectedIncident.status} · Severity: {selectedIncident.severity}</p>
+            {selectedIncident.resolution_notes && <p className="text-sm">Resolution notes: {selectedIncident.resolution_notes}</p>}
+            {actionError && <ActionErrorBanner what={actionError.what} error={actionError.error} />}
+            <select value={incidentStatusUpdate} onChange={(e) => setIncidentStatusUpdate(e.target.value)} className={inputCls}>
+              <option value="">— No status change —</option>
+              <option value="open">Open</option>
+              <option value="investigating">Investigating</option>
+              <option value="resolved">Resolved</option>
+              <option value="closed">Closed</option>
+              <option value="false_positive">False Positive</option>
+            </select>
+            <textarea value={incidentNotes} onChange={(e) => setIncidentNotes(e.target.value)} rows={2} className={inputCls} placeholder="Resolution notes" />
+            <div className="flex gap-2 justify-end">
+              <button onClick={() => { setSelectedIncident(null); setIncidentStatusUpdate(''); setIncidentNotes(''); }} className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg">Close</button>
               <button
-                onClick={() => { setSelectedIncident(null); setIncidentStatusUpdate(''); setIncidentNotes(''); }}
-                className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-              >
-                Close
-              </button>
-              <button
-                onClick={submitIncidentStatus}
-                disabled={actionBusy === `incident-${selectedIncident.id}` || (!incidentStatusUpdate && !incidentNotes)}
-                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition disabled:opacity-50"
+                disabled={actionBusy !== null || (!incidentStatusUpdate && incidentNotes === (selectedIncident.resolution_notes ?? ''))}
+                onClick={() => {
+                  const target = selectedIncident;
+                  runAction(`incident-${target.id}`, 'update the incident', async () => {
+                    const payload: Record<string, string> = {};
+                    if (incidentStatusUpdate) payload.status = incidentStatusUpdate;
+                    if (incidentNotes) payload.resolution_notes = incidentNotes;
+                    await dlpApi.updateIncident(target.id, payload);
+                    const data = await dlpApi.getIncidents();
+                    setIncidents(Array.isArray(data) ? (data as Row[]) : []);
+                    setSelectedIncident(null);
+                    setIncidentStatusUpdate('');
+                    setIncidentNotes('');
+                    return 'Incident updated';
+                  });
+                }}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg disabled:opacity-50"
               >
                 Update Incident
               </button>
@@ -894,65 +790,43 @@ export default function DLPDashboard() {
       {/* Edit Policy Modal */}
       {editingPolicy && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => setEditingPolicy(null)}>
-          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[520px] max-h-screen overflow-y-auto" onClick={(e) => e.stopPropagation()}>
             <h2 className="text-xl font-bold mb-4">Edit DLP Policy</h2>
-            <form onSubmit={submitEditPolicy} className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium mb-1">Policy Name</label>
-                <input
-                  type="text"
-                  value={editingPolicy.name}
-                  onChange={(e) => setEditingPolicy({ ...editingPolicy, name: e.target.value })}
-                  required
-                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">Description</label>
-                <textarea
-                  value={editingPolicy.description}
-                  onChange={(e) => setEditingPolicy({ ...editingPolicy, description: e.target.value })}
-                  rows={3}
-                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">Severity</label>
-                <select
-                  value={editingPolicy.severity}
-                  onChange={(e) => setEditingPolicy({ ...editingPolicy, severity: e.target.value })}
-                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
-                >
-                  <option value="low">Low</option>
-                  <option value="medium">Medium</option>
-                  <option value="high">High</option>
-                  <option value="critical">Critical</option>
-                </select>
-              </div>
-              <div className="flex items-center gap-2">
-                <input
-                  id="edit-enabled"
-                  type="checkbox"
-                  checked={editingPolicy.enabled}
-                  onChange={(e) => setEditingPolicy({ ...editingPolicy, enabled: e.target.checked })}
-                />
-                <label htmlFor="edit-enabled" className="text-sm">Enabled</label>
-              </div>
-              <div className="flex gap-2 mt-6">
-                <button
-                  type="button"
-                  onClick={() => setEditingPolicy(null)}
-                  className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={actionBusy === `edit-${editingPolicy.id}`}
-                  className="flex-1 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition disabled:opacity-50"
-                >
-                  Save
-                </button>
+            <form
+              className="space-y-4"
+              onSubmit={(e) => {
+                e.preventDefault();
+                const fd = new FormData(e.currentTarget);
+                const target = editingPolicy;
+                runAction(`edit-${target.id}`, 'update the policy', async () => {
+                  await api.patch(`/dlp/policies/${target.id}`, {
+                    name: fd.get('name'),
+                    description: fd.get('description') || undefined,
+                    severity: fd.get('severity'),
+                    enabled: fd.get('enabled') === 'on',
+                    data_patterns: patternsFromForm(fd),
+                    channels_monitored: fd.getAll('channel').map(String),
+                  });
+                  await refreshPolicies();
+                  setEditingPolicy(null);
+                  return 'Policy updated';
+                });
+              }}
+            >
+              {actionError && <ActionErrorBanner what={actionError.what} error={actionError.error} />}
+              <input name="name" required defaultValue={editingPolicy.name} className={inputCls} />
+              <textarea name="description" rows={2} defaultValue={editingPolicy.description ?? ''} className={inputCls} />
+              <select name="severity" defaultValue={editingPolicy.severity || 'medium'} className={inputCls}>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+                <option value="critical">Critical</option>
+              </select>
+              <PolicyPatternFields policy={editingPolicy} />
+              <label className="flex items-center gap-2 text-sm"><input name="enabled" type="checkbox" defaultChecked={editingPolicy.enabled !== false} /> Enabled</label>
+              <div className="flex gap-2">
+                <button type="button" onClick={() => setEditingPolicy(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg">Cancel</button>
+                <button type="submit" disabled={actionBusy !== null} className="flex-1 px-4 py-2 bg-indigo-600 text-white rounded-lg disabled:opacity-50">Save</button>
               </div>
             </form>
           </div>
@@ -962,74 +836,26 @@ export default function DLPDashboard() {
       {/* Test Policy Modal */}
       {testingPolicy && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => setTestingPolicy(null)}>
-          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[32rem] max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
-            <h2 className="text-xl font-bold mb-4">Test Policy: {testingPolicy.name}</h2>
-            <div className="space-y-3">
-              <div>
-                <label className="block text-sm font-medium mb-1">Sample Content</label>
-                <textarea
-                  value={testSampleText}
-                  onChange={(e) => setTestSampleText(e.target.value)}
-                  rows={5}
-                  placeholder="Paste content to evaluate against this policy."
-                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 font-mono text-sm"
-                />
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[560px] max-h-screen overflow-y-auto space-y-3" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-xl font-bold">Test Policy: {testingPolicy.name}</h2>
+            <p className="text-xs text-gray-500">Evaluates this policy&apos;s own patterns ({(testingPolicy.data_patterns ?? []).join(', ') || 'none configured'}) on the sample; nothing is stored.</p>
+            <textarea value={testSampleText} onChange={(e) => setTestSampleText(e.target.value)} rows={5} placeholder="Paste content to evaluate." className={clsx(inputCls, 'font-mono text-sm')} />
+            <ActionErrorBanner what="test the policy" error={testError} />
+            {testResult && (
+              <div className="text-sm space-y-1 bg-gray-50 dark:bg-gray-900 rounded p-3">
+                <p className="font-medium">
+                  {testResult.sample_result?.has_violations ? `${testResult.violations_detected} match(es)` : 'No match'} · {testResult.sample_result?.patterns_evaluated ?? 0} pattern(s) evaluated
+                </p>
+                {(testResult.matched_patterns ?? []).length > 0 && <p>Matched: {testResult.matched_patterns.join(', ')}</p>}
+                {testResult.redacted_excerpt && <p className="font-mono text-xs">{testResult.redacted_excerpt}</p>}
+                <p className="text-xs text-gray-500">
+                  Content scanning for this policy: {testResult.evaluation_status || 'not evaluated'}{testResult.evaluation_reason ? ` (${testResult.evaluation_reason})` : ''}
+                </p>
               </div>
-              {testError && (
-                <div className="px-3 py-2 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 text-red-700 text-sm">
-                  {testError}
-                </div>
-              )}
-              {testResult && (
-                <div>
-                  <h3 className="text-sm font-semibold mb-2">Result</h3>
-                  <pre className="text-xs bg-gray-100 dark:bg-gray-900 rounded p-3 overflow-auto max-h-64">
-                    {JSON.stringify(testResult, null, 2)}
-                  </pre>
-                </div>
-              )}
-            </div>
-            <div className="mt-4 flex justify-end gap-2">
-              <button
-                onClick={() => setTestingPolicy(null)}
-                className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-              >
-                Close
-              </button>
-              <button
-                onClick={runTestPolicy}
-                disabled={actionBusy === `test-${testingPolicy.id}` || !testSampleText.trim()}
-                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition disabled:opacity-50"
-              >
-                Run Test
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Action Toast */}
-      {actionMessage && (
-        <div className="fixed bottom-6 right-6 bg-green-600 text-white px-4 py-2 rounded-lg shadow-lg z-50 flex items-center gap-2">
-          <CheckCircle className="w-4 h-4" />
-          <span className="text-sm">{actionMessage}</span>
-          <button onClick={() => setActionMessage(null)} className="ml-2 text-white/80 hover:text-white">
-            <XCircle className="w-4 h-4" />
-          </button>
-        </div>
-      )}
-
-      {/* Classification Detail Modal */}
-      {selectedClassification && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => setSelectedClassification(null)}>
-          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[32rem] max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
-            <h2 className="text-xl font-bold mb-4">Classification: {selectedClassification}</h2>
-            <div className="space-y-3 text-sm">
-              <div><span className="font-medium text-gray-600 dark:text-gray-400">Policies using this classification:</span> <span className="ml-2 font-semibold">not available</span></div>
-              <div><span className="font-medium text-gray-600 dark:text-gray-400">Related incidents:</span> <span className="ml-2 font-semibold">not available</span></div>
-            </div>
-            <div className="mt-4 flex justify-end">
-              <button onClick={() => setSelectedClassification(null)} className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Close</button>
+            )}
+            <div className="flex gap-2 justify-end">
+              <button onClick={() => setTestingPolicy(null)} className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg">Close</button>
+              <button onClick={runTestPolicy} disabled={actionBusy !== null || !testSampleText.trim()} className="px-4 py-2 bg-indigo-600 text-white rounded-lg disabled:opacity-50">Run Test</button>
             </div>
           </div>
         </div>
@@ -1037,80 +863,56 @@ export default function DLPDashboard() {
 
       {/* New Policy Modal */}
       {showNewPolicyModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto">
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => setShowNewPolicyModal(false)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[520px] max-h-screen overflow-y-auto" onClick={(e) => e.stopPropagation()}>
             <h2 className="text-xl font-bold mb-4">Create DLP Policy</h2>
             <form
-              onSubmit={async (e) => {
-                e.preventDefault();
-                const formData = new FormData(e.currentTarget);
-                const name = formData.get('name') as string;
-                const description = formData.get('description') as string;
-                const severity = formData.get('severity') as string;
-                const policyType = formData.get('policy_type') as string;
-                if (!name.trim()) return;
-                try {
-                  await dlpApi.createPolicy({
-                    name: name.trim(),
-                    description: description || undefined,
-                    severity: severity || 'medium',
-                    policy_type: policyType || 'custom_pattern',
-                    enabled: true,
-                  });
-                  // Refresh policies list
-                  const policiesData = await dlpApi.getPolicies();
-                  setPolicies(Array.isArray(policiesData) ? policiesData : []);
-                  setShowNewPolicyModal(false);
-                } catch (err) {
-                  console.error('Error creating DLP policy:', err);
-                  setError(`Failed to create policy: ${describeLoadError(err)}`);
-                }
-              }}
               className="space-y-4"
+              onSubmit={(e) => {
+                e.preventDefault();
+                const fd = new FormData(e.currentTarget);
+                runAction('create', 'create the policy', async () => {
+                  await api.post('/dlp/policies', {
+                    name: String(fd.get('name') || '').trim(),
+                    description: fd.get('description') || undefined,
+                    severity: fd.get('severity') || 'medium',
+                    enabled: true,
+                    data_patterns: patternsFromForm(fd),
+                    channels_monitored: fd.getAll('channel').map(String),
+                  });
+                  await refreshPolicies();
+                  setShowNewPolicyModal(false);
+                  return 'Policy created';
+                });
+              }}
             >
-              <div>
-                <label className="block text-sm font-medium mb-1">Policy Name</label>
-                <input type="text" name="name" required placeholder="e.g., PII Protection Policy" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">Description</label>
-                <textarea name="description" placeholder="Describe the policy purpose..." rows={3} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">Severity</label>
-                <select name="severity" defaultValue="medium" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
-                  <option value="low">Low</option>
-                  <option value="medium">Medium</option>
-                  <option value="high">High</option>
-                  <option value="critical">Critical</option>
-                </select>
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">Data Classification</label>
-                <select name="policy_type" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
-                  <option value="">Select classification...</option>
-                  {classifications.map((c, i) => (
-                    <option key={i} value={c}>{c}</option>
-                  ))}
-                </select>
-              </div>
-              <div className="flex gap-2 mt-6">
-                <button
-                  type="button"
-                  onClick={() => setShowNewPolicyModal(false)}
-                  className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="flex-1 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition"
-                >
-                  Create Policy
-                </button>
+              {actionError && <ActionErrorBanner what={actionError.what} error={actionError.error} />}
+              <input type="text" name="name" required placeholder="e.g., PII Protection Policy" className={inputCls} />
+              <textarea name="description" placeholder="Describe the policy purpose..." rows={2} className={inputCls} />
+              <select name="severity" defaultValue="medium" className={inputCls}>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+                <option value="critical">Critical</option>
+              </select>
+              <PolicyPatternFields />
+              <div className="flex gap-2">
+                <button type="button" onClick={() => setShowNewPolicyModal(false)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg">Cancel</button>
+                <button type="submit" disabled={actionBusy !== null} className="flex-1 px-4 py-2 bg-indigo-600 text-white rounded-lg disabled:opacity-50">Create</button>
               </div>
             </form>
           </div>
+        </div>
+      )}
+
+      {/* Action Toast */}
+      {actionMessage && (
+        <div className="fixed bottom-4 right-4 bg-green-600 text-white px-4 py-2 rounded-lg shadow-lg flex items-center gap-2 z-50">
+          <CheckCircle className="w-4 h-4" />
+          <span className="text-sm">{actionMessage}</span>
+          <button onClick={() => setActionMessage(null)} className="ml-2 text-white/80 hover:text-white" aria-label="Dismiss">
+            <XCircle className="w-4 h-4" />
+          </button>
         </div>
       )}
     </div>

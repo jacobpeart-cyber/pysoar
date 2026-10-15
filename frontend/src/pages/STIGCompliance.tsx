@@ -5,21 +5,23 @@ import {
   ChevronRight,
   Plus,
   Filter,
-  Download,
   Play,
   Loader2,
   AlertCircle,
   CheckCircle,
   AlertTriangle,
   Clock,
-  Copy,
-  Eye,
   Zap,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
 import LoadErrorBanner from '../components/LoadErrorBanner';
-import { describeLoadError } from '../lib/loadError';
+import ActionErrorBanner from '../components/ActionErrorBanner';
+import type { Row } from '../lib/apiRow';
+
+const NA = 'not available';
+// Only agents enrolled with this capability run whole-benchmark scans.
+const STIG_SCAN_CAPABILITY = 'stig_scan';
 
 type TabType = 'dashboard' | 'benchmarks' | 'results' | 'remediation';
 
@@ -44,6 +46,8 @@ interface DashboardData {
   top_failing_rules: Array<{ rule_id: string; title: string; failures: number }>;
   last_scan_date: string | null;
   compliance_trend: string;
+  scans_not_run?: number;
+  scans_pending?: number;
 }
 
 interface Benchmark {
@@ -56,18 +60,26 @@ interface Benchmark {
   lastScanDate: string;
 }
 
+// Scan statuses: completed, failed, pending_results (awaiting an ARF
+// upload), dispatched / awaiting_approval (agent command), not_run /
+// no_agent / no_automatable_rules (nothing was evaluated; see status_reason).
 interface Scan {
   id: string;
   host: string;
   benchmark: string;
-  status: 'completed' | 'running' | 'in-progress' | 'failed';
-  compliance: number;
+  status: string;
+  status_reason?: string | null;
+  agent_id?: string | null;
+  command_id?: string | null;
+  // Null unless the scan completed with results.
+  compliance: number | null;
   findings: {
     open: number;
     naf: number;
     na: number;
     nr: number;
   };
+  cat?: { i: number; ii: number; iii: number };
   date: string;
 }
 
@@ -80,15 +92,6 @@ interface ScanResult {
   description?: string;
 }
 
-interface Remediation {
-  id: string;
-  finding: string;
-  severity: Severity;
-  host: string;
-  status: 'open' | 'in-progress' | 'remediated';
-  assignedTo: string;
-  dueDate: string;
-}
 
 interface ComplianceAgent {
   id: string;
@@ -113,21 +116,46 @@ const RULE_STATUS_LABEL: Record<string, RuleStatus> = {
 };
 
 // STIGScanResultResponse → the Scan row shape the tables render.
-function scanFromApi(s: any): Scan {
+function scanFromApi(s: Row): Scan {
   return {
     id: s.id,
     host: s.target_host,
     benchmark: s.benchmark_id_ref,
     status: s.status,
-    compliance: s.compliance_percentage,
+    status_reason: s.status_reason ?? null,
+    agent_id: s.agent_id ?? null,
+    command_id: s.command_id ?? null,
+    compliance: s.status === 'completed' && s.compliance_percentage != null ? Number(s.compliance_percentage) : null,
     findings: {
-      open: s.open_findings,
-      naf: s.not_a_finding,
-      na: s.not_applicable,
-      nr: s.not_reviewed,
+      open: s.open_findings ?? 0,
+      naf: s.not_a_finding ?? 0,
+      na: s.not_applicable ?? 0,
+      nr: s.not_reviewed ?? 0,
     },
+    cat: { i: s.cat1_open ?? 0, ii: s.cat2_open ?? 0, iii: s.cat3_open ?? 0 },
     date: s.completed_at ?? s.started_at ?? s.created_at ?? '',
   };
+}
+
+function ComplianceCell({ scan }: { scan: Scan }) {
+  if (scan.compliance === null) {
+    return (
+      <span className="text-xs text-gray-500 dark:text-gray-400" title={scan.status_reason ?? undefined}>
+        {NA}{scan.status_reason ? ` (${scan.status_reason})` : ` (${String(scan.status).replace(/_/g, ' ')})`}
+      </span>
+    );
+  }
+  return (
+    <>
+      <div className="w-16 h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden inline-block align-middle">
+        <div
+          className={clsx('h-full rounded-full', scan.compliance >= 80 ? 'bg-green-500' : scan.compliance >= 60 ? 'bg-yellow-500' : 'bg-red-500')}
+          style={{ width: `${scan.compliance}%` }}
+        />
+      </div>
+      <span className="text-xs text-gray-600 dark:text-gray-400 ml-2">{scan.compliance.toFixed(1)}%</span>
+    </>
+  );
 }
 
 export default function STIGCompliance() {
@@ -136,6 +164,9 @@ export default function STIGCompliance() {
   const [platformFilter, setPlatformFilter] = useState<string>('all');
   const [severityFilter, setSeverityFilter] = useState<string>('all');
   const [launchScanFor, setLaunchScanFor] = useState<string | null>(null);
+  const [launchResult, setLaunchResult] = useState<Row | null>(null);
+  const [actionError, setActionError] = useState<{ what: string; error: unknown } | null>(null);
+  const [remediationResult, setRemediationResult] = useState<Row | null>(null);
   const queryClient = useQueryClient();
 
   const { data: dashboardData, isLoading: dashboardLoading, error: dashboardError } = useQuery<DashboardData>({
@@ -157,7 +188,7 @@ export default function STIGCompliance() {
       // camelCase card shape.
       const raw = response.data;
       const list = Array.isArray(raw) ? raw : (raw?.items ?? raw?.benchmarks ?? []);
-      return list.map((b: any) => ({
+      return list.map((b: Row) => ({
         id: b.id ?? '',
         name: b.title || b.benchmark_id || 'Untitled benchmark',
         platform: b.platform ?? '',
@@ -196,7 +227,7 @@ export default function STIGCompliance() {
       // STIGScanResultResponse.findings is {rule_id: {status, severity, title?}}.
       const findings = response.data?.findings;
       if (!findings || typeof findings !== 'object') return [];
-      return Object.entries(findings as Record<string, any>).map(([ruleId, f]) => ({
+      return Object.entries(findings as Record<string, Row>).map(([ruleId, f]) => ({
         id: ruleId,
         ruleId,
         title: f?.title ?? '',
@@ -208,28 +239,21 @@ export default function STIGCompliance() {
     enabled: !!expandedScan,
   });
 
-  const { data: remediations, isLoading: remediationsLoading, error: remediationsError } = useQuery<Remediation[]>({
-    queryKey: ['stig-remediations', severityFilter],
-    queryFn: async () => {
-      const params = new URLSearchParams();
-      if (severityFilter !== 'all') params.append('severity', severityFilter);
-      const response = await api.get(`/stig/scans?${params}`);
-      return response.data;
-    },
-  });
+  // Remediation works per completed scan with open findings.
+  const remediations: Scan[] = (scans ?? []).filter((s) => s.status === 'completed' && s.findings.open > 0);
 
   const runScanMutation = useMutation({
-    mutationFn: async (params: { host: string; benchmark_id: string }) => {
+    mutationFn: async (params: { host: string; benchmark_id: string; scan_type: string }) => {
       const response = await api.post('/stig/scans/launch', params);
       return response.data;
     },
-    onSuccess: () => {
+    onSuccess: (data: Row) => {
+      setActionError(null);
+      setLaunchResult(data);
       queryClient.invalidateQueries({ queryKey: ['stig-scans'] });
       queryClient.invalidateQueries({ queryKey: ['stig-dashboard'] });
     },
-    onError: (err: unknown) => {
-      alert(`Scan launch failed: ${describeLoadError(err)}`);
-    },
+    onError: (err: unknown) => setActionError({ what: 'launch the STIG scan', error: err }),
   });
 
   const autoRemediateMutation = useMutation({
@@ -252,17 +276,12 @@ export default function STIGCompliance() {
       });
       return response.data;
     },
-    onError: (err: unknown) => {
-      alert(`Auto-remediate failed: ${describeLoadError(err)}`);
-    },
-    onSuccess: (data) => {
-      queryClient.invalidateQueries({ queryKey: ['stig-remediations'] });
+    onError: (err: unknown) => setActionError({ what: 'auto-remediate', error: err }),
+    onSuccess: (data: Row) => {
+      setActionError(null);
+      setRemediationResult(data);
+      queryClient.invalidateQueries({ queryKey: ['stig-scans'] });
       queryClient.invalidateQueries({ queryKey: ['stig-dashboard'] });
-      if (data && typeof data === 'object') {
-        const remediated = (data as any).remediated ?? 0;
-        const awaiting = (data as any).awaiting_integration ?? 0;
-        alert(`Auto-remediate dispatched: ${remediated} rules submitted, ${awaiting} awaiting integration.`);
-      }
     },
   });
 
@@ -296,6 +315,32 @@ export default function STIGCompliance() {
           Security Technical Implementation Guide scan results and remediation tracking
         </p>
       </div>
+
+      {actionError && <ActionErrorBanner what={actionError.what} error={actionError.error} />}
+      {launchResult && (
+        <div className="text-sm bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded p-3 flex justify-between gap-4">
+          <span>
+            Scan on <span className="font-mono">{launchResult.host}</span> ({launchResult.benchmark}):{' '}
+            <span className="font-medium">{String(launchResult.status).replace(/_/g, ' ')}</span>
+            {launchResult.status_reason ? `. ${launchResult.status_reason}` : ''}
+            {launchResult.command_id ? ` · agent command ${launchResult.command_id}` : ''}
+            {launchResult.total_checks != null ? ` · ${launchResult.total_checks} rule(s) in the benchmark` : ''}
+            {launchResult.note ? ` · ${launchResult.note}` : ''}
+            {' '}No compliance figure is recorded until results arrive.
+          </span>
+          <button onClick={() => setLaunchResult(null)} className="text-xs underline">dismiss</button>
+        </div>
+      )}
+      {remediationResult && (
+        <div className="text-sm bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded p-3 flex justify-between gap-4">
+          <span>
+            Auto-remediate on {remediationResult.host}: {remediationResult.attempted ?? 0} fix(es) attempted,{' '}
+            {remediationResult.awaiting_integration ?? 0} awaiting an integration, {remediationResult.failed ?? 0} failed.
+            {remediationResult.note ? ` ${remediationResult.note}` : ''}
+          </span>
+          <button onClick={() => setRemediationResult(null)} className="text-xs underline">dismiss</button>
+        </div>
+      )}
 
       {/* Tab Navigation */}
       <div className="border-b border-gray-200 dark:border-gray-700">
@@ -345,8 +390,8 @@ export default function STIGCompliance() {
         <LaunchScanModal
           benchmarkId={launchScanFor}
           onClose={() => setLaunchScanFor(null)}
-          onSubmit={(host) => {
-            runScanMutation.mutate({ host, benchmark_id: launchScanFor });
+          onSubmit={(host, scanType) => {
+            runScanMutation.mutate({ host, benchmark_id: launchScanFor, scan_type: scanType });
             setLaunchScanFor(null);
           }}
           submitting={runScanMutation.isPending}
@@ -368,11 +413,11 @@ export default function STIGCompliance() {
       )}
 
       {/* Remediation Tab */}
-      {activeTab === 'remediation' && <LoadErrorBanner what="remediation rows" error={remediationsError} />}
+      {activeTab === 'remediation' && <LoadErrorBanner what="STIG scans" error={scansError} />}
       {activeTab === 'remediation' && (
         <RemediationTab
-          remediations={remediations || []}
-          loading={remediationsLoading}
+          remediations={remediations}
+          loading={scansLoading}
           severityFilter={severityFilter}
           setSeverityFilter={setSeverityFilter}
           onAutoRemediate={(scanId, categories) =>
@@ -417,10 +462,22 @@ function DashboardTab({
           color="green"
         />
         <KPICard
-          label="Avg Compliance"
-          value={`${Math.round(data?.average_compliance || 0)}%`}
+          label="Avg Compliance (completed scans)"
+          value={(data?.recent_scans || []).some((s) => s.status === 'completed') || (data?.average_compliance ?? 0) > 0 ? `${Math.round(data?.average_compliance || 0)}%` : NA}
           icon={AlertTriangle}
           color="yellow"
+        />
+        <KPICard
+          label="Scans Not Run"
+          value={data?.scans_not_run ?? NA}
+          icon={AlertCircle}
+          color="yellow"
+        />
+        <KPICard
+          label="Scans Awaiting Results"
+          value={data?.scans_pending ?? NA}
+          icon={Clock}
+          color="blue"
         />
         <KPICard
           label="CAT I Findings"
@@ -516,10 +573,13 @@ function DashboardTab({
                   Benchmark
                 </th>
                 <th className="px-4 py-3 text-left font-semibold text-gray-700 dark:text-gray-300">
+                  Status
+                </th>
+                <th className="px-4 py-3 text-left font-semibold text-gray-700 dark:text-gray-300">
                   Compliance
                 </th>
                 <th className="px-4 py-3 text-left font-semibold text-gray-700 dark:text-gray-300">
-                  CAT I/II/III
+                  Open / NaF / N/A
                 </th>
                 <th className="px-4 py-3 text-left font-semibold text-gray-700 dark:text-gray-300">
                   Date
@@ -535,23 +595,11 @@ function DashboardTab({
                   <td className="px-4 py-3 text-gray-600 dark:text-gray-400">
                     {scan.benchmark}
                   </td>
+                  <td className="px-4 py-3 text-xs">
+                    <span className={clsx('px-2 py-0.5 rounded-full', getStatusColor(scan.status))}>{String(scan.status).replace(/_/g, ' ')}</span>
+                  </td>
                   <td className="px-4 py-3">
-                    <div className="w-16 h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
-                      <div
-                        className={clsx(
-                          'h-full rounded-full',
-                          scan.compliance >= 80
-                            ? 'bg-green-500'
-                            : scan.compliance >= 60
-                            ? 'bg-yellow-500'
-                            : 'bg-red-500'
-                        )}
-                        style={{ width: `${scan.compliance}%` }}
-                      />
-                    </div>
-                    <span className="text-xs text-gray-600 dark:text-gray-400 ml-2">
-                      {scan.compliance}%
-                    </span>
+                    <ComplianceCell scan={scan} />
                   </td>
                   <td className="px-4 py-3 text-sm text-gray-600 dark:text-gray-400">
                     <span className="font-mono">
@@ -559,10 +607,13 @@ function DashboardTab({
                     </span>
                   </td>
                   <td className="px-4 py-3 text-gray-600 dark:text-gray-400">
-                    {new Date(scan.date || "").toLocaleDateString()}
+                    {scan.date ? new Date(scan.date).toLocaleDateString() : '—'}
                   </td>
                 </tr>
               ))}
+              {(data?.recent_scans || []).length === 0 && (
+                <tr><td colSpan={6} className="px-4 py-6 text-center text-gray-500">No STIG scan recorded.</td></tr>
+              )}
             </tbody>
           </table>
         </div>
@@ -957,32 +1008,20 @@ function ScanResultsTab({
                       getStatusColor(scan.status)
                     )}
                   >
-                    {scan.status}
+                    {String(scan.status).replace(/_/g, ' ')}
                   </span>
+                  {scan.status_reason && (
+                    <div className="text-xs text-gray-500 mt-1 max-w-xs">{scan.status_reason}</div>
+                  )}
                 </td>
                 <td className="px-6 py-4 text-sm">
-                  <div className="w-16 h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
-                    <div
-                      className={clsx(
-                        'h-full rounded-full',
-                        scan.compliance >= 80
-                          ? 'bg-green-500'
-                          : scan.compliance >= 60
-                          ? 'bg-yellow-500'
-                          : 'bg-red-500'
-                      )}
-                      style={{ width: `${scan.compliance}%` }}
-                    />
-                  </div>
-                  <span className="text-xs text-gray-600 dark:text-gray-400 ml-2">
-                    {scan.compliance}%
-                  </span>
+                  <ComplianceCell scan={scan} />
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 font-mono">
                   {scan.findings.open}/{scan.findings.naf}/{scan.findings.na}/{scan.findings.nr}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {new Date(scan.date || "").toLocaleDateString()}
+                  {scan.date ? new Date(scan.date).toLocaleDateString() : '—'}
                 </td>
                 <td className="px-6 py-4 text-center">
                   <button
@@ -1008,10 +1047,10 @@ function ScanResultsTab({
             No scans yet
           </h3>
           <p className="text-sm text-gray-600 dark:text-gray-400 max-w-lg mx-auto">
-            Run a scan from the Benchmarks tab to populate this view. For
-            fully-automated scans, enroll an endpoint agent with the
-            compliance capability — the weekly fleet sweep (Sundays 06:00
-            UTC) runs every loaded benchmark against every enrolled agent.
+            Run a scan from the Benchmarks tab to populate this view. Scans run
+            through an endpoint agent enrolled with the {STIG_SCAN_CAPABILITY} capability
+            (approved in the agent queue); without one a scan is recorded as not run with the
+            reason. A manual scan waits for an ARF results upload.
           </p>
         </div>
       )}
@@ -1077,14 +1116,16 @@ function RemediationTab({
   onAutoRemediate,
   autoRemediatePending,
 }: {
-  remediations: Remediation[];
+  remediations: Scan[];
   loading: boolean;
   severityFilter: string;
   setSeverityFilter: (value: string) => void;
   onAutoRemediate: (scanId: string, categories: string[]) => void;
   autoRemediatePending: boolean;
 }) {
-  const [selectedRemediation, setSelectedRemediation] = useState<Remediation | null>(null);
+  const [selectedRemediation, setSelectedRemediation] = useState<Scan | null>(null);
+  const catCount = (s: Scan, cat: string) => (cat === 'CAT I' ? s.cat?.i ?? 0 : cat === 'CAT II' ? s.cat?.ii ?? 0 : s.cat?.iii ?? 0);
+  const visible = severityFilter === 'all' ? remediations : remediations.filter((s) => catCount(s, severityFilter) > 0);
 
   if (loading) {
     return (
@@ -1102,12 +1143,11 @@ function RemediationTab({
           <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-md p-6">
             <h2 className="text-xl font-semibold text-gray-900 dark:text-white mb-4">Remediation Details</h2>
             <div className="space-y-3 text-sm">
-              <div><span className="text-gray-500">Finding:</span> <span className="text-gray-900 dark:text-white font-medium">{selectedRemediation.finding}</span></div>
-              <div><span className="text-gray-500">Severity:</span> <span className={clsx('px-2 py-1 rounded text-xs font-medium', getSeverityColor(selectedRemediation.severity))}>{selectedRemediation.severity}</span></div>
               <div><span className="text-gray-500">Host:</span> <span className="font-mono text-gray-900 dark:text-white">{selectedRemediation.host}</span></div>
-              <div><span className="text-gray-500">Status:</span> {selectedRemediation.status}</div>
-              <div><span className="text-gray-500">Assigned To:</span> {selectedRemediation.assignedTo}</div>
-              <div><span className="text-gray-500">Due Date:</span> {new Date(selectedRemediation.dueDate || "").toLocaleDateString()}</div>
+              <div><span className="text-gray-500">Benchmark:</span> {selectedRemediation.benchmark}</div>
+              <div><span className="text-gray-500">Open findings:</span> {selectedRemediation.findings.open} (CAT I {selectedRemediation.cat?.i ?? 0}, CAT II {selectedRemediation.cat?.ii ?? 0}, CAT III {selectedRemediation.cat?.iii ?? 0})</div>
+              <div><span className="text-gray-500">Compliance:</span> <ComplianceCell scan={selectedRemediation} /></div>
+              <div><span className="text-gray-500">Scanned:</span> {selectedRemediation.date ? new Date(selectedRemediation.date).toLocaleString() : '—'}</div>
             </div>
             <button onClick={() => setSelectedRemediation(null)} className="mt-6 w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">Close</button>
           </div>
@@ -1131,7 +1171,7 @@ function RemediationTab({
             </select>
           </div>
           <div className="text-xs text-gray-500 dark:text-gray-400">
-            Use <span className="font-medium">Auto-Remediate</span> per scan result to queue automatic fixes.
+            Completed scans with open findings. <span className="font-medium">Auto-Remediate</span> queues the rules&apos; fixes for that host; rules without an automated fix are skipped.
           </div>
         </div>
       </div>
@@ -1154,10 +1194,10 @@ function RemediationTab({
                 Status
               </th>
               <th className="px-6 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300">
-                Assigned To
+                Open CAT I/II/III
               </th>
               <th className="px-6 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300">
-                Due Date
+                Scanned
               </th>
               <th className="px-6 py-3 text-center text-xs font-semibold text-gray-700 dark:text-gray-300">
                 Actions
@@ -1165,43 +1205,40 @@ function RemediationTab({
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-            {remediations.map((remediation) => (
+            {visible.length === 0 && (
+              <tr><td colSpan={7} className="px-6 py-8 text-center text-sm text-gray-500">No completed scan has open findings{severityFilter !== 'all' ? ` at ${severityFilter}` : ''}.</td></tr>
+            )}
+            {visible.map((remediation) => {
+              const topCat = (remediation.cat?.i ?? 0) > 0 ? 'CAT I' : (remediation.cat?.ii ?? 0) > 0 ? 'CAT II' : 'CAT III';
+              const cats = severityFilter === 'all' ? ['CAT I', 'CAT II', 'CAT III'].filter((c) => catCount(remediation, c) > 0) : [severityFilter];
+              return (
               <tr key={remediation.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
                 <td className="px-6 py-4 text-sm text-gray-900 dark:text-white">
-                  {remediation.finding}
+                  {remediation.findings.open} open finding(s) · {remediation.benchmark}
                 </td>
                 <td className="px-6 py-4 text-sm">
                   <span
                     className={clsx(
                       'inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium',
-                      getSeverityColor(remediation.severity)
+                      getSeverityColor(topCat)
                     )}
                   >
-                    {remediation.severity}
+                    {topCat}
                   </span>
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 font-mono">
                   {remediation.host}
                 </td>
                 <td className="px-6 py-4 text-sm">
-                  <span
-                    className={clsx(
-                      'inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium',
-                      remediation.status === 'open'
-                        ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400'
-                        : remediation.status === 'in-progress'
-                        ? 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400'
-                        : 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400'
-                    )}
-                  >
-                    {remediation.status}
+                  <span className={clsx('inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium', getStatusColor(remediation.status))}>
+                    {String(remediation.status).replace(/_/g, ' ')}
                   </span>
                 </td>
-                <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {remediation.assignedTo}
+                <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 font-mono">
+                  {remediation.cat?.i ?? 0}/{remediation.cat?.ii ?? 0}/{remediation.cat?.iii ?? 0}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {new Date(remediation.dueDate || "").toLocaleDateString()}
+                  {remediation.date ? new Date(remediation.date).toLocaleDateString() : '—'}
                 </td>
                 <td className="px-6 py-4 text-center">
                   <div className="flex items-center justify-center gap-3">
@@ -1212,9 +1249,9 @@ function RemediationTab({
                       Details
                     </button>
                     <button
-                      onClick={() => onAutoRemediate(remediation.id, [remediation.severity])}
+                      onClick={() => onAutoRemediate(remediation.id, cats)}
                       disabled={autoRemediatePending}
-                      title={`Auto-remediate ${remediation.severity} findings for this scan`}
+                      title={`Auto-remediate ${cats.join(', ')} findings for this scan`}
                       className="inline-flex items-center gap-1 px-3 py-1 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:bg-gray-400 text-xs font-medium"
                     >
                       <Zap className="w-3 h-3" />
@@ -1223,7 +1260,8 @@ function RemediationTab({
                   </div>
                 </td>
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -1300,6 +1338,12 @@ function getStatusColor(status: string) {
     'completed': 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400',
     'in-progress': 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400',
     'failed': 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400',
+    'dispatched': 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400',
+    'awaiting_approval': 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400',
+    'pending_results': 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400',
+    'not_run': 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300',
+    'no_agent': 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300',
+    'no_automatable_rules': 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300',
     'Open': 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400',
     'Not a Finding': 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400',
     'N/A': 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-400',
@@ -1316,22 +1360,23 @@ function LaunchScanModal({
 }: {
   benchmarkId: string;
   onClose: () => void;
-  onSubmit: (host: string) => void;
+  onSubmit: (host: string, scanType: string) => void;
   submitting: boolean;
 }) {
   const [selectedHost, setSelectedHost] = useState<string>('');
   const [manualHost, setManualHost] = useState<string>('');
   const [useManual, setUseManual] = useState<boolean>(false);
+  const [scanType, setScanType] = useState<string>('agent');
 
   const { data: agentsData, isLoading: agentsLoading, error: agentsError } = useQuery<{
     total: number;
     agents: ComplianceAgent[];
   }>({
-    queryKey: ['compliance-agents'],
+    queryKey: ['stig-scan-agents'],
     queryFn: async () => {
-      // Backend supports `capability` filter (singular).
+      // Only agents enrolled with stig_scan run whole-benchmark scans.
       const response = await api.get('/agents', {
-        params: { capability: 'compliance' },
+        params: { capability: STIG_SCAN_CAPABILITY },
       });
       const data = response.data;
       // Defensive parse for either {agents:[]} or array
@@ -1352,7 +1397,7 @@ function LaunchScanModal({
     e.preventDefault();
     const host = useManual || !hasAgents ? manualHost.trim() : selectedHost.trim();
     if (!host) return;
-    onSubmit(host);
+    onSubmit(host, scanType);
   };
 
   return (
@@ -1381,7 +1426,18 @@ function LaunchScanModal({
         </p>
 
         <form onSubmit={handleSubmit} className="space-y-4">
-          <LoadErrorBanner what="compliance agents" error={agentsError} />
+          <LoadErrorBanner what="stig_scan agents" error={agentsError} />
+          <div>
+            <label className="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">Scan type</label>
+            <select
+              value={scanType}
+              onChange={(e) => setScanType(e.target.value)}
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm"
+            >
+              <option value="agent">Agent (oscap on the host's stig_scan agent, after approval)</option>
+              <option value="manual">Manual (register the scan and upload the ARF results)</option>
+            </select>
+          </div>
           {agentsLoading ? (
             <div className="flex items-center gap-2 text-sm text-gray-500">
               <Loader2 className="w-4 h-4 animate-spin" /> Loading agents...
@@ -1397,7 +1453,7 @@ function LaunchScanModal({
                 required
                 className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
               >
-                <option value="">Select a compliance-capable host</option>
+                <option value="">Select a stig_scan-capable host</option>
                 {agents.map((a) => (
                   <option key={a.id} value={a.hostname}>
                     {a.hostname}
@@ -1417,8 +1473,8 @@ function LaunchScanModal({
             <div>
               {!hasAgents && (
                 <div className="mb-3 p-3 rounded-lg bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 text-yellow-800 dark:text-yellow-300 text-xs">
-                  No compliance-capable agent enrolled; scan will record{' '}
-                  <code className="font-mono">status='no_agent'</code>.
+                  No agent with the <code className="font-mono">{STIG_SCAN_CAPABILITY}</code> capability is enrolled; an agent scan
+                  will be recorded as not run with the reason. Choose a manual scan to upload ARF results instead.
                 </div>
               )}
               <label className="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">

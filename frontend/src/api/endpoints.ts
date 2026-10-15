@@ -500,11 +500,23 @@ export const vulnmgmtApi = {
     return response.data;
   },
 
-  runScanProfile: async (profileId: string): Promise<any> => {
-    // Scan profiles are executed by creating a scan run via the
-    // vulnerability scanner. The import-scan endpoint is the realistic
-    // trigger — it imports findings from a named scan profile.
-    const response = await api.post('/vulnmgmt/vulnerabilities/import-scan', { scan_profile_id: profileId });
+  // Import a scanner export (Nessus / OpenVAS / Qualys / CSV / JSON). The
+  // response reports instances created / updated / reopened and skipped
+  // findings by reason; 422 scan_parse_failed carries `errors`.
+  importScan: async (data: { scan_profile_id?: string; scan_format: string; scan_data: string }): Promise<any> => {
+    const response = await api.post('/vulnmgmt/vulnerabilities/import-scan', data);
+    return response.data;
+  },
+
+  // Fetch the CISA KEV feed server-side and flag tracked CVEs (502
+  // kev_feed_unavailable when the feed cannot be reached).
+  syncKev: async (): Promise<any> => {
+    const response = await api.post('/vulnmgmt/vulnerabilities/sync-kev');
+    return response.data;
+  },
+
+  refreshScores: async (): Promise<any> => {
+    const response = await api.post('/vulnmgmt/instances/refresh-scores');
     return response.data;
   },
 

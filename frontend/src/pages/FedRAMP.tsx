@@ -12,7 +12,6 @@ import {
   ChevronRight,
   CheckCircle2,
   AlertTriangle,
-  XCircle,
   Clock,
   Loader2,
   BarChart3,
@@ -20,13 +19,27 @@ import {
   FolderOpen,
   FileDown,
   RefreshCw,
-  ArrowUpRight,
   Info,
   AlertCircle,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
 import { describeLoadError } from '../lib/loadError';
+import ActionErrorBanner from '../components/ActionErrorBanner';
+import type { Row } from '../lib/apiRow';
+
+// Generated documents mark every fact the platform does not hold with this
+// prefix (src/compliance/system_facts.py); count them so nobody mistakes a
+// draft for a finished document.
+const PLACEHOLDER_PREFIX = '[TO BE COMPLETED';
+
+function countPlaceholders(doc: unknown): number {
+  try {
+    return (JSON.stringify(doc).match(/\[TO BE COMPLETED/g) || []).length;
+  } catch {
+    return 0;
+  }
+}
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -39,10 +52,11 @@ type ImplementationStatus =
   | 'not_implemented'
   | 'planned'
   | 'alternative'
-  | 'not_applicable';
+  | 'not_applicable'
+  | 'not_assessed';
 type Priority = 'P1' | 'P2' | 'P3';
 type RiskLevel = 'critical' | 'high' | 'moderate' | 'low';
-type ReadinessBadge = 'Ready' | 'In Progress' | 'Not Ready';
+type ReadinessBadge = 'Ready' | 'In Progress' | 'Not Ready' | 'Not Assessed';
 
 interface ReadinessData {
   score: number;
@@ -90,44 +104,25 @@ interface FedRAMPControl {
   evidenceRequired?: string[];
 }
 
-interface POAMItem {
-  id: string;
-  poamId: string;
-  controlId: string;
-  weakness: string;
-  riskLevel: RiskLevel;
-  status: 'open' | 'in_progress' | 'closed' | 'delayed';
-  milestones: string[];
-  scheduledCompletionDate: string;
-  assignedTo: string;
-  resourcesRequired: string;
-}
-
+// GET /fedramp/poam/report (FedRAMPGenerator.generate_poam_report).
 interface POAMReport {
-  items: POAMItem[];
+  items: Row[];
   summary: {
-    total: number;
-    open: number;
-    inProgress: number;
-    closed: number;
-    delayed: number;
-    overdue: number;
+    total_items: number;
+    status_breakdown: Record<string, number>;
+    severity_breakdown: Record<string, number>;
+    overdue_items: number;
   };
-  timelineData: { month: string; open: number; closed: number; new: number }[];
+  timeline: { month: string; due: number; completed: number; open: number }[];
+  overdue_items?: Row[];
 }
 
-interface EvidenceFamily {
-  family: string;
-  label: string;
-  totalRequired: number;
-  collected: number;
-  controls: { controlId: string; hasEvidence: boolean; lastCollected?: string }[];
-}
-
+// GET /fedramp/evidence/status.
 interface EvidenceStatus {
-  families: EvidenceFamily[];
-  overallCollected: number;
-  overallRequired: number;
+  families: Row[];
+  total_controls: number;
+  controls_with_evidence: number;
+  overall_evidence_coverage_pct: number;
 }
 
 interface FedRAMPDocument {
@@ -154,12 +149,26 @@ const CONTROL_FAMILIES = [
   'PE', 'PL', 'PM', 'PS', 'RA', 'SA', 'SC', 'SI',
 ];
 
+// NIST SP 800-53 family names as the FedRAMP catalogue stores them
+// (src/fedramp/controls.py FAMILY_CODES); evidence collection filters by code.
+const FAMILY_CODE_BY_NAME: Record<string, string> = {
+  'Access Control': 'AC', 'Awareness and Training': 'AT', 'Audit and Accountability': 'AU',
+  'Security Assessment and Authorization': 'CA', 'Configuration Management': 'CM', 'Contingency Planning': 'CP',
+  'Identification and Authentication': 'IA', 'Incident Response': 'IR', 'Maintenance': 'MA', 'Media Protection': 'MP',
+  'Physical and Environmental Protection': 'PE', 'Planning': 'PL', 'Personnel Security': 'PS', 'Risk Assessment': 'RA',
+  'System and Services Acquisition': 'SA', 'System and Communications Protection': 'SC',
+  'System and Information Integrity': 'SI', 'Program Management': 'PM',
+};
+const familyCode = (family: string) => FAMILY_CODE_BY_NAME[family] ?? family;
+
 const STATUS_OPTIONS: { value: ImplementationStatus | ''; label: string }[] = [
   { value: '', label: 'All Statuses' },
   { value: 'implemented', label: 'Implemented' },
-  { value: 'partial', label: 'Partial' },
+  { value: 'partially_implemented', label: 'Partial' },
   { value: 'not_implemented', label: 'Not Implemented' },
   { value: 'planned', label: 'Planned' },
+  { value: 'not_assessed', label: 'Not Assessed' },
+  { value: 'not_applicable', label: 'Not Applicable' },
 ];
 
 const PRIORITY_OPTIONS: { value: Priority | ''; label: string }[] = [
@@ -180,6 +189,7 @@ function statusColor(status: ImplementationStatus): string {
     case 'planned': return 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400';
     case 'alternative': return 'bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-400';
     case 'not_applicable': return 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300';
+    case 'not_assessed': return 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400 border border-dashed border-gray-300';
     case 'not_implemented':
     default:
       return 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400';
@@ -195,27 +205,33 @@ function statusLabel(status: ImplementationStatus): string {
     case 'planned': return 'Planned';
     case 'alternative': return 'Alternative';
     case 'not_applicable': return 'Not Applicable';
+    case 'not_assessed': return 'Not Assessed';
     case 'not_implemented':
     default:
       return 'Not Implemented';
   }
 }
 
-function riskColor(level: RiskLevel): string {
+function riskColor(level: RiskLevel | string): string {
   switch (level) {
-    case 'critical': return 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400';
+    case 'critical':
+    case 'very_high': return 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400';
     case 'high': return 'bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-400';
-    case 'moderate': return 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400';
+    case 'moderate':
+    case 'medium': return 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400';
     case 'low': return 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400';
+    default: return 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300';
   }
 }
 
-function poamStatusColor(status: POAMItem['status']): string {
+function poamStatusColor(status: string): string {
   switch (status) {
     case 'open': return 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400';
     case 'in_progress': return 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400';
+    case 'completed':
     case 'closed': return 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400';
     case 'delayed': return 'bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-400';
+    default: return 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300';
   }
 }
 
@@ -224,6 +240,7 @@ function badgeVariant(badge: ReadinessBadge): string {
     case 'Ready': return 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400 border-green-300 dark:border-green-700';
     case 'In Progress': return 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400 border-yellow-300 dark:border-yellow-700';
     case 'Not Ready': return 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400 border-red-300 dark:border-red-700';
+    case 'Not Assessed': return 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300 border-gray-300 dark:border-gray-600';
   }
 }
 
@@ -317,7 +334,7 @@ function ScoreGauge({ score, size = 180 }: { score: number; size?: number }) {
 // ─── Tab: Readiness Dashboard ────────────────────────────────────────────────
 
 function ReadinessTab() {
-  const { data: rawData, isLoading, error } = useQuery<any>({
+  const { data: rawData, isLoading, error } = useQuery<Row>({
     queryKey: ['fedramp', 'readiness'],
     queryFn: async () => {
       const r = await api.get('/fedramp/readiness');
@@ -337,45 +354,46 @@ function ReadinessTab() {
       downloadBlob(blob, data?.filename ?? 'FedRAMP_SSP_Export.json');
     },
   });
+  const sspDoc = exportSSP.data?.document ?? null;
 
   if (isLoading) return <LoadingState message="Calculating readiness..." />;
   if (error) return <ErrorState message="Failed to load readiness data." error={error} />;
   if (!rawData) return <EmptyState icon={<BarChart3 className="w-10 h-10" />} title="No Data" description="No readiness assessment has been performed yet." />;
 
-  // Safely extract data - backend returns snake_case keys
-  const data = rawData as any;
-  const score = Number(data?.overall_readiness_score ?? data?.score ?? 0) || 0;
+  // FedRAMPGenerator.generate_readiness_report (snake_case keys).
+  const data = rawData;
+  const score = Number(data?.overall_readiness_score ?? 0) || 0;
   const totalControls = Number(data?.total_controls ?? 0) || 0;
+  const assessmentStatus: string = data?.assessment_status ?? 'not_assessed';
 
-  // Transform family_readiness dict to array for rendering
-  const familyData = data?.family_readiness ?? data?.controlFamilyBreakdown ?? {};
-  const controlFamilyBreakdown: { family: string; percentImplemented: number; implemented: number; total: number }[] =
-    Array.isArray(familyData)
-      ? familyData
-      : Object.entries(familyData || {}).map(([key, val]: [string, any]) => ({
-          family: key,
-          percentImplemented: Number(val?.readiness_pct ?? 0) || 0,
-          implemented: Number(val?.implemented ?? 0) || 0,
-          total: Number(val?.total ?? 0) || 0,
-        }));
+  const familyData = (data?.family_readiness ?? {}) as Record<string, Row>;
+  const controlFamilyBreakdown: { family: string; percentImplemented: number; implemented: number; total: number; notAssessed: number }[] =
+    Object.entries(familyData).map(([key, val]) => ({
+      family: key,
+      percentImplemented: Number(val?.readiness_pct ?? 0) || 0,
+      implemented: Number(val?.implemented ?? 0) || 0,
+      total: Number(val?.total ?? 0) || 0,
+      notAssessed: Number(val?.not_assessed ?? 0) || 0,
+    }));
 
-  const gapSummary = data?.status_breakdown ?? data?.gapSummary ?? {};
-  // Ensure gapSummary is always a plain object with expected keys
+  const gapSummary = (data?.status_breakdown ?? {}) as Record<string, number>;
   const gap = {
-    implemented: Number(gapSummary?.implemented ?? 0) || 0,
-    partially_implemented: Number(gapSummary?.partially_implemented ?? gapSummary?.partial ?? 0) || 0,
-    planned: Number(gapSummary?.planned ?? gapSummary?.not_assessed ?? 0) || 0,
-    not_implemented: Number(gapSummary?.not_implemented ?? gapSummary?.alternative ?? 0) || 0,
+    implemented: Number(gapSummary.implemented ?? 0) || 0,
+    partially_implemented: Number(gapSummary.partially_implemented ?? 0) || 0,
+    planned: Number(gapSummary.planned ?? 0) || 0,
+    not_implemented: Number(gapSummary.not_implemented ?? 0) || 0,
+    not_assessed: Number(gapSummary.not_assessed ?? 0) || 0,
   };
+  const gaps: Row[] = Array.isArray(data?.gap_analysis?.gaps) ? data.gap_analysis.gaps : [];
 
-  // Backend returns [{priority: "Critical", action: "..."}] — normalize to display format
-  const rawRecs: any[] = Array.isArray(data?.recommendations) ? data.recommendations : [];
-  const recommendations = rawRecs.map((rec: any, i: number) => ({
+  // Computed from the gaps (recommendations_basis: computed_from_gaps).
+  const rawRecs: Row[] = Array.isArray(data?.recommendations) ? data.recommendations : [];
+  const recommendations = rawRecs.map((rec, i) => ({
     id: rec?.id ?? `rec-${i}`,
-    priority: rec?.priority ?? 'Medium',
+    priority: rec?.priority ?? '',
     title: rec?.title ?? rec?.action ?? 'Recommendation',
-    description: rec?.description ?? rec?.action ?? '',
-    controlFamily: rec?.controlFamily ?? rec?.control_family ?? '',
+    description: rec?.action ?? '',
+    controlFamily: rec?.control_family ?? '',
     effort: rec?.effort ?? '',
   }));
 
@@ -387,17 +405,31 @@ function ReadinessTab() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6 flex flex-col items-center justify-center">
           <ScoreGauge score={score} />
+          <p className="mt-3 text-xs text-center text-gray-500 dark:text-gray-400">
+            {assessmentStatus === 'not_assessed'
+              ? 'No control has been assessed yet; the score counts not-assessed controls as not implemented.'
+              : assessmentStatus === 'partially_assessed'
+              ? `${data?.not_assessed_controls ?? 0} control(s) not assessed (counted as not implemented).`
+              : 'Every control has an assessed status.'}
+          </p>
           <button
             onClick={() => exportSSP.mutate()}
             disabled={exportSSP.isPending}
             className={clsx(
-              'mt-6 flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-medium transition-colors',
+              'mt-4 flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-medium transition-colors',
               'bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed'
             )}
           >
             {exportSSP.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
             Generate SSP
           </button>
+          {exportSSP.error && <div className="mt-3 w-full"><ActionErrorBanner what="generate the SSP" error={exportSSP.error} /></div>}
+          {sspDoc && (
+            <p className="mt-3 text-xs text-gray-600 dark:text-gray-400 text-center">
+              Draft built from stored facts: {countPlaceholders(sspDoc)} placeholder(s) to complete
+              {Array.isArray(sspDoc.missing_facts) && sspDoc.missing_facts.length > 0 ? ` (missing: ${sspDoc.missing_facts.join(', ')})` : ''}.
+            </p>
+          )}
         </div>
 
         <div className="lg:col-span-2 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
@@ -408,6 +440,7 @@ function ReadinessTab() {
               { label: 'Partial', count: gap.partially_implemented, color: 'text-yellow-600 dark:text-yellow-400', bg: 'bg-yellow-50 dark:bg-yellow-900/20' },
               { label: 'Planned', count: gap.planned, color: 'text-blue-600 dark:text-blue-400', bg: 'bg-blue-50 dark:bg-blue-900/20' },
               { label: 'Not Implemented', count: gap.not_implemented, color: 'text-red-600 dark:text-red-400', bg: 'bg-red-50 dark:bg-red-900/20' },
+              { label: 'Not Assessed', count: gap.not_assessed, color: 'text-gray-600 dark:text-gray-300', bg: 'bg-gray-50 dark:bg-gray-900/40' },
             ].map((item) => (
               <div key={item.label} className={clsx('rounded-lg p-4 text-center', item.bg)}>
                 <p className={clsx('text-2xl font-bold', item.color)}>{item.count}</p>
@@ -417,7 +450,25 @@ function ReadinessTab() {
           </div>
           <div className="text-xs text-gray-500 dark:text-gray-400">
             Total Controls: <span className="font-semibold text-gray-700 dark:text-gray-300">{totalControls}</span>
+            {data?.assessment_basis && <p className="mt-1">{data.assessment_basis}</p>}
           </div>
+          {gaps.length > 0 && (
+            <details className="mt-4">
+              <summary className="cursor-pointer text-xs font-medium text-gray-700 dark:text-gray-300">
+                {data?.gap_analysis?.total_gaps ?? gaps.length} gap(s), highest priority first
+              </summary>
+              <ul className="mt-2 max-h-56 overflow-y-auto text-xs space-y-1">
+                {gaps.slice(0, 100).map((g) => (
+                  <li key={g.control_id} className="flex gap-2">
+                    <span className="font-mono w-16 shrink-0">{g.control_id}</span>
+                    <span className="w-8 shrink-0">{g.priority}</span>
+                    <span className={clsx('px-1.5 rounded shrink-0', statusColor(g.current_status))}>{statusLabel(g.current_status)}</span>
+                    <span className="text-gray-500 truncate" title={g.reason ?? ''}>{g.reason || g.title}</span>
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
         </div>
       </div>
 
@@ -441,8 +492,8 @@ function ReadinessTab() {
                 <span className="w-14 text-xs text-right font-medium text-gray-600 dark:text-gray-400">
                   {cf.percentImplemented}%
                 </span>
-                <span className="w-16 text-xs text-right text-gray-400 dark:text-gray-500">
-                  {cf.implemented}/{cf.total}
+                <span className="w-28 text-xs text-right text-gray-400 dark:text-gray-500" title="implemented / total (not assessed)">
+                  {cf.implemented}/{cf.total}{cf.notAssessed ? ` (${cf.notAssessed} n/a)` : ''}
                 </span>
               </div>
             ))}
@@ -452,7 +503,9 @@ function ReadinessTab() {
 
       {/* Recommendations */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-        <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4">Recommendations</h3>
+        <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4">
+          Recommendations <span className="font-normal text-xs text-gray-400">(computed from the gaps above)</span>
+        </h3>
         {recommendations.length === 0 ? (
           <p className="text-sm text-gray-500 dark:text-gray-400">No recommendations at this time.</p>
         ) : (
@@ -515,22 +568,24 @@ function ControlsTab() {
   const [searchTerm, setSearchTerm] = useState('');
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
-  const { data: controlsRaw, isLoading, error } = useQuery<any>({
+  const { data: controlsRaw, isLoading, error } = useQuery<Row>({
     queryKey: ['fedramp', 'controls'],
-    queryFn: async () => (await api.get('/fedramp/controls')).data,
+    queryFn: async () => (await api.get('/fedramp/controls', { params: { limit: 500 } })).data,
   });
-  const controls: FedRAMPControl[] = Array.isArray(controlsRaw) ? controlsRaw : (controlsRaw?.controls || []);
+  const controls: Row[] = useMemo(
+    () => (Array.isArray(controlsRaw) ? controlsRaw : (controlsRaw?.controls || [])),
+    [controlsRaw],
+  );
 
   const updateStatus = useMutation({
-    // Backend expects implementation_status as a query parameter (not a JSON body).
-    // Map the UI's "partial" → backend "partially_implemented" so the value
-    // satisfies FedRAMPGenerator.IMPLEMENTATION_STATUSES validation.
-    mutationFn: ({ id, status }: { id: string; status: ImplementationStatus }) => {
+    // Backend expects implementation_status (and the optional narrative) as
+    // query parameters; the change is recorded as a manual status.
+    mutationFn: ({ id, status, narrative }: { id: string; status: ImplementationStatus; narrative?: string }) => {
       const backendStatus = status === 'partial' ? 'partially_implemented' : status;
       return api.post(
         `/fedramp/controls/${id}/update`,
         null,
-        { params: { implementation_status: backendStatus } }
+        { params: { implementation_status: backendStatus, implementation_narrative: narrative || undefined } }
       );
     },
     onSuccess: () => {
@@ -541,7 +596,7 @@ function ControlsTab() {
 
   const filtered = useMemo(() => {
     if (!controls) return [];
-    return controls.filter((c: any) => {
+    return controls.filter((c: Row) => {
       const cFamily = c.family || '';
       const cStatus = c.implementation_status || c.status || '';
       const cPriority = c.priority || '';
@@ -610,6 +665,8 @@ function ControlsTab() {
         </div>
       </div>
 
+      {updateStatus.error && <ActionErrorBanner what="update the control status" error={updateStatus.error} />}
+
       {/* Table */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
         <div className="overflow-x-auto">
@@ -639,10 +696,10 @@ function ControlsTab() {
                   return (
                     <ControlRow
                       key={control.id}
-                      control={control}
+                      control={control as FedRAMPControl & Row}
                       isExpanded={isExpanded}
                       onToggle={() => setExpandedId(isExpanded ? null : control.id)}
-                      onUpdateStatus={(status) => updateStatus.mutate({ id: control.id, status })}
+                      onUpdateStatus={(status, narrative) => updateStatus.mutate({ id: control.id, status, narrative })}
                       isUpdating={updateStatus.isPending}
                     />
                   );
@@ -663,13 +720,15 @@ function ControlRow({
   onUpdateStatus,
   isUpdating,
 }: {
-  control: FedRAMPControl;
+  control: FedRAMPControl & Row;
   isExpanded: boolean;
   onToggle: () => void;
-  onUpdateStatus: (status: ImplementationStatus) => void;
+  onUpdateStatus: (status: ImplementationStatus, narrative?: string) => void;
   isUpdating: boolean;
 }) {
   const [pendingStatus, setPendingStatus] = useState<ImplementationStatus | ''>('');
+  const [narrative, setNarrative] = useState('');
+  const basis = control.assessment_basis as Row | null | undefined;
 
   return (
     <>
@@ -680,7 +739,7 @@ function ControlRow({
         <td className="px-4 py-3 text-gray-400">
           {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
         </td>
-        <td className="px-4 py-3 font-mono font-medium text-gray-900 dark:text-gray-100">{(control as any).controlId || control.id}</td>
+        <td className="px-4 py-3 font-mono font-medium text-gray-900 dark:text-gray-100">{control.controlId || control.id}</td>
         <td className="px-4 py-3 text-gray-600 dark:text-gray-400">{control.family}</td>
         <td className="px-4 py-3 text-gray-800 dark:text-gray-200 max-w-xs truncate">{control.title || 'Untitled'}</td>
         <td className="px-4 py-3">
@@ -696,12 +755,15 @@ function ControlRow({
           </span>
         </td>
         <td className="px-4 py-3">
-          <span className={clsx('inline-flex items-center px-2 py-0.5 rounded text-xs font-medium', statusColor(((control as any).implementation_status || control.status)))}>
-            {statusLabel(((control as any).implementation_status || control.status))}
+          <span className={clsx('inline-flex items-center px-2 py-0.5 rounded text-xs font-medium', statusColor(control.implementation_status || control.status))}>
+            {statusLabel(control.implementation_status || control.status)}
           </span>
+          {control.status_source && (
+            <div className="text-[10px] text-gray-400 mt-0.5">{control.status_source === 'manual' ? 'set manually' : control.status_source}</div>
+          )}
         </td>
         <td className="px-4 py-3 text-gray-500 dark:text-gray-400 text-xs">
-          {(control as any).pysoar_mapping || <span className="text-gray-300 dark:text-gray-600">--</span>}
+          {control.pysoar_mapping || <span className="text-gray-300 dark:text-gray-600">--</span>}
         </td>
         <td className="px-4 py-3">
           <Info className="w-4 h-4 text-gray-400" />
@@ -720,20 +782,39 @@ function ControlRow({
               <div>
                 <h4 className="font-semibold text-gray-700 dark:text-gray-300 mb-1">Implementation Guidance</h4>
                 <p className="text-gray-600 dark:text-gray-400 text-xs leading-relaxed">
-                  {(control as any).guidance || 'No guidance available.'}
+                  {control.guidance || 'No guidance available.'}
                 </p>
               </div>
-              {(control as any).responsible_role && (
+              <div className="md:col-span-2">
+                <h4 className="font-semibold text-gray-700 dark:text-gray-300 mb-1">Assessment Basis</h4>
+                {!basis ? (
+                  <p className="text-xs text-gray-500">
+                    {control.implementation_status === 'not_assessed'
+                      ? 'Not assessed: no control record has been evaluated by the attester or set by a person.'
+                      : 'No attester result stored for this control.'}
+                  </p>
+                ) : (
+                  <div className="text-xs text-gray-600 dark:text-gray-400 space-y-0.5">
+                    <p>Result: {String(basis.result ?? 'not_assessed').replace(/_/g, ' ')}{basis.checked_at ? ` · ${new Date(basis.checked_at).toLocaleString()}` : ''}</p>
+                    {basis.summary && <p>{basis.summary}</p>}
+                    {basis.reason && <p className="text-orange-700 dark:text-orange-300">Reason: {basis.reason}</p>}
+                  </div>
+                )}
+                <p className="text-xs text-gray-500 mt-1">
+                  Framework: {control.framework ?? 'not tracked'} · Responsible party: {control.responsible_party || '—'} · Last result: {control.last_assessment_result || '—'}
+                </p>
+              </div>
+              {control.responsible_role && (
                 <div>
                   <h4 className="font-semibold text-gray-700 dark:text-gray-300 mb-1">Responsible Role</h4>
-                  <p className="text-gray-600 dark:text-gray-400 text-xs">{(control as any).responsible_role}</p>
+                  <p className="text-gray-600 dark:text-gray-400 text-xs">{control.responsible_role}</p>
                 </div>
               )}
-              {(control as any).evidence_required && (control as any).evidence_required.length > 0 && (
+              {Array.isArray(control.evidence_required) && control.evidence_required.length > 0 && (
                 <div>
                   <h4 className="font-semibold text-gray-700 dark:text-gray-300 mb-1">Required Evidence</h4>
                   <ul className="list-disc list-inside text-xs text-gray-600 dark:text-gray-400 space-y-0.5">
-                    {(control as any).evidence_required.map((ev, i) => (
+                    {(control.evidence_required as string[]).map((ev: string, i: number) => (
                       <li key={i}>{ev}</li>
                     ))}
                   </ul>
@@ -754,14 +835,22 @@ function ControlRow({
                   <option value="implemented">Implemented</option>
                   <option value="partial">Partial</option>
                   <option value="planned">Planned</option>
+                  <option value="not_implemented">Not Implemented</option>
                   <option value="alternative">Alternative</option>
                   <option value="not_applicable">Not Applicable</option>
                 </select>
+                <input
+                  value={narrative}
+                  onClick={(e) => e.stopPropagation()}
+                  onChange={(e) => setNarrative(e.target.value)}
+                  placeholder="Implementation narrative (optional)"
+                  className="flex-1 text-xs border border-gray-300 dark:border-gray-600 rounded px-2 py-1 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
+                />
                 <button
                   disabled={!pendingStatus || isUpdating}
                   onClick={(e) => {
                     e.stopPropagation();
-                    if (pendingStatus) onUpdateStatus(pendingStatus as ImplementationStatus);
+                    if (pendingStatus) onUpdateStatus(pendingStatus as ImplementationStatus, narrative);
                   }}
                   className={clsx(
                     'px-3 py-1 text-xs rounded font-medium transition-colors',
@@ -803,18 +892,19 @@ function POAMTab() {
   if (error) return <ErrorState message="Failed to load POA&M report." error={error} />;
   if (!data) return <EmptyState icon={<ClipboardList className="w-10 h-10" />} title="No POA&Ms" description="No plan of action and milestones items found." />;
 
-  const items: any[] = Array.isArray(data?.items) ? data.items : [];
-  const rawSummary = data?.summary ?? {};
+  const items: Row[] = Array.isArray(data?.items) ? data.items : [];
+  const statusCounts = data?.summary?.status_breakdown ?? {};
   const summary = {
-    total: rawSummary.total ?? 0,
-    open: rawSummary.open ?? 0,
-    inProgress: rawSummary.inProgress ?? rawSummary.in_progress ?? 0,
-    closed: rawSummary.closed ?? 0,
-    delayed: rawSummary.delayed ?? 0,
-    overdue: rawSummary.overdue ?? 0,
+    total: data?.summary?.total_items ?? 0,
+    open: statusCounts.open ?? 0,
+    inProgress: statusCounts.in_progress ?? 0,
+    closed: (statusCounts.completed ?? 0) + (statusCounts.closed ?? 0),
+    delayed: statusCounts.delayed ?? 0,
+    overdue: data?.summary?.overdue_items ?? 0,
   };
-  const timelineData: any[] = Array.isArray(data?.timelineData ?? data?.timeline_data) ? (data.timelineData ?? data.timeline_data) : [];
-  const maxTimelineValue = timelineData.length > 0 ? Math.max(...timelineData.flatMap((t: any) => [t.open ?? 0, t.closed ?? 0, t.new ?? 0]), 1) : 1;
+  // timeline: [{month: YYYY-MM, due, completed, open}] by scheduled completion month.
+  const timelineData = Array.isArray(data?.timeline) ? data.timeline : [];
+  const maxTimelineValue = timelineData.length > 0 ? Math.max(...timelineData.flatMap((t) => [t.open ?? 0, t.completed ?? 0, t.due ?? 0]), 1) : 1;
 
   return (
     <div className="space-y-6">
@@ -840,35 +930,39 @@ function POAMTab() {
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300">POA&M Timeline</h3>
           <div className="flex items-center gap-4 text-xs text-gray-500 dark:text-gray-400">
-            <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-red-500" /> Open</span>
-            <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-green-500" /> Closed</span>
-            <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-blue-500" /> New</span>
+            <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-blue-500" /> Due</span>
+            <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-green-500" /> Completed</span>
+            <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-red-500" /> Still open</span>
           </div>
         </div>
+        {timelineData.length === 0 ? (
+          <p className="text-sm text-gray-500 dark:text-gray-400 text-center py-10">No POA&M item has a scheduled completion date.</p>
+        ) : (
         <div className="flex items-end gap-2 h-40">
           {timelineData.map((t, i) => (
             <div key={i} className="flex-1 flex flex-col items-center gap-1">
               <div className="flex items-end gap-0.5 w-full h-32">
                 <div
-                  className="flex-1 bg-red-500 rounded-t transition-all"
-                  style={{ height: `${(t.open / maxTimelineValue) * 100}%` }}
-                  title={`Open: ${t.open}`}
+                  className="flex-1 bg-blue-500 rounded-t transition-all"
+                  style={{ height: `${(t.due / maxTimelineValue) * 100}%` }}
+                  title={`Due: ${t.due}`}
                 />
                 <div
                   className="flex-1 bg-green-500 rounded-t transition-all"
-                  style={{ height: `${(t.closed / maxTimelineValue) * 100}%` }}
-                  title={`Closed: ${t.closed}`}
+                  style={{ height: `${(t.completed / maxTimelineValue) * 100}%` }}
+                  title={`Completed: ${t.completed}`}
                 />
                 <div
-                  className="flex-1 bg-blue-500 rounded-t transition-all"
-                  style={{ height: `${(t.new / maxTimelineValue) * 100}%` }}
-                  title={`New: ${t.new}`}
+                  className="flex-1 bg-red-500 rounded-t transition-all"
+                  style={{ height: `${(t.open / maxTimelineValue) * 100}%` }}
+                  title={`Open: ${t.open}`}
                 />
               </div>
               <span className="text-[10px] text-gray-400 dark:text-gray-500 truncate w-full text-center">{t.month}</span>
             </div>
           ))}
         </div>
+        )}
       </div>
 
       {/* POA&M Table */}
@@ -908,16 +1002,17 @@ function POAMTab() {
                   </td>
                 </tr>
               ) : (
-                items.map((item: any, idx: number) => {
-                  const dueDate = item.scheduledCompletionDate ?? item.scheduled_completion_date ?? '';
+                items.map((item: Row, idx: number) => {
+                  const rawDue = item.scheduled_completion_date;
+                  const dueDate = rawDue && rawDue !== 'None' ? String(rawDue) : '';
                   const itemStatus = item.status ?? 'open';
-                  const isOverdue = dueDate && new Date(dueDate) < new Date() && itemStatus !== 'closed';
-                  const riskLvl = item.riskLevel ?? item.risk_level ?? item.severity ?? 'moderate';
+                  const isOverdue = dueDate && new Date(dueDate) < new Date() && !['completed', 'closed', 'cancelled', 'accepted'].includes(itemStatus);
+                  const riskLvl = item.severity || 'unrated';
                   return (
-                    <tr key={item.id ?? idx} className="hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors">
-                      <td className="px-4 py-3 font-mono text-xs font-medium text-gray-900 dark:text-gray-100">{item.poamId ?? item.poam_id ?? '-'}</td>
-                      <td className="px-4 py-3 font-mono text-xs text-gray-600 dark:text-gray-400">{item.controlId ?? item.control_id ?? '-'}</td>
-                      <td className="px-4 py-3 text-gray-800 dark:text-gray-200 max-w-xs truncate">{item.weakness ?? item.weakness_description ?? '-'}</td>
+                    <tr key={item.poam_id ?? idx} className="hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors">
+                      <td className="px-4 py-3 font-mono text-xs font-medium text-gray-900 dark:text-gray-100">{item.poam_id ?? '-'}</td>
+                      <td className="px-4 py-3 font-mono text-xs text-gray-600 dark:text-gray-400">{item.control_id || '-'}</td>
+                      <td className="px-4 py-3 text-gray-800 dark:text-gray-200 max-w-xs truncate">{item.weakness_description || '-'}</td>
                       <td className="px-4 py-3">
                         <span className={clsx('inline-flex items-center px-2 py-0.5 rounded text-xs font-medium capitalize', riskColor(riskLvl))}>
                           {riskLvl}
@@ -928,7 +1023,7 @@ function POAMTab() {
                           {String(itemStatus).replace('_', ' ')}
                         </span>
                       </td>
-                      <td className="px-4 py-3 text-xs text-gray-600 dark:text-gray-400">{item.assignedTo ?? item.assigned_to ?? item.responsible_party ?? '-'}</td>
+                      <td className="px-4 py-3 text-xs text-gray-600 dark:text-gray-400">{item.responsible_party || '-'}</td>
                       <td className="px-4 py-3">
                         <span className={clsx('text-xs', isOverdue ? 'text-red-600 dark:text-red-400 font-semibold' : 'text-gray-600 dark:text-gray-400')}>
                           {dueDate || '-'}
@@ -964,40 +1059,46 @@ function EvidenceTab() {
       const res = await api.post('/audit-evidence/evidence/collect-all', { family });
       return res.data;
     },
-    onSuccess: (data: any) => {
-      const count = Array.isArray(data?.results) ? data.results.length : 0;
-      alert(`Evidence collection completed. ${count} rule(s) run.`);
+    onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['fedramp', 'evidence', 'status'] });
     },
-    onError: (err: any) => {
-      const msg = err?.response?.data?.detail || err?.message || 'Evidence collection failed';
-      alert(msg);
-    },
   });
+  const collectResult = collectEvidence.data as Row | undefined;
 
   if (isLoading) return <LoadingState message="Loading evidence status..." />;
   if (error) return <ErrorState message="Failed to load evidence status." error={error} />;
   if (!data) return <EmptyState icon={<FolderOpen className="w-10 h-10" />} title="No Evidence Data" description="Evidence collection has not been configured." />;
 
-  const rawFamilies: any[] = Array.isArray(data?.families) ? data.families : [];
-  // Normalize backend field names to what the UI expects
-  const families = rawFamilies.map((f: any) => ({
-    family: f.family || f.label || '',
-    label: f.family || f.label || '',
-    totalRequired: Number(f.totalRequired ?? f.total_controls ?? 0),
-    collected: Number(f.collected ?? f.controls_with_evidence ?? 0),
-    controls: Array.isArray(f.controls) ? f.controls : (f.evidence_artifacts || []).map((a: any) => ({
-      id: a.control_id || a.id || '',
-      controlId: a.control_id || a.id || '',
+  const rawFamilies: Row[] = Array.isArray(data?.families) ? data.families : [];
+  // Per family: controls with at least one evidence artifact attached.
+  const families = rawFamilies.map((f) => ({
+    family: f.family || '',
+    label: f.family || '',
+    totalRequired: Number(f.total_controls ?? 0),
+    collected: Number(f.controls_with_evidence ?? 0),
+    controls: ((f.evidence_artifacts || []) as Row[]).map((a) => ({
+      id: a.id || '',
+      controlId: a.title || a.id || '',
       hasEvidence: true,
+      reviewStatus: a.review_status as string | undefined,
     })),
   }));
-  const overallCollected = Number(data?.overallCollected ?? data?.overall_collected ?? data?.controls_with_evidence ?? 0) || 0;
-  const overallRequired = Number(data?.overallRequired ?? data?.overall_required ?? data?.total_controls ?? 0) || 0;
-  const overallPercent = overallRequired > 0 ? Math.round((overallCollected / (overallRequired || 1)) * 100) : 0;
+  const overallCollected = Number(data?.controls_with_evidence ?? 0) || 0;
+  const overallRequired = Number(data?.total_controls ?? 0) || 0;
+  const overallPercent = overallRequired > 0 ? Math.round((overallCollected / overallRequired) * 100) : 0;
 
   return (
     <div className="space-y-6">
+      {collectEvidence.error && <ActionErrorBanner what="collect evidence" error={collectEvidence.error} />}
+      {collectResult && (
+        <div className="text-sm bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded p-3">
+          Evidence collection {String(collectResult.status ?? '').replace(/_/g, ' ')}
+          {collectResult.family ? ` for ${collectResult.family}` : ''}: {collectResult.rules_run ?? 0} rule(s) run, {collectResult.collected ?? 0} collected,{' '}
+          {collectResult.evidence_written ?? 0} evidence row(s) written, {collectResult.awaiting_integration ?? 0} awaiting an integration,{' '}
+          {collectResult.no_matching_controls ?? 0} without matching controls, {collectResult.failed ?? 0} failed.
+          {collectResult.reason ? ` ${collectResult.reason}` : ''}
+        </div>
+      )}
       {/* Overall progress */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
         <div className="flex items-center justify-between mb-3">
@@ -1021,7 +1122,7 @@ function EvidenceTab() {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
         {families.map((fam) => {
           const percent = fam.totalRequired > 0 ? Math.round((fam.collected / fam.totalRequired) * 100) : 0;
-          const isCollecting = collectEvidence.isPending && collectEvidence.variables === fam.family;
+          const isCollecting = collectEvidence.isPending && collectEvidence.variables === familyCode(fam.family);
 
           return (
             <div
@@ -1058,7 +1159,7 @@ function EvidenceTab() {
                   {fam.collected} / {fam.totalRequired} collected
                 </span>
                 <button
-                  onClick={() => collectEvidence.mutate(fam.family)}
+                  onClick={() => collectEvidence.mutate(familyCode(fam.family))}
                   disabled={isCollecting}
                   className={clsx(
                     'flex items-center gap-1 px-2.5 py-1 text-xs rounded font-medium transition-colors',
@@ -1073,18 +1174,12 @@ function EvidenceTab() {
               {/* Control-level detail */}
               {fam.controls.length > 0 && (
                 <div className="mt-3 pt-3 border-t border-gray-100 dark:border-gray-700 space-y-1.5 max-h-32 overflow-y-auto">
-                  {fam.controls.map((ctrl: any, idx: number) => (
-                    <div key={ctrl.id ?? ctrl.controlId ?? idx} className="flex items-center justify-between text-xs">
-                      <span className="font-mono text-gray-600 dark:text-gray-400">{ctrl.controlId ?? ctrl.id ?? '-'}</span>
-                      {ctrl.hasEvidence ? (
-                        <span className="flex items-center gap-1 text-green-600 dark:text-green-400">
-                          <CheckCircle2 className="w-3 h-3" /> Collected
-                        </span>
-                      ) : (
-                        <span className="flex items-center gap-1 text-gray-400 dark:text-gray-500">
-                          <XCircle className="w-3 h-3" /> Missing
-                        </span>
-                      )}
+                  {fam.controls.map((ctrl, idx: number) => (
+                    <div key={ctrl.id || idx} className="flex items-center justify-between text-xs gap-2">
+                      <span className="text-gray-600 dark:text-gray-400 truncate">{ctrl.controlId || '-'}</span>
+                      <span className="flex items-center gap-1 text-green-600 dark:text-green-400 shrink-0">
+                        <CheckCircle2 className="w-3 h-3" /> {ctrl.reviewStatus ? ctrl.reviewStatus.replace(/_/g, ' ') : 'attached'}
+                      </span>
                     </div>
                   ))}
                 </div>
@@ -1127,7 +1222,7 @@ const FEDRAMP_DOCUMENTS: { type: string; name: string; description: string; endp
 ];
 
 function DocumentsTab() {
-  const [generatedDocs, setGeneratedDocs] = useState<Record<string, any>>({});
+  const [generatedDocs, setGeneratedDocs] = useState<Record<string, Row>>({});
 
   const generateDoc = useMutation({
     mutationFn: async ({ endpoint, docType }: { endpoint: string; docType: string }) => {
@@ -1167,7 +1262,9 @@ function DocumentsTab() {
           <div>
             <p className="text-sm text-gray-700 dark:text-gray-300 font-medium">FedRAMP Document Package</p>
             <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-              Generate and download required FedRAMP Moderate authorization documents. Documents are auto-populated from your current control implementation data and PySOAR configurations.
+              Generate FedRAMP Moderate drafts from the facts stored for this organisation (organisation, components, integrations,
+              policies, control records, playbooks, scans). Every fact that is not recorded is left as an explicit
+              &quot;{PLACEHOLDER_PREFIX}: ...]&quot; placeholder; the drafts are not submission-ready until those are completed.
             </p>
           </div>
         </div>
@@ -1175,8 +1272,11 @@ function DocumentsTab() {
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {FEDRAMP_DOCUMENTS.map((doc) => {
-          const isGenerating = generateDoc.isPending && (generateDoc.variables as any)?.docType === doc.type;
-          const isDownloading = downloadDoc.isPending && (downloadDoc.variables as any)?.docType === doc.type;
+          const isGenerating = generateDoc.isPending && generateDoc.variables?.docType === doc.type;
+          const isDownloading = downloadDoc.isPending && downloadDoc.variables?.docType === doc.type;
+          const generated = generatedDocs[doc.type];
+          const failed = (generateDoc.error && generateDoc.variables?.docType === doc.type) ? generateDoc.error
+            : (downloadDoc.error && downloadDoc.variables?.docType === doc.type) ? downloadDoc.error : null;
 
           return (
             <div
@@ -1212,6 +1312,19 @@ function DocumentsTab() {
                       Download
                     </button>
                   </div>
+                  {failed && <div className="mt-2"><ActionErrorBanner what={`generate the ${doc.name}`} error={failed} /></div>}
+                  {generated && (
+                    <div className="mt-3 text-xs text-gray-600 dark:text-gray-400 space-y-1">
+                      <p>{countPlaceholders(generated)} placeholder(s) left to complete.</p>
+                      {Array.isArray(generated.missing_facts) && generated.missing_facts.length > 0 && (
+                        <ul className="list-disc ml-4">
+                          {generated.missing_facts.map((m: unknown, i: number) => (
+                            <li key={i}>{typeof m === 'string' ? m : JSON.stringify(m)}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -1227,7 +1340,7 @@ function DocumentsTab() {
 export default function FedRAMP() {
   const [activeTab, setActiveTab] = useState<TabType>('readiness');
 
-  const { data: readinessData, error: readinessError } = useQuery<any>({
+  const { data: readinessData, error: readinessError } = useQuery<Row>({
     queryKey: ['fedramp', 'readiness'],
     queryFn: async () => (await api.get('/fedramp/readiness')).data,
     staleTime: 60_000,
@@ -1239,7 +1352,11 @@ export default function FedRAMP() {
   const readinessScore =
     rawReadinessScore == null || !Number.isFinite(Number(rawReadinessScore)) ? null : Number(rawReadinessScore);
   const badge: ReadinessBadge | null =
-    readinessScore == null ? null : readinessScore >= 80 ? 'Ready' : readinessScore >= 40 ? 'In Progress' : 'Not Ready';
+    readinessScore == null
+      ? null
+      : readinessData?.assessment_status === 'not_assessed'
+      ? 'Not Assessed'
+      : readinessScore >= 80 ? 'Ready' : readinessScore >= 40 ? 'In Progress' : 'Not Ready';
   const generatedAt = readinessData?.generated_at ?? readinessData?.lastAssessmentDate;
   const lastAssessment = generatedAt
     ? new Date(generatedAt).toLocaleDateString('en-US', {
@@ -1267,7 +1384,7 @@ export default function FedRAMP() {
           </div>
           <div className="flex items-center gap-4">
             <div className="text-right">
-              <p className="text-xs text-gray-500 dark:text-gray-400">Last Assessment</p>
+              <p className="text-xs text-gray-500 dark:text-gray-400">Readiness computed</p>
               <p className="text-sm font-medium text-gray-700 dark:text-gray-300">{lastAssessment}</p>
             </div>
             {badge ? (

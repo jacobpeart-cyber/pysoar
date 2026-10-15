@@ -2,27 +2,45 @@ import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   BarChart3,
-  ChevronDown,
-  ChevronRight,
   Plus,
   Filter,
   Shield,
-  ShieldAlert,
   Loader2,
   Zap,
-  Lock,
-  Server,
   AlertCircle,
   CheckCircle,
   AlertTriangle,
   Clock,
-  TrendingUp,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
 import DetailDrawer, { DetailSection } from '../components/DetailDrawer';
 import FormModal from '../components/FormModal';
 import LoadErrorBanner from '../components/LoadErrorBanner';
+import ActionErrorBanner from '../components/ActionErrorBanner';
+import type { Row } from '../lib/apiRow';
+
+const NA = 'not available';
+
+// Posture checks the device trust profile carries (src/zerotrust/engine.py):
+// the first four are measured by the endpoint agent, the last two only come
+// from an explicit administrator override.
+const AGENT_POSTURE_CHECKS = ['os_patched', 'av_active', 'encryption_enabled', 'firewall_on'] as const;
+const OVERRIDE_ONLY_CHECKS = ['certificate_valid', 'jailbroken'] as const;
+const CHECK_LABELS: Record<string, string> = {
+  os_patched: 'OS patched',
+  av_active: 'Antivirus active',
+  encryption_enabled: 'Disk encryption',
+  firewall_on: 'Firewall on',
+  certificate_valid: 'Device certificate valid',
+  jailbroken: 'Jailbroken / rooted',
+};
+
+function checkLabel(value: unknown): string {
+  if (value === true) return 'yes';
+  if (value === false) return 'no';
+  return 'not reported';
+}
 
 type TabType = 'overview' | 'access-control' | 'devices' | 'segmentation' | 'policies';
 
@@ -49,12 +67,6 @@ function getStatusColor(status: string) {
   return colors[status] || colors.healthy;
 }
 
-interface Pillar {
-  name: string;
-  score: number;
-  status: 'healthy' | 'at-risk' | 'critical';
-}
-
 interface DashboardData {
   total_policies: number;
   enabled_policies: number;
@@ -72,7 +84,10 @@ interface DashboardData {
   maturity_score: number;
   maturity_level: string;
   last_updated: string;
-  pillars?: any;
+  pillars?: Record<string, Row>;
+  not_reported_devices?: number;
+  access_decisions_24h?: number;
+  configured_pillars?: number;
 }
 
 // GET /zerotrust/decisions row (zerotrust.py list_access_decisions):
@@ -86,16 +101,24 @@ interface AccessDecision {
   risk_score: number;
 }
 
-// GET /zerotrust/devices row. The list projection carries no compliance
-// fields; those are only on GET /zerotrust/devices/{device_id}.
+// GET /zerotrust/devices row (_device_summary): stored fields plus the
+// posture derived from what the agent (or an admin override) reported.
 interface Device {
   id: string;
   device_id: string;
   hostname: string | null;
   device_type: string;
+  os_type?: string | null;
+  os_version?: string | null;
   trust_score: number;
   trust_level: string;
   last_seen: string | null;
+  last_assessment_at?: string | null;
+  compliance_checks?: Record<string, boolean | string>;
+  is_compliant?: boolean | null;
+  posture_status?: 'reported' | 'partial' | 'not_reported' | string;
+  posture_source?: string | null;
+  posture_reported_at?: string | null;
 }
 
 // MicroSegmentResponse
@@ -127,13 +150,14 @@ interface DeviceStats {
   conditional: number;
   untrusted: number;
   blocked: number;
+  not_reported?: number;
 }
 
 export default function ZeroTrustDashboard() {
   const [activeTab, setActiveTab] = useState<TabType>('overview');
   const [expandedDevice, setExpandedDevice] = useState<string | null>(null);
   const [decisionFilter, setDecisionFilter] = useState<string>('all');
-  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<{ what: string; error: unknown } | null>(null);
   const queryClient = useQueryClient();
 
   const { data: dashboardData, isLoading: dashboardLoading, error: dashboardError } = useQuery<DashboardData>({
@@ -152,7 +176,7 @@ export default function ZeroTrustDashboard() {
     },
   });
 
-  const { data: devicesRaw, isLoading: devicesLoading, error: devicesError } = useQuery<any>({
+  const { data: devicesRaw, isLoading: devicesLoading, error: devicesError } = useQuery<Row>({
     queryKey: ['zerotrust-devices'],
     queryFn: async () => {
       const response = await api.get('/zerotrust/devices');
@@ -165,7 +189,7 @@ export default function ZeroTrustDashboard() {
   // received a hardcoded `[]` for recentDecisions so the live decisions
   // table was always empty despite /zerotrust/decisions returning real
   // rows.
-  const { data: accessDecisionsRaw, isLoading: accessDecisionsLoading, error: accessDecisionsError } = useQuery<any>({
+  const { data: accessDecisionsRaw, isLoading: accessDecisionsLoading, error: accessDecisionsError } = useQuery<Row>({
     queryKey: ['zerotrust-decisions', 'access-control'],
     queryFn: async () => {
       // The handler pages with skip/limit (it ignores `size`).
@@ -177,7 +201,7 @@ export default function ZeroTrustDashboard() {
     ? accessDecisionsRaw
     : (accessDecisionsRaw?.decisions || accessDecisionsRaw?.items || []);
 
-  const { data: segmentsRaw, isLoading: segmentsLoading, error: segmentsError } = useQuery<any>({
+  const { data: segmentsRaw, isLoading: segmentsLoading, error: segmentsError } = useQuery<Row>({
     queryKey: ['zerotrust-segments'],
     queryFn: async () => {
       const response = await api.get('/zerotrust/segments');
@@ -186,7 +210,7 @@ export default function ZeroTrustDashboard() {
   });
   const segments: Segment[] = Array.isArray(segmentsRaw) ? segmentsRaw : (segmentsRaw?.segments || segmentsRaw?.items || []);
 
-  const { data: policiesRaw, isLoading: policiesLoading, error: policiesError } = useQuery<any>({
+  const { data: policiesRaw, isLoading: policiesLoading, error: policiesError } = useQuery<Row>({
     queryKey: ['zerotrust-policies'],
     queryFn: async () => {
       // enabled_only defaults to true server-side, which hid disabled
@@ -205,13 +229,9 @@ export default function ZeroTrustDashboard() {
     onSuccess: () => {
       setActionError(null);
       queryClient.invalidateQueries({ queryKey: ['zerotrust-devices'] });
+      queryClient.invalidateQueries({ queryKey: ['zerotrust-device-stats'] });
     },
-    onError: (err: any) => {
-      console.error('Device assessment failed:', err);
-      setActionError(
-        err?.response?.data?.detail || err?.message || 'Failed to assess devices'
-      );
-    },
+    onError: (err: unknown) => setActionError({ what: 'assess devices', error: err }),
   });
 
   const evaluateAccessMutation = useMutation({
@@ -223,7 +243,7 @@ export default function ZeroTrustDashboard() {
       subject_id: string;
       resource_type: string;
       resource_id: string;
-      context: Record<string, any>;
+      context: Record<string, unknown>;
     }) => {
       const response = await api.post('/zerotrust/evaluate-access', data);
       return response.data;
@@ -231,13 +251,9 @@ export default function ZeroTrustDashboard() {
     onSuccess: () => {
       setActionError(null);
       queryClient.invalidateQueries({ queryKey: ['zerotrust-dashboard'] });
+      queryClient.invalidateQueries({ queryKey: ['zerotrust-decisions'] });
     },
-    onError: (err: any) => {
-      console.error('Access evaluation failed:', err);
-      setActionError(
-        err?.response?.data?.detail || err?.message || 'Failed to evaluate access'
-      );
-    },
+    onError: (err: unknown) => setActionError({ what: 'evaluate access', error: err }),
   });
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -272,9 +288,8 @@ export default function ZeroTrustDashboard() {
       </div>
 
       {actionError && (
-        <div className="flex items-start gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">
-          <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
-          <div className="flex-1">{actionError}</div>
+        <div className="flex items-start gap-2">
+          <div className="flex-1"><ActionErrorBanner what={actionError.what} error={actionError.error} /></div>
           <button
             onClick={() => setActionError(null)}
             className="text-red-700 hover:text-red-900 text-sm"
@@ -349,6 +364,11 @@ export default function ZeroTrustDashboard() {
           expandedDevice={expandedDevice}
           setExpandedDevice={setExpandedDevice}
           onAssessDevices={() => assessDevicesMutation.mutate()}
+          onChanged={() => {
+            queryClient.invalidateQueries({ queryKey: ['zerotrust-devices'] });
+            queryClient.invalidateQueries({ queryKey: ['zerotrust-device-stats'] });
+            queryClient.invalidateQueries({ queryKey: ['zerotrust-dashboard'] });
+          }}
         />
         </>
       )}
@@ -396,7 +416,17 @@ function OverviewTab({
     );
   }
 
-  const pillarArray = Array.isArray(data?.pillars) ? data.pillars : Object.entries(data?.pillars || {}).map(([k, v]: [string, any]) => ({ name: k, score: v?.score || 0, status: (v?.score || 0) >= 70 ? 'healthy' : 'at-risk' }));
+  // Each pillar is assessed from the tenant's stored configuration
+  // (policies, device profiles, segments, enforced sessions, agents);
+  // a pillar with nothing configured is "not_configured", not a low score.
+  const pillarArray: Row[] = Object.entries(data?.pillars || {}).map(([k, v]) => ({
+    name: k,
+    score: Number(v?.score ?? 0),
+    maturity_level: v?.maturity_level,
+    configured: v?.status !== 'not_configured',
+    status: v?.status === 'not_configured' ? 'not_configured' : Number(v?.score ?? 0) >= 70 ? 'healthy' : Number(v?.score ?? 0) >= 40 ? 'at-risk' : 'critical',
+    criteria: Array.isArray(v?.criteria) ? v.criteria : [],
+  }));
 
   const maturityLevels = (() => {
     const levels: { level: MaturityLevel; label: string; pillarCount: number }[] = [
@@ -405,15 +435,12 @@ function OverviewTab({
       { level: 'advanced', label: 'Advanced', pillarCount: 0 },
       { level: 'optimal', label: 'Optimal', pillarCount: 0 },
     ];
-    const pillarArray = Array.isArray(data?.pillars) ? data.pillars : Object.entries(data?.pillars || {}).map(([k, v]: [string, any]) => ({ name: k, score: v?.score || 0, status: (v?.score || 0) >= 70 ? 'healthy' : 'at-risk' }));
-    if (pillarArray.length > 0) {
-      pillarArray.forEach((pillar: any) => {
-        if (pillar.score >= 90) levels[3].pillarCount += 1;
-        else if (pillar.score >= 70) levels[2].pillarCount += 1;
-        else if (pillar.score >= 40) levels[1].pillarCount += 1;
-        else levels[0].pillarCount += 1;
-      });
-    }
+    pillarArray.filter((p) => p.configured).forEach((pillar) => {
+      if (pillar.score >= 90) levels[3].pillarCount += 1;
+      else if (pillar.score >= 70) levels[2].pillarCount += 1;
+      else if (pillar.score >= 40) levels[1].pillarCount += 1;
+      else levels[0].pillarCount += 1;
+    });
     return levels;
   })();
 
@@ -421,9 +448,13 @@ function OverviewTab({
     <div className="space-y-6">
       {/* Maturity Level Banner */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-        <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
+        <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-1">
           Zero Trust Maturity
         </h2>
+        <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
+          Score {data ? data.maturity_score.toFixed(1) : NA} from stored configuration · {data?.configured_pillars ?? NA} of {pillarArray.length || NA} pillars configured ·{' '}
+          {data?.access_decisions_24h ?? NA} access decision(s) in the last 24 h · {data?.not_reported_devices ?? NA} device(s) without reported posture
+        </p>
         <div className="flex items-center gap-3">
           {maturityLevels.map((item) => (
             <div
@@ -446,17 +477,19 @@ function OverviewTab({
 
       {/* Pillar Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
-        {pillarArray.map((pillar: any) => (
+        {pillarArray.map((pillar) => (
           <div
             key={pillar.name}
             className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-5"
           >
-            <h3 className="font-semibold text-gray-900 dark:text-white mb-3">
-              {pillar.name}
+            <h3 className="font-semibold text-gray-900 dark:text-white mb-3 capitalize">
+              {String(pillar.name).replace(/_/g, ' ')}
             </h3>
 
             <div className="space-y-3">
-              {/* Score Gauge */}
+              {!pillar.configured ? (
+                <p className="text-xs text-gray-500 dark:text-gray-400">Nothing configured for this pillar yet; no score is claimed.</p>
+              ) : (
               <div>
                 <div className="flex items-end justify-between mb-1">
                   <span className="text-xs text-gray-600 dark:text-gray-400">Score</span>
@@ -478,16 +511,26 @@ function OverviewTab({
                   />
                 </div>
               </div>
+              )}
 
               {/* Status */}
               <span
                 className={clsx(
                   'inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium',
-                  getStatusColor(pillar.status)
+                  pillar.configured ? getStatusColor(pillar.status) : 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300'
                 )}
               >
-                {(pillar.status || '').replace('-', ' ')}
+                {String(pillar.status || '').replace(/[-_]/g, ' ')}
               </span>
+              {pillar.criteria.length > 0 && (
+                <ul className="text-xs text-gray-600 dark:text-gray-400 space-y-0.5">
+                  {pillar.criteria.map((c: Row) => (
+                    <li key={c.key} title={`evidence: ${typeof c.evidence === 'object' ? JSON.stringify(c.evidence) : String(c.evidence)}`}>
+                      {String(c.key).replace(/_/g, ' ')}: {c.points}/{c.weight}
+                    </li>
+                  ))}
+                </ul>
+              )}
             </div>
           </div>
         ))}
@@ -582,7 +625,7 @@ function AccessControlTab({
     subject_id: string;
     resource_type: string;
     resource_id: string;
-    context: Record<string, any>;
+    context: Record<string, unknown>;
   }) => void;
 }) {
   const [evalSubjectType, setEvalSubjectType] = useState('user');
@@ -846,6 +889,7 @@ function DeviceTrustTab({
   expandedDevice,
   setExpandedDevice,
   onAssessDevices,
+  onChanged,
 }: {
   devices: Device[];
   stats?: DeviceStats;
@@ -853,10 +897,13 @@ function DeviceTrustTab({
   expandedDevice: string | null;
   setExpandedDevice: (id: string | null) => void;
   onAssessDevices: () => void;
+  onChanged: () => void;
 }) {
-  const [detailDevice, setDetailDevice] = useState<any | null>(null);
+  const [detailDevice, setDetailDevice] = useState<Row | null>(null);
   const [reassessedDevices, setReassessedDevices] = useState<Record<string, number>>({});
   const [detailError, setDetailError] = useState<unknown>(null);
+  const [overrideDevice, setOverrideDevice] = useState<Device | { device_id: string; hostname: null } | null>(null);
+  const [overrideError, setOverrideError] = useState<unknown>(null);
 
   if (loading) {
     return (
@@ -869,24 +916,44 @@ function DeviceTrustTab({
   return (
     <div className="space-y-6">
       {/* Device Stats */}
-      <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
-        <StatCard label="Total Devices" value={stats?.total ?? 'not available'} color="blue" />
-        <StatCard label="Trusted" value={stats?.trusted ?? 'not available'} color="green" />
-        <StatCard label="Conditional" value={stats?.conditional ?? 'not available'} color="yellow" />
-        <StatCard label="Untrusted" value={stats?.untrusted ?? 'not available'} color="orange" />
-        <StatCard label="Blocked" value={stats?.blocked ?? 'not available'} color="red" />
+      <div className="grid grid-cols-2 md:grid-cols-6 gap-4">
+        <StatCard label="Total Devices" value={stats?.total ?? NA} color="blue" />
+        <StatCard label="Trusted" value={stats?.trusted ?? NA} color="green" />
+        <StatCard label="Conditional" value={stats?.conditional ?? NA} color="yellow" />
+        <StatCard label="Untrusted" value={stats?.untrusted ?? NA} color="orange" />
+        <StatCard label="Blocked" value={stats?.blocked ?? NA} color="red" />
+        <StatCard label="Posture Not Reported" value={stats?.not_reported ?? NA} color="blue" />
       </div>
 
-      {/* Assess Devices Button */}
-      <button
-        onClick={onAssessDevices}
-        className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium"
-      >
-        <Zap className="w-5 h-5" />
-        Assess All Devices
-      </button>
+      <p className="text-xs text-gray-500 dark:text-gray-400">
+        Posture comes from the endpoint agent (OS patched, antivirus, encryption, firewall). A device whose agent never reported is
+        &quot;not reported&quot;: it is counted neither compliant nor non-compliant.
+      </p>
+
+      <div className="flex flex-wrap gap-3">
+        <button
+          onClick={onAssessDevices}
+          className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium"
+        >
+          <Zap className="w-5 h-5" />
+          Re-score All Devices
+        </button>
+        <button
+          onClick={() => { setOverrideError(null); setOverrideDevice({ device_id: '', hostname: null }); }}
+          className="inline-flex items-center gap-2 px-4 py-3 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 text-sm"
+          title="Record posture for a device by hand (admin; marked as an override)"
+        >
+          <Shield className="w-4 h-4" />
+          Record Posture Override
+        </button>
+      </div>
 
       <LoadErrorBanner what="the device" error={detailError} />
+      {devices.length === 0 && (
+        <p className="text-sm text-gray-500 dark:text-gray-400 text-center py-8 border border-dashed border-gray-300 dark:border-gray-700 rounded-lg">
+          No device trust profile yet. Profiles are created when an endpoint agent reports posture or an administrator records one.
+        </p>
+      )}
 
       {/* Devices Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -905,12 +972,41 @@ function DeviceTrustTab({
                   {(device.device_type || 'unknown').charAt(0).toUpperCase() + (device.device_type || 'unknown').slice(1)}
                 </p>
               </div>
-              {/* The list projection has no compliance verdict; show the
-                  backend's trust_level instead of inventing one. */}
-              <span className="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-300">
-                {device.trust_level || 'unknown'}
-              </span>
+              <div className="flex flex-col items-end gap-1">
+                <span className="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-300">
+                  {device.trust_level || 'unknown'}
+                </span>
+                <span
+                  className={clsx(
+                    'inline-flex items-center px-2 py-0.5 rounded-full text-xs',
+                    device.is_compliant === true
+                      ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400'
+                      : device.is_compliant === false
+                      ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400'
+                      : 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-400'
+                  )}
+                >
+                  {device.is_compliant === true ? 'compliant' : device.is_compliant === false ? 'non-compliant' : String(device.posture_status || 'not_reported').replace(/_/g, ' ')}
+                </span>
+              </div>
             </div>
+
+            <div className="grid grid-cols-2 gap-1 text-xs mb-3">
+              {AGENT_POSTURE_CHECKS.map((k) => {
+                const v = device.compliance_checks?.[k];
+                return (
+                  <span key={k} className={clsx(v === true ? 'text-green-700 dark:text-green-400' : v === false ? 'text-red-700 dark:text-red-400' : 'text-gray-400')}>
+                    {CHECK_LABELS[k]}: {checkLabel(v)}
+                  </span>
+                );
+              })}
+            </div>
+            {device.posture_source && (
+              <p className="text-xs text-gray-500 mb-2">
+                Source: {device.posture_source === 'admin_override' ? 'administrator override (not measured)' : device.posture_source}
+                {device.posture_reported_at ? ` · ${new Date(device.posture_reported_at).toLocaleString()}` : ''}
+              </p>
+            )}
 
             {/* Trust Score Gauge */}
             <div className="mb-3">
@@ -976,11 +1072,68 @@ function DeviceTrustTab({
                     ? `Re-assessed ${new Date(reassessedDevices[device.id]).toLocaleTimeString()}`
                     : 'Re-assess'}
                 </button>
+                <button
+                  onClick={(e) => { e.stopPropagation(); setOverrideError(null); setOverrideDevice(device); }}
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-xs font-medium"
+                >
+                  Record Posture Override (admin)
+                </button>
               </div>
             )}
           </div>
         ))}
       </div>
+
+      {overrideDevice && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50" onClick={() => setOverrideDevice(null)}>
+          <form
+            className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-md mx-4 p-6 space-y-3"
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={async (e) => {
+              e.preventDefault();
+              const fd = new FormData(e.currentTarget);
+              const deviceId = String(fd.get('device_id') || overrideDevice.device_id).trim();
+              const body: Record<string, boolean> = {};
+              for (const k of [...AGENT_POSTURE_CHECKS, ...OVERRIDE_ONLY_CHECKS]) {
+                const v = String(fd.get(k) || '');
+                if (v === 'yes') body[k] = true;
+                else if (v === 'no') body[k] = false;
+              }
+              try {
+                await api.put(`/zerotrust/devices/${encodeURIComponent(deviceId)}/compliance`, body);
+                setOverrideDevice(null);
+                onChanged();
+              } catch (err) {
+                setOverrideError(err);
+              }
+            }}
+          >
+            <h2 className="text-lg font-semibold">Posture override{overrideDevice.device_id ? `: ${overrideDevice.hostname || overrideDevice.device_id}` : ''}</h2>
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              Admin only. Stored with source &quot;admin_override&quot; and written to the audit log; it feeds the device check of access decisions.
+              Leave a check unset to keep what was reported.
+            </p>
+            <ActionErrorBanner what="record the posture override" error={overrideError} />
+            {!overrideDevice.device_id && (
+              <input name="device_id" required placeholder="device id" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-sm" />
+            )}
+            {[...AGENT_POSTURE_CHECKS, ...OVERRIDE_ONLY_CHECKS].map((k) => (
+              <label key={k} className="flex items-center justify-between text-sm">
+                <span>{CHECK_LABELS[k]}</span>
+                <select name={k} defaultValue="" className="px-2 py-1 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-sm">
+                  <option value="">unset</option>
+                  <option value="yes">yes</option>
+                  <option value="no">no</option>
+                </select>
+              </label>
+            ))}
+            <div className="flex gap-2 pt-2">
+              <button type="submit" className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">Save override</button>
+              <button type="button" onClick={() => setOverrideDevice(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg">Cancel</button>
+            </div>
+          </form>
+        </div>
+      )}
 
       <DetailDrawer
         open={!!detailDevice}
@@ -1007,18 +1160,17 @@ function DeviceTrustTab({
                     { label: 'Trust Score', value: detailDevice.trust_score },
                     { label: 'Trust Level', value: detailDevice.trust_level },
                     {
-                      label: 'Compliance',
-                      value: detailDevice.compliance_status && Object.keys(detailDevice.compliance_status).length > 0
-                        ? JSON.stringify(detailDevice.compliance_status)
-                        : null,
-                      mono: true,
-                      full: true,
+                      label: 'Compliant',
+                      value: detailDevice.is_compliant === true ? 'yes' : detailDevice.is_compliant === false ? 'no' : `not determined (${String(detailDevice.posture_status || 'not_reported').replace(/_/g, ' ')})`,
                     },
-                    { label: 'Encryption', value: detailDevice.encryption_enabled ? 'Enabled' : 'Disabled' },
-                    { label: 'Antivirus', value: detailDevice.antivirus_active ? 'Active' : 'Inactive' },
-                    { label: 'Firewall', value: detailDevice.firewall_enabled ? 'Enabled' : 'Disabled' },
-                    { label: 'Certificate', value: detailDevice.certificate_valid ? 'Valid' : 'Invalid' },
-                    { label: 'Jailbroken', value: detailDevice.jailbroken ? 'Yes' : 'No' },
+                    {
+                      label: 'Posture source',
+                      value: detailDevice.posture_source === 'admin_override' ? 'administrator override (not measured)' : detailDevice.posture_source,
+                    },
+                    ...[...AGENT_POSTURE_CHECKS, ...OVERRIDE_ONLY_CHECKS].map((k) => ({
+                      label: CHECK_LABELS[k],
+                      value: checkLabel(detailDevice.compliance_checks?.[k]),
+                    })),
                     {
                       label: 'Risk Factors',
                       value: Array.isArray(detailDevice.risk_factors) && detailDevice.risk_factors.length > 0

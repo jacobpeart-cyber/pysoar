@@ -80,13 +80,26 @@ function itemsFrom(body: Record<string, unknown>): string[] {
       else items.push(str(raw));
     }
   }
-  // 422 no_valid_rows (ITDR CSV import): [{line, error}] or plain strings
+  // 422 no_valid_rows (ITDR CSV import): [{line, error}] or plain strings;
+  // request validation entries [{loc, msg}] and row errors [{row, reason}].
   if (Array.isArray(body.errors)) {
     for (const raw of body.errors) {
       const e = asRecord(raw);
-      if (e) items.push(e.line !== undefined ? `Line ${str(e.line)}: ${str(e.error)}` : str(e.error ?? e.message));
-      else items.push(str(raw));
+      if (!e) items.push(str(raw));
+      else if (e.line !== undefined) items.push(`Line ${str(e.line)}: ${str(e.error)}`);
+      else if (Array.isArray(e.loc)) items.push(`${e.loc.map(str).join('.')}: ${str(e.msg)}`);
+      else if (e.row !== undefined) items.push(`Row ${str(e.row)}: ${str(e.reason ?? e.error)}`);
+      else items.push(str(e.error ?? e.message ?? e.msg));
     }
+  }
+  // The app-wide validation handler nests the list: {details: {errors}}.
+  const details = asRecord(body.details);
+  if (details && Array.isArray(details.errors)) items.push(...itemsFrom({ errors: details.errors }));
+  // 422 invalid_fair_input / invalid_field: the input at fault.
+  if (typeof body.field === 'string' && body.field) items.push(`Field: ${body.field}`);
+  // 409 agent_selection_required (OT actions): the capable agents to pick from.
+  if (Array.isArray(body.agent_ids) && body.agent_ids.length) {
+    items.push(`Capable agents: ${body.agent_ids.map(str).join(', ')}`);
   }
   // 502 darkweb_scan_failed: {source: {label, status, reason|error}}
   const sources = asRecord(body.sources);

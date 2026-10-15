@@ -27,7 +27,8 @@ import { api } from '../lib/api';
 import clsx from 'clsx';
 import FormModal from '../components/FormModal';
 import LoadErrorBanner from '../components/LoadErrorBanner';
-import { describeLoadError } from '../lib/loadError';
+import ActionErrorBanner from '../components/ActionErrorBanner';
+import type { Row } from '../lib/apiRow';
 
 type TabType = 'dashboard' | 'audit-trail' | 'evidence' | 'packages' | 'conmon';
 
@@ -46,6 +47,11 @@ const statusColorMap: Record<string, string> = {
   draft: 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-400',
   'in-review': 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400',
   submitted: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400',
+  collecting: 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-400',
+  packaged: 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400',
+  compliant: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400',
+  non_compliant: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400',
+  not_assessed: 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300',
 };
 
 const riskColorMap: Record<string, string> = {
@@ -67,9 +73,16 @@ function getRiskColor(risk: string): string {
 // or null when there is no such field; null renders "not available".
 interface DashboardData {
   auditEventsThisMonth: number | null;
+  auditEventsLast24h: number | null;
   evidenceItemsCount: number | null;
+  approvedEvidenceCount: number | null;
   activePackagesCount: number | null;
+  // FedRAMP Moderate readiness from control records; null without controls.
   readinessScore: number | null;
+  readinessFramework: string | null;
+  conmonStatus: string | null;
+  lastConmonRun: string | null;
+  recentEvents: AuditEvent[];
   // Packages whose evidence_items map is non-empty, out of all packages.
   packageCoverage: {
     withEvidence: number;
@@ -102,23 +115,30 @@ interface EvidenceItem {
   created_at?: string;
 }
 
+// EvidencePackageResponse (src/schemas/audit_evidence.py).
 interface Package {
   id: string;
   name: string;
-  framework: string;
-  status: 'draft' | 'in-review' | 'submitted' | 'approved';
-  evidenceCount: number;
-  dueDate: string;
-  assessor: string;
+  description?: string | null;
+  package_type: string;
+  framework_id?: string | null;
+  status: string;
+  evidence_items: Record<string, unknown>;
+  due_date?: string | null;
+  assessor?: string | null;
+  submitted_at?: string | null;
+  package_hash?: string | null;
 }
 
+// GET /audit-evidence/conmon/status rows.
 interface ConMonStatus {
   id: string;
   name: string;
   active: boolean;
-  lastRun: string;
+  lastRun: string | null;
   status?: string;
-  compliance_percentage?: number;
+  reason?: string | null;
+  compliance_percentage?: number | null;
   last_run?: string; // back-compat alias
 }
 
@@ -130,7 +150,8 @@ export default function AuditEvidence() {
   const [dateRangeFilter, setDateRangeFilter] = useState<string>('7d');
   const [evidenceStatusFilter, setEvidenceStatusFilter] = useState<string>('all');
   const [evidenceTypeFilter, setEvidenceTypeFilter] = useState<string>('all');
-  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<{ what: string; error: unknown } | null>(null);
+  const [conmonReport, setConmonReport] = useState<Row | null>(null);
   const queryClient = useQueryClient();
 
   const { data: dashboardData, isLoading: dashboardLoading, error: dashboardError } = useQuery<DashboardData>({
@@ -146,20 +167,24 @@ export default function AuditEvidence() {
         api.get('/audit-evidence/packages'),
         api.get('/audit-evidence/dashboard/stats'),
       ]);
-      const pkgs: any[] = Array.isArray(pkgRes.data) ? pkgRes.data : (pkgRes.data?.items || []);
-      const active = pkgs.filter((p: any) => p.status !== 'approved' && p.status !== 'archived').length;
-      const hasEvidence = (p: any) =>
+      const pkgs: Row[] = Array.isArray(pkgRes.data) ? pkgRes.data : (pkgRes.data?.items || []);
+      const active = pkgs.filter((p) => p.status !== 'approved' && p.status !== 'archived').length;
+      const hasEvidence = (p: Row) =>
         p?.evidence_items && typeof p.evidence_items === 'object' && Object.keys(p.evidence_items).length > 0;
       const withEv = pkgs.filter(hasEvidence).length;
       const stats = statsRes.data ?? {};
+      const num = (v: unknown) => (typeof v === 'number' ? v : null);
       return {
-        auditEventsThisMonth: typeof stats.audit_entries_this_month === 'number' ? stats.audit_entries_this_month : null,
-        // AuditDashboardStats has no evidence-item total and no readiness
-        // score; /readiness/check is the real readiness source and is not
-        // wired here, so neither number is invented.
-        evidenceItemsCount: null,
+        auditEventsThisMonth: num(stats.audit_entries_this_month),
+        auditEventsLast24h: num(stats.audit_events_last_24h),
+        evidenceItemsCount: num(stats.total_evidence_items),
+        approvedEvidenceCount: num(stats.approved_evidence_items),
         activePackagesCount: active,
-        readinessScore: null,
+        readinessScore: num(stats.readiness_score),
+        readinessFramework: stats.readiness_framework ?? null,
+        conmonStatus: stats.conmon_status ?? null,
+        lastConmonRun: stats.last_conmon_run ?? null,
+        recentEvents: Array.isArray(stats.recent_audit_events) ? stats.recent_audit_events : [],
         packageCoverage: pkgs.length > 0
           ? { withEvidence: withEv, withoutEvidence: pkgs.length - withEv }
           : null,
@@ -179,7 +204,7 @@ export default function AuditEvidence() {
       // reads. Previously only `type` was passed, so resultFilter and
       // dateRangeFilter were silently ignored — user changed filters
       // and saw no change in results.
-      const body: Record<string, any> = {};
+      const body: Record<string, string> = {};
       if (eventTypeFilter !== 'all') body.event_type = eventTypeFilter;
       if (resultFilter !== 'all') body.result = resultFilter;
       const rangeDays: Record<string, number> = {
@@ -221,36 +246,25 @@ export default function AuditEvidence() {
       const response = await api.get('/audit-evidence/conmon/status');
       const d = response.data;
       if (Array.isArray(d)) return d;
-      // Back-compat: older /conmon/status returned an object {status, checks, last_run}
-      if (d && typeof d === 'object' && d.checks && typeof d.checks === 'object') {
-        const now = d.last_run || new Date().toISOString();
-        return Object.entries(d.checks).map(([key, val]: [string, any]) => ({
-          id: key,
-          name: key.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
-          active: val?.status === 'compliant' || val?.status === 'on_track',
-          lastRun: now,
-        }));
-      }
+      // An object without rows is not a status list; show nothing rather
+      // than inventing a run time.
       return [];
     },
   });
 
+  // Runs and stores a ConMon cycle (its time becomes lastRun).
   const runConMonMutation = useMutation({
     mutationFn: async () => {
       const response = await api.post('/audit-evidence/conmon/run');
       return response.data;
     },
-    onSuccess: () => {
+    onSuccess: (data: Row) => {
       setActionError(null);
+      setConmonReport(data);
       queryClient.invalidateQueries({ queryKey: ['conmon-status'] });
       queryClient.invalidateQueries({ queryKey: ['audit-evidence-dashboard'] });
     },
-    onError: (err: any) => {
-      console.error('ConMon run failed:', err);
-      setActionError(
-        err?.response?.data?.detail || err?.message || 'Failed to run continuous monitoring'
-      );
-    },
+    onError: (err: unknown) => setActionError({ what: 'run the ConMon cycle', error: err }),
   });
 
   const deleteEvidenceMutation = useMutation({
@@ -260,6 +274,7 @@ export default function AuditEvidence() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['evidence-items'] });
     },
+    onError: (err: unknown) => setActionError({ what: 'delete the evidence item', error: err }),
   });
 
   const approveEvidenceMutation = useMutation({
@@ -271,9 +286,7 @@ export default function AuditEvidence() {
       setActionError(null);
       queryClient.invalidateQueries({ queryKey: ['evidence-items'] });
     },
-    onError: (err: unknown) => {
-      setActionError(`Failed to approve evidence. ${describeLoadError(err)}`);
-    },
+    onError: (err: unknown) => setActionError({ what: 'approve the evidence', error: err }),
   });
 
   // Helpers now live at module scope (statusColorMap/riskColorMap + getStatusColor/getRiskColor)
@@ -288,9 +301,8 @@ export default function AuditEvidence() {
       </div>
 
       {actionError && (
-        <div className="flex items-start gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">
-          <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
-          <div className="flex-1">{actionError}</div>
+        <div className="flex items-start gap-2">
+          <div className="flex-1"><ActionErrorBanner what={actionError.what} error={actionError.error} /></div>
           <button
             onClick={() => setActionError(null)}
             className="text-red-700 hover:text-red-900 text-sm"
@@ -334,8 +346,8 @@ export default function AuditEvidence() {
             <DashboardTab
               data={dashboardData}
               loading={dashboardLoading}
-              recentEvents={(auditTrail || []).slice(0, 5)}
-              recentEventsError={auditError}
+              recentEvents={(dashboardData?.recentEvents ?? []).slice(0, 5)}
+              recentEventsError={null}
             />
           )}
         </>
@@ -377,16 +389,27 @@ export default function AuditEvidence() {
       {activeTab === 'packages' && (
         <>
           <LoadErrorBanner what="evidence packages" error={packagesError} />
-          <PackagesTab packages={packages || []} loading={packagesLoading} />
+          <PackagesTab packages={packages || []} loading={packagesLoading} evidence={evidenceItems || []} />
         </>
       )}
 
       {/* ConMon Tab */}
       {activeTab === 'conmon' && <LoadErrorBanner what="continuous monitoring status" error={conmonError} />}
+      {activeTab === 'conmon' && conmonReport && (
+        <div className="text-sm bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded p-3 flex justify-between gap-4">
+          <span>
+            ConMon cycle {conmonReport.persisted ? 'stored' : 'computed (not stored)'}: overall{' '}
+            <span className="font-medium">{String(conmonReport.overall_status ?? 'not_assessed').replace(/_/g, ' ')}</span>
+            {conmonReport.assessment_id ? ` · assessment ${conmonReport.assessment_id}` : ''}.
+          </span>
+          <button onClick={() => setConmonReport(null)} className="text-xs underline">dismiss</button>
+        </div>
+      )}
       {activeTab === 'conmon' && (
         <ConMonTab
           statuses={conmonStatuses || []}
           loading={conmonLoading}
+          running={runConMonMutation.isPending}
           onRunConMon={() => runConMonMutation.mutate()}
         />
       )}
@@ -422,13 +445,13 @@ function DashboardTab({
       {/* KPI Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         <KPICard
-          label="Audit Events (this month)"
+          label={`Audit Events (this month)${typeof data?.auditEventsLast24h === 'number' ? ` · ${data.auditEventsLast24h} in 24 h` : ''}`}
           value={fmt(data?.auditEventsThisMonth)}
           icon={Square}
           color="blue"
         />
         <KPICard
-          label="Evidence Items"
+          label={`Evidence Items${typeof data?.approvedEvidenceCount === 'number' ? ` · ${data.approvedEvidenceCount} approved` : ''}`}
           value={fmt(data?.evidenceItemsCount)}
           icon={FileText}
           color="green"
@@ -440,12 +463,17 @@ function DashboardTab({
           color="orange"
         />
         <KPICard
-          label="Readiness Score"
+          label={`Readiness (${data?.readinessFramework || 'FedRAMP Moderate'})`}
           value={typeof data?.readinessScore === 'number' ? `${data.readinessScore}%` : 'not available'}
           icon={CheckCircle}
           color="purple"
         />
       </div>
+      <p className="text-xs text-gray-500 dark:text-gray-400">
+        ConMon: {String(data?.conmonStatus ?? 'not_run').replace(/_/g, ' ')}
+        {data?.lastConmonRun ? ` · last cycle ${new Date(data.lastConmonRun).toLocaleString()}` : ' · no cycle stored yet'}
+        {typeof data?.readinessScore !== 'number' && ' · readiness is not available until FedRAMP control records exist'}
+      </p>
 
       {/* Evidence Coverage Chart */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
@@ -795,9 +823,29 @@ function EvidenceTab({
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
+  const [collectResult, setCollectResult] = useState<Row | null>(null);
+  const [collectError, setCollectError] = useState<unknown>(null);
+  const [collecting, setCollecting] = useState(false);
+
+  // Run every enabled automated evidence rule: each one collects, reports
+  // awaiting_integration, finds no matching controls, or fails.
+  const collectAll = async () => {
+    setCollecting(true);
+    setCollectError(null);
+    setCollectResult(null);
+    try {
+      const res = await api.post('/audit-evidence/evidence/collect-all', {});
+      setCollectResult(res.data);
+      queryClient.invalidateQueries({ queryKey: ['evidence-items'] });
+    } catch (err) {
+      setCollectError(err);
+    } finally {
+      setCollecting(false);
+    }
+  };
 
   // Load compliance controls so the upload form can attach evidence to a real control
-  const { data: controlsData, error: controlsError } = useQuery<{ items?: any[] } | any[]>({
+  const { data: controlsData, error: controlsError } = useQuery<{ items?: Row[] } | Row[]>({
     queryKey: ['compliance-controls-for-evidence'],
     queryFn: async () => {
       const res = await api.get('/compliance/controls', { params: { limit: 500 } });
@@ -805,8 +853,8 @@ function EvidenceTab({
     },
   });
   const controlOptions: Array<{ value: string; label: string }> = (() => {
-    const list = Array.isArray(controlsData) ? controlsData : (controlsData as any)?.items || [];
-    return list.map((c: any) => ({
+    const list: Row[] = Array.isArray(controlsData) ? controlsData : controlsData?.items || [];
+    return list.map((c: Row) => ({
       value: c.id,
       label: `${c.control_id || c.code || c.id} — ${c.title || ''}`.slice(0, 120),
     }));
@@ -824,7 +872,7 @@ function EvidenceTab({
   const evidenceStatuses = ['all', 'pending', 'reviewed', 'approved'];
 
   const getTypeIcon = (type: string) => {
-    const icons: Record<string, React.ComponentType> = {
+    const icons: Record<string, React.ComponentType<{ className?: string }>> = {
       document: FileText,
       screenshot: Image,
       log: Square,
@@ -836,6 +884,40 @@ function EvidenceTab({
 
   return (
     <div className="space-y-6">
+      <div className="flex flex-wrap items-center gap-3">
+        <button
+          onClick={collectAll}
+          disabled={collecting}
+          className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium disabled:opacity-50"
+        >
+          {collecting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Zap className="w-4 h-4" />}
+          Run Automated Evidence Rules
+        </button>
+        <span className="text-xs text-gray-500 dark:text-gray-400">
+          Rules that need an integration that is not installed report &quot;awaiting integration&quot; and write nothing.
+        </span>
+      </div>
+      <ActionErrorBanner what="run the automated evidence rules" error={collectError} />
+      {collectResult && (
+        <div className="text-sm bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded p-3 space-y-1">
+          <p>
+            {String(collectResult.status ?? '').replace(/_/g, ' ')}: {collectResult.rules_run ?? 0} rule(s) run, {collectResult.collected ?? 0} collected,{' '}
+            {collectResult.evidence_written ?? 0} evidence row(s) written, {collectResult.awaiting_integration ?? 0} awaiting an integration,{' '}
+            {collectResult.no_matching_controls ?? 0} without matching controls, {collectResult.failed ?? 0} failed.
+            {collectResult.reason ? ` ${collectResult.reason}` : ''}
+          </p>
+          {collectResult.results && typeof collectResult.results === 'object' && Object.keys(collectResult.results).length > 0 && (
+            <ul className="text-xs list-disc ml-5 max-h-40 overflow-y-auto">
+              {(Object.values(collectResult.results) as Row[]).map((r: Row, i: number) => (
+                <li key={i}>
+                  {r.rule_name ?? r.rule_id ?? `rule ${i + 1}`}: {String(r.status ?? '').replace(/_/g, ' ')}
+                  {r.evidence?.reason ? ` (${r.evidence.reason})` : r.reason ? ` (${r.reason})` : ''}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
       {/* Filters */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
         <div className="flex items-center gap-2 mb-4">
@@ -1182,11 +1264,29 @@ function EvidenceTab({
 function PackagesTab({
   packages,
   loading,
+  evidence,
 }: {
   packages: Package[];
   loading: boolean;
+  evidence: EvidenceItem[];
 }) {
   const queryClient = useQueryClient();
+  const [pkgActionError, setPkgActionError] = useState<{ what: string; error: unknown } | null>(null);
+  const [pkgNotice, setPkgNotice] = useState<string | null>(null);
+  const [addingTo, setAddingTo] = useState<Package | null>(null);
+  const [selectedEvidence, setSelectedEvidence] = useState<string[]>([]);
+  const pkgAction = async (what: string, fn: () => Promise<string | void>) => {
+    setPkgActionError(null);
+    setPkgNotice(null);
+    try {
+      const msg = await fn();
+      if (msg) setPkgNotice(msg);
+      queryClient.invalidateQueries({ queryKey: ['audit-packages'] });
+      queryClient.invalidateQueries({ queryKey: ['audit-evidence-dashboard'] });
+    } catch (error) {
+      setPkgActionError({ what, error });
+    }
+  };
   const [showCreatePkg, setShowCreatePkg] = useState(false);
   const [pkgName, setPkgName] = useState('');
   const [pkgDescription, setPkgDescription] = useState('');
@@ -1210,6 +1310,59 @@ function PackagesTab({
 
   return (
     <div className="space-y-6">
+      {pkgActionError && <ActionErrorBanner what={pkgActionError.what} error={pkgActionError.error} />}
+      {pkgNotice && (
+        <div className="text-sm bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded p-3 flex justify-between gap-4">
+          <span>{pkgNotice}</span>
+          <button onClick={() => setPkgNotice(null)} className="text-xs underline">dismiss</button>
+        </div>
+      )}
+      {addingTo && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setAddingTo(null)}>
+          <div className="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-lg mx-4 p-6 space-y-3" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Add evidence to {addingTo.name}</h2>
+            {evidence.length === 0 ? (
+              <p className="text-sm text-gray-500">No evidence item is stored. Upload or collect evidence first.</p>
+            ) : (
+              <div className="max-h-72 overflow-y-auto space-y-1 text-sm">
+                {evidence.map((ev) => (
+                  <label key={ev.id} className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={selectedEvidence.includes(ev.id)}
+                      onChange={(e) => setSelectedEvidence((prev) => (e.target.checked ? [...prev, ev.id] : prev.filter((x) => x !== ev.id)))}
+                    />
+                    <span className="truncate">{ev.title}</span>
+                    <span className="text-xs text-gray-500">{ev.control} · {ev.status}</span>
+                  </label>
+                ))}
+              </div>
+            )}
+            <div className="flex gap-2">
+              <button
+                disabled={selectedEvidence.length === 0}
+                onClick={() => {
+                  const target = addingTo;
+                  pkgAction('add evidence to the package', async () => {
+                    const res = await api.post(`/audit-evidence/packages/${target.id}/evidence`, { evidence_ids: selectedEvidence });
+                    setAddingTo(null);
+                    return `${res.data?.added ?? 0} item(s) added to ${target.name}${res.data?.not_found?.length ? `, ${res.data.not_found.length} not found` : ''}; the package now holds ${res.data?.evidence_count ?? 0}.`;
+                  });
+                }}
+                className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg disabled:opacity-50"
+              >
+                Add {selectedEvidence.length || ''} item(s)
+              </button>
+              <button onClick={() => setAddingTo(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg">Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {packages.length === 0 && (
+        <p className="text-sm text-gray-500 dark:text-gray-400 text-center py-8 border border-dashed border-gray-300 dark:border-gray-700 rounded-lg">
+          No evidence package yet.
+        </p>
+      )}
       {/* Create Package Button */}
       <button
         onClick={() => {
@@ -1383,22 +1536,11 @@ function PackagesTab({
                   {pkg.name}
                 </h3>
                 <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-                  {pkg.framework}
+                  {String(pkg.package_type || '').replace(/_/g, ' ')}
                 </p>
               </div>
-              <span
-                className={clsx(
-                  'inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium',
-                  pkg.status === 'draft'
-                    ? 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-400'
-                    : pkg.status === 'in-review'
-                    ? 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400'
-                    : pkg.status === 'submitted'
-                    ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400'
-                    : 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400'
-                )}
-              >
-                {(pkg.status || '').replace('-', ' ')}
+              <span className={clsx('inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium', getStatusColor(pkg.status))}>
+                {(pkg.status || '').replace(/[-_]/g, ' ')}
               </span>
             </div>
 
@@ -1406,34 +1548,53 @@ function PackagesTab({
               <div className="flex items-center justify-between text-sm text-gray-600 dark:text-gray-400">
                 <span>Evidence Items</span>
                 <span className="font-medium text-gray-900 dark:text-white">
-                  {pkg.evidenceCount}
+                  {Object.keys(pkg.evidence_items || {}).length}
                 </span>
               </div>
               <div className="flex items-center justify-between text-sm text-gray-600 dark:text-gray-400">
                 <span>Due Date</span>
                 <span className="font-medium text-gray-900 dark:text-white">
-                  {new Date(pkg.dueDate || pkg.due_date || "").toLocaleDateString()}
+                  {pkg.due_date ? new Date(pkg.due_date).toLocaleDateString() : 'no due date'}
                 </span>
               </div>
               <div className="flex items-center justify-between text-sm text-gray-600 dark:text-gray-400">
                 <span>Assessor</span>
                 <span className="font-medium text-gray-900 dark:text-white">
-                  {pkg.assessor}
+                  {pkg.assessor || '—'}
                 </span>
               </div>
+              {pkg.package_hash && (
+                <div className="text-xs text-gray-500 font-mono truncate" title={pkg.package_hash}>sha256 {pkg.package_hash}</div>
+              )}
             </div>
 
-            <div className="flex gap-2">
-              {pkg.status === 'draft' && (
+            <div className="flex flex-wrap gap-2">
+              {!pkg.submitted_at && (
                 <button
-                  onClick={async () => {
-                    try {
-                      await api.post(`/audit-evidence/packages/${pkg.id}/submit`);
-                      queryClient.invalidateQueries({ queryKey: ['audit-packages'] });
-                    } catch (err) {
-                      console.error('Package submit failed:', err);
-                    }
-                  }}
+                  onClick={() => { setSelectedEvidence([]); setAddingTo(pkg); }}
+                  className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm font-medium"
+                >
+                  Add Evidence
+                </button>
+              )}
+              {!pkg.submitted_at && (
+                <button
+                  onClick={() => pkgAction(`build ${pkg.name}`, async () => {
+                    const res = await api.post(`/audit-evidence/packages/${pkg.id}/package`);
+                    return `${pkg.name} built${res.data?.package_hash ? ` (sha256 ${String(res.data.package_hash).slice(0, 16)}…)` : ''}.`;
+                  })}
+                  title="Assemble and hash the package (refused while it holds no evidence)"
+                  className="flex-1 px-4 py-2 border border-blue-600 text-blue-700 dark:text-blue-300 rounded-lg text-sm font-medium"
+                >
+                  Build Package
+                </button>
+              )}
+              {!pkg.submitted_at && (
+                <button
+                  onClick={() => pkgAction(`submit ${pkg.name}`, async () => {
+                    await api.post(`/audit-evidence/packages/${pkg.id}/submit`);
+                    return `${pkg.name} submitted.`;
+                  })}
                   className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium"
                 >
                   Submit
@@ -1455,12 +1616,12 @@ function PackagesTab({
                     document.body.removeChild(a);
                     URL.revokeObjectURL(url);
                   } catch (err) {
-                    console.error('Package report download failed:', err);
+                    setPkgActionError({ what: 'download the package report', error: err });
                   }
                 }}
                 className="flex-1 px-4 py-2 bg-gray-100 dark:bg-gray-700 text-gray-900 dark:text-white rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 text-sm font-medium"
               >
-                View Details
+                Download Report
               </button>
             </div>
           </div>
@@ -1473,12 +1634,15 @@ function PackagesTab({
 function ConMonTab({
   statuses,
   loading,
+  running,
   onRunConMon,
 }: {
   statuses: ConMonStatus[];
   loading: boolean;
+  running: boolean;
   onRunConMon: () => void;
 }) {
+  const [reportError, setReportError] = useState<unknown>(null);
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -1500,7 +1664,9 @@ function ConMonTab({
               <h3 className="font-semibold text-gray-900 dark:text-white">
                 {status.name}
               </h3>
-              {status.active ? (
+              {status.status === 'not_assessed' ? (
+                <Clock className="w-5 h-5 text-gray-400" />
+              ) : status.active ? (
                 <CheckCircle className="w-5 h-5 text-green-600 dark:text-green-400" />
               ) : (
                 <AlertCircle className="w-5 h-5 text-red-600 dark:text-red-400" />
@@ -1509,22 +1675,21 @@ function ConMonTab({
 
             <div className="space-y-2 text-sm text-gray-600 dark:text-gray-400">
               <div>
-                Status: <span className="font-medium text-gray-900 dark:text-white capitalize">
-                  {status.status || (status.active ? 'Active' : 'Inactive')}
+                Status: <span className="font-medium text-gray-900 dark:text-white">
+                  {String(status.status || (status.active ? 'passing' : 'failing')).replace(/_/g, ' ')}
                 </span>
               </div>
-              {status.compliance_percentage != null && (
-                <div>
-                  Compliance: <span className="font-medium text-gray-900 dark:text-white">
-                    {status.compliance_percentage.toFixed(1)}%
-                  </span>
-                </div>
-              )}
+              <div>
+                Compliance: <span className="font-medium text-gray-900 dark:text-white">
+                  {status.compliance_percentage != null ? `${status.compliance_percentage.toFixed(1)}%` : 'not available'}
+                </span>
+              </div>
+              {status.reason && <div className="text-xs">{status.reason}</div>}
               <div>
                 Last Run: <span className="font-medium text-gray-900 dark:text-white">
                   {(() => {
                     const ts = status.lastRun || status.last_run;
-                    if (!ts) return '—';
+                    if (!ts) return 'no cycle stored';
                     const d = new Date(ts);
                     return isNaN(d.getTime()) ? '—' : d.toLocaleString();
                   })()}
@@ -1535,13 +1700,21 @@ function ConMonTab({
         ))}
       </div>
 
+      {statuses.length === 0 && (
+        <p className="text-sm text-gray-500 dark:text-gray-400 text-center py-6 border border-dashed border-gray-300 dark:border-gray-700 rounded-lg">
+          No ConMon check is reported.
+        </p>
+      )}
+      <ActionErrorBanner what="download the monthly report" error={reportError} />
+
       {/* Run ConMon Button */}
       <button
         onClick={onRunConMon}
-        className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium"
+        disabled={running}
+        className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium disabled:opacity-50"
       >
-        <Play className="w-5 h-5" />
-        Run ConMon Cycle
+        {running ? <Loader2 className="w-5 h-5 animate-spin" /> : <Play className="w-5 h-5" />}
+        Run and Store ConMon Cycle
       </button>
 
       {/* Generate Monthly Report — streams real FedRAMP ConMon monthly JSON report from backend */}
@@ -1567,7 +1740,7 @@ function ConMonTab({
             document.body.removeChild(a);
             URL.revokeObjectURL(url);
           } catch (err) {
-            console.error('Monthly report download failed:', err);
+            setReportError(err);
           }
         }}
         className="inline-flex items-center gap-2 px-6 py-3 bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white rounded-lg hover:bg-gray-300 dark:hover:bg-gray-600 font-medium"

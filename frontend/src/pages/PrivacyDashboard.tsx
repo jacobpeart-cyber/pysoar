@@ -13,6 +13,245 @@ import {
   BookOpen,
 } from 'lucide-react';
 import { api } from '../lib/api';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import ActionErrorBanner from '../components/ActionErrorBanner';
+import type { Row } from '../lib/apiRow';
+
+const NA = 'not available';
+
+function downloadBlob(blob: Blob, name: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// One data subject request and its workflow: verify identity -> search the
+// systems that hold personal data -> export (access / portability) or erase
+// (erasure) -> close. Every step is a server call; refusals show the
+// server's reason.
+function DSRDetail({ dsr, sources, onClose, onChanged }: { dsr: Row; sources: Row[]; onClose: () => void; onChanged: (updated?: Row) => void }) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<{ what: string; error: unknown } | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [method, setMethod] = useState('government_id');
+  const [evidence, setEvidence] = useState('');
+  const [pickedSources, setPickedSources] = useState<string[]>([]);
+  const [nextStatus, setNextStatus] = useState('');
+  const [denialReason, setDenialReason] = useState('');
+  const [notes, setNotes] = useState('');
+  const isExport = dsr.request_type === 'access' || dsr.request_type === 'portability';
+  const isErasure = dsr.request_type === 'erasure';
+
+  const step = async (key: string, what: string, fn: () => Promise<string | void>) => {
+    setBusy(key);
+    setError(null);
+    setNotice(null);
+    try {
+      const msg = await fn();
+      if (msg) setNotice(msg);
+    } catch (err) {
+      setError({ what, error: err });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const dataFound = (dsr.data_found?.sources ?? {}) as Record<string, Row>;
+  const erasureSources = (dsr.erasure_log?.sources ?? {}) as Record<string, Row>;
+
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50" onClick={onClose}>
+      <div className="bg-white rounded-lg p-6 max-w-2xl w-full shadow-xl max-h-[90vh] overflow-y-auto space-y-4" onClick={(e) => e.stopPropagation()}>
+        <div className="flex justify-between items-start">
+          <div>
+            <h2 className="text-lg font-bold text-gray-900">{dsr.request_type} request · {dsr.subject_name}</h2>
+            <p className="text-sm text-gray-500">{dsr.subject_email} · {String(dsr.regulation || '').toUpperCase()}</p>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600"><X className="w-5 h-5" /></button>
+        </div>
+        <div className="grid grid-cols-2 gap-2 text-sm">
+          <p>Status: <span className={`px-2 py-0.5 rounded text-xs font-medium ${statusBadgeClass(dsr.status || '')}`}>{dsr.status}</span></p>
+          <p>Deadline: {dsr.deadline ? String(dsr.deadline).slice(0, 10) : NA}
+            {dsr.overdue ? <span className="text-red-600 font-medium"> (overdue)</span> : dsr.days_remaining != null ? ` (${dsr.days_remaining} day(s) left)` : ''}</p>
+          <p>Identity: {dsr.identity_verified_at ? `verified ${String(dsr.identity_verified_at).slice(0, 10)} (${dsr.identity_verification_method})` : 'not verified'}</p>
+          <p>Searched: {dsr.searched_at ? String(dsr.searched_at).slice(0, 16).replace('T', ' ') : 'not yet'}</p>
+          {dsr.exported_at && <p className="col-span-2">Exported {String(dsr.exported_at).slice(0, 10)}: {dsr.export_record_count} record(s), sha256 <span className="font-mono text-xs">{dsr.export_sha256}</span></p>}
+          {dsr.processing_notes && <p className="col-span-2">Notes: {dsr.processing_notes}</p>}
+          {dsr.denial_reason && <p className="col-span-2 text-red-700">Denied: {dsr.denial_reason}</p>}
+        </div>
+
+        {error && <ActionErrorBanner what={error.what} error={error.error} />}
+        {notice && <p className="text-sm bg-blue-50 border border-blue-200 rounded p-2">{notice}</p>}
+
+        {dsr.status === 'received' && (
+          <div className="border rounded p-3 space-y-2">
+            <h3 className="text-sm font-semibold">1. Verify identity</h3>
+            <div className="grid grid-cols-2 gap-2">
+              <select value={method} onChange={(e) => setMethod(e.target.value)} className="border border-gray-300 rounded px-2 py-1 text-sm">
+                <option value="government_id">Government ID</option>
+                <option value="email_confirmation">E-mail confirmation</option>
+                <option value="account_login">Authenticated account</option>
+                <option value="knowledge_based">Knowledge-based questions</option>
+                <option value="other">Other</option>
+              </select>
+              <input value={evidence} onChange={(e) => setEvidence(e.target.value)} placeholder="How it was verified (evidence reference)" className="border border-gray-300 rounded px-2 py-1 text-sm" />
+            </div>
+            <button
+              disabled={busy !== null || evidence.trim().length < 3}
+              onClick={() => step('verify', 'verify the identity', async () => {
+                const res = await api.post(`/privacy/dsr/requests/${dsr.id}/verify-identity`, { verification_method: method, evidence });
+                onChanged(res.data);
+                return 'Identity verified.';
+              })}
+              className="px-3 py-1.5 text-sm bg-indigo-600 text-white rounded disabled:opacity-50"
+            >
+              Record Verification
+            </button>
+          </div>
+        )}
+
+        <div className="border rounded p-3 space-y-2">
+          <h3 className="text-sm font-semibold">2. Search systems for the subject&apos;s data</h3>
+          <div className="grid grid-cols-2 gap-1 text-xs">
+            {sources.map((s) => (
+              <label key={s.key} className="flex items-center gap-1" title={s.note ?? ''}>
+                <input
+                  type="checkbox"
+                  checked={pickedSources.includes(s.key)}
+                  onChange={(e) => setPickedSources((prev) => (e.target.checked ? [...prev, s.key] : prev.filter((k) => k !== s.key)))}
+                />
+                {s.label} <span className="text-gray-400">({s.erasure}{s.retain_reason ? `: ${s.retain_reason}` : ''})</span>
+              </label>
+            ))}
+          </div>
+          <p className="text-xs text-gray-500">None ticked = every source. Matching is on the subject&apos;s e-mail and identifier.</p>
+          <button
+            disabled={busy !== null}
+            onClick={() => step('search', 'search the systems', async () => {
+              const qs = new URLSearchParams();
+              pickedSources.forEach((k) => qs.append('systems', k));
+              // URLSearchParams keeps repeated keys (systems=a&systems=b), which the
+              // FastAPI list query expects.
+              const res = await api.post(`/privacy/dsr/requests/${dsr.id}/search-systems`, null, { params: qs });
+              onChanged();
+              return `${res.data?.total_records ?? 0} record(s) found across ${Object.keys(res.data?.sources ?? {}).length} source(s).`;
+            })}
+            className="px-3 py-1.5 text-sm border border-indigo-600 text-indigo-700 rounded disabled:opacity-50"
+          >
+            Search Systems
+          </button>
+          {Object.keys(dataFound).length > 0 && (
+            <ul className="text-xs list-disc ml-5">
+              {Object.entries(dataFound).map(([k, v]) => (
+                <li key={k}>{v.label ?? k}: {v.records} record(s) · erasure: {v.erasure}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        {isExport && (
+          <div className="border rounded p-3 space-y-2">
+            <h3 className="text-sm font-semibold">3. Export the subject&apos;s data</h3>
+            <div className="flex gap-2">
+              <button
+                disabled={busy !== null}
+                onClick={() => step('export-json', 'compile the export', async () => {
+                  const res = await api.post(`/privacy/dsr/requests/${dsr.id}/compile-data`, null, { params: { format_type: 'json' } });
+                  downloadBlob(new Blob([JSON.stringify(res.data?.package ?? res.data, null, 2)], { type: 'application/json' }), `dsr-${dsr.id}.json`);
+                  onChanged();
+                  return `Exported ${res.data?.record_count ?? 0} record(s); sha256 ${res.data?.sha256 ?? NA}.`;
+                })}
+                className="px-3 py-1.5 text-sm bg-indigo-600 text-white rounded disabled:opacity-50"
+              >
+                Download JSON
+              </button>
+              <button
+                disabled={busy !== null}
+                onClick={() => step('export-csv', 'compile the export', async () => {
+                  const res = await api.post(`/privacy/dsr/requests/${dsr.id}/compile-data`, null, { params: { format_type: 'csv' }, responseType: 'blob' });
+                  downloadBlob(res.data as Blob, `dsr-${dsr.id}.csv`);
+                  onChanged();
+                  const sha = res.headers?.['x-export-sha256'];
+                  return `CSV exported${sha ? `; sha256 ${sha}` : ''}.`;
+                })}
+                className="px-3 py-1.5 text-sm border border-gray-300 rounded disabled:opacity-50"
+              >
+                Download CSV
+              </button>
+            </div>
+          </div>
+        )}
+
+        {isErasure && (
+          <div className="border border-red-200 rounded p-3 space-y-2">
+            <h3 className="text-sm font-semibold text-red-700">3. Execute erasure (admin)</h3>
+            <p className="text-xs text-gray-600">
+              Anonymises, redacts or deletes the subject&apos;s rows per source; sources with a retention obligation are kept and listed with the reason.
+            </p>
+            <button
+              disabled={busy !== null}
+              onClick={() => {
+                if (!window.confirm(`Erase the stored personal data of ${dsr.subject_email}? This cannot be undone.`)) return;
+                step('erase', 'execute the erasure', async () => {
+                  const res = await api.post(`/privacy/dsr/requests/${dsr.id}/execute-erasure`, { confirm: true });
+                  onChanged(res.data);
+                  return `Erasure ${res.data?.status}: ${res.data?.erasure_log?.records_processed ?? 0} record(s) processed, ${res.data?.erasure_log?.records_retained ?? 0} retained.`;
+                });
+              }}
+              className="px-3 py-1.5 text-sm bg-red-600 text-white rounded disabled:opacity-50"
+            >
+              Execute Erasure
+            </button>
+            {Object.keys(erasureSources).length > 0 && (
+              <ul className="text-xs list-disc ml-5">
+                {Object.entries(erasureSources).map(([k, v]) => (
+                  <li key={k}>{k}: {v.action} {v.records ?? 0}{v.remaining ? `, ${v.remaining} remaining` : ''}{v.reason ? ` (${v.reason})` : ''}{v.note ? ` · ${v.note}` : ''}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+
+        <div className="border rounded p-3 space-y-2">
+          <h3 className="text-sm font-semibold">Status</h3>
+          <div className="grid grid-cols-2 gap-2">
+            <select value={nextStatus} onChange={(e) => setNextStatus(e.target.value)} className="border border-gray-300 rounded px-2 py-1 text-sm">
+              <option value="">— choose —</option>
+              <option value="processing">processing</option>
+              <option value="completed">completed</option>
+              <option value="partially_complete">partially complete</option>
+              <option value="denied">denied</option>
+              <option value="appealed">appealed</option>
+            </select>
+            <input value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Processing notes (optional)" className="border border-gray-300 rounded px-2 py-1 text-sm" />
+            {nextStatus === 'denied' && (
+              <input value={denialReason} onChange={(e) => setDenialReason(e.target.value)} placeholder="Denial reason (required)" className="col-span-2 border border-gray-300 rounded px-2 py-1 text-sm" />
+            )}
+          </div>
+          <p className="text-xs text-gray-500">The server enforces the workflow; erasure requests close only through Execute Erasure.</p>
+          <button
+            disabled={busy !== null || !nextStatus}
+            onClick={() => step('status', `move the request to ${nextStatus}`, async () => {
+              const res = await api.patch(`/privacy/dsr/requests/${dsr.id}`, {
+                status: nextStatus,
+                processing_notes: notes || undefined,
+                denial_reason: nextStatus === 'denied' ? denialReason : undefined,
+              });
+              onChanged(res.data);
+              return `Status set to ${res.data?.status ?? nextStatus}.`;
+            })}
+            className="px-3 py-1.5 text-sm border border-gray-300 rounded disabled:opacity-50"
+          >
+            Update Status
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 // --- Helpers ---
 
@@ -58,6 +297,8 @@ function riskBadgeClass(level: string): string {
       return 'bg-green-100 text-green-800';
     case 'negligible':
       return 'bg-gray-100 text-gray-600';
+    case 'not_assessed':
+      return 'bg-gray-50 text-gray-500 border border-dashed border-gray-300';
     default:
       return 'bg-gray-100 text-gray-800';
   }
@@ -95,6 +336,11 @@ export default function PrivacyDashboard() {
   const [showCreateROPA, setShowCreateROPA] = useState(false);
   const [showCreateIncident, setShowCreateIncident] = useState(false);
   const [consentSubjectId, setConsentSubjectId] = useState('');
+  const [openDsrId, setOpenDsrId] = useState<string | null>(null);
+  const [overdueOnly, setOverdueOnly] = useState(false);
+  const [rowError, setRowError] = useState<{ what: string; error: unknown } | null>(null);
+  const [incidentRegs, setIncidentRegs] = useState<string[]>([]);
+  const [deadlines, setDeadlines] = useState<Record<string, Row>>({});
 
   // --- DSR Form State ---
   const [dsrForm, setDsrForm] = useState({
@@ -150,22 +396,32 @@ export default function PrivacyDashboard() {
 
   // --- Queries ---
 
-  const { data: statsData } = useQuery({
+  const { data: statsData, error: statsError } = useQuery({
     queryKey: ['privacy-stats'],
     queryFn: async () => (await api.get('/privacy/dashboard/stats')).data,
   });
 
-  const { data: dsrData, isLoading: dsrLoading } = useQuery({
-    queryKey: ['privacy-dsrs'],
-    queryFn: async () => (await api.get('/privacy/dsr/requests')).data,
+  const { data: dsrData, isLoading: dsrLoading, error: dsrError } = useQuery({
+    queryKey: ['privacy-dsrs', overdueOnly],
+    queryFn: async () => (await api.get('/privacy/dsr/requests', { params: { overdue: overdueOnly || undefined } })).data,
   });
 
-  const { data: piaData, isLoading: piaLoading } = useQuery({
+  const { data: dsrSources } = useQuery<Row>({
+    queryKey: ['privacy-dsr-sources'],
+    queryFn: async () => (await api.get('/privacy/dsr/sources')).data,
+  });
+
+  const { data: deadlineAlerts, error: alertsError } = useQuery<Row[]>({
+    queryKey: ['privacy-dsr-alerts'],
+    queryFn: async () => (await api.get('/privacy/dsr/deadline-alerts')).data,
+  });
+
+  const { data: piaData, isLoading: piaLoading, error: piaError } = useQuery({
     queryKey: ['privacy-pias'],
     queryFn: async () => (await api.get('/privacy/pia/assessments')).data,
   });
 
-  const { data: consentData, isLoading: consentLoading } = useQuery({
+  const { data: consentData, isLoading: consentLoading, error: consentError } = useQuery({
     queryKey: ['privacy-consent', consentSubjectId],
     queryFn: async () => {
       if (!consentSubjectId) return [];
@@ -174,12 +430,12 @@ export default function PrivacyDashboard() {
     enabled: activeTab === 'consent',
   });
 
-  const { data: ropaData, isLoading: ropaLoading } = useQuery({
+  const { data: ropaData, isLoading: ropaLoading, error: ropaError } = useQuery({
     queryKey: ['privacy-ropa'],
     queryFn: async () => (await api.get('/privacy/ropa/processing-records')).data,
   });
 
-  const { data: incidentData, isLoading: incidentLoading } = useQuery({
+  const { data: incidentData, isLoading: incidentLoading, error: incidentError } = useQuery({
     queryKey: ['privacy-incidents'],
     queryFn: async () => (await api.get('/privacy/incidents/reports')).data,
   });
@@ -273,6 +529,21 @@ export default function PrivacyDashboard() {
     );
   }, [incidents, searchTerm]);
 
+  const openDsr = dsrs.find((d: Row) => d?.id === openDsrId) ?? null;
+  const refreshPrivacy = () => {
+    queryClient.invalidateQueries({ queryKey: ['privacy-dsrs'] });
+    queryClient.invalidateQueries({ queryKey: ['privacy-stats'] });
+    queryClient.invalidateQueries({ queryKey: ['privacy-dsr-alerts'] });
+  };
+  const rowAction = async (what: string, fn: () => Promise<void>) => {
+    setRowError(null);
+    try {
+      await fn();
+    } catch (error) {
+      setRowError({ what, error });
+    }
+  };
+
   const tabs = [
     { id: 'dsr' as const, label: 'DSR Requests', icon: UserCheck },
     { id: 'pia' as const, label: 'PIAs', icon: FileText },
@@ -293,13 +564,33 @@ export default function PrivacyDashboard() {
           <p className="text-gray-500 mt-1">Data Subject Rights, PIAs, Consent, ROPA & Incident Management</p>
         </div>
 
+        <div className="mb-4 space-y-2">
+          <LoadErrorBanner what="privacy statistics" error={statsError} />
+          <LoadErrorBanner what="DSR deadline alerts" error={alertsError} />
+          {rowError && <ActionErrorBanner what={rowError.what} error={rowError.error} />}
+          {(deadlineAlerts ?? []).length > 0 && (
+            <div className="text-sm bg-red-50 border border-red-200 text-red-800 rounded p-3">
+              <p className="font-medium">Open DSRs near or past their deadline</p>
+              <ul className="list-disc ml-5">
+                {(deadlineAlerts ?? []).map((a) => (
+                  <li key={a.dsr_id}>
+                    <button className="underline" onClick={() => { setActiveTab('dsr'); setOpenDsrId(a.dsr_id); }}>{a.subject}</button>: {a.status}
+                    {a.days_overdue != null ? ` (${a.days_overdue} day(s) overdue)` : a.days_remaining != null ? ` (${a.days_remaining} day(s) left)` : ''}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+
         {/* Stats Cards */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
           <div className="bg-white rounded-lg border border-gray-200 p-5">
             <div className="flex justify-between items-start">
               <div>
                 <p className="text-sm text-gray-500">Total DSRs</p>
-                <p className="text-2xl font-bold text-gray-900 mt-1">{statsData?.total_dsrs ?? dsrs.length}</p>
+                <p className="text-2xl font-bold text-gray-900 mt-1">{statsData?.total_dsrs ?? NA}</p>
+                <p className="text-xs text-gray-400">{statsData?.closed_dsrs ?? NA} closed · {statsData?.overdue_dsrs ?? NA} overdue</p>
               </div>
               <UserCheck className="w-6 h-6 text-indigo-500" />
             </div>
@@ -307,8 +598,8 @@ export default function PrivacyDashboard() {
           <div className="bg-white rounded-lg border border-gray-200 p-5">
             <div className="flex justify-between items-start">
               <div>
-                <p className="text-sm text-gray-500">Pending DSRs</p>
-                <p className="text-2xl font-bold text-yellow-600 mt-1">{statsData?.pending_dsrs ?? '-'}</p>
+                <p className="text-sm text-gray-500">Open DSRs</p>
+                <p className="text-2xl font-bold text-yellow-600 mt-1">{statsData?.pending_dsrs ?? NA}</p>
               </div>
               <Clock className="w-6 h-6 text-yellow-500" />
             </div>
@@ -318,7 +609,10 @@ export default function PrivacyDashboard() {
               <div>
                 <p className="text-sm text-gray-500">DSR Compliance Rate</p>
                 <p className="text-2xl font-bold text-green-600 mt-1">
-                  {statsData?.dsr_compliance_rate != null ? `${statsData.dsr_compliance_rate}%` : '-'}
+                  {statsData?.dsr_compliance_rate != null ? `${statsData.dsr_compliance_rate}%` : NA}
+                </p>
+                <p className="text-xs text-gray-400">
+                  {statsData?.dsr_compliance_rate != null ? 'closed DSRs closed by their deadline' : 'no DSR has been closed yet'}
                 </p>
               </div>
               <Scale className="w-6 h-6 text-green-500" />
@@ -328,7 +622,7 @@ export default function PrivacyDashboard() {
             <div className="flex justify-between items-start">
               <div>
                 <p className="text-sm text-gray-500">Active PIAs</p>
-                <p className="text-2xl font-bold text-purple-600 mt-1">{statsData?.active_pias ?? pias.length}</p>
+                <p className="text-2xl font-bold text-purple-600 mt-1">{statsData?.active_pias ?? NA}</p>
               </div>
               <FileText className="w-6 h-6 text-purple-500" />
             </div>
@@ -390,6 +684,9 @@ export default function PrivacyDashboard() {
                 <option value="denied">Denied</option>
                 <option value="appealed">Appealed</option>
               </select>
+              <label className="flex items-center gap-1 text-sm text-gray-600">
+                <input type="checkbox" checked={overdueOnly} onChange={(e) => setOverdueOnly(e.target.checked)} /> Overdue only
+              </label>
               <button
                 onClick={() => setShowCreateDSR(true)}
                 className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm flex items-center gap-2"
@@ -397,6 +694,7 @@ export default function PrivacyDashboard() {
                 <Plus className="w-4 h-4" /> New DSR
               </button>
             </div>
+            <LoadErrorBanner what="DSR requests" error={dsrError} />
             {dsrLoading ? (
               <p className="text-gray-500 py-8 text-center">Loading...</p>
             ) : (
@@ -415,8 +713,8 @@ export default function PrivacyDashboard() {
                   </thead>
                   <tbody>
                     {filteredDSRs.map((row: any) => (
-                      <tr key={row?.id} className="border-t border-gray-100 hover:bg-gray-50">
-                        <td className="px-4 py-3 text-sm font-mono text-indigo-600">{row?.id || ''}</td>
+                      <tr key={row?.id} className="border-t border-gray-100 hover:bg-gray-50 cursor-pointer" onClick={() => setOpenDsrId(row?.id)}>
+                        <td className="px-4 py-3 text-sm font-mono text-indigo-600 underline">{row?.id || ''}</td>
                         <td className="px-4 py-3 text-sm text-gray-900">{row?.request_type || ''}</td>
                         <td className="px-4 py-3 text-sm">
                           <span className="bg-gray-100 text-gray-700 px-2 py-0.5 rounded text-xs uppercase">
@@ -432,7 +730,10 @@ export default function PrivacyDashboard() {
                             {row?.status || ''}
                           </span>
                         </td>
-                        <td className="px-4 py-3 text-sm text-gray-600">{row?.deadline || ''}</td>
+                        <td className="px-4 py-3 text-sm text-gray-600">
+                          {row?.deadline ? String(row.deadline).slice(0, 10) : NA}
+                          {row?.overdue ? <div className="text-xs text-red-600">overdue</div> : row?.days_remaining != null ? <div className="text-xs text-gray-400">{row.days_remaining} day(s) left</div> : null}
+                        </td>
                         <td className="px-4 py-3 text-sm text-gray-500">{row?.created_at?.slice(0, 10) || ''}</td>
                       </tr>
                     ))}
@@ -457,6 +758,7 @@ export default function PrivacyDashboard() {
                 <Plus className="w-4 h-4" /> New PIA
               </button>
             </div>
+            <LoadErrorBanner what="PIA assessments" error={piaError} />
             {piaLoading ? (
               <p className="text-gray-500 py-8 text-center">Loading...</p>
             ) : (
@@ -484,9 +786,22 @@ export default function PrivacyDashboard() {
                           </span>
                         </td>
                         <td className="px-4 py-3 text-sm">
-                          <span className={`px-2 py-0.5 rounded text-xs font-medium ${riskBadgeClass(pia?.risk_level || '')}`}>
-                            {pia?.risk_level || ''}
-                          </span>
+                          <select
+                            value={pia?.risk_level || 'not_assessed'}
+                            aria-label="Risk level"
+                            onChange={(e) => {
+                              const value = e.target.value;
+                              rowAction('update the PIA risk level', async () => {
+                                await api.patch(`/privacy/pia/assessments/${pia.id}`, { risk_level: value });
+                                queryClient.invalidateQueries({ queryKey: ['privacy-pias'] });
+                              });
+                            }}
+                            className={`px-2 py-0.5 rounded text-xs font-medium ${riskBadgeClass(pia?.risk_level || '')}`}
+                          >
+                            {['not_assessed', 'negligible', 'low', 'medium', 'high', 'critical'].map((l) => (
+                              <option key={l} value={l}>{l.replace('_', ' ')}</option>
+                            ))}
+                          </select>
                         </td>
                         <td className="px-4 py-3 text-sm text-gray-500">{pia?.updated_at?.slice(0, 10) || ''}</td>
                       </tr>
@@ -524,6 +839,7 @@ export default function PrivacyDashboard() {
                 <Plus className="w-4 h-4" /> New Consent
               </button>
             </div>
+            <LoadErrorBanner what="consent records" error={consentError} />
             {consentLoading ? (
               <p className="text-gray-500 py-8 text-center">Loading...</p>
             ) : !consentSubjectId ? (
@@ -579,6 +895,7 @@ export default function PrivacyDashboard() {
                 <Plus className="w-4 h-4" /> New Processing Record
               </button>
             </div>
+            <LoadErrorBanner what="processing records" error={ropaError} />
             {ropaLoading ? (
               <p className="text-gray-500 py-8 text-center">Loading...</p>
             ) : (
@@ -603,8 +920,20 @@ export default function PrivacyDashboard() {
                         <td className="px-4 py-3 text-sm text-gray-600">
                           {Array.isArray(rec?.data_categories) ? rec.data_categories.join(', ') : (rec?.data_categories || '')}
                         </td>
-                        <td className="px-4 py-3 text-sm text-gray-600">{rec?.retention_period_days ?? ''}</td>
-                        <td className="px-4 py-3 text-sm text-gray-500">{rec?.created_at?.slice(0, 10) || ''}</td>
+                        <td className="px-4 py-3 text-sm text-gray-600">{rec?.retention_period_days ?? NA}</td>
+                        <td className="px-4 py-3 text-sm text-gray-500">
+                          {rec?.created_at?.slice(0, 10) || ''}
+                          <div className="text-xs">reviewed {rec?.last_reviewed ? String(rec.last_reviewed).slice(0, 10) : 'never'}</div>
+                          <button
+                            className="text-xs text-indigo-600 underline"
+                            onClick={() => rowAction('mark the record reviewed', async () => {
+                              await api.patch(`/privacy/ropa/processing-records/${rec.id}`, { last_reviewed: new Date().toISOString() });
+                              queryClient.invalidateQueries({ queryKey: ['privacy-ropa'] });
+                            })}
+                          >
+                            Mark reviewed today (admin)
+                          </button>
+                        </td>
                       </tr>
                     ))}
                     {ropas.length === 0 && (
@@ -628,6 +957,7 @@ export default function PrivacyDashboard() {
                 <Plus className="w-4 h-4" /> Report Incident
               </button>
             </div>
+            <LoadErrorBanner what="privacy incidents" error={incidentError} />
             {incidentLoading ? (
               <p className="text-gray-500 py-8 text-center">Loading...</p>
             ) : (
@@ -664,6 +994,28 @@ export default function PrivacyDashboard() {
                             <span className="text-red-600 font-medium">Required{inc?.notification_deadline ? ` by ${inc.notification_deadline}` : ''}</span>
                           ) : (
                             <span className="text-gray-400">Not required</span>
+                          )}
+                          <div className="text-xs text-gray-500">
+                            Regulations: {(inc?.regulations_implicated ?? []).join(', ') || 'none recorded'}
+                          </div>
+                          <button
+                            className="text-xs text-indigo-600 underline"
+                            onClick={() => rowAction('compute notification deadlines', async () => {
+                              const res = await api.post(`/privacy/incidents/reports/${inc.id}/notification-deadlines`);
+                              setDeadlines((prev) => ({ ...prev, [inc.id]: res.data }));
+                            })}
+                          >
+                            Notification deadlines
+                          </button>
+                          {deadlines[inc?.id] && (
+                            <div className="text-xs text-gray-600">
+                              {deadlines[inc.id].status === 'not_assessed'
+                                ? `Not assessed: ${deadlines[inc.id].detail ?? 'no regulation recorded'}`
+                                : Object.entries(deadlines[inc.id] as Record<string, unknown>)
+                                    .filter(([, v]) => typeof v === 'string' && /^\d{4}-/.test(v))
+                                    .map(([k, v]) => `${k}: ${String(v).slice(0, 16).replace('T', ' ')}`)
+                                    .join(' · ') || JSON.stringify(deadlines[inc.id])}
+                            </div>
                           )}
                         </td>
                         <td className="px-4 py-3 text-sm text-gray-600">{inc?.subjects_affected_count ?? '-'}</td>
@@ -740,7 +1092,7 @@ export default function PrivacyDashboard() {
                   {createDSR.isPending ? 'Creating...' : 'Create DSR'}
                 </button>
               </div>
-              {createDSR.isError && <p className="text-red-500 text-xs mt-2">Failed to create DSR. Please try again.</p>}
+              <div className="mt-2"><ActionErrorBanner what="create the DSR" error={createDSR.error} /></div>
             </div>
           </div>
         )}
@@ -807,7 +1159,7 @@ export default function PrivacyDashboard() {
                   {createPIA.isPending ? 'Creating...' : 'Create PIA'}
                 </button>
               </div>
-              {createPIA.isError && <p className="text-red-500 text-xs mt-2">Failed to create PIA. Please try again.</p>}
+              <div className="mt-2"><ActionErrorBanner what="create the PIA" error={createPIA.error} /></div>
             </div>
           </div>
         )}
@@ -858,7 +1210,7 @@ export default function PrivacyDashboard() {
                   {createConsent.isPending ? 'Creating...' : 'Create Consent'}
                 </button>
               </div>
-              {createConsent.isError && <p className="text-red-500 text-xs mt-2">Failed to create consent record.</p>}
+              <div className="mt-2"><ActionErrorBanner what="create the consent record" error={createConsent.error} /></div>
             </div>
           </div>
         )}
@@ -938,7 +1290,7 @@ export default function PrivacyDashboard() {
                   {createROPA.isPending ? 'Creating...' : 'Create Record'}
                 </button>
               </div>
-              {createROPA.isError && <p className="text-red-500 text-xs mt-2">Failed to create processing record.</p>}
+              <div className="mt-2"><ActionErrorBanner what="create the processing record" error={createROPA.error} /></div>
             </div>
           </div>
         )}
@@ -983,6 +1335,17 @@ export default function PrivacyDashboard() {
                   <label className="block text-xs font-medium text-gray-600 mb-1">Subjects Affected Count</label>
                   <input type="number" value={incidentForm.subjects_affected_count} onChange={(e) => setIncidentForm({ ...incidentForm, subjects_affected_count: parseInt(e.target.value) || 0 })} className="w-full border border-gray-300 rounded px-3 py-2 text-sm" />
                 </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Regulations implicated (sets notification deadlines)</label>
+                  <div className="flex gap-4 text-sm">
+                    {['gdpr', 'ccpa', 'hipaa'].map((r) => (
+                      <label key={r} className="flex items-center gap-1">
+                        <input type="checkbox" checked={incidentRegs.includes(r)} onChange={(e) => setIncidentRegs((prev) => (e.target.checked ? [...prev, r] : prev.filter((x) => x !== r)))} />
+                        {r.toUpperCase()}
+                      </label>
+                    ))}
+                  </div>
+                </div>
               </div>
               <div className="flex gap-3 mt-5">
                 <button onClick={() => setShowCreateIncident(false)} className="flex-1 border border-gray-300 text-gray-700 px-4 py-2 rounded-lg text-sm hover:bg-gray-50">Cancel</button>
@@ -990,6 +1353,7 @@ export default function PrivacyDashboard() {
                   onClick={() => createIncident.mutate({
                     ...incidentForm,
                     data_types_affected: incidentForm.data_types_affected.split(',').map((s) => s.trim()).filter(Boolean),
+                    regulations_implicated: incidentRegs,
                   })}
                   disabled={createIncident.isPending || !incidentForm.title || !incidentForm.description}
                   className="flex-1 bg-red-600 hover:bg-red-700 disabled:bg-red-300 text-white px-4 py-2 rounded-lg text-sm"
@@ -997,9 +1361,18 @@ export default function PrivacyDashboard() {
                   {createIncident.isPending ? 'Reporting...' : 'Report Incident'}
                 </button>
               </div>
-              {createIncident.isError && <p className="text-red-500 text-xs mt-2">Failed to report incident.</p>}
+              <div className="mt-2"><ActionErrorBanner what="report the incident" error={createIncident.error} /></div>
             </div>
           </div>
+        )}
+
+        {openDsr && (
+          <DSRDetail
+            dsr={openDsr}
+            sources={(dsrSources?.sources ?? []) as Row[]}
+            onClose={() => setOpenDsrId(null)}
+            onChanged={() => refreshPrivacy()}
+          />
         )}
       </div>
     </div>

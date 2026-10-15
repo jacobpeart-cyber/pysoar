@@ -6,22 +6,43 @@ import {
   ChevronRight,
   Plus,
   Filter,
-  Download,
   Calendar,
   CheckCircle,
   Clock,
   AlertCircle,
   Loader2,
   X,
-  Edit2,
-  Eye,
   FileText,
+  Trash2,
+  ShieldCheck,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
 import FormModal from '../components/FormModal';
 import LoadErrorBanner from '../components/LoadErrorBanner';
+import ActionErrorBanner from '../components/ActionErrorBanner';
 import { describeLoadError } from '../lib/loadError';
+import type { Row } from '../lib/apiRow';
+
+const NA = 'not available';
+
+// Statuses a control can hold (src/schemas/compliance.py ControlStatus plus
+// the attester's not_assessed).
+const CONTROL_STATUSES = ['implemented', 'partially_implemented', 'planned', 'not_implemented', 'not_applicable', 'not_assessed'];
+// Statuses a person can set by hand (PUT /controls/{id}); not_assessed is
+// the attester's verdict, not a manual one.
+const MANUAL_STATUSES = ['implemented', 'partially_implemented', 'planned', 'not_implemented', 'not_applicable'];
+const CONTROL_FAMILIES = ['AC', 'AT', 'AU', 'CA', 'CM', 'CP', 'IA', 'IR', 'MA', 'MP', 'PE', 'PL', 'PM', 'PS', 'PT', 'RA', 'SA', 'SC', 'SI', 'SR'];
+
+const controlStatusColor = (status: string) => {
+  switch (status) {
+    case 'implemented': return 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400';
+    case 'partially_implemented': return 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400';
+    case 'planned': return 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400';
+    case 'not_implemented': return 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400';
+    default: return 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-400';
+  }
+};
 
 type TabType = 'overview' | 'controls' | 'poams' | 'cui' | 'cisa';
 
@@ -33,25 +54,43 @@ interface DashboardData {
   overdue_poams: number;
   upcoming_poams?: number;
   upcoming_assessments: number;
-  control_status_breakdown: { total: number; implemented: number };
+  control_status_breakdown: Record<string, number>;
   active_cisa_directives: number;
   cui_assets_total: number;
   cui_assets_active?: number;
-  trends: Array<{ date: string; score: number }>;
+  // Stored assessment scores (90 days), one point per framework assessment.
+  trends: Array<{ date: string; framework_id?: string; score: number; satisfied?: number; failed?: number; controls?: number }>;
   last_updated?: string;
+}
+
+interface AssessmentBasis {
+  control?: string;
+  result?: 'pass' | 'fail' | 'not_assessed' | string;
+  summary?: string;
+  reason?: string | null;
+  basis?: Array<{ kind: string; source: string; value: unknown }>;
+  checked_at?: string;
+  approved_evidence?: number;
 }
 
 interface Control {
   id: string;
+  control_id: string;
+  framework_id: string;
   title: string;
   control_family: string;
-  status: 'implemented' | 'partially' | 'planned' | 'not_implemented';
-  implementation_status: string;
-  baseline: 'L' | 'M' | 'H';
-  last_assessed_at: string;
+  status: string;
+  implementation_status: number;
+  implementation_details?: string | null;
+  responsible_party?: string | null;
+  baseline: string | null;
+  last_assessed_at: string | null;
+  last_assessment_result?: string | null;
   evidence_ids: string[];
-  description?: string;
-  relatedControls?: string[];
+  description?: string | null;
+  related_controls?: Record<string, unknown>;
+  assessment_basis?: AssessmentBasis | null;
+  status_source?: 'seed' | 'attester' | 'manual' | string | null;
 }
 
 interface POAM {
@@ -95,8 +134,33 @@ export default function ComplianceDashboard() {
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [poamStatusFilter, setPOAMStatusFilter] = useState<string>('all');
   const [riskLevelFilter, setRiskLevelFilter] = useState<string>('all');
-  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<{ what: string; error: unknown } | null>(null);
+  const [attestResult, setAttestResult] = useState<Row | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
   const queryClient = useQueryClient();
+
+  const { data: frameworks, error: frameworksError } = useQuery<Row[]>({
+    queryKey: ['compliance-frameworks'],
+    queryFn: async () => (await api.get('/compliance/frameworks')).data,
+  });
+
+  const runFrameworkAction = async (fw: Row, kind: 'attest' | 'assess') => {
+    setBusy(`${kind}-${fw.id}`);
+    setActionError(null);
+    try {
+      const res = kind === 'attest'
+        ? await api.post(`/compliance/frameworks/${fw.id}/attest`)
+        : await api.post(`/compliance/frameworks/${fw.id}/assess`);
+      setAttestResult({ ...res.data, kind, framework_name: fw.short_name || fw.name });
+      queryClient.invalidateQueries({ queryKey: ['compliance-dashboard'] });
+      queryClient.invalidateQueries({ queryKey: ['compliance-controls'] });
+      queryClient.invalidateQueries({ queryKey: ['compliance-frameworks'] });
+    } catch (error) {
+      setActionError({ what: kind === 'attest' ? `run the attester on ${fw.short_name || fw.name}` : `assess ${fw.short_name || fw.name}`, error });
+    } finally {
+      setBusy(null);
+    }
+  };
 
   const { data: dashboardData, isLoading: dashboardLoading, error: dashboardError } = useQuery<DashboardData>({
     queryKey: ['compliance-dashboard'],
@@ -113,6 +177,7 @@ export default function ComplianceDashboard() {
       if (frameworkFilter !== 'all') params.append('framework_id', frameworkFilter);
       if (familyFilter !== 'all') params.append('family', familyFilter);
       if (statusFilter !== 'all') params.append('status', statusFilter);
+      params.append('limit', '500');
       const response = await api.get(`/compliance/controls?${params}`);
       return response.data;
     },
@@ -154,12 +219,7 @@ export default function ComplianceDashboard() {
       setActionError(null);
       queryClient.invalidateQueries({ queryKey: ['compliance-poams'] });
     },
-    onError: (err: any) => {
-      console.error('Create POAM failed:', err);
-      setActionError(
-        err?.response?.data?.detail || err?.message || 'Failed to create POA&M'
-      );
-    },
+    onError: (err: unknown) => setActionError({ what: 'create the POA&M', error: err }),
   });
 
   const getStatusBadgeColor = (status: string) => {
@@ -188,15 +248,39 @@ export default function ComplianceDashboard() {
       </div>
 
       {actionError && (
-        <div className="flex items-start gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">
-          <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
-          <div className="flex-1">{actionError}</div>
+        <div className="flex items-start gap-2">
+          <div className="flex-1"><ActionErrorBanner what={actionError.what} error={actionError.error} /></div>
           <button
             onClick={() => setActionError(null)}
             className="text-red-700 hover:text-red-900"
+            aria-label="Dismiss"
           >
             <X className="w-4 h-4" />
           </button>
+        </div>
+      )}
+      {attestResult && (
+        <div className="text-sm bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded p-3 space-y-1">
+          <div className="flex justify-between gap-4">
+            <span className="font-medium">
+              {attestResult.kind === 'attest'
+                ? `Attester on ${attestResult.framework_name}: ${attestResult.attested} control(s) checked, ${attestResult.passed} pass, ${attestResult.failed} fail, ${attestResult.not_assessed} not assessed; ${attestResult.manual_status_kept} manually set status(es) kept.`
+                : `Assessment of ${attestResult.framework_name}: score ${attestResult.compliance_score ?? NA}, ${attestResult.not_assessed ?? 0} control(s) not assessed, ${attestResult.other_than_satisfied ?? 0} other than satisfied.`}
+            </span>
+            <button onClick={() => setAttestResult(null)} className="text-xs underline">dismiss</button>
+          </div>
+          {attestResult.kind === 'attest' && Array.isArray(attestResult.controls) && (
+            <details>
+              <summary className="cursor-pointer text-xs">Per-control results</summary>
+              <ul className="text-xs max-h-48 overflow-y-auto mt-1">
+                {attestResult.controls.map((c: Row) => (
+                  <li key={c.control_record_id ?? c.control_id}>
+                    <span className="font-mono">{c.control_id}</span>: {c.result} → {String(c.status).replace(/_/g, ' ')}{c.reason ? ` (${c.reason})` : ''}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
         </div>
       )}
 
@@ -229,10 +313,16 @@ export default function ComplianceDashboard() {
         <LoadErrorBanner what="the compliance dashboard" error={dashboardError} />
       )}
       {activeTab === 'overview' && !dashboardError && (
-        <OverviewTab
-          data={dashboardData}
-          loading={dashboardLoading}
-        />
+        <>
+          <LoadErrorBanner what="compliance frameworks" error={frameworksError} />
+          <OverviewTab
+            data={dashboardData}
+            loading={dashboardLoading}
+            frameworks={frameworks ?? []}
+            busy={busy}
+            onFrameworkAction={runFrameworkAction}
+          />
+        </>
       )}
 
       {/* Controls Tab */}
@@ -252,6 +342,10 @@ export default function ComplianceDashboard() {
           statusFilter={statusFilter}
           setStatusFilter={setStatusFilter}
           frameworkScores={dashboardData?.framework_scores || []}
+          onSaved={() => {
+            queryClient.invalidateQueries({ queryKey: ['compliance-controls'] });
+            queryClient.invalidateQueries({ queryKey: ['compliance-dashboard'] });
+          }}
         />
       )}
 
@@ -300,9 +394,15 @@ export default function ComplianceDashboard() {
 function OverviewTab({
   data,
   loading,
+  frameworks,
+  busy,
+  onFrameworkAction,
 }: {
   data?: DashboardData;
   loading: boolean;
+  frameworks: Row[];
+  busy: string | null;
+  onFrameworkAction: (fw: Row, kind: 'attest' | 'assess') => void;
 }) {
   if (loading) {
     return (
@@ -353,24 +453,28 @@ function OverviewTab({
               <div className="absolute inset-0 flex items-center justify-center">
                 <div className="text-center">
                   <div className="text-3xl font-bold text-gray-900 dark:text-white">
-                    {data?.overall_compliance_score || 0}
+                    {data && data.frameworks_total > 0 ? data.overall_compliance_score : '—'}
                   </div>
-                  <div className="text-xs text-gray-500 dark:text-gray-400">%</div>
+                  <div className="text-xs text-gray-500 dark:text-gray-400">{data && data.frameworks_total > 0 ? '%' : NA}</div>
                 </div>
               </div>
             </div>
           </div>
           <div className="flex-1">
-            <p className="text-gray-600 dark:text-gray-400 mb-4">
-              Your organization's overall compliance posture across all federal frameworks.
+            <p className="text-gray-600 dark:text-gray-400 mb-2">
+              Mean of the stored framework scores. A score moves only when a framework is assessed; controls the
+              attester cannot check stay &quot;not assessed&quot; and are never counted as implemented.
             </p>
-            <a
-              href="#"
-              className="inline-flex items-center text-blue-600 dark:text-blue-400 hover:underline"
-            >
-              View detailed breakdown
-              <ChevronRight className="w-4 h-4 ml-1" />
-            </a>
+            {data?.control_status_breakdown && (
+              <div className="flex flex-wrap gap-2 text-xs">
+                {Object.entries(data.control_status_breakdown).filter(([k]) => k !== 'total').map(([k, v]) => (
+                  <span key={k} className={clsx('px-2 py-0.5 rounded-full', controlStatusColor(k))}>
+                    {k.replace(/_/g, ' ')}: {v}
+                  </span>
+                ))}
+                <span className="px-2 py-0.5 rounded-full bg-gray-100 dark:bg-gray-700">total: {data.control_status_breakdown.total ?? 0}</span>
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -397,17 +501,26 @@ function OverviewTab({
       </div>
 
       {/* Framework Score Cards */}
+      {frameworks.length === 0 && (
+        <p className="text-sm text-gray-500 dark:text-gray-400 text-center py-6 border border-dashed border-gray-300 dark:border-gray-700 rounded-lg">
+          No compliance framework is enabled for this organisation.
+        </p>
+      )}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-        {(data?.framework_scores ?? []).map((fw) => (
+        {frameworks.map((f): Row => ({ ...f, name: f.short_name || f.name, score: Number(f.compliance_score ?? 0) })).map((fw) => (
           <div
-            key={fw.name}
+            key={fw.id}
             className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-5"
           >
-            <div className="flex items-start justify-between mb-4">
+            <div className="flex items-start justify-between mb-2">
               <h3 className="font-semibold text-gray-900 dark:text-white">
                 {fw.name}
               </h3>
+              <span className="text-xs text-gray-500">{String(fw.status || '').replace(/_/g, ' ')}</span>
             </div>
+            <p className="text-xs text-gray-500 mb-3">
+              {fw.implemented_controls}/{fw.total_controls} implemented · last assessed {fw.last_assessment_at ? new Date(fw.last_assessment_at).toLocaleDateString() : 'never'}
+            </p>
 
             <div className="space-y-3">
               {/* Score Gauge */}
@@ -432,6 +545,25 @@ function OverviewTab({
                   />
                 </div>
               </div>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => onFrameworkAction(fw, 'attest')}
+                  disabled={busy !== null}
+                  title="Check every control the attester has a rule for against platform facts (admin)"
+                  className="flex-1 inline-flex items-center justify-center gap-1 px-2 py-1.5 text-xs bg-blue-600 text-white rounded disabled:opacity-50"
+                >
+                  <ShieldCheck className="w-3 h-3" />
+                  {busy === `attest-${fw.id}` ? 'Running...' : 'Run Attester'}
+                </button>
+                <button
+                  onClick={() => onFrameworkAction(fw, 'assess')}
+                  disabled={busy !== null}
+                  title="Recompute the framework score from the stored control statuses"
+                  className="flex-1 px-2 py-1.5 text-xs border border-gray-300 dark:border-gray-600 rounded disabled:opacity-50"
+                >
+                  {busy === `assess-${fw.id}` ? 'Assessing...' : 'Assess'}
+                </button>
+              </div>
             </div>
           </div>
         ))}
@@ -440,22 +572,28 @@ function OverviewTab({
       {/* Compliance Trend Chart */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
         <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-6">
-          Compliance Trend (90 Days)
+          Compliance Trend (90 Days, stored assessments)
         </h2>
-        <div className="h-64 flex items-end justify-between gap-1">
-          {(data?.trends || []).map((point, idx) => {
-            const height = Math.max(point.score * 1.25, 10);
-            return (
-              <div key={idx} className="flex-1 flex flex-col items-center">
-                <div
-                  className="w-full bg-blue-500 dark:bg-blue-600 rounded-t"
-                  style={{ height: `${height}%`, minHeight: '4px' }}
-                  title={`${point.score}% on ${point.date}`}
-                />
-              </div>
-            );
-          })}
-        </div>
+        {(data?.trends || []).length === 0 ? (
+          <p className="text-sm text-gray-500 dark:text-gray-400 text-center py-12">
+            No framework assessment is stored for the last 90 days.
+          </p>
+        ) : (
+          <div className="h-64 flex items-end justify-between gap-1">
+            {(data?.trends || []).map((point, idx) => {
+              const fwName = frameworks.find((f) => f.id === point.framework_id)?.short_name ?? point.framework_id ?? '';
+              return (
+                <div key={idx} className="flex-1 flex flex-col items-center h-full justify-end">
+                  <div
+                    className="w-full bg-blue-500 dark:bg-blue-600 rounded-t"
+                    style={{ height: `${Math.min(100, Math.max(point.score, 0))}%`, minHeight: '4px' }}
+                    title={`${fwName} ${point.score}% on ${point.date}${point.controls != null ? ` (${point.satisfied ?? 0} satisfied / ${point.failed ?? 0} failed of ${point.controls})` : ''}`}
+                  />
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* Upcoming Assessments */}
@@ -491,6 +629,7 @@ function ControlsTab({
   statusFilter,
   setStatusFilter,
   frameworkScores,
+  onSaved,
 }: {
   controls: Control[];
   loading: boolean;
@@ -503,6 +642,7 @@ function ControlsTab({
   statusFilter: string;
   setStatusFilter: (value: string) => void;
   frameworkScores: Array<{ name: string; score: number }>;
+  onSaved: () => void;
 }) {
   if (loading) {
     return (
@@ -512,8 +652,8 @@ function ControlsTab({
     );
   }
 
-  const controlFamilies = ['AC', 'AU', 'CM', 'CP', 'IA', 'SC', 'SI'];
-  const controlStatuses = ['implemented', 'partially', 'planned', 'not_implemented'];
+  const controlFamilies = CONTROL_FAMILIES;
+  const controlStatuses = CONTROL_STATUSES;
 
   return (
     <div className="space-y-6">
@@ -601,7 +741,7 @@ function ControlsTab({
                 Status
               </th>
               <th className="px-6 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300">
-                Implementation
+                Attester Result
               </th>
               <th className="px-6 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300">
                 Baseline
@@ -612,6 +752,9 @@ function ControlsTab({
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+            {controls.length === 0 && (
+              <tr><td colSpan={7} className="px-6 py-8 text-center text-sm text-gray-500">No control matches these filters.</td></tr>
+            )}
             {controls.map((control) => (
               <tr
                 key={control.id}
@@ -635,26 +778,22 @@ function ControlsTab({
                   {control.control_family ?? ''}
                 </td>
                 <td className="px-6 py-4 text-sm">
-                  <span
-                    className={clsx(
-                      'inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium',
-                      control.status === 'implemented'
-                        ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400'
-                        : control.status === 'partially'
-                        ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400'
-                        : control.status === 'planned'
-                        ? 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400'
-                        : 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-400'
-                    )}
-                  >
-                    {control.status}
+                  <span className={clsx('inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium', controlStatusColor(control.status))}>
+                    {control.status.replace(/_/g, ' ')}
                   </span>
+                  {control.status_source && (
+                    <div className="text-xs text-gray-500 mt-1">
+                      {control.status_source === 'manual' ? 'set by a person' : control.status_source === 'attester' ? 'set by the attester' : 'catalogue seed (unassessed)'}
+                    </div>
+                  )}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {control.implementation_status ?? 'N/A'}
+                  {control.assessment_basis?.result
+                    ? <span title={control.assessment_basis.summary ?? ''}>{String(control.assessment_basis.result).replace(/_/g, ' ')}</span>
+                    : 'no rule run'}
                 </td>
                 <td className="px-6 py-4 text-sm font-medium text-gray-900 dark:text-white">
-                  {control.baseline}
+                  {control.baseline || '—'}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
                   {control.evidence_ids?.length ?? 0}
@@ -671,6 +810,8 @@ function ControlsTab({
           {controls.find((c) => c.id === expandedControl) && (
             <ControlExpandedDetails
               control={controls.find((c) => c.id === expandedControl)!}
+              onClose={() => setExpandedControl(null)}
+              onSaved={onSaved}
             />
           )}
         </div>
@@ -679,13 +820,45 @@ function ControlsTab({
   );
 }
 
-function ControlExpandedDetails({ control }: { control: Control }) {
+function ControlExpandedDetails({ control, onClose, onSaved }: { control: Control; onClose: () => void; onSaved: () => void }) {
+  const [saveError, setSaveError] = useState<unknown>(null);
+  const [saving, setSaving] = useState(false);
+  const basis = control.assessment_basis;
+  const related = Object.entries(control.related_controls ?? {});
   return (
     <div className="space-y-4">
       <div>
-        <h3 className="font-semibold text-gray-900 dark:text-white">Description</h3>
+        <h3 className="font-semibold text-gray-900 dark:text-white">{control.control_id}: {control.title}</h3>
         <p className="text-sm text-gray-700 dark:text-gray-300 mt-1">
           {control.description || 'No description available'}
+        </p>
+      </div>
+
+      <div className="bg-white dark:bg-gray-800 rounded-lg p-3 text-sm space-y-1">
+        <h4 className="font-medium text-gray-700 dark:text-gray-300">Assessment basis</h4>
+        {!basis ? (
+          <p className="text-gray-500">The attester has not evaluated this control (no rule has run for it).</p>
+        ) : (
+          <>
+            <p>
+              Result: <span className="font-medium">{String(basis.result ?? 'not_assessed').replace(/_/g, ' ')}</span>
+              {basis.checked_at ? ` · checked ${new Date(basis.checked_at).toLocaleString()}` : ''}
+              {basis.approved_evidence != null ? ` · ${basis.approved_evidence} approved evidence item(s)` : ''}
+            </p>
+            {basis.summary && <p className="text-gray-700 dark:text-gray-300">{basis.summary}</p>}
+            {basis.reason && <p className="text-orange-700 dark:text-orange-300">Reason: {basis.reason}</p>}
+            {Array.isArray(basis.basis) && basis.basis.length > 0 && (
+              <ul className="list-disc ml-5 text-xs text-gray-600 dark:text-gray-400">
+                {basis.basis.map((b, i) => (
+                  <li key={i}>{b.kind} · {b.source}: {typeof b.value === 'object' ? JSON.stringify(b.value) : String(b.value)}</li>
+                ))}
+              </ul>
+            )}
+          </>
+        )}
+        <p className="text-xs text-gray-500">
+          Status source: {control.status_source ?? NA}
+          {control.status_source === 'manual' ? ' (the attester records its result here but does not overwrite a status a person set)' : ''}
         </p>
       </div>
 
@@ -704,38 +877,67 @@ function ControlExpandedDetails({ control }: { control: Control }) {
         </div>
       </div>
 
-      {control.relatedControls && control.relatedControls.length > 0 && (
+      {related.length > 0 && (
         <div>
           <h4 className="text-sm font-medium text-gray-700 dark:text-gray-300">Related Controls</h4>
           <div className="flex flex-wrap gap-2 mt-2">
-            {(control.relatedControls ?? control.related_controls ?? []).map((relatedId) => (
+            {related.map(([k, v]) => (
               <span
-                key={relatedId}
+                key={k}
                 className="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-white dark:bg-gray-700 border border-gray-200 dark:border-gray-600 text-gray-700 dark:text-gray-300"
               >
-                {relatedId}
+                {k}{Array.isArray(v) ? `: ${v.join(', ')}` : typeof v === 'string' ? `: ${v}` : ''}
               </span>
             ))}
           </div>
         </div>
       )}
 
-      <div className="pt-4 border-t border-blue-200 dark:border-blue-800 flex gap-2">
-        <button
-          onClick={() => setExpandedControl(null)}
-          className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium"
-        >
-          <FileText className="w-4 h-4" />
-          View Evidence
-        </button>
-        <button
-          onClick={() => setExpandedControl(null)}
-          className="inline-flex items-center gap-2 px-4 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-white border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-600 text-sm font-medium"
-        >
-          <Edit2 className="w-4 h-4" />
-          Edit
-        </button>
-      </div>
+      <form
+        className="pt-4 border-t border-blue-200 dark:border-blue-800 space-y-2"
+        onSubmit={async (e) => {
+          e.preventDefault();
+          const fd = new FormData(e.currentTarget);
+          const impl = String(fd.get('implementation_status') || '').trim();
+          setSaving(true);
+          setSaveError(null);
+          try {
+            await api.put(`/compliance/controls/${control.id}`, {
+              status: fd.get('status'),
+              implementation_status: impl === '' ? undefined : Number(impl),
+              responsible_party: fd.get('responsible_party') || undefined,
+              implementation_details: fd.get('implementation_details') || undefined,
+            });
+            onSaved();
+            onClose();
+          } catch (err) {
+            setSaveError(err);
+          } finally {
+            setSaving(false);
+          }
+        }}
+      >
+        <h4 className="text-sm font-medium text-gray-700 dark:text-gray-300">Mark status manually (admin)</h4>
+        <p className="text-xs text-gray-500">A manually set status is recorded as such and the attester will not overwrite it.</p>
+        <ActionErrorBanner what="save the control status" error={saveError} />
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+          <select name="status" defaultValue={MANUAL_STATUSES.includes(control.status) ? control.status : 'planned'} className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-sm">
+            {MANUAL_STATUSES.map((s) => <option key={s} value={s}>{s.replace(/_/g, ' ')}</option>)}
+          </select>
+          <input name="implementation_status" type="number" min={0} max={100} step="any" defaultValue={control.implementation_status ?? ''} placeholder="% implemented" className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-sm" />
+          <input name="responsible_party" defaultValue={control.responsible_party ?? ''} placeholder="Responsible party" className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-sm" />
+        </div>
+        <textarea name="implementation_details" rows={2} defaultValue={control.implementation_details ?? ''} placeholder="Implementation narrative" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-sm" />
+        <div className="flex gap-2">
+          <button type="submit" disabled={saving} className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium disabled:opacity-50">
+            <FileText className="w-4 h-4" />
+            {saving ? 'Saving...' : 'Save Status'}
+          </button>
+          <button type="button" onClick={onClose} className="px-4 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-lg text-sm font-medium">
+            Close
+          </button>
+        </div>
+      </form>
     </div>
   );
 }
@@ -759,6 +961,7 @@ function POAMsTab({
 }) {
   const queryClient = useQueryClient();
   const [showCreatePOAM, setShowCreatePOAM] = useState(false);
+  const [deleteError, setDeleteError] = useState<unknown>(null);
 
   if (loading) {
     return (
@@ -768,7 +971,7 @@ function POAMsTab({
     );
   }
 
-  const poamStatuses = ['open', 'in_progress', 'completed'];
+  const poamStatuses = ['open', 'in_progress', 'delayed', 'completed', 'cancelled', 'accepted'];
   const riskLevels = ['high', 'medium', 'low'];
 
   // Calculate stats
@@ -803,12 +1006,13 @@ function POAMsTab({
           color="red"
         />
         <StatCard
-          label="Completed This Quarter"
+          label="Completed (listed)"
           value={stats.completed}
           icon={CheckCircle}
           color="green"
         />
       </div>
+      <ActionErrorBanner what="delete the POA&M" error={deleteError} />
 
       {/* Filters */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
@@ -881,6 +1085,9 @@ function POAMsTab({
               <th className="px-6 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300">
                 Days Remaining
               </th>
+              <th className="px-6 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300">
+                Actions
+              </th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
@@ -949,6 +1156,24 @@ function POAMsTab({
                       </span>
                     );
                   })()}
+                </td>
+                <td className="px-6 py-4 text-sm">
+                  <button
+                    onClick={async () => {
+                      if (!window.confirm(`Delete POA&M "${poam.weakness_name}"?`)) return;
+                      setDeleteError(null);
+                      try {
+                        await api.delete(`/compliance/poams/${poam.id}`);
+                        queryClient.invalidateQueries({ queryKey: ['compliance-poams'] });
+                      } catch (err) {
+                        setDeleteError(err);
+                      }
+                    }}
+                    className="text-red-600 hover:text-red-800"
+                    title="Delete POA&M (analyst / admin)"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
                 </td>
               </tr>
             ))}
@@ -1202,6 +1427,8 @@ function CISATab({
   directives: CISADirective[];
   loading: boolean;
 }) {
+  const [checks, setChecks] = useState<Record<string, Row>>({});
+  const [checkError, setCheckError] = useState<{ what: string; error: unknown } | null>(null);
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -1221,6 +1448,7 @@ function CISATab({
           automated check against platform state.
         </p>
       </div>
+      {checkError && <ActionErrorBanner what={checkError.what} error={checkError.error} />}
       {directives.length === 0 ? (
         <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-8 text-center text-sm text-gray-500 dark:text-gray-400">
           No CISA directives are being tracked yet. Directives are seeded per
@@ -1267,8 +1495,32 @@ function CISATab({
               </div>
             </div>
 
+            {checks[directive.id] && (() => {
+              const c = checks[directive.id];
+              return (
+                <div className="mb-3 text-sm bg-gray-50 dark:bg-gray-700/50 rounded p-3 space-y-1">
+                  <p>
+                    Result: <span className="font-medium">{String(c.compliance_status ?? 'not_assessed').replace(/_/g, ' ')}</span>
+                    {c.assessed === false && ' (stored status; this directive has no automated check)'}
+                  </p>
+                  {c.basis && <p className="text-xs text-gray-500">{typeof c.basis === 'string' ? c.basis : JSON.stringify(c.basis)}</p>}
+                  {c.kev && Array.isArray(c.kev.overdue_cves) && c.kev.overdue_cves.length > 0 && (
+                    <p className="text-xs text-red-700">Overdue KEV CVEs: {c.kev.overdue_cves.slice(0, 20).join(', ')}{c.kev.overdue_cves.length > 20 ? '…' : ''}</p>
+                  )}
+                </div>
+              );
+            })()}
+
             <button
-              onClick={() => api.post(`/compliance/cisa/directives/${directive.id}/check`)}
+              onClick={async () => {
+                setCheckError(null);
+                try {
+                  const res = await api.post(`/compliance/cisa/directives/${directive.id}/check`);
+                  setChecks((prev) => ({ ...prev, [directive.id]: res.data }));
+                } catch (err) {
+                  setCheckError({ what: `check ${directive.title}`, error: err });
+                }
+              }}
               className="w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium"
             >
               Check Compliance
