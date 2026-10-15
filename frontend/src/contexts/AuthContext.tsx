@@ -1,5 +1,9 @@
 import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 import { authApi, apiClient } from '../api';
+import { publicAuthApi } from '../api/publicAuth';
+
+/** What a password login produced: a session, or an MFA challenge to answer. */
+export type LoginResult = { mfaRequired: false } | { mfaRequired: true; mfaToken: string; expiresIn: number };
 
 interface User {
   id: string;
@@ -16,7 +20,8 @@ interface AuthContextType {
   token: string | null;
   isLoading: boolean;
   isAuthenticated: boolean;
-  login: (email: string, password: string) => Promise<void>;
+  login: (email: string, password: string) => Promise<LoginResult>;
+  completeMfaLogin: (mfaToken: string, code: string) => Promise<void>;
   logout: () => Promise<void>;
 }
 
@@ -45,15 +50,32 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     initializeAuth();
   }, []);
 
-  const login = async (email: string, password: string) => {
+  const login = async (email: string, password: string): Promise<LoginResult> => {
     try {
       const response = await authApi.login(email, password);
-      setToken(response.access_token);
+      if ('mfa_required' in response && response.mfa_required) {
+        return { mfaRequired: true, mfaToken: response.mfa_token, expiresIn: response.expires_in };
+      }
+      setToken(apiClient.getToken());
       // Fetch user profile since login response may not include user data
       const userData = await authApi.getProfile();
       setUser(userData);
+      return { mfaRequired: false };
     } catch (error) {
       apiClient.clearToken();
+      throw error;
+    }
+  };
+
+  const completeMfaLogin = async (mfaToken: string, code: string) => {
+    const tokens = await publicAuthApi.verifyMfa(mfaToken, code);
+    authApi.storeTokens(tokens.access_token, tokens.refresh_token);
+    setToken(tokens.access_token);
+    try {
+      setUser(await authApi.getProfile());
+    } catch (error) {
+      apiClient.clearToken();
+      setToken(null);
       throw error;
     }
   };
@@ -76,6 +98,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         isLoading,
         isAuthenticated: !!user,
         login,
+        completeMfaLogin,
         logout,
       }}
     >

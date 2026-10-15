@@ -6,6 +6,7 @@ import { ThemeProvider } from './contexts/ThemeContext'
 import Layout from './components/Layout'
 
 const Login = React.lazy(() => import('./pages/Login'))
+const ResetPassword = React.lazy(() => import('./pages/ResetPassword'))
 const Dashboard = React.lazy(() => import('./pages/Dashboard'))
 const Alerts = React.lazy(() => import('./pages/Alerts'))
 const AlertDetail = React.lazy(() => import('./pages/AlertDetail'))
@@ -148,6 +149,8 @@ function AppRoutes() {
             </PublicRoute>
           }
         />
+        {/* Public: a reset link works whether or not someone is signed in. */}
+        <Route path="/reset-password" element={<ResetPassword />} />
         <Route
           path="/"
           element={

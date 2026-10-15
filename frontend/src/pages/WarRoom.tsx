@@ -15,6 +15,9 @@ import clsx from 'clsx';
 import { collaborationApi } from '../api/endpoints';
 import LoadErrorBanner from '../components/LoadErrorBanner';
 import { describeLoadError } from '../lib/loadError';
+import { useAuth } from '../contexts/AuthContext';
+import { roleGate } from '../lib/roles';
+import { ActionItemControls, ArtifactsPanel, JoinLeave, TimelinePanel } from '../components/WarRoomPanels';
 
 // ---------------------------------------------------------------------------
 // Types matching backend response schemas
@@ -109,6 +112,9 @@ export default function WarRoom() {
   const queryClient = useQueryClient();
   const [activeTab, setActiveTab] = useState<'rooms' | 'actions' | 'archived'>('rooms');
   const [selectedRoom, setSelectedRoom] = useState<WarRoomType | null>(null);
+  const [roomTab, setRoomTab] = useState<'chat' | 'timeline' | 'artifacts'>('chat');
+  const { user } = useAuth();
+  const gate = roleGate(user?.role, user?.is_superuser);
   const [showCreateRoom, setShowCreateRoom] = useState(false);
   const [showCreateAction, setShowCreateAction] = useState(false);
   const [newMessage, setNewMessage] = useState('');
@@ -519,6 +525,7 @@ export default function WarRoom() {
                         </span>
                       </div>
                     </div>
+                    <ActionItemControls item={item} userId={user?.id} gate={gate} />
                   </div>
                 ))}
               </div>
@@ -566,7 +573,10 @@ export default function WarRoom() {
         {/* ================================================================ */}
         {/* War Room Detail Modal (Chat)                                      */}
         {/* ================================================================ */}
-        {selectedRoom && (
+        {selectedRoom && (() => {
+          // The list is re-read after join/leave, so participants come from the server.
+          const liveRoom = warRooms.find((r) => r.id === selectedRoom.id) ?? selectedRoom;
+          return (
           <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
             <div className="bg-gray-800 border border-gray-700 rounded-lg max-w-2xl w-full flex flex-col" style={{ maxHeight: '80vh' }}>
               <div className="flex items-start justify-between p-6 border-b border-gray-700">
@@ -576,15 +586,50 @@ export default function WarRoom() {
                     <span className={clsx('px-2 py-0.5 rounded text-xs font-medium', severityColors[selectedRoom.severity_level])}>
                       {selectedRoom.severity_level}
                     </span>
-                    <span>{Array.isArray(selectedRoom.participants) ? selectedRoom.participants.length : 0} participants</span>
+                    <span>{Array.isArray(liveRoom.participants) ? liveRoom.participants.length : 0} participants</span>
                     <span>Started {formatDateTime(selectedRoom.created_at)}</span>
                   </div>
                 </div>
-                <button onClick={() => setSelectedRoom(null)} className="text-gray-400 hover:text-white transition-colors">
-                  <X className="w-5 h-5" />
-                </button>
+                <div className="flex items-start gap-3">
+                  <JoinLeave
+                    roomId={selectedRoom.id}
+                    participants={Array.isArray(liveRoom.participants) ? liveRoom.participants : []}
+                    userId={user?.id}
+                    gate={gate}
+                  />
+                  <button onClick={() => setSelectedRoom(null)} className="text-gray-400 hover:text-white transition-colors">
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
               </div>
 
+              <div className="flex gap-2 px-6 pt-3 border-b border-gray-700">
+                {(['chat', 'timeline', 'artifacts'] as const).map((t) => (
+                  <button
+                    key={t}
+                    onClick={() => setRoomTab(t)}
+                    className={clsx(
+                      'px-3 py-2 text-sm border-b-2 -mb-px capitalize',
+                      roomTab === t ? 'border-orange-500 text-white' : 'border-transparent text-gray-400 hover:text-gray-200',
+                    )}
+                  >
+                    {t}
+                  </button>
+                ))}
+              </div>
+
+              {roomTab === 'timeline' && (
+                <div className="flex-1 overflow-y-auto p-6 min-h-[200px]">
+                  <TimelinePanel roomId={selectedRoom.id} gate={gate} />
+                </div>
+              )}
+              {roomTab === 'artifacts' && (
+                <div className="flex-1 overflow-y-auto p-6 min-h-[200px]">
+                  <ArtifactsPanel roomId={selectedRoom.id} />
+                </div>
+              )}
+
+              {roomTab === 'chat' && (
               <div className="flex-1 overflow-y-auto p-6 space-y-4 min-h-[200px]">
                 {messagesError ? (
                   <LoadErrorBanner what="messages" error={messagesError} />
@@ -602,11 +647,13 @@ export default function WarRoom() {
                   ))
                 )}
               </div>
+              )}
 
               <div className="border-t border-gray-700 p-6 space-y-3">
-                {chatError && (
+                {roomTab === 'chat' && chatError && (
                   <div className="bg-red-900/30 border border-red-700 rounded p-2 text-sm text-red-300">{chatError}</div>
                 )}
+                {roomTab === 'chat' && (
                 <div className="flex gap-2">
                   <input
                     type="text"
@@ -624,6 +671,7 @@ export default function WarRoom() {
                     <Send className="w-4 h-4" />
                   </button>
                 </div>
+                )}
 
                 <div className="flex gap-2">
                   <button
@@ -646,7 +694,8 @@ export default function WarRoom() {
               </div>
             </div>
           </div>
-        )}
+          );
+        })()}
 
         {/* ================================================================ */}
         {/* Create War Room Modal                                             */}

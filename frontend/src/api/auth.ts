@@ -20,17 +20,36 @@ export interface UserProfile {
   role: string;
   is_active: boolean;
   is_superuser: boolean;
+  organization_id: string | null;
   created_at: string;
   updated_at: string;
 }
 
+/** Body of POST /auth/login when the account has MFA enabled: no tokens yet. */
+export interface MfaChallenge {
+  mfa_required: true;
+  mfa_token: string;
+  expires_in: number;
+}
+
 export const authApi = {
-  login: async (email: string, password: string): Promise<LoginResponse> => {
+  login: async (email: string, password: string): Promise<LoginResponse | MfaChallenge> => {
     const response = await api.post('/auth/login', { email, password });
+    if (response.data?.mfa_required) {
+      // The password was right but the account needs its second factor;
+      // POST /mfa/verify trades this short-lived token for the session.
+      return response.data as MfaChallenge;
+    }
     const { access_token, refresh_token } = response.data;
     apiClient.setToken(access_token);
     apiClient.setRefreshToken(refresh_token);
     return response.data;
+  },
+
+  /** Store the session issued by POST /mfa/verify. */
+  storeTokens: (accessToken: string, refreshToken: string): void => {
+    apiClient.setToken(accessToken);
+    apiClient.setRefreshToken(refreshToken);
   },
 
   logout: async (): Promise<void> => {
@@ -56,9 +75,9 @@ export const authApi = {
     return response.data;
   },
 
-  changePassword: async (oldPassword: string, newPassword: string): Promise<void> => {
+  changePassword: async (currentPassword: string, newPassword: string): Promise<void> => {
     await api.post('/auth/change-password', {
-      old_password: oldPassword,
+      current_password: currentPassword,
       new_password: newPassword,
     });
   },

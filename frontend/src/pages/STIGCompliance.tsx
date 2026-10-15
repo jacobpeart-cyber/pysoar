@@ -18,6 +18,7 @@ import clsx from 'clsx';
 import LoadErrorBanner from '../components/LoadErrorBanner';
 import ActionErrorBanner from '../components/ActionErrorBanner';
 import type { Row } from '../lib/apiRow';
+import { StigBenchmarkDrawer, StigRuleSearch } from '../components/StigRuleBrowser';
 
 const NA = 'not available';
 // Only agents enrolled with this capability run whole-benchmark scans.
@@ -740,6 +741,7 @@ function BenchmarksTab({
   setPlatformFilter: (value: string) => void;
   onRunScan: (id: string) => void;
 }) {
+  const [browsing, setBrowsing] = useState<string | null>(null);
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -754,6 +756,10 @@ function BenchmarksTab({
     <div className="space-y-6">
       {/* XCCDF upload — the operator path to load DISA STIG content */}
       <XCCDFUploader />
+
+      {/* Rule search across every imported benchmark */}
+      <StigRuleSearch />
+      {browsing && <StigBenchmarkDrawer benchmarkId={browsing} onClose={() => setBrowsing(null)} />}
 
       {/* Filter */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
@@ -836,13 +842,21 @@ function BenchmarksTab({
               </div>
             </div>
 
-            <button
-              onClick={() => onRunScan(benchmark.id)}
-              className="w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium flex items-center justify-center gap-2"
-            >
-              <Play className="w-4 h-4" />
-              Scan
-            </button>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setBrowsing(benchmark.id)}
+                className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm font-medium hover:bg-gray-50 dark:hover:bg-gray-700"
+              >
+                Rules
+              </button>
+              <button
+                onClick={() => onRunScan(benchmark.id)}
+                className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium flex items-center justify-center gap-2"
+              >
+                <Play className="w-4 h-4" />
+                Scan
+              </button>
+            </div>
           </div>
         ))}
       </div>

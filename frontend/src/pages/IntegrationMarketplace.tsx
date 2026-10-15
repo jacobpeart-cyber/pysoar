@@ -16,6 +16,7 @@ import { api } from '../lib/api';
 import LoadErrorBanner from '../components/LoadErrorBanner';
 import { describeLoadError } from '../lib/loadError';
 import DetailDrawer, { DetailSection } from '../components/DetailDrawer';
+import type { Row } from '../lib/apiRow';
 
 const getHealthColor = (health: string | null) => {
   switch (health) {
@@ -54,6 +55,8 @@ export default function IntegrationMarketplace() {
   const [loading, setLoading] = useState(true);
   const [connectorsError, setConnectorsError] = useState<unknown>(null);
   const [installedError, setInstalledError] = useState<unknown>(null);
+  const [executionsError, setExecutionsError] = useState<unknown>(null);
+  const [executionsTotal, setExecutionsTotal] = useState<number | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [showNewWebhookModal, setShowNewWebhookModal] = useState(false);
@@ -65,16 +68,20 @@ export default function IntegrationMarketplace() {
     try {
       // size=100: the backend defaults to 20, which hid most of the
       // registry's connectors. Both lists return {items, total, ...}.
-      const [connectorsRes, installedRes] = await Promise.allSettled([
+      const [connectorsRes, installedRes, executionsRes] = await Promise.allSettled([
         api.get('/integrations/connectors', { params: { size: 100 } }),
         api.get('/integrations/installed', { params: { size: 100 } }),
+        // Newest first, this organisation only.
+        api.get('/integrations/executions', { params: { size: 100 } }),
       ]);
       setConnectors(connectorsRes.status === 'fulfilled' ? (connectorsRes.value.data?.items ?? []) : []);
       setConnectorsError(connectorsRes.status === 'rejected' ? (connectorsRes.reason ?? new Error('request failed')) : null);
       setInstalled(installedRes.status === 'fulfilled' ? (installedRes.value.data?.items ?? []) : []);
       setInstalledError(installedRes.status === 'rejected' ? (installedRes.reason ?? new Error('request failed')) : null);
-      // Executions and webhooks are not loaded by this page yet.
-      setExecutions([]);
+      setExecutions(executionsRes.status === 'fulfilled' ? (executionsRes.value.data?.items ?? []) : []);
+      setExecutionsTotal(executionsRes.status === 'fulfilled' ? (executionsRes.value.data?.total ?? null) : null);
+      setExecutionsError(executionsRes.status === 'rejected' ? (executionsRes.reason ?? new Error('request failed')) : null);
+      // Webhooks are not loaded by this page yet.
       setWebhooks([]);
     } finally {
       setLoading(false);
@@ -99,6 +106,14 @@ export default function IntegrationMarketplace() {
     ? Math.round((activeIntegrations / installedCount) * 100)
     : null;
   const shown = (n: number | null, suffix = '') => (n === null ? 'not available' : `${n}${suffix}`);
+  // Execution rows carry the installed integration id; name it from the
+  // installed list and the connector registry.
+  const integrationLabel = (installedId: string | null | undefined): string => {
+    const inst = installed.find((i: Row) => i.id === installedId);
+    if (!inst) return installedId ? `integration ${String(installedId).slice(0, 8)}` : 'unknown integration';
+    const conn = connectors.find((c: Row) => c.id === inst.connector_id);
+    return inst.name || conn?.display_name || conn?.name || inst.connector_id || String(installedId).slice(0, 8);
+  };
 
   const categories = ['all', ...new Set(connectors.map(c => c.category))];
   const filteredConnectors = connectors.filter(c => {
@@ -355,14 +370,25 @@ export default function IntegrationMarketplace() {
             {/* Executions Tab */}
             {activeTab === 'executions' && (
               <div className="space-y-6">
+                <LoadErrorBanner what="integration executions" error={executionsError} />
+                {!executionsError && executions.length === 0 && !loading && (
+                  <p className="text-sm text-gray-500 dark:text-gray-400">
+                    No integration action has run in this organisation yet. Executions are recorded when a playbook step
+                    or an analyst runs an installed integration&apos;s action.
+                  </p>
+                )}
+                {executionsTotal !== null && executionsTotal > executions.length && (
+                  <p className="text-xs text-gray-500 dark:text-gray-400">Showing the newest {executions.length} of {executionsTotal}.</p>
+                )}
+                {executions.length > 0 && (
                 <div className="bg-white dark:bg-gray-800 rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700">
                   <table className="w-full">
                     <thead>
                       <tr className="border-b border-gray-200 dark:border-gray-700">
-                        <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Connector</th>
-                        <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Execution Time</th>
+                        <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Integration</th>
+                        <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Started</th>
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Status</th>
-                        <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Records</th>
+                        <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Trigger</th>
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Duration</th>
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Actions</th>
                       </tr>
@@ -370,15 +396,15 @@ export default function IntegrationMarketplace() {
                     <tbody>
                       {executions.map((exec) => (
                         <tr key={exec.id} className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 transition">
-                          <td className="px-6 py-4 text-sm font-medium">{exec.connector}</td>
-                          <td className="px-6 py-4 text-sm">{new Date(exec.executionTime || "").toLocaleString()}</td>
+                          <td className="px-6 py-4 text-sm font-medium">{integrationLabel(exec.installed_id)}</td>
+                          <td className="px-6 py-4 text-sm">{exec.started_at || exec.created_at ? new Date(exec.started_at || exec.created_at).toLocaleString() : 'not started'}</td>
                           <td className="px-6 py-4">
                             <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(exec.status)}`}>
                               {exec.status}
                             </span>
                           </td>
-                          <td className="px-6 py-4 text-sm">{exec.recordsProcessed.toLocaleString()}</td>
-                          <td className="px-6 py-4 text-sm">{exec.duration}s</td>
+                          <td className="px-6 py-4 text-sm">{exec.triggered_by || 'not recorded'}</td>
+                          <td className="px-6 py-4 text-sm">{typeof exec.duration_ms === 'number' ? `${exec.duration_ms} ms` : 'not recorded'}</td>
                           <td className="px-6 py-4 text-sm">
                             <button
                               onClick={() => setDetailExec(exec)}
@@ -393,6 +419,7 @@ export default function IntegrationMarketplace() {
                     </tbody>
                   </table>
                 </div>
+                )}
               </div>
             )}
 
@@ -534,8 +561,8 @@ export default function IntegrationMarketplace() {
       <DetailDrawer
         open={!!detailExec}
         onClose={() => setDetailExec(null)}
-        title={`Execution · ${detailExec?.integrationName || detailExec?.integration_name || 'Integration'}`}
-        subtitle={detailExec ? `${detailExec.status || 'unknown'} · ${detailExec.recordsProcessed ?? 0} records` : undefined}
+        title={`Execution · ${detailExec ? integrationLabel(detailExec.installed_id) : 'Integration'}`}
+        subtitle={detailExec ? `${detailExec.status || 'unknown'} · ${detailExec.triggered_by || 'trigger not recorded'}` : undefined}
         sections={
           detailExec
             ? ([
@@ -543,19 +570,23 @@ export default function IntegrationMarketplace() {
                   title: 'Execution',
                   fields: [
                     { label: 'Execution ID', value: detailExec.id, mono: true, full: true },
-                    { label: 'Integration', value: detailExec.integrationName || detailExec.integration_name },
+                    { label: 'Integration', value: integrationLabel(detailExec.installed_id) },
+                    { label: 'Action ID', value: detailExec.action_id, mono: true },
                     { label: 'Status', value: detailExec.status },
-                    { label: 'Records Processed', value: detailExec.recordsProcessed ?? detailExec.records_processed ?? 0 },
-                    { label: 'Duration', value: detailExec.duration != null ? `${detailExec.duration}s` : null },
-                    { label: 'Started', value: detailExec.startedAt || detailExec.started_at ? new Date(detailExec.startedAt || detailExec.started_at).toLocaleString() : null },
-                    { label: 'Completed', value: detailExec.completedAt || detailExec.completed_at ? new Date(detailExec.completedAt || detailExec.completed_at).toLocaleString() : null },
+                    { label: 'Triggered by', value: detailExec.triggered_by },
+                    { label: 'Playbook run', value: detailExec.playbook_run_id, mono: true },
+                    { label: 'Duration', value: detailExec.duration_ms != null ? `${detailExec.duration_ms} ms` : null },
+                    { label: 'Retries', value: detailExec.retry_count },
+                    { label: 'Started', value: detailExec.started_at ? new Date(detailExec.started_at).toLocaleString() : null },
+                    { label: 'Completed', value: detailExec.completed_at ? new Date(detailExec.completed_at).toLocaleString() : null },
                   ],
                 },
                 {
-                  title: 'Result',
+                  title: 'Input and result',
                   fields: [
-                    { label: 'Error', value: detailExec.error || detailExec.error_message, full: true, mono: true },
-                    { label: 'Summary', value: detailExec.summary, full: true },
+                    { label: 'Error', value: detailExec.error_message, full: true, mono: true },
+                    { label: 'Input', value: detailExec.input_data, full: true, mono: true },
+                    { label: 'Output', value: detailExec.output_data, full: true, mono: true },
                   ],
                 },
               ] as DetailSection[])

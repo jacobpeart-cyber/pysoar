@@ -19,6 +19,8 @@ import type { Row } from '../lib/apiRow';
 import LoadErrorBanner from '../components/LoadErrorBanner';
 import ActionErrorBanner from '../components/ActionErrorBanner';
 import { describeLoadError } from '../lib/loadError';
+import { useRoleGate, ANALYST_ONLY_REASON } from '../lib/roles';
+import type { RoleGate } from '../lib/roles';
 
 const getSeverityColor = (severity: string) => {
   switch (severity) {
@@ -126,6 +128,7 @@ const instanceIdsFor = async (vulnerabilityId: string): Promise<string[]> => {
 };
 
 export default function VulnManagement() {
+  const gate = useRoleGate();
   const [activeTab, setActiveTab] = useState('vulnerabilities');
   const [vulnerabilities, setVulnerabilities] = useState<Row[]>([]);
   const [scanProfiles, setScanProfiles] = useState<Row[]>([]);
@@ -871,6 +874,7 @@ export default function VulnManagement() {
               )}
               <div><span className="font-medium">Patch Available:</span> {selectedVulnerability.patchAvailable ? 'Yes' : 'No'}</div>
             </div>
+            <AddInstanceForm vulnerabilityId={String(selectedVulnerability.id)} gate={gate} onCreated={() => loadData()} />
             <button onClick={() => setSelectedVulnerability(null)} className="mt-6 w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Close</button>
           </div>
         </div>
@@ -1221,5 +1225,80 @@ export default function VulnManagement() {
         }}
       />
     </div>
+  );
+}
+
+// POST /vulnmgmt/instances: record one affected asset for this catalogue
+// vulnerability by hand (scanner import is the other creator). Risk and SLA
+// are computed by the server from the catalogue row; a second record for the
+// same asset, port and protocol answers 409 duplicate_instance.
+function AddInstanceForm({
+  vulnerabilityId,
+  gate,
+  onCreated,
+}: {
+  vulnerabilityId: string;
+  gate: RoleGate;
+  onCreated: () => void;
+}) {
+  const [form, setForm] = useState({ asset_name: '', asset_ip: '', port: '', protocol: '', status: 'open' });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+  const [created, setCreated] = useState<Row | null>(null);
+  const cls = 'w-full px-2 py-1 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 text-sm';
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setCreated(null);
+    if (!form.asset_name.trim() && !form.asset_ip.trim()) {
+      setError(new Error('Give the asset name or IP address.'));
+      return;
+    }
+    setBusy(true);
+    try {
+      const res = await api.post('/vulnmgmt/instances', {
+        vulnerability_id: vulnerabilityId,
+        asset_name: form.asset_name.trim() || null,
+        asset_ip: form.asset_ip.trim() || null,
+        port: form.port ? Number(form.port) : null,
+        protocol: form.protocol.trim() || null,
+        status: form.status,
+        discovered_by: 'manual',
+      });
+      setCreated(res.data);
+      setForm({ asset_name: '', asset_ip: '', port: '', protocol: '', status: 'open' });
+      onCreated();
+    } catch (err) {
+      setError(err);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <form onSubmit={submit} className="mt-6 border-t border-gray-200 dark:border-gray-700 pt-4 space-y-2">
+      <h3 className="font-semibold text-sm">Add affected instance</h3>
+      <div className="grid grid-cols-2 gap-2">
+        <input value={form.asset_name} onChange={(e) => setForm({ ...form, asset_name: e.target.value })} placeholder="Asset name" className={cls} disabled={!gate.isAnalyst} />
+        <input value={form.asset_ip} onChange={(e) => setForm({ ...form, asset_ip: e.target.value })} placeholder="IP address" className={cls} disabled={!gate.isAnalyst} />
+        <input type="number" min={0} max={65535} value={form.port} onChange={(e) => setForm({ ...form, port: e.target.value })} placeholder="Port (optional)" className={cls} disabled={!gate.isAnalyst} />
+        <input value={form.protocol} onChange={(e) => setForm({ ...form, protocol: e.target.value })} placeholder="Protocol (optional)" className={cls} disabled={!gate.isAnalyst} />
+        <select value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value })} className={cls} disabled={!gate.isAnalyst}>
+          {['open', 'in_progress', 'mitigated', 'patched', 'accepted', 'false_positive', 'deferred'].map((s) => (
+            <option key={s} value={s}>{s.replace(/_/g, ' ')}</option>
+          ))}
+        </select>
+        <button type="submit" disabled={busy || !gate.isAnalyst} title={gate.isAnalyst ? undefined : ANALYST_ONLY_REASON} className="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 text-sm">
+          {busy ? 'Adding...' : 'Add instance'}
+        </button>
+      </div>
+      {!gate.isAnalyst && <p className="text-xs text-gray-500">{ANALYST_ONLY_REASON}</p>}
+      <p className="text-xs text-gray-500">Risk score and SLA are computed by the server from this vulnerability; a status the server does not know is refused.</p>
+      <ActionErrorBanner what="add the instance" error={error} />
+      {created && (
+        <p className="text-xs text-green-700 dark:text-green-400">
+          Instance recorded ({String(created.id).slice(0, 8)}): risk {created.risk_score ?? NA}, SLA {created.sla_status ?? NA}.
+        </p>
+      )}
+    </form>
   );
 }

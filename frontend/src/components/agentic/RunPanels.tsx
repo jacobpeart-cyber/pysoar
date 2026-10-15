@@ -223,7 +223,11 @@ export const PolicyEventList: React.FC<{ events?: PolicyEvent[] | null }> = ({ e
 
 /* ----------------------------------------------------------- trust banner */
 
-export const TrustBanner: React.FC<{ trust?: TrustAssessment | null }> = ({ trust }) => {
+export const TrustBanner: React.FC<{
+  trust?: TrustAssessment | null;
+  /** Rendered under a lockdown: the acknowledgement control (the only way out). */
+  acknowledge?: React.ReactNode;
+}> = ({ trust, acknowledge }) => {
   const tier = trust?.tier;
   if (!tier || tier === 'clean') return null;
   const lockdown = tier === 'lockdown';
@@ -260,7 +264,7 @@ export const TrustBanner: React.FC<{ trust?: TrustAssessment | null }> = ({ trus
           )}
         >
           {lockdown
-            ? 'Prompt-injection content was found in this session. Write actions are locked: the runtime will not execute or propose any state-changing tool until the session is reset.'
+            ? 'Prompt-injection content was found in this session. Write actions are locked: the runtime will not execute or propose any state-changing tool until an analyst acknowledges the finding or a new session is started.'
             : 'Suspicious instruction-like content was found in the data this session read. Proposals raised here are marked suspect and need admin review.'}
         </p>
         {hits.length > 0 ? (
@@ -289,6 +293,7 @@ export const TrustBanner: React.FC<{ trust?: TrustAssessment | null }> = ({ trus
             ))}
           </ul>
         ) : null}
+        {lockdown && acknowledge ? acknowledge : null}
       </div>
     </div>
   );
@@ -304,7 +309,9 @@ export const RunFooter: React.FC<{
   runId?: string | null;
   stopReason?: string | null;
   honestyNote?: boolean | null;
-}> = ({ provider, model, credentialSource, usage, runId, stopReason, honestyNote }) => {
+  /** Opens the run timeline; without it the run id is plain text. */
+  onOpenRun?: (runId: string) => void;
+}> = ({ provider, model, credentialSource, usage, runId, stopReason, honestyNote, onOpenRun }) => {
   const bits: string[] = [];
   if (provider) bits.push(provider);
   if (model) bits.push(model);
@@ -314,11 +321,21 @@ export const RunFooter: React.FC<{
     bits.push(`${tokens.toLocaleString()} tokens${usage?.estimated ? ' (est.)' : ''}`);
   }
   if (stopReason) bits.push(`stop: ${stopReason}`);
-  if (runId) bits.push(`run ${runId.slice(0, 8)}`);
-  if (bits.length === 0) return null;
+  if (runId && !onOpenRun) bits.push(`run ${runId.slice(0, 8)}`);
+  if (bits.length === 0 && !runId) return null;
   return (
     <div className="mt-2 text-[10px] text-gray-500 dark:text-gray-400 flex flex-wrap gap-x-2 gap-y-0.5">
       <span>{bits.join(' · ')}</span>
+      {runId && onOpenRun ? (
+        <button
+          type="button"
+          onClick={() => onOpenRun(runId)}
+          className="font-mono text-blue-600 dark:text-blue-400 hover:underline"
+          title="Open the run timeline"
+        >
+          run {runId.slice(0, 8)}
+        </button>
+      ) : null}
       {honestyNote ? (
         <span className="text-amber-600 dark:text-amber-400">honesty note applied</span>
       ) : null}

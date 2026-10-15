@@ -25,6 +25,9 @@ import clsx from 'clsx';
 import LoadErrorBanner from '../components/LoadErrorBanner';
 import ActionErrorBanner from '../components/ActionErrorBanner';
 import type { Row } from '../lib/apiRow';
+import FormModal from '../components/FormModal';
+import { useRoleGate, ANALYST_ONLY_REASON } from '../lib/roles';
+import { readableSubmit } from '../lib/formSubmit';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area, PieChart, Pie, Cell } from 'recharts';
 
 const NA = 'not available';
@@ -272,6 +275,8 @@ export default function ExposureManagement() {
   const [includeInactive, setIncludeInactive] = useState(false);
   const [actionError, setActionError] = useState<{ what: string; error: unknown } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [showAddAsset, setShowAddAsset] = useState(false);
+  const gate = useRoleGate();
   const [notice, setNotice] = useState<string | null>(null);
   const [scanImportResult, setScanImportResult] = useState<Row | null>(null);
   const [assetImportResult, setAssetImportResult] = useState<Row | null>(null);
@@ -785,6 +790,15 @@ export default function ExposureManagement() {
               </div>
               <div className="flex flex-wrap gap-2 pt-2 border-t border-gray-200 dark:border-gray-700">
                 <button
+                  onClick={() => setShowAddAsset(true)}
+                  disabled={busy !== null || !gate.isAnalyst}
+                  title={gate.isAnalyst ? 'Register one asset by hand' : ANALYST_ONLY_REASON}
+                  className="flex items-center gap-2 px-3 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                >
+                  <Plus className="w-4 h-4" />
+                  Add Asset
+                </button>
+                <button
                   onClick={() => assetFileInput.current?.click()}
                   disabled={busy !== null}
                   title="CSV with a header row or a JSON array: hostname, ip_address, asset_type, criticality, environment, ..."
@@ -812,6 +826,54 @@ export default function ExposureManagement() {
                   Network, cloud, Active Directory and DNS discovery are not available (no scanner or directory integration).
                 </span>
               </div>
+              {!gate.isAnalyst && (
+                <p className="text-xs text-gray-500 dark:text-gray-400">Adding, importing and discovering assets: {ANALYST_ONLY_REASON}</p>
+              )}
+              <FormModal
+                open={showAddAsset}
+                onClose={() => setShowAddAsset(false)}
+                title="Add exposure asset"
+                description="Registers the asset as you describe it. Risk score and vulnerability count stay empty until a scan import or assessment fills them."
+                submitLabel="Add asset"
+                fields={[
+                  { name: 'hostname', label: 'Hostname', placeholder: 'web-01.example.com' },
+                  { name: 'ip_address', label: 'IP address', placeholder: '10.0.0.5' },
+                  {
+                    name: 'asset_type', label: 'Asset type', type: 'select', required: true, defaultValue: 'server',
+                    options: ['server', 'workstation', 'network', 'database', 'application', 'cloud', 'container', 'iot'].map((v) => ({ value: v, label: v })),
+                  },
+                  {
+                    name: 'environment', label: 'Environment', type: 'select', defaultValue: 'production',
+                    options: ['production', 'staging', 'development', 'test'].map((v) => ({ value: v, label: v })),
+                  },
+                  {
+                    name: 'criticality', label: 'Criticality', type: 'select', defaultValue: 'medium',
+                    options: ['critical', 'high', 'medium', 'low'].map((v) => ({ value: v, label: v })),
+                  },
+                  {
+                    name: 'is_internet_facing', label: 'Internet facing', type: 'select', defaultValue: 'false',
+                    options: [{ value: 'false', label: 'No' }, { value: 'true', label: 'Yes' }],
+                  },
+                  { name: 'os_type', label: 'OS type', placeholder: 'linux' },
+                  { name: 'owner', label: 'Owner' },
+                ]}
+                onSubmit={async (v) => {
+                  if (!v.hostname?.trim() && !v.ip_address?.trim()) {
+                    throw new Error('Give a hostname or an IP address.');
+                  }
+                  await readableSubmit(api.post('/exposure/assets', {
+                    hostname: v.hostname?.trim() || null,
+                    ip_address: v.ip_address?.trim() || null,
+                    asset_type: v.asset_type,
+                    environment: v.environment || 'production',
+                    criticality: v.criticality || 'medium',
+                    is_internet_facing: v.is_internet_facing === 'true',
+                    os_type: v.os_type?.trim() || null,
+                    owner: v.owner?.trim() || null,
+                  }));
+                  queryClient.invalidateQueries({ queryKey: ['exposure'] });
+                }}
+              />
               <input
                 ref={assetFileInput}
                 type="file"

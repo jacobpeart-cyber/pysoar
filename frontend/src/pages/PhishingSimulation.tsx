@@ -16,6 +16,9 @@ import { api } from '../api/client';
 import LoadErrorBanner from '../components/LoadErrorBanner';
 import ActionErrorBanner from '../components/ActionErrorBanner';
 import { describeLoadError } from '../lib/loadError';
+import { useRoleGate, ANALYST_ONLY_REASON } from '../lib/roles';
+import { GroupMembersEditor, TemplateCreateModal } from '../components/PhishingPanels';
+import type { GroupMember } from '../components/PhishingPanels';
 
 // ---------------------------------------------------------------------------
 // Types matching actual backend response schemas
@@ -67,6 +70,7 @@ interface TargetGroupType {
   campaigns_participated: number;
   last_campaign_date: string | null;
   created_at: string | null;
+  members?: GroupMember[];
 }
 
 interface AwarenessScore {
@@ -142,6 +146,8 @@ export default function PhishingSimulation() {
   const [selectedCampaign, setSelectedCampaign] = useState<Campaign | null>(null);
   const [showModal, setShowModal] = useState(false);
   const [showGroupModal, setShowGroupModal] = useState(false);
+  const [showTemplateModal, setShowTemplateModal] = useState(false);
+  const gate = useRoleGate();
   const [createError, setCreateError] = useState<string | null>(null);
 
   // ---------------------------------------------------------------------------
@@ -566,6 +572,19 @@ export default function PhishingSimulation() {
         {/* ================================================================= */}
         {activeTab === 'templates' && (
           <div className="grid grid-cols-1 gap-4">
+            <div className="flex flex-col items-end">
+              <button
+                onClick={() => setShowTemplateModal(true)}
+                disabled={!gate.isAnalyst}
+                title={gate.isAnalyst ? undefined : ANALYST_ONLY_REASON}
+                className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded flex items-center gap-2 transition-colors disabled:opacity-50"
+              >
+                <Plus className="w-4 h-4" />
+                New Template
+              </button>
+              {!gate.isAnalyst && <p className="text-xs text-gray-400 mt-1">{ANALYST_ONLY_REASON}</p>}
+            </div>
+            {showTemplateModal && <TemplateCreateModal onClose={() => setShowTemplateModal(false)} />}
             {templatesError ? (
               <LoadErrorBanner what="templates" error={templatesError} />
             ) : templates.length === 0 ? (
@@ -708,6 +727,7 @@ export default function PhishingSimulation() {
                         <p className="text-2xl font-bold text-white">{group.member_count}</p>
                       </div>
                     </div>
+                    <GroupMembersEditor groupId={group.id} members={Array.isArray(group.members) ? group.members : []} gate={gate} />
                   </div>
                 ))}
               </div>

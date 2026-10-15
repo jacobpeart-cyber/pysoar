@@ -29,8 +29,10 @@ import ChatWorkbench from '../components/ChatWorkbench';
 import PendingApprovals from '../components/agentic/PendingApprovals';
 import LoadErrorBanner from '../components/LoadErrorBanner';
 import { describeLoadError } from '../lib/loadError';
+import { AgentDetailDrawer, AgentOversightPanel, CreateAgentModal } from '../components/agentic/AgentOps';
+import { ADMIN_ONLY_REASON, roleGate } from '../lib/roles';
 
-type TabId = 'chat' | 'investigations' | 'approvals' | 'triage' | 'anomalies' | 'predictions' | 'models' | 'agents';
+type TabId = 'chat' | 'investigations' | 'approvals' | 'triage' | 'anomalies' | 'predictions' | 'models' | 'agents' | 'oversight';
 
 const priorityColors: Record<string, string> = {
   critical: 'text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20',
@@ -54,10 +56,12 @@ const AgenticSOC: React.FC = () => {
     // and land on the chat workbench without a second click.
     const params = new URLSearchParams(window.location.search);
     const t = (params.get('tab') as TabId | null) || null;
-    const valid: TabId[] = ['chat', 'investigations', 'approvals', 'triage', 'anomalies', 'predictions', 'models', 'agents'];
+    const valid: TabId[] = ['chat', 'investigations', 'approvals', 'triage', 'anomalies', 'predictions', 'models', 'agents', 'oversight'];
     return t && valid.includes(t) ? t : 'chat';
   });
   const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
+  const [creatingAgent, setCreatingAgent] = useState(false);
+  const gate = roleGate(user?.role, user?.is_superuser);
   const [selectedInvestigation, setSelectedInvestigation] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -476,6 +480,8 @@ const AgenticSOC: React.FC = () => {
             { id: 'models', label: 'Models' },
             // Config — the SOC agent roster (mostly reference).
             { id: 'agents', label: 'Agents' },
+            // Auditor surface: usage, policy events, evidence export, runs.
+            { id: 'oversight', label: 'Oversight' },
           ] as const).map((tab) => (
             <button
               key={tab.id}
@@ -505,12 +511,28 @@ const AgenticSOC: React.FC = () => {
           {/* Agents Tab */}
           {activeTab === 'agents' && (
             <div>
-              <h2 className="text-xl font-bold text-gray-900 dark:text-white mb-6">Active Agents</h2>
+              <div className="flex items-start justify-between gap-4 mb-6">
+                <h2 className="text-xl font-bold text-gray-900 dark:text-white">SOC Agents</h2>
+                <div className="text-right">
+                  <button
+                    onClick={() => setCreatingAgent(true)}
+                    disabled={!gate.isAdmin}
+                    title={gate.isAdmin ? undefined : ADMIN_ONLY_REASON}
+                    className="px-3 py-2 text-sm rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    Create agent
+                  </button>
+                  {!gate.isAdmin ? (
+                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">Creating a SOC agent: {ADMIN_ONLY_REASON}</p>
+                  ) : null}
+                </div>
+              </div>
               <div className="mb-4 empty:hidden"><LoadErrorBanner what="SOC agents" error={loadErrors.agents} /></div>
-              {agents.length === 0 ? (
+              {agents.length === 0 && !loadErrors.agents ? (
                 <div className="text-center py-8 text-gray-500 dark:text-gray-400 text-sm">
-                  No agents registered. Agents come online when the backend
-                  workers boot.
+                  No SOC agent exists in this organisation. Until an admin
+                  creates one, agent proposals answer 409 and auto-triage
+                  skips the organisation.
                 </div>
               ) : null}
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
@@ -1009,6 +1031,8 @@ const AgenticSOC: React.FC = () => {
             </div>
           )}
 
+          {activeTab === 'oversight' && <AgentOversightPanel gate={gate} />}
+
           {/* Approvals Tab — one card per action; approve/deny and the
               integrity hash echo live in the shared ApprovalCard so the
               chat workbench and this page cannot diverge. */}
@@ -1024,6 +1048,21 @@ const AgenticSOC: React.FC = () => {
             </div>
           )}
         </div>
+
+        {creatingAgent ? (
+          <CreateAgentModal
+            onClose={() => setCreatingAgent(false)}
+            onCreated={(agent) => setAgents((prev) => [agent, ...prev])}
+          />
+        ) : null}
+        {selectedAgent ? (
+          <AgentDetailDrawer
+            agentId={selectedAgent}
+            gate={gate}
+            onClose={() => setSelectedAgent(null)}
+            onSaved={(agent) => setAgents((prev) => prev.map((a) => (a.id === agent.id ? agent : a)))}
+          />
+        ) : null}
 
         {/* Bottom chat widget removed — the full Chat tab (first in
             the tab row) is the primary agent workbench now. No sense

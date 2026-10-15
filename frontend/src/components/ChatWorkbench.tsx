@@ -25,6 +25,8 @@ import {
   TrustBanner,
 } from './agentic/RunPanels';
 import { normalizeFailure } from './agentic/runtime';
+import { RunTimelineDrawer, TrustAcknowledge } from './agentic/AgentOps';
+import { roleGate } from '../lib/roles';
 
 type ChatRole = 'user' | 'assistant' | 'system';
 
@@ -158,6 +160,11 @@ const ChatWorkbench: React.FC = () => {
   const [correctionNote, setCorrectionNote] = useState<string>('');
   const [correctionBusy, setCorrectionBusy] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Run timeline opened from a run id in a footer.
+  const [openRunId, setOpenRunId] = useState<string | null>(null);
+  // Tier the server reported after a trust acknowledgement, per session.
+  const [ackTiers, setAckTiers] = useState<Record<string, string>>({});
+  const gate = roleGate(role, user?.is_superuser);
 
   // A viewer may never ask for proposals — the API answers 403 — so the
   // flag is coerced off at render and again at send time.
@@ -414,13 +421,28 @@ const ChatWorkbench: React.FC = () => {
     }
 
     const run: RunRecord | null = m.run ?? (env ? envelopeToRun(env) : null);
+    const ackTier = activeSessionId ? ackTiers[activeSessionId] : undefined;
+    const trust =
+      run?.trust && run.trust.tier === 'lockdown' && ackTier ? { ...run.trust, tier: ackTier } : run?.trust ?? null;
 
     return (
       <>
         {m.content ? <div className="whitespace-pre-wrap">{m.content}</div> : null}
         {run ? (
           <>
-            <TrustBanner trust={run.trust} />
+            <TrustBanner
+              trust={trust}
+              acknowledge={
+                <TrustAcknowledge
+                  sessionId={activeSessionId}
+                  hits={trust?.hits || []}
+                  gate={gate}
+                  onAcknowledged={(tier) => {
+                    if (activeSessionId) setAckTiers((t) => ({ ...t, [activeSessionId]: tier }));
+                  }}
+                />
+              }
+            />
             <ActionsTakenPanel tools={run.tools_invoked} />
             {run.proposals.map((p, idx) => (
               <ApprovalCard
@@ -449,6 +471,7 @@ const ChatWorkbench: React.FC = () => {
               runId={run.run_id}
               stopReason={run.stop_reason}
               honestyNote={run.honesty_note_applied}
+              onOpenRun={setOpenRunId}
             />
           </>
         ) : null}
@@ -740,6 +763,7 @@ const ChatWorkbench: React.FC = () => {
         </div>
       </section>
       </div>
+      {openRunId ? <RunTimelineDrawer runId={openRunId} gate={gate} onClose={() => setOpenRunId(null)} /> : null}
     </div>
   );
 };

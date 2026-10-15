@@ -1,4 +1,5 @@
 import { api } from './client';
+import type { Row } from '../lib/apiRow';
 import {
   PaginatedResponse,
   Alert,
@@ -790,6 +791,82 @@ export const agenticApi = {
     const response = await api.get('/agentic/tools');
     return response.data?.tools || [];
   },
+
+  // --- SOC agent management and the auditor surface (wave 5) ---
+
+  getAgent: async (agentId: string): Promise<Row> => {
+    const response = await api.get(`/agentic/agents/${agentId}`);
+    return response.data;
+  },
+
+  /** Admin only; the server answers 403 role_not_permitted otherwise. */
+  createAgent: async (body: {
+    name: string;
+    agent_type: string;
+    capabilities?: string[];
+    llm_model?: string;
+    temperature?: number;
+    max_reasoning_steps?: number;
+    autonomy_level?: string;
+  }): Promise<Row> => {
+    const response = await api.post('/agentic/agents', body);
+    return response.data;
+  },
+
+  /** Admin only. Omitted fields are unchanged. */
+  updateAgent: async (
+    agentId: string,
+    body: {
+      name?: string;
+      status?: string;
+      temperature?: number;
+      max_reasoning_steps?: number;
+      autonomy_level?: string;
+    },
+  ): Promise<Row> => {
+    const response = await api.put(`/agentic/agents/${agentId}`, body);
+    return response.data;
+  },
+
+  /** Everything recorded about one run (analyst+); 404 run_not_found otherwise. */
+  getRun: async (runId: string): Promise<Row> => {
+    const response = await api.get(`/agentic/runs/${runId}`);
+    return response.data;
+  },
+
+  /** LLM token spend for the organisation over `days` (analyst+). */
+  getUsage: async (days: number): Promise<Row> => {
+    const response = await api.get('/agentic/usage', { params: { days } });
+    return response.data;
+  },
+
+  /** Policy and tool audit rows, newest first (analyst+). */
+  getPolicyEvents: async (params: {
+    decision?: string;
+    tool?: string;
+    reason_code?: string;
+    page?: number;
+    size?: number;
+  }): Promise<Row> => {
+    const response = await api.get('/agentic/policy-events', { params });
+    return response.data;
+  },
+
+  /** Per-decision evidence export (admin). CSV comes back as a Blob. */
+  exportEvidence: async (params: { format: 'csv' | 'json'; from?: string; to?: string }) => {
+    return api.get('/agentic/evidence/export', { params, responseType: 'blob' });
+  },
+
+  /** Downgrade a lockdown to flagged by acknowledging the hits (analyst+). */
+  acknowledgeTrust: async (body: {
+    session_id?: string;
+    investigation_id?: string;
+    record_hash?: string;
+    reason: string;
+  }): Promise<Row> => {
+    const response = await api.post('/agentic/trust/acknowledge', body);
+    return response.data;
+  },
 };
 
 // Playbook Builder
@@ -1202,6 +1279,12 @@ export const datalakeApi = {
     return extractData(response.data);
   },
 
+  /** Counts by status (built-in scheduled tasks counted apart from registered rows). */
+  getPipelineStatus: async (): Promise<Row> => {
+    const response = await api.get('/data-lake/dashboard/pipeline-status');
+    return response.data;
+  },
+
   runQuery: async (query: string): Promise<any> => {
     const response = await api.post('/data-lake/query', { query });
     return response.data;
@@ -1288,6 +1371,44 @@ export const collaborationApi = {
 
   archiveWarRoom: async (warRoomId: string): Promise<any> => {
     const response = await api.post(`/collaboration/rooms/${warRoomId}/archive`);
+    return response.data;
+  },
+
+  // --- wave 5: participation, timeline, action item updates, artifacts ---
+
+  /** Analyst+. 400 when the room is at capacity or not joinable. */
+  joinRoom: async (roomId: string): Promise<Row> => {
+    const response = await api.post(`/collaboration/rooms/${roomId}/join`);
+    return response.data;
+  },
+
+  leaveRoom: async (roomId: string): Promise<Row> => {
+    const response = await api.post(`/collaboration/rooms/${roomId}/leave`);
+    return response.data;
+  },
+
+  getTimeline: async (roomId: string, params?: { key_only?: boolean; page?: number; size?: number }): Promise<Row> => {
+    const response = await api.get(`/collaboration/rooms/${roomId}/timeline`, { params });
+    return response.data;
+  },
+
+  addTimelineEvent: async (
+    roomId: string,
+    body: { event_type: string; description: string; event_time?: string; is_key_event?: boolean; mitre_technique?: string },
+  ): Promise<Row> => {
+    const response = await api.post(`/collaboration/rooms/${roomId}/timeline`, body);
+    return response.data;
+  },
+
+  /** Analyst+. Only the fields sent change. */
+  updateActionItem: async (actionId: string, body: { status?: string; assigned_to?: string }): Promise<Row> => {
+    const response = await api.patch(`/collaboration/actions/${actionId}`, body);
+    return response.data;
+  },
+
+  /** Metadata registry only (name, hash, size): no bytes are stored. */
+  getArtifacts: async (roomId: string, params?: { page?: number; size?: number }): Promise<Row> => {
+    const response = await api.get(`/collaboration/rooms/${roomId}/artifacts`, { params });
     return response.data;
   },
 
@@ -1419,6 +1540,8 @@ export interface PolicyEvent {
 
 export interface TrustHit {
   family?: string | null;
+  /** sha256 of the flagged snippet; what /agentic/trust/acknowledge takes as record_hash. */
+  snippet_sha256?: string | null;
   preview?: string | null;
   label?: string | null;
 }

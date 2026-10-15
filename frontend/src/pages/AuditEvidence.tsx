@@ -12,7 +12,6 @@ import {
   Image,
   Square,
   Settings,
-  Eye,
   Trash2,
   Calendar,
   CheckCircle,
@@ -29,6 +28,7 @@ import FormModal from '../components/FormModal';
 import LoadErrorBanner from '../components/LoadErrorBanner';
 import ActionErrorBanner from '../components/ActionErrorBanner';
 import type { Row } from '../lib/apiRow';
+import { filenameFromDisposition, parseBlobError, saveBlob } from '../lib/download';
 
 type TabType = 'dashboard' | 'audit-trail' | 'evidence' | 'packages' | 'conmon';
 
@@ -124,6 +124,7 @@ interface Package {
   framework_id?: string | null;
   status: string;
   evidence_items: Record<string, unknown>;
+  control_mappings?: Record<string, unknown>;
   due_date?: string | null;
   assessor?: string | null;
   submitted_at?: string | null;
@@ -825,6 +826,24 @@ function EvidenceTab({
   const [uploading, setUploading] = useState(false);
   const [collectResult, setCollectResult] = useState<Row | null>(null);
   const [collectError, setCollectError] = useState<unknown>(null);
+  const [downloadError, setDownloadError] = useState<unknown>(null);
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
+
+  // Stream the stored artifact back (tenant-scoped on the server; a path
+  // outside the organisation's evidence root answers 403, a missing file 404).
+  const downloadEvidence = async (item: EvidenceItem) => {
+    setDownloadError(null);
+    setDownloadingId(item.id);
+    try {
+      const res = await api.get(`/audit-evidence/evidence/${item.id}/download`, { responseType: 'blob' });
+      const fallback = (item.title || `evidence-${item.id}`).replace(/[^\w.-]+/g, '_');
+      saveBlob(res.data as Blob, filenameFromDisposition(res.headers?.['content-disposition'], fallback));
+    } catch (err) {
+      setDownloadError(await parseBlobError(err));
+    } finally {
+      setDownloadingId(null);
+    }
+  };
   const [collecting, setCollecting] = useState(false);
 
   // Run every enabled automated evidence rule: each one collects, reports
@@ -898,6 +917,7 @@ function EvidenceTab({
         </span>
       </div>
       <ActionErrorBanner what="run the automated evidence rules" error={collectError} />
+      <ActionErrorBanner what="download the evidence file" error={downloadError} />
       {collectResult && (
         <div className="text-sm bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded p-3 space-y-1">
           <p>
@@ -1028,13 +1048,19 @@ function EvidenceTab({
                     </span>
                   </td>
                   <td className="px-6 py-4 text-center space-x-2">
-                    {item.contentUrl && (
+                    {item.contentUrl ? (
                       <button
-                        title="View"
-                        className="text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 p-2 rounded inline-block"
+                        onClick={() => downloadEvidence(item)}
+                        disabled={downloadingId === item.id}
+                        title="Download the evidence file"
+                        className="text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 p-2 rounded inline-block disabled:opacity-50"
                       >
-                        <Eye className="w-4 h-4" />
+                        {downloadingId === item.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
                       </button>
+                    ) : (
+                      <span className="text-xs text-gray-400" title="This evidence row was recorded without an uploaded file">
+                        no file
+                      </span>
                     )}
                     {item.status === 'reviewed' && (
                       <button
@@ -1274,6 +1300,7 @@ function PackagesTab({
   const [pkgActionError, setPkgActionError] = useState<{ what: string; error: unknown } | null>(null);
   const [pkgNotice, setPkgNotice] = useState<string | null>(null);
   const [addingTo, setAddingTo] = useState<Package | null>(null);
+  const [detailId, setDetailId] = useState<string | null>(null);
   const [selectedEvidence, setSelectedEvidence] = useState<string[]>([]);
   const pkgAction = async (what: string, fn: () => Promise<string | void>) => {
     setPkgActionError(null);
@@ -1569,6 +1596,12 @@ function PackagesTab({
             </div>
 
             <div className="flex flex-wrap gap-2">
+              <button
+                onClick={() => setDetailId(pkg.id)}
+                className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm font-medium"
+              >
+                Details
+              </button>
               {!pkg.submitted_at && (
                 <button
                   onClick={() => { setSelectedEvidence([]); setAddingTo(pkg); }}
@@ -1626,6 +1659,102 @@ function PackagesTab({
             </div>
           </div>
         ))}
+      </div>
+      {detailId && <PackageDetail packageId={detailId} evidence={evidence} onClose={() => setDetailId(null)} />}
+    </div>
+  );
+}
+
+// GET /audit-evidence/packages/{id}: the package as stored, re-read from the
+// server so the contents reflect the last Add Evidence / Build call.
+function PackageDetail({
+  packageId,
+  evidence,
+  onClose,
+}: {
+  packageId: string;
+  evidence: EvidenceItem[];
+  onClose: () => void;
+}) {
+  const { data: pkg, isLoading, error } = useQuery<Package & Row>({
+    queryKey: ['audit-package', packageId],
+    queryFn: async () => (await api.get(`/audit-evidence/packages/${packageId}`)).data,
+    staleTime: 0,
+  });
+  const titles = new Map(evidence.map((e) => [e.id, e.title]));
+  const items = Object.entries(pkg?.evidence_items || {});
+  const mappings = Object.entries((pkg?.control_mappings as Record<string, unknown> | undefined) || {});
+  const show = (v: unknown) => (typeof v === 'string' ? v : JSON.stringify(v));
+  return (
+    <div className="fixed inset-0 z-50 flex justify-end bg-black/40" onClick={onClose}>
+      <div
+        role="dialog"
+        aria-label="Evidence package"
+        className="w-full max-w-2xl h-full overflow-y-auto bg-white dark:bg-gray-800 p-6 space-y-4"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between">
+          <div>
+            <h2 className="text-lg font-semibold text-gray-900 dark:text-white">{pkg?.name ?? 'Evidence package'}</h2>
+            <p className="text-xs font-mono text-gray-500">{packageId}</p>
+          </div>
+          <button onClick={onClose} className="text-gray-500 hover:text-gray-800 dark:hover:text-gray-200">Close</button>
+        </div>
+        <LoadErrorBanner what="the evidence package" error={error} />
+        {isLoading && <Loader2 className="w-5 h-5 animate-spin text-gray-400" />}
+        {pkg && (
+          <div className="space-y-4 text-sm">
+            <dl className="grid grid-cols-2 gap-2">
+              {[
+                ['Status', pkg.status],
+                ['Type', pkg.package_type],
+                ['Framework', pkg.framework_id],
+                ['Assessor', pkg.assessor],
+                ['Due', pkg.due_date ? new Date(pkg.due_date).toLocaleDateString() : null],
+                ['Submitted', pkg.submitted_at ? new Date(pkg.submitted_at).toLocaleString() : null],
+              ].map(([k, v]) => (
+                <div key={String(k)}>
+                  <dt className="text-xs text-gray-500">{k}</dt>
+                  <dd className="text-gray-900 dark:text-white">{v || 'not set'}</dd>
+                </div>
+              ))}
+            </dl>
+            {pkg.description && <p className="text-gray-700 dark:text-gray-300">{pkg.description}</p>}
+            <div>
+              <h3 className="font-semibold text-gray-900 dark:text-white mb-1">Package hash</h3>
+              <p className="font-mono text-xs break-all text-gray-700 dark:text-gray-300">
+                {pkg.package_hash || 'not built yet: Build Package hashes the evidence it holds'}
+              </p>
+            </div>
+            <div>
+              <h3 className="font-semibold text-gray-900 dark:text-white mb-1">Evidence items ({items.length})</h3>
+              {items.length === 0 ? (
+                <p className="text-xs text-gray-500">No evidence attached. Build and Submit are refused (409 package_empty) until some is.</p>
+              ) : (
+                <ul className="space-y-1 text-xs">
+                  {items.map(([id, v]) => (
+                    <li key={id} className="border border-gray-200 dark:border-gray-700 rounded p-2">
+                      <span className="font-medium">{titles.get(id) ?? id}</span>
+                      <span className="block font-mono text-gray-500 break-all">{show(v)}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+            <div>
+              <h3 className="font-semibold text-gray-900 dark:text-white mb-1">Control mappings ({mappings.length})</h3>
+              {mappings.length === 0 ? (
+                <p className="text-xs text-gray-500">No control mappings recorded on this package.</p>
+              ) : (
+                <ul className="space-y-1 text-xs font-mono">
+                  {mappings.map(([k, v]) => (
+                    <li key={k}>{k}: {show(v)}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

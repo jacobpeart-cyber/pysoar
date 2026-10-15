@@ -482,6 +482,7 @@ export default function DataLakeDashboard() {
         {/* Pipelines Tab */}
         {activeTab === 'pipelines' && (
           <div>
+            <PipelineStatusPanel />
             <div className="mb-4">
               <LoadErrorBanner what="pipelines" error={pipelinesError} />
             </div>
@@ -1077,6 +1078,82 @@ export default function DataLakeDashboard() {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// GET /data-lake/dashboard/pipeline-status: counts computed from the
+// organisation's pipeline rows plus the platform's scheduled tasks. Built-in
+// pipelines are scheduled Celery tasks (no per-run history); registered rows
+// record a definition that no executor runs.
+function PipelineStatusPanel() {
+  const { data, error, isLoading } = useQuery({
+    queryKey: ['pipelineStatus'],
+    queryFn: () => datalakeApi.getPipelineStatus(),
+  });
+  const recent: Row[] = Array.isArray(data?.recent_executions) ? data.recent_executions : [];
+  const chips: { label: string; key: string; cls: string; title: string }[] = [
+    { label: 'Active', key: 'active_pipelines', cls: 'bg-green-900/40 text-green-300', title: 'Pipeline rows marked active' },
+    { label: 'Scheduled (built-in)', key: 'scheduled_builtin_pipelines', cls: 'bg-blue-900/40 text-blue-300', title: 'Platform tasks on the beat schedule; run history is not recorded' },
+    { label: 'Registered (no executor)', key: 'registered_pipelines', cls: 'bg-gray-700 text-gray-300', title: 'Definitions only: no executor runs user-defined pipelines' },
+    { label: 'Paused', key: 'paused_pipelines', cls: 'bg-yellow-900/40 text-yellow-300', title: 'Pipeline rows marked paused' },
+    { label: 'Error', key: 'error_pipelines', cls: 'bg-red-900/40 text-red-300', title: 'Pipeline rows in error or failed' },
+  ];
+  return (
+    <div className="mb-6 bg-gray-800 border border-gray-700 rounded-lg p-6 space-y-4">
+      <div className="flex items-center justify-between">
+        <h3 className="text-lg font-semibold">Pipeline status</h3>
+        {data?.generated_at && <span className="text-xs text-gray-400">as of {new Date(data.generated_at).toLocaleString()}</span>}
+      </div>
+      <LoadErrorBanner what="pipeline status" error={error} />
+      {isLoading && <p className="text-sm text-gray-400">Loading...</p>}
+      {data && (
+        <>
+          <div className="flex flex-wrap gap-2">
+            {chips.map((c) => (
+              <span key={c.key} title={c.title} className={clsx('px-3 py-1 rounded-full text-xs font-medium', c.cls)}>
+                {c.label}: {typeof data[c.key] === 'number' ? data[c.key] : NA}
+              </span>
+            ))}
+            <span className="px-3 py-1 rounded-full text-xs font-medium bg-gray-900 text-gray-300">
+              Total: {typeof data.total_pipelines === 'number' ? data.total_pipelines : NA}
+            </span>
+          </div>
+          <p className="text-xs text-gray-400">
+            No executor runs user-defined data-lake pipelines: a registered pipeline records its definition only. Built-in
+            pipelines are the platform&apos;s scheduled tasks; they run, but their run history is not recorded.
+          </p>
+          <p className="text-sm text-gray-300">
+            Record success rate:{' '}
+            {typeof data.avg_success_rate === 'number'
+              ? `${data.avg_success_rate}% (processed records minus errors)`
+              : 'not available: no pipeline has processed records'}
+          </p>
+          <div>
+            <p className="text-sm text-gray-300 mb-1">Last run per pipeline</p>
+            {recent.length === 0 ? (
+              <p className="text-xs text-gray-500">No pipeline row has a recorded run.</p>
+            ) : (
+              <table className="w-full text-sm text-gray-300">
+                <thead className="text-left text-xs text-gray-400">
+                  <tr><th>Pipeline</th><th>Status</th><th>Records</th><th>Avg time</th><th>Last run</th></tr>
+                </thead>
+                <tbody>
+                  {recent.map((r) => (
+                    <tr key={r.pipeline_id} className="border-t border-gray-700">
+                      <td className="py-1">{r.pipeline_name}</td>
+                      <td>{r.status}</td>
+                      <td>{typeof r.records_processed === 'number' ? r.records_processed.toLocaleString() : NA}</td>
+                      <td>{typeof r.execution_time_ms === 'number' ? `${r.execution_time_ms} ms` : NA}</td>
+                      <td className="text-xs">{r.timestamp ? new Date(r.timestamp).toLocaleString() : NA}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 }

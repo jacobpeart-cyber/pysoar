@@ -13,6 +13,9 @@ import {
   Pencil,
 } from 'lucide-react';
 import { api } from '../lib/api';
+import LoadErrorBanner from '../components/LoadErrorBanner';
+import ActionErrorBanner from '../components/ActionErrorBanner';
+import { useRoleGate, ANALYST_ONLY_REASON } from '../lib/roles';
 
 // --- Types ---
 
@@ -66,7 +69,8 @@ interface Mitigation {
   mitigation_type: string | null;
   implementation_status: string;
   control_reference: any;
-  effectiveness: number | null;
+  /** MitigationResponse.effectiveness_score (0-100). */
+  effectiveness_score: number | null;
 }
 
 interface Dashboard {
@@ -821,9 +825,12 @@ export default function ThreatModeling() {
                   <AlertTriangle className="w-5 h-5 text-yellow-400" />
                   Mitigations for: {threats.find((t) => t.id === selectedThreatId)?.title ?? 'Selected Threat'}
                 </h2>
+                <div className="mb-3">
+                  <LoadErrorBanner what="mitigations" error={mitigationsQuery.error} />
+                </div>
                 {mitigationsQuery.isLoading ? (
                   <p className="text-gray-500 text-sm">Loading mitigations...</p>
-                ) : mitigations.length === 0 ? (
+                ) : mitigationsQuery.error ? null : mitigations.length === 0 ? (
                   <p className="text-gray-500 text-sm">No mitigations for this threat.</p>
                 ) : (
                   <div className="bg-gray-800 border border-gray-700 rounded-lg overflow-hidden">
@@ -848,15 +855,15 @@ export default function ThreatModeling() {
                               </span>
                             </td>
                             <td className="px-4 py-3 text-sm">
-                              {mit.effectiveness != null ? (
+                              {mit.effectiveness_score != null ? (
                                 <div className="flex items-center gap-2">
                                   <div className="w-16 h-2 bg-gray-700 rounded-full">
                                     <div
                                       className="h-full bg-blue-500 rounded-full"
-                                      style={{ width: `${Math.min(100, mit.effectiveness)}%` }}
+                                      style={{ width: `${Math.min(100, mit.effectiveness_score)}%` }}
                                     />
                                   </div>
-                                  <span className="text-gray-400 text-xs">{mit.effectiveness}%</span>
+                                  <span className="text-gray-400 text-xs">{mit.effectiveness_score}%</span>
                                 </div>
                               ) : (
                                 <span className="text-gray-500">-</span>
@@ -870,6 +877,9 @@ export default function ThreatModeling() {
                       </tbody>
                     </table>
                   </div>
+                )}
+                {selectedModelId && (
+                  <MitigationCreateForm modelId={selectedModelId} threatId={selectedThreatId} />
                 )}
               </div>
             )}
@@ -1204,5 +1214,74 @@ export default function ThreatModeling() {
         )}
       </div>
     </div>
+  );
+}
+
+// POST /threat-modeling/{model_id}/threats/{threat_id}/mitigations: the
+// only way a threat gets a mitigation. Analyst+ on the server.
+function MitigationCreateForm({ modelId, threatId }: { modelId: string; threatId: string }) {
+  const queryClient = useQueryClient();
+  const gate = useRoleGate();
+  const empty = {
+    title: '', description: '', mitigation_type: 'preventive', implementation_status: 'planned',
+    effectiveness_score: '0', assigned_to: '', deadline: '', verification_method: '', controls: '',
+  };
+  const [form, setForm] = useState(empty);
+  const create = useMutation({
+    mutationFn: async () => {
+      const controls = form.controls.split(',').map((c) => c.trim()).filter(Boolean);
+      return (await api.post(`/threat-modeling/${modelId}/threats/${threatId}/mitigations`, {
+        threat_id: threatId,
+        title: form.title.trim(),
+        description: form.description.trim() || null,
+        mitigation_type: form.mitigation_type,
+        implementation_status: form.implementation_status,
+        effectiveness_score: Math.max(0, Math.min(100, Number(form.effectiveness_score) || 0)),
+        assigned_to: form.assigned_to.trim() || null,
+        deadline: form.deadline || null,
+        verification_method: form.verification_method.trim() || null,
+        control_reference: controls.length ? { nist_800_53: controls } : null,
+      })).data;
+    },
+    onSuccess: () => {
+      setForm(empty);
+      queryClient.invalidateQueries({ queryKey: ['threat-mitigations', modelId, threatId] });
+    },
+  });
+  const cls = 'bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white text-sm placeholder-gray-500';
+  const off = !gate.isAnalyst;
+  return (
+    <form
+      className="mt-4 bg-gray-800 border border-gray-700 rounded-lg p-4 space-y-3"
+      onSubmit={(e) => {
+        e.preventDefault();
+        create.mutate();
+      }}
+    >
+      <p className="text-sm font-semibold text-white">Add mitigation</p>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+        <input value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} placeholder="Title *" className={cls} disabled={off} />
+        <select value={form.mitigation_type} onChange={(e) => setForm({ ...form, mitigation_type: e.target.value })} className={cls} disabled={off}>
+          {['preventive', 'detective', 'corrective', 'compensating', 'deterrent'].map((t) => <option key={t} value={t}>{t}</option>)}
+        </select>
+        <select value={form.implementation_status} onChange={(e) => setForm({ ...form, implementation_status: e.target.value })} className={cls} disabled={off}>
+          {['planned', 'in_progress', 'implemented', 'verified', 'not_applicable'].map((t) => <option key={t} value={t}>{t.replace(/_/g, ' ')}</option>)}
+        </select>
+        <label className="text-xs text-gray-400 flex items-center gap-2">
+          Effectiveness (0-100, your estimate)
+          <input type="number" min={0} max={100} value={form.effectiveness_score} onChange={(e) => setForm({ ...form, effectiveness_score: e.target.value })} className={`${cls} w-20`} disabled={off} />
+        </label>
+        <input value={form.assigned_to} onChange={(e) => setForm({ ...form, assigned_to: e.target.value })} placeholder="Owner" className={cls} disabled={off} />
+        <input type="date" value={form.deadline} onChange={(e) => setForm({ ...form, deadline: e.target.value })} className={cls} disabled={off} title="Deadline" />
+        <input value={form.controls} onChange={(e) => setForm({ ...form, controls: e.target.value })} placeholder="NIST 800-53 controls (e.g. AC-3, SI-4)" className={cls} disabled={off} />
+        <input value={form.verification_method} onChange={(e) => setForm({ ...form, verification_method: e.target.value })} placeholder="How it is verified" className={`${cls} md:col-span-2`} disabled={off} />
+      </div>
+      <textarea value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} rows={2} placeholder="Description" className={`${cls} w-full`} disabled={off} />
+      <button type="submit" disabled={off || !form.title.trim() || create.isPending} title={off ? ANALYST_ONLY_REASON : undefined} className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm disabled:opacity-50">
+        {create.isPending ? 'Adding...' : 'Add mitigation'}
+      </button>
+      {off && <p className="text-xs text-gray-400">{ANALYST_ONLY_REASON}</p>}
+      <ActionErrorBanner what="add the mitigation" error={create.error} />
+    </form>
   );
 }

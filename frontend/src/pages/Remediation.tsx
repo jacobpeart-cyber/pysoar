@@ -39,6 +39,8 @@ import FormModal from '../components/FormModal';
 import LoadErrorBanner from '../components/LoadErrorBanner';
 import { describeLoadError } from '../lib/loadError';
 import ActionErrorBanner from '../components/ActionErrorBanner';
+import type { Row } from '../lib/apiRow';
+import { useRoleGate, ADMIN_ONLY_REASON } from '../lib/roles';
 
 interface Tab {
   id: string;
@@ -122,6 +124,7 @@ const tabs: Tab[] = [
   { id: 'dashboard', label: 'Dashboard' },
   { id: 'policies', label: 'Policies' },
   { id: 'executions', label: 'Executions' },
+  { id: 'playbooks', label: 'Playbooks' },
   { id: 'quick-actions', label: 'Quick Actions' },
   { id: 'integrations', label: 'Integrations' },
 ];
@@ -1613,6 +1616,7 @@ export default function Remediation() {
           {activeTab === 'dashboard' && renderDashboard()}
           {activeTab === 'policies' && renderPolicies()}
           {activeTab === 'executions' && renderExecutions()}
+          {activeTab === 'playbooks' && <PlaybooksTab onOpenExecutions={() => setActiveTab('executions')} />}
           {activeTab === 'quick-actions' && renderQuickActions()}
           {activeTab === 'integrations' && renderIntegrations()}
         </div>
@@ -2128,6 +2132,345 @@ function CreatePolicyModal({ onClose, onCreated }: { onClose: () => void; onCrea
             </button>
           </div>
         </form>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Playbooks tab (wave 5): GET/POST /remediation/playbooks, GET/PUT
+// /remediation/playbooks/{id}, POST /remediation/playbooks/{id}/execute.
+// Create, edit and execute are admin-only on the server.
+// ============================================================================
+
+const PLAYBOOK_TYPES = ['incident_response', 'vulnerability_remediation', 'compliance_fix', 'threat_containment', 'recovery'];
+const ON_FAILURE = [
+  { value: 'continue', label: 'continue with the next step' },
+  { value: 'retry', label: 'retry once, then continue' },
+  { value: 'abort', label: 'stop the run' },
+];
+
+interface PlaybookStepDraft {
+  action_id: string;
+  on_failure: string;
+}
+
+interface RemediationPlaybookRow {
+  id: string;
+  name: string;
+  description?: string | null;
+  playbook_type: string;
+  steps: { action_id?: string; type?: string; action_type?: string; on_failure?: string | null }[];
+  is_enabled: boolean;
+  is_template?: boolean;
+  success_count: number;
+  failure_count: number;
+  created_by?: string;
+  created_at?: string | null;
+  updated_at?: string | null;
+  last_executed_at?: string | null;
+}
+
+const stepKeyOf = (s: RemediationPlaybookRow['steps'][number]) => s.action_id || s.type || s.action_type || '';
+
+function PlaybooksTab({ onOpenExecutions }: { onOpenExecutions: () => void }) {
+  const gate = useRoleGate();
+  const [editing, setEditing] = useState<RemediationPlaybookRow | 'new' | null>(null);
+  const [openId, setOpenId] = useState<string | null>(null);
+  const { data, isLoading, error } = useQuery<RemediationPlaybookRow[]>({
+    queryKey: ['remediation-playbooks'],
+    queryFn: async () => (await api.get('/remediation/playbooks', { params: { limit: 200 } })).data,
+  });
+  const playbooks = Array.isArray(data) ? data : [];
+  return (
+    <div className="space-y-4">
+      <div className="flex items-start justify-between gap-4">
+        <p className="text-sm text-gray-600 dark:text-gray-400 max-w-3xl">
+          A remediation playbook is an ordered list of registry actions run against one target. Each step reports its
+          honest state: executed, queued for approval, awaiting integration, detection only or failed. A failed step
+          fails the run.
+        </p>
+        <div className="text-right">
+          <button
+            onClick={() => setEditing('new')}
+            disabled={!gate.isAdmin}
+            title={gate.isAdmin ? undefined : ADMIN_ONLY_REASON}
+            className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm disabled:opacity-50"
+          >
+            <Plus className="w-4 h-4" />
+            New playbook
+          </button>
+          {!gate.isAdmin && <p className="text-xs text-gray-500 mt-1">Create, edit and run: {ADMIN_ONLY_REASON}</p>}
+        </div>
+      </div>
+      <LoadErrorBanner what="remediation playbooks" error={error} />
+      {isLoading && <LoadingState />}
+      {!isLoading && !error && playbooks.length === 0 && (
+        <p className="text-sm text-gray-500 dark:text-gray-400">No remediation playbooks in this organisation.</p>
+      )}
+      {playbooks.length > 0 && (
+        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 dark:bg-gray-700 text-left text-gray-600 dark:text-gray-300">
+              <tr>
+                <th className="px-4 py-3">Name</th>
+                <th className="px-4 py-3">Type</th>
+                <th className="px-4 py-3">Steps</th>
+                <th className="px-4 py-3">Runs (ok / failed)</th>
+                <th className="px-4 py-3">Last run</th>
+                <th className="px-4 py-3">State</th>
+              </tr>
+            </thead>
+            <tbody>
+              {playbooks.map((p) => (
+                <tr
+                  key={p.id}
+                  onClick={() => setOpenId(p.id)}
+                  className="border-t border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer"
+                >
+                  <td className="px-4 py-3 font-medium text-gray-900 dark:text-white">{p.name}</td>
+                  <td className="px-4 py-3">{p.playbook_type.replace(/_/g, ' ')}</td>
+                  <td className="px-4 py-3">{(p.steps || []).map(stepKeyOf).join(' → ') || 'no steps'}</td>
+                  <td className="px-4 py-3">{p.success_count ?? 0} / {p.failure_count ?? 0}</td>
+                  <td className="px-4 py-3">{p.last_executed_at ? new Date(p.last_executed_at).toLocaleString() : 'never'}</td>
+                  <td className="px-4 py-3">{p.is_enabled ? 'enabled' : 'disabled'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {openId && (
+        <PlaybookDetail
+          playbookId={openId}
+          isAdmin={gate.isAdmin}
+          onClose={() => setOpenId(null)}
+          onEdit={(p) => { setOpenId(null); setEditing(p); }}
+          onOpenExecutions={onOpenExecutions}
+        />
+      )}
+      {editing && <PlaybookEditor playbook={editing === 'new' ? null : editing} onClose={() => setEditing(null)} />}
+    </div>
+  );
+}
+
+function PlaybookEditor({ playbook, onClose }: { playbook: RemediationPlaybookRow | null; onClose: () => void }) {
+  const queryClient = useQueryClient();
+  const { data: registry, error: registryError } = useQuery<RemediationActionSpec[]>({
+    queryKey: ['remediation-action-registry'],
+    queryFn: () => remediationApi.getActions(),
+  });
+  const specs = Array.isArray(registry) ? registry : [];
+  const [name, setName] = useState(playbook?.name ?? '');
+  const [description, setDescription] = useState(playbook?.description ?? '');
+  const [type, setType] = useState(playbook?.playbook_type ?? 'incident_response');
+  const [enabled, setEnabled] = useState(playbook?.is_enabled ?? true);
+  const [steps, setSteps] = useState<PlaybookStepDraft[]>(
+    (playbook?.steps || []).map((s) => ({ action_id: stepKeyOf(s), on_failure: s.on_failure || 'continue' })),
+  );
+  const unknown = steps.filter((s) => s.action_id && specs.length > 0 && !specs.some((x) => x.key === s.action_id || x.aliases?.includes(s.action_id)));
+  const save = useMutation({
+    mutationFn: async () => {
+      const body = {
+        name: name.trim(),
+        description: description.trim() || null,
+        playbook_type: type,
+        is_enabled: enabled,
+        is_template: false,
+        steps: steps.filter((s) => s.action_id).map((s) => ({ action_id: s.action_id, on_failure: s.on_failure })),
+      };
+      return playbook
+        ? (await api.put(`/remediation/playbooks/${playbook.id}`, body)).data
+        : (await api.post('/remediation/playbooks', body)).data;
+    },
+    onSuccess: (saved: RemediationPlaybookRow) => {
+      queryClient.invalidateQueries({ queryKey: ['remediation-playbooks'] });
+      queryClient.setQueryData(['remediation-playbook', saved.id], saved);
+      onClose();
+    },
+  });
+  const field = 'w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm';
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+      <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-full max-w-2xl max-h-[90vh] overflow-y-auto space-y-3">
+        <h2 className="text-xl font-bold text-gray-900 dark:text-white">{playbook ? `Edit ${playbook.name}` : 'New remediation playbook'}</h2>
+        <label className="block text-sm">Name<input value={name} onChange={(e) => setName(e.target.value)} className={field} /></label>
+        <label className="block text-sm">Description<textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={2} className={field} /></label>
+        <label className="block text-sm">
+          Type
+          <select value={type} onChange={(e) => setType(e.target.value)} className={field} disabled={!!playbook}>
+            {PLAYBOOK_TYPES.map((t) => <option key={t} value={t}>{t.replace(/_/g, ' ')}</option>)}
+          </select>
+          {playbook && <span className="text-xs text-gray-500">The server keeps the type it was created with; edits change name, description, steps and enabled.</span>}
+        </label>
+        <label className="flex items-center gap-2 text-sm">
+          <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
+          Enabled (a disabled playbook refuses to run)
+        </label>
+        <div className="space-y-2">
+          <p className="text-sm font-medium">Steps (run in order against the target given at run time)</p>
+          <LoadErrorBanner what="the action registry" error={registryError} />
+          {steps.map((s, i) => (
+            <div key={i} className="flex flex-wrap gap-2 items-center">
+              <span className="text-xs text-gray-500 w-6">{i + 1}.</span>
+              <select value={s.action_id} onChange={(e) => setSteps(steps.map((x, j) => (j === i ? { ...x, action_id: e.target.value } : x)))} className={`${field} flex-1 min-w-[12rem]`}>
+                <option value="">choose an action</option>
+                {s.action_id && !specs.some((x) => x.key === s.action_id) && <option value={s.action_id}>{s.action_id} (stored)</option>}
+                {specs.map((x) => <option key={x.key} value={x.key}>{x.label} ({x.key}{x.reversible ? ', reversible' : ''})</option>)}
+              </select>
+              <select value={s.on_failure} onChange={(e) => setSteps(steps.map((x, j) => (j === i ? { ...x, on_failure: e.target.value } : x)))} className={`${field} w-56`}>
+                {ON_FAILURE.map((o) => <option key={o.value} value={o.value}>on failure: {o.label}</option>)}
+              </select>
+              <button type="button" onClick={() => setSteps(steps.filter((_, j) => j !== i))} className="text-sm text-red-600">Remove</button>
+            </div>
+          ))}
+          <button type="button" onClick={() => setSteps([...steps, { action_id: '', on_failure: 'continue' }])} className="text-sm text-blue-600">+ Add step</button>
+          {unknown.length > 0 && (
+            <p className="text-xs text-amber-700 dark:text-amber-300">
+              Not in the action registry: {unknown.map((u) => u.action_id).join(', ')}. These steps fail when the playbook runs.
+            </p>
+          )}
+          <p className="text-xs text-gray-500 dark:text-gray-400">
+            Steps store the action key and the failure rule only: the playbook API keeps no per-step parameters, so every
+            step acts on the run&apos;s target with the action&apos;s defaults. An action that needs another parameter fails
+            and says which.
+          </p>
+        </div>
+        <ActionErrorBanner what="save the playbook" error={save.error} />
+        <div className="flex gap-2 justify-end">
+          <button onClick={onClose} className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm">Cancel</button>
+          <button onClick={() => save.mutate()} disabled={save.isPending || !name.trim()} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm disabled:opacity-50">
+            {save.isPending ? 'Saving...' : 'Save playbook'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PlaybookDetail({
+  playbookId,
+  isAdmin,
+  onClose,
+  onEdit,
+  onOpenExecutions,
+}: {
+  playbookId: string;
+  isAdmin: boolean;
+  onClose: () => void;
+  onEdit: (p: RemediationPlaybookRow) => void;
+  onOpenExecutions: () => void;
+}) {
+  const queryClient = useQueryClient();
+  const { data: pb, error, isLoading } = useQuery<RemediationPlaybookRow>({
+    queryKey: ['remediation-playbook', playbookId],
+    queryFn: async () => (await api.get(`/remediation/playbooks/${playbookId}`)).data,
+  });
+  const [target, setTarget] = useState('');
+  const [targetType, setTargetType] = useState('host');
+  const run = useMutation({
+    mutationFn: async () =>
+      (await api.post(`/remediation/playbooks/${playbookId}/execute`, {
+        target_entity: target.trim(),
+        target_type: targetType,
+        trigger_source: 'manual',
+      })).data,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['remediation-playbooks'] });
+      queryClient.invalidateQueries({ queryKey: ['remediation-playbook', playbookId] });
+      queryClient.invalidateQueries({ queryKey: ['remediation-executions'] });
+      queryClient.invalidateQueries({ queryKey: ['remediation-dashboard'] });
+    },
+  });
+  const result = run.data;
+  const results: Row[] = Array.isArray(result?.action_results) ? result.action_results : [];
+  const reversible = results.filter((r) => r?.reversible);
+  return (
+    <div className="fixed inset-0 bg-black/50 flex justify-end z-50" onClick={onClose}>
+      <div className="w-full max-w-2xl h-full overflow-y-auto bg-white dark:bg-gray-800 p-6 space-y-4" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-start justify-between">
+          <div>
+            <h2 className="text-xl font-bold text-gray-900 dark:text-white">{pb?.name ?? 'Remediation playbook'}</h2>
+            <p className="text-xs font-mono text-gray-500">{playbookId}</p>
+          </div>
+          <button onClick={onClose} className="text-sm text-gray-500 hover:text-gray-800 dark:hover:text-gray-200">Close</button>
+        </div>
+        <LoadErrorBanner what="the playbook" error={error} />
+        {isLoading && <LoadingState />}
+        {pb && (
+          <>
+            {pb.description && <p className="text-sm text-gray-700 dark:text-gray-300">{pb.description}</p>}
+            <dl className="grid grid-cols-2 gap-2 text-sm">
+              <div><dt className="text-xs text-gray-500">Type</dt><dd>{pb.playbook_type.replace(/_/g, ' ')}</dd></div>
+              <div><dt className="text-xs text-gray-500">State</dt><dd>{pb.is_enabled ? 'enabled' : 'disabled'}</dd></div>
+              <div><dt className="text-xs text-gray-500">Runs ok / failed</dt><dd>{pb.success_count ?? 0} / {pb.failure_count ?? 0}</dd></div>
+              <div><dt className="text-xs text-gray-500">Last run</dt><dd>{pb.last_executed_at ? new Date(pb.last_executed_at).toLocaleString() : 'never'}</dd></div>
+              <div><dt className="text-xs text-gray-500">Created by</dt><dd className="font-mono text-xs">{pb.created_by || 'not recorded'}</dd></div>
+              <div><dt className="text-xs text-gray-500">Updated</dt><dd>{pb.updated_at ? new Date(pb.updated_at).toLocaleString() : 'not recorded'}</dd></div>
+            </dl>
+            <div>
+              <p className="text-sm font-medium mb-1">Steps</p>
+              {(pb.steps || []).length === 0 ? (
+                <p className="text-sm text-gray-500">No steps: running it is refused (400 empty_playbook).</p>
+              ) : (
+                <ol className="list-decimal ml-5 text-sm space-y-0.5">
+                  {pb.steps.map((s, i) => (
+                    <li key={i}><span className="font-mono">{stepKeyOf(s) || 'no action key'}</span> · on failure: {s.on_failure || 'continue'}</li>
+                  ))}
+                </ol>
+              )}
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={() => onEdit(pb)}
+                disabled={!isAdmin}
+                title={isAdmin ? undefined : ADMIN_ONLY_REASON}
+                className="px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg disabled:opacity-50"
+              >
+                Edit
+              </button>
+            </div>
+            <div className="border-t border-gray-200 dark:border-gray-700 pt-4 space-y-2">
+              <p className="text-sm font-medium">Run against a target</p>
+              <div className="flex flex-wrap gap-2">
+                <input value={target} onChange={(e) => setTarget(e.target.value)} placeholder="hostname, IP, username or file" disabled={!isAdmin} className="flex-1 min-w-[12rem] px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-sm" />
+                <select value={targetType} onChange={(e) => setTargetType(e.target.value)} disabled={!isAdmin} className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-sm">
+                  {['host', 'ip', 'user', 'file'].map((t) => <option key={t} value={t}>{t}</option>)}
+                </select>
+                <button
+                  onClick={() => run.mutate()}
+                  disabled={!isAdmin || !target.trim() || run.isPending || !pb.is_enabled}
+                  title={!isAdmin ? ADMIN_ONLY_REASON : !pb.is_enabled ? 'Disabled playbooks refuse to run' : undefined}
+                  className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm disabled:opacity-50"
+                >
+                  {run.isPending ? 'Running...' : 'Run playbook'}
+                </button>
+              </div>
+              {!isAdmin && <p className="text-xs text-gray-500">Running a remediation playbook: {ADMIN_ONLY_REASON}</p>}
+              {!pb.is_enabled && <p className="text-xs text-gray-500">This playbook is disabled; the server refuses to run it.</p>}
+              <ActionErrorBanner what="run the playbook" error={run.error} />
+              {result && (
+                <div className="space-y-2">
+                  <div className="flex flex-wrap items-center gap-2 text-sm">
+                    <span>Run {String(result.execution_id).slice(0, 8)}:</span>
+                    <span className="font-medium">{result.overall_result || result.status}</span>
+                    <span className="text-gray-500">
+                      {result.actions_completed} executed · {result.actions_awaiting_integration} could not act · {result.actions_failed} failed
+                    </span>
+                  </div>
+                  {result.error && <p className="text-xs text-red-700 dark:text-red-300">{String(result.error)}</p>}
+                  {results.map((r, i) => <ActionResultRow key={i} entry={r} />)}
+                  <p className="text-xs text-gray-600 dark:text-gray-400">
+                    {reversible.length > 0
+                      ? `${reversible.length} action(s) stored a revert handle: roll them back from the Executions tab (admin).`
+                      : 'No action stored a revert handle, so a rollback of this run would be refused (409 not_reversible).'}{' '}
+                    <button onClick={onOpenExecutions} className="underline">Open Executions</button>
+                  </p>
+                </div>
+              )}
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

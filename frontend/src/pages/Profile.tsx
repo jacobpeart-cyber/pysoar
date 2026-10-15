@@ -5,7 +5,6 @@ import {
   Mail,
   Phone,
   Building,
-  Shield,
   Key,
   Save,
   Loader2,
@@ -15,6 +14,8 @@ import {
 import { useAuth } from '../contexts/AuthContext';
 import { api } from '../lib/api';
 import clsx from 'clsx';
+import { MfaPanel, SessionsPanel } from '../components/AccountSecurity';
+import { passwordChangeFailure } from '../lib/passwordPolicy';
 
 export default function Profile() {
   const { user } = useAuth();
@@ -23,6 +24,8 @@ export default function Profile() {
   const [showSuccess, setShowSuccess] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [passwordError, setPasswordError] = useState<string | null>(null);
+  // Failed rules from a 400 password_policy answer.
+  const [passwordRules, setPasswordRules] = useState<string[]>([]);
 
   const [profileData, setProfileData] = useState({
     full_name: user?.full_name || '',
@@ -68,11 +71,10 @@ export default function Profile() {
       setPasswordData({ current_password: '', new_password: '', confirm_password: '' });
       setTimeout(() => setShowSuccess(false), 3000);
     },
-    onError: (err: any) => {
-      console.error('Password change failed:', err);
-      setPasswordError(
-        err?.response?.data?.detail || err?.message || 'Failed to update password'
-      );
+    onError: (err: unknown) => {
+      const failure = passwordChangeFailure(err, 'Failed to update password');
+      setPasswordError(failure.summary);
+      setPasswordRules(failure.rules);
     },
   });
 
@@ -83,6 +85,7 @@ export default function Profile() {
 
   const handlePasswordSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    setPasswordRules([]);
     if (passwordData.new_password !== passwordData.confirm_password) {
       setPasswordError('New password and confirmation do not match');
       return;
@@ -270,9 +273,16 @@ export default function Profile() {
             </div>
 
             {passwordError && (
-              <div className="flex items-center gap-2 p-3 mb-4 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
-                <AlertCircle className="w-4 h-4" />
-                {passwordError}
+              <div className="p-3 mb-4 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+                <div className="flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4" />
+                  {passwordError}
+                </div>
+                {passwordRules.length > 0 && (
+                  <ul className="list-disc ml-10 mt-1">
+                    {passwordRules.map((r) => <li key={r}>{r}</li>)}
+                  </ul>
+                )}
               </div>
             )}
 
@@ -334,61 +344,9 @@ export default function Profile() {
             </div>
           </form>
 
-          {/* Active Sessions */}
-          <div className="bg-white rounded-lg border border-gray-200 p-6">
-            <div className="flex items-center gap-2 mb-6">
-              <Shield className="w-5 h-5 text-gray-500" />
-              <h2 className="text-lg font-semibold text-gray-900">Active Sessions</h2>
-            </div>
+          <SessionsPanel />
 
-            <div className="space-y-4">
-              <div className="flex items-center justify-between p-4 bg-green-50 border border-green-200 rounded-lg">
-                <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-full bg-green-100 flex items-center justify-center">
-                    <CheckCircle className="w-5 h-5 text-green-600" />
-                  </div>
-                  <div>
-                    <p className="font-medium text-gray-900">Current Session</p>
-                    <p className="text-sm text-gray-500">Active now</p>
-                  </div>
-                </div>
-                <span className="text-xs text-green-600 font-medium">This device</span>
-              </div>
-            </div>
-          </div>
-
-          {/* Two-Factor Authentication */}
-          <div className="bg-white rounded-lg border border-gray-200 p-6">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-full bg-gray-100 flex items-center justify-center">
-                  <Shield className="w-5 h-5 text-gray-600" />
-                </div>
-                <div>
-                  <h3 className="font-medium text-gray-900">Two-Factor Authentication</h3>
-                  <p className="text-sm text-gray-500">
-                    Add an extra layer of security to your account
-                  </p>
-                </div>
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="text-sm text-gray-500">Not enabled</span>
-                <button
-                  onClick={async () => {
-                    try {
-                      await api.post('/auth/mfa/enable');
-                      // MFA setup initiated
-                    } catch (err) {
-                      console.error('MFA enable failed:', err);
-                    }
-                  }}
-                  className="px-4 py-2 text-sm text-blue-600 hover:text-blue-700"
-                >
-                  Enable
-                </button>
-              </div>
-            </div>
-          </div>
+          <MfaPanel />
         </div>
       )}
     </div>

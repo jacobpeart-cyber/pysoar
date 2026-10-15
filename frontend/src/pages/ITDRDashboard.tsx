@@ -24,6 +24,7 @@ import { itdrApi } from '../api/endpoints';
 import { api } from '../lib/api';
 import LoadErrorBanner from '../components/LoadErrorBanner';
 import { describeLoadError } from '../lib/loadError';
+import { useRoleGate, ANALYST_ONLY_REASON } from '../lib/roles';
 
 const getSeverityColor = (severity: string) => {
   switch (severity) {
@@ -1605,7 +1606,91 @@ function IdentitySourcesPanel({ onChanged }: { onChanged: () => void }) {
           </div>
         )}
       </div>
+      <AddIdentityForm onCreated={refresh} />
     </div>
+  );
+}
+
+// POST /itdr/identities: one identity entered by hand, for accounts no
+// directory integration or CSV export covers. Risk starts at the server's
+// default and is computed by the ITDR analysis, not entered here.
+function AddIdentityForm({ onCreated }: { onCreated: () => void }) {
+  const gate = useRoleGate();
+  const empty = {
+    user_id: '', username: '', email: '', display_name: '', identity_provider: 'active_directory',
+    privilege_level: 'standard', is_service_account: false, mfa_enabled: false, groups: '',
+  };
+  const [form, setForm] = useState(empty);
+  const create = useMutation({
+    mutationFn: async () =>
+      (await api.post<ITDRIdentity>('/itdr/identities', {
+        user_id: form.user_id.trim(),
+        username: form.username.trim(),
+        email: form.email.trim(),
+        display_name: form.display_name.trim() || null,
+        identity_provider: form.identity_provider,
+        privilege_level: form.privilege_level,
+        is_service_account: form.is_service_account,
+        mfa_enabled: form.mfa_enabled,
+        group_memberships: form.groups.split(',').map((g) => g.trim()).filter(Boolean),
+      })).data,
+    onSuccess: () => {
+      setForm(empty);
+      onCreated();
+    },
+  });
+  const cls = 'px-2 py-1 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-sm';
+  const ready = form.user_id.trim() && form.username.trim() && form.email.trim().length >= 5;
+  return (
+    <form
+      className="border-t border-gray-200 dark:border-gray-700 pt-3 space-y-2"
+      onSubmit={(e) => {
+        e.preventDefault();
+        create.mutate();
+      }}
+    >
+      <p className="font-medium text-sm">Add one identity by hand</p>
+      <p className="text-xs text-gray-500 dark:text-gray-400">
+        For an account no directory sync or CSV covers. MFA enrolment is what you state here; nothing verifies it against
+        the identity provider.
+      </p>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+        <input value={form.user_id} onChange={(e) => setForm({ ...form, user_id: e.target.value })} placeholder="Directory user id *" className={cls} disabled={!gate.isAnalyst} />
+        <input value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} placeholder="Username *" className={cls} disabled={!gate.isAnalyst} />
+        <input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="Email *" className={cls} disabled={!gate.isAnalyst} />
+        <input value={form.display_name} onChange={(e) => setForm({ ...form, display_name: e.target.value })} placeholder="Display name" className={cls} disabled={!gate.isAnalyst} />
+        <select value={form.identity_provider} onChange={(e) => setForm({ ...form, identity_provider: e.target.value })} className={cls} disabled={!gate.isAnalyst}>
+          {['active_directory', 'azure_ad', 'okta', 'ping', 'custom_saml', 'ldap'].map((p) => <option key={p} value={p}>{humanize(p)}</option>)}
+        </select>
+        <select value={form.privilege_level} onChange={(e) => setForm({ ...form, privilege_level: e.target.value })} className={cls} disabled={!gate.isAnalyst}>
+          {['standard', 'elevated', 'admin', 'service_account', 'privileged_access'].map((p) => <option key={p} value={p}>{humanize(p)}</option>)}
+        </select>
+        <input value={form.groups} onChange={(e) => setForm({ ...form, groups: e.target.value })} placeholder="Groups (comma separated)" className={cls} disabled={!gate.isAnalyst} />
+        <label className="flex items-center gap-1 text-sm">
+          <input type="checkbox" checked={form.is_service_account} onChange={(e) => setForm({ ...form, is_service_account: e.target.checked })} disabled={!gate.isAnalyst} />
+          Service account
+        </label>
+        <label className="flex items-center gap-1 text-sm">
+          <input type="checkbox" checked={form.mfa_enabled} onChange={(e) => setForm({ ...form, mfa_enabled: e.target.checked })} disabled={!gate.isAnalyst} />
+          MFA enrolled (stated)
+        </label>
+      </div>
+      <button
+        type="submit"
+        disabled={!gate.isAnalyst || !ready || create.isPending}
+        title={gate.isAnalyst ? undefined : ANALYST_ONLY_REASON}
+        className="px-3 py-2 text-sm rounded-lg bg-blue-600 text-white disabled:opacity-50"
+      >
+        {create.isPending ? 'Adding…' : 'Add identity'}
+      </button>
+      {!gate.isAnalyst && <p className="text-xs text-gray-500">{ANALYST_ONLY_REASON}</p>}
+      <ActionErrorBanner what="add the identity" error={create.error} />
+      {create.data && (
+        <p className="text-xs text-green-700 dark:text-green-400">
+          Added {create.data.username} ({String(create.data.id).slice(0, 8)}).
+        </p>
+      )}
+    </form>
   );
 }
 
