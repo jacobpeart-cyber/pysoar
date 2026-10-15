@@ -488,10 +488,17 @@ def _check_policy_control(snap: ClusterSnapshot) -> CheckOutcome:
         if _meta(ns).get("name") not in SYSTEM_NAMESPACES
         and "pod-security.kubernetes.io/enforce" not in (_meta(ns).get("labels") or {})
     ]
-    if hooks:
-        return CheckOutcome("pass", f"policy engine admission webhooks present: {', '.join(hooks[:5])}")
     if not unlabelled:
         return CheckOutcome("pass", "every workload namespace enforces a Pod Security Admission level")
+    if hooks:
+        # A Gatekeeper/Kyverno webhook being registered says nothing about which
+        # policies it enforces; that cannot be verified from the API alone.
+        return CheckOutcome(
+            "not_assessed",
+            "policy engine webhook present (" + ", ".join(hooks[:5]) + ") but its enforced policies are not "
+            "verifiable from the API; namespaces without pod-security enforce labels: "
+            + ", ".join(unlabelled[:10]),
+        )
     return CheckOutcome(
         "fail",
         "no Gatekeeper/Kyverno webhook and namespaces without a pod-security.kubernetes.io/enforce label",

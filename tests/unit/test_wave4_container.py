@@ -628,3 +628,47 @@ def test_scan_action_is_capability_gated():
     assert capability_allows(["container_scan"], "scan_container_image")
     assert not capability_allows(["ir"], "scan_container_image")
     assert not requires_approval("scan_container_image")
+
+
+def test_image_reference_grammar_refuses_option_and_shell_strings() -> None:
+    """The reference is handed to an agent that runs trivy/grype on it."""
+    from src.container_security.scanning import validate_image_reference
+
+    for good in ("nginx", "library/nginx:1.25", "registry.example.com:5000/web/app:1.0",
+                 "ghcr.io/org/app@sha256:" + "a" * 64, "r.io/a/b:1.0@sha256:" + "0" * 64):
+        assert validate_image_reference(good) == good
+    for bad in ("--db-repository=evil/x", "nginx; rm -rf /", "nginx && curl x", "web app:1", "",
+                "registry.example.com/web/app:1.0 --quiet", "a/b:tag with space", "$(id)"):
+        with pytest.raises(ValueError):
+            validate_image_reference(bad)
+
+
+async def test_image_registration_refuses_malformed_references(
+    client: AsyncClient, org_a_headers: dict[str, str],
+) -> None:
+    bad = await client.post(f"{BASE}/images", json={
+        "registry": "registry.example.com", "repository": "web/app; rm -rf /", "tag": "1.0",
+    }, headers=org_a_headers)
+    assert bad.status_code == 422, bad.text
+    assert bad.json()["detail"]["error"] == "invalid_image_reference"
+    opt = await client.post(f"{BASE}/images", json={
+        "registry": "", "repository": "--db-repository=evil", "tag": "latest",
+    }, headers=org_a_headers)
+    assert opt.status_code == 422, opt.text
+
+
+def test_policy_control_check_does_not_pass_on_a_webhook_name_alone() -> None:
+    from src.container_security.kube import ClusterSnapshot, _check_policy_control
+
+    snap = ClusterSnapshot(version="v1.30", data={
+        "validatingwebhooks": [{"metadata": {"name": "gatekeeper-validating-webhook-configuration"}}],
+        "namespaces": [{"metadata": {"name": "payments", "labels": {}}}],
+    })
+    outcome = _check_policy_control(snap)
+    assert outcome.status == "not_assessed"
+    assert "not verifiable" in outcome.reason
+    enforced = ClusterSnapshot(version="v1.30", data={
+        "validatingwebhooks": [],
+        "namespaces": [{"metadata": {"name": "payments", "labels": {"pod-security.kubernetes.io/enforce": "restricted"}}}],
+    })
+    assert _check_policy_control(enforced).status == "pass"

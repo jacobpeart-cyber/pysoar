@@ -211,6 +211,17 @@ async def create_image(
     compliance change only when a real scanner reports. 409 when the same
     registry/repository:tag is already registered in this organisation.
     """
+    from src.container_security.scanning import validate_image_reference
+
+    candidate = f"{request.registry}/{request.repository}" if request.registry else request.repository
+    try:
+        validate_image_reference(f"{candidate}:{request.tag}")
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "invalid_image_reference",
+                    "detail": "registry, repository and tag must form a valid image reference"},
+        ) from None
     dup = (await db.execute(
         select(ContainerImage.id).where(
             ContainerImage.organization_id == org_id,

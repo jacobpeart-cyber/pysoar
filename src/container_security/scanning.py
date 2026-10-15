@@ -24,6 +24,7 @@ recomputed from the stored rows.
 
 from __future__ import annotations
 
+import re
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -52,6 +53,28 @@ MAX_REPORT_CHARS = 20_000_000
 MAX_VULNS_PER_REPORT = 20_000
 INTEGRATION_TIMEOUT = 300.0
 SEVERITIES = ("critical", "high", "medium", "low", "negligible", "unknown")
+
+
+
+# OCI distribution reference grammar (registry[:port]/)?path(:tag)?(@sha256:hex)?.
+# The reference is handed to an agent that runs ``trivy image <ref>`` / ``grype
+# <ref>`` and to scanner integrations, so anything outside this grammar
+# (option-looking strings, shell metacharacters, whitespace) is refused before
+# it leaves the server.
+_REF_COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+_REF_REGISTRY = r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*(?::[0-9]{1,5})?)"
+IMAGE_REFERENCE_RE = re.compile(
+    r"^(?:" + _REF_REGISTRY + r"/)?" + _REF_COMPONENT + r"(?:/" + _REF_COMPONENT + r")*"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?(?:@sha256:[a-f0-9]{64})?$"
+)
+
+
+def validate_image_reference(ref: str) -> str:
+    """Return ``ref`` when it is a well-formed image reference, else raise ValueError."""
+    text = str(ref or "").strip()
+    if not text or len(text) > 512 or not IMAGE_REFERENCE_RE.fullmatch(text):
+        raise ValueError("invalid image reference")
+    return text
 
 
 def image_ref(image: ContainerImage) -> str:
@@ -360,8 +383,18 @@ async def request_scan(
     from src.integrations.netguard import OutboundTargetRefused
 
     org_id = image.organization_id
-    ref = image_ref(image)
     now = datetime.now(timezone.utc)
+    try:
+        ref = validate_image_reference(image_ref(image))
+    except ValueError:
+        scan = ContainerImageScan(
+            image_id=image.id, organization_id=org_id, method="none", scanner=scanner,
+            status="failed", requested_by=requested_by, started_at=now,
+        )
+        db.add(scan)
+        fail_scan(image, scan, "invalid_image_reference: the stored registry/repository:tag is not a valid image reference")
+        await db.flush()
+        return ScanDispatch(scan.status, "invalid image reference; re-register the image", scan, "none")
 
     integrations = [] if agent_id else await scanner_integrations(db, org_id)
     if integrations:
