@@ -1,16 +1,22 @@
 """Exposure Management and CTEM API endpoints"""
 
+import csv
+import io
+import json
 import math
 import uuid
 from datetime import datetime, timezone
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 
 from fastapi import Depends, APIRouter, HTTPException, Query, status
-from sqlalchemy import select, func, and_, or_, desc
+from sqlalchemy import case, select, func, and_, or_, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import DatabaseSession, OrganizationId, require_role
 from src.core.logging import get_logger
+from src.exposure.scoring import OPEN_LINK_STATUSES, organization_risk, rescore_assets, rescore_organization
+from src.exposure.snapshots import capture_daily_snapshot, read_trend
+from src.models.audit import AuditLog
 from src.models.user import User, UserRole
 from src.exposure.models import (
     ExposureAsset,
@@ -91,8 +97,8 @@ async def get_asset_or_404(db: AsyncSession, asset_id: str, organization_id: str
             and_(
                 ExposureAsset.id == asset_id,
                 ExposureAsset.organization_id == organization_id,
-            )
-        )
+            ),
+        ),
     )
     asset = result.scalar_one_or_none()
     if not asset:
@@ -110,8 +116,8 @@ async def get_vulnerability_or_404(db: AsyncSession, vuln_id: str, organization_
             and_(
                 Vulnerability.id == vuln_id,
                 Vulnerability.organization_id == organization_id,
-            )
-        )
+            ),
+        ),
     )
     vuln = result.scalar_one_or_none()
     if not vuln:
@@ -129,8 +135,8 @@ async def get_asset_vulnerability_or_404(db: AsyncSession, mapping_id: str, orga
             and_(
                 AssetVulnerability.id == mapping_id,
                 AssetVulnerability.organization_id == organization_id,
-            )
-        )
+            ),
+        ),
     )
     mapping = result.scalar_one_or_none()
     if not mapping:
@@ -148,8 +154,8 @@ async def get_scan_or_404(db: AsyncSession, scan_id: str, organization_id: str) 
             and_(
                 ExposureScan.id == scan_id,
                 ExposureScan.organization_id == organization_id,
-            )
-        )
+            ),
+        ),
     )
     scan = result.scalar_one_or_none()
     if not scan:
@@ -167,8 +173,8 @@ async def get_ticket_or_404(db: AsyncSession, ticket_id: str, organization_id: s
             and_(
                 RemediationTicket.id == ticket_id,
                 RemediationTicket.organization_id == organization_id,
-            )
-        )
+            ),
+        ),
     )
     ticket = result.scalar_one_or_none()
     if not ticket:
@@ -186,8 +192,8 @@ async def get_attack_surface_or_404(db: AsyncSession, surface_id: str, organizat
             and_(
                 AttackSurface.id == surface_id,
                 AttackSurface.organization_id == organization_id,
-            )
-        )
+            ),
+        ),
     )
     surface = result.scalar_one_or_none()
     if not surface:
@@ -214,6 +220,64 @@ async def _require_ids_in_org(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"field": field, "error": "unknown_ids", "ids": sorted(missing)},
         )
+
+
+def _split_csv(values: Optional[list[str]]) -> list[str]:
+    """``["critical,high", "low"]`` -> ``["critical", "high", "low"]``."""
+    out: list[str] = []
+    for value in values or []:
+        out.extend(v.strip() for v in str(value).split(",") if v.strip())
+    return out
+
+
+def _audit(
+    db: AsyncSession, user: User, org_id: str, action: str, resource_type: str,
+    resource_id: Optional[str], description: str, payload: Optional[dict[str, Any]] = None, success: bool = True,
+) -> None:
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            organization_id=org_id,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            description=description[:4000],
+            new_value=json.dumps(payload, default=str)[:20000] if payload is not None else None,
+            success=success,
+        ),
+    )
+
+
+async def _vulnerability_responses(db: AsyncSession, org_id: str, vulns: list[Vulnerability]) -> list[dict[str, Any]]:
+    """Catalogue rows with ``affected_assets`` / ``total_links`` / ``status``
+    computed from their stored asset links."""
+    stats: dict[str, tuple[int, int]] = {}
+    if vulns:
+        is_open = AssetVulnerability.status.in_(OPEN_LINK_STATUSES)
+        for vuln_id, total_links, open_assets in (
+            await db.execute(
+                select(
+                    AssetVulnerability.vulnerability_id,
+                    func.count(AssetVulnerability.id),
+                    func.count(func.distinct(case((is_open, AssetVulnerability.asset_id), else_=None))),
+                )
+                .where(
+                    AssetVulnerability.organization_id == org_id,
+                    AssetVulnerability.vulnerability_id.in_([v.id for v in vulns]),
+                )
+                .group_by(AssetVulnerability.vulnerability_id),
+            )
+        ).all():
+            stats[vuln_id] = (int(total_links or 0), int(open_assets or 0))
+    out = []
+    for v in vulns:
+        data = VulnerabilityResponse.model_validate(v).model_dump()
+        total_links, open_assets = stats.get(v.id, (0, 0))
+        data["affected_assets"] = open_assets
+        data["total_links"] = total_links
+        data["status"] = "open" if open_assets else ("remediated" if total_links else "unlinked")
+        out.append(data)
+    return out
 
 
 # ============================================================================
@@ -274,10 +338,18 @@ async def list_assets(
     is_internet_facing: Optional[bool] = None,
     min_risk_score: Optional[float] = Query(None, ge=0.0),
     max_risk_score: Optional[float] = Query(None, le=100.0),
+    include_inactive: bool = False,
 ):
-    """List exposure assets with filtering and pagination"""
+    """List exposure assets with filtering and pagination.
+
+    Deactivated (deleted) assets are hidden unless ``include_inactive=true``.
+    ``asset_type`` / ``criticality`` / ``environment`` accept comma-separated
+    values.
+    """
     query = select(ExposureAsset)
     query = query.where(ExposureAsset.organization_id == org_id)
+    if not include_inactive:
+        query = query.where(ExposureAsset.is_active == True)  # noqa: E712
 
     if search:
         search_filter = f"%{search}%"
@@ -287,17 +359,17 @@ async def list_assets(
                 ExposureAsset.ip_address.ilike(search_filter),
                 ExposureAsset.business_unit.ilike(search_filter),
                 ExposureAsset.owner.ilike(search_filter),
-            )
+            ),
         )
 
     if asset_type:
-        query = query.where(ExposureAsset.asset_type == asset_type)
+        query = query.where(ExposureAsset.asset_type.in_(_split_csv([asset_type])))
 
     if environment:
-        query = query.where(ExposureAsset.environment == environment)
+        query = query.where(ExposureAsset.environment.in_(_split_csv([environment])))
 
     if criticality:
-        query = query.where(ExposureAsset.criticality == criticality)
+        query = query.where(ExposureAsset.criticality.in_(_split_csv([criticality])))
 
     if is_internet_facing is not None:
         query = query.where(ExposureAsset.is_internet_facing == is_internet_facing)
@@ -310,7 +382,7 @@ async def list_assets(
 
     # Get total count
     count_result = await db.execute(
-        select(func.count()).select_from(query.subquery())
+        select(func.count()).select_from(query.subquery()),
     )
     total = count_result.scalar() or 0
 
@@ -349,7 +421,7 @@ async def update_asset(
     _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
-    """Update an exposure asset"""
+    """Update an exposure asset (criticality / exposure changes rescore it)."""
     asset = await get_asset_or_404(db, asset_id, org_id)
 
     update_data = asset_data.model_dump(exclude_unset=True, exclude_none=True)
@@ -358,6 +430,8 @@ async def update_asset(
         setattr(asset, key, value)
 
     await db.flush()
+    if {"criticality", "is_internet_facing"} & set(update_data):
+        await rescore_assets(db, org_id, [asset.id])
     await db.refresh(asset)
 
     return asset
@@ -376,61 +450,232 @@ async def deactivate_asset(
     await db.flush()
 
 
+_LOG_DISCOVERY_TYPES = {"siem", "logs", "log"}
+MAX_ASSET_IMPORT_ROWS = 10_000
+_ASSET_IMPORT_FIELDS = (
+    "hostname", "ip_address", "mac_address", "asset_type", "os_type", "os_version", "environment",
+    "criticality", "business_unit", "owner", "location", "cloud_provider", "cloud_region",
+    "cloud_resource_id", "network_zone",
+)
+_CRITICALITIES = {"critical", "high", "medium", "low"}
+
+
 @router.post("/assets/discover", response_model=DiscoveryResult)
 async def trigger_asset_discovery(
     discovery_request: AssetDiscoveryRequest,
     org_id: OrganizationId,
-    _user: AdminRoleUser = None,
+    current_user: AdminRoleUser = None,
+    db: DatabaseSession = None,
 ):
-    """Trigger asset discovery scan (network, cloud, AD, DNS).
+    """Run asset discovery now.
 
-    Admin-only (it would touch live networks). No on-demand discovery engine
-    exists: this used to insert a scan stuck at "running" and report zeros.
-    It now says so. Assets are still discovered from SIEM logs by the
-    scheduled ``run_asset_discovery`` task.
+    ``scan_type`` ``siem`` (or ``logs``): discovers assets from the org's
+    ingested log_entries of the last 24 hours (the same code the nightly task
+    runs), records an exposure scan row of type ``discovery`` and returns the
+    real counts (new assets created, known assets seen again).
+
+    ``network`` / ``cloud`` / ``active-directory`` / ``dns``: 501
+    ``not_implemented``; no active scanner or directory integration exists, so
+    nothing is started or recorded.
     """
-    logger.info(
-        "exposure_discovery_not_implemented",
+    scan_type = (discovery_request.scan_type or "").lower().strip()
+    if scan_type not in _LOG_DISCOVERY_TYPES:
+        logger.info("exposure_discovery_not_implemented", organization_id=org_id, scan_type=scan_type)
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail={
+                "error": "not_implemented",
+                "detail": (
+                    f"{scan_type or 'This'} discovery is not implemented (no active network scanner, cloud "
+                    "or directory integration); no scan was started. Use scan_type 'siem' to discover "
+                    "assets from ingested logs, POST /exposure/assets/import for an inventory file, or a "
+                    "scanner import."
+                ),
+            },
+        )
+
+    from src.exposure.tasks import _run_asset_discovery_async
+
+    started = datetime.now(timezone.utc)
+    result = await _run_asset_discovery_async(org_id, "siem", session=db)
+    seen_total = result["assets_discovered"] + result["assets_updated"]
+    scan = ExposureScan(
+        id=str(uuid.uuid4()),
+        scan_type="discovery",
+        scan_name="SIEM log asset discovery (last 24 h)",
+        status="completed",
+        scanner="siem_logs",
+        target_assets=[],
+        started_at=started,
+        completed_at=datetime.now(timezone.utc),
+        total_hosts=seen_total,
+        hosts_scanned=seen_total,
+        results_summary={k: v for k, v in result.items() if k != "organization_id"},
+        initiated_by=current_user.id,
         organization_id=org_id,
-        scan_type=discovery_request.scan_type,
     )
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail={
-            "error": "not_implemented",
-            "detail": (
-                "On-demand asset discovery is not implemented; no scan was started. "
-                "Assets are discovered from ingested SIEM logs on a schedule, "
-                "or can be added via POST /exposure/assets or a scanner import."
-            ),
-        },
-    )
+    db.add(scan)
+    _audit(db, current_user, org_id, "exposure.asset_discovery", "exposure_scan", scan.id,
+           f"SIEM asset discovery: {result['assets_discovered']} new, {result['assets_updated']} seen again",
+           result)
+    await db.flush()
+    return {
+        "scan_id": scan.id,
+        "discovered_assets": seen_total,
+        "new_assets": result["assets_discovered"],
+        "updated_assets": result["assets_updated"],
+        "status": "completed",
+        "log_rows_scanned": result["log_rows_scanned"],
+        "truncated": result["truncated"],
+        "detail": "Assets observed as log sources in the last 24 hours.",
+    }
+
+
+def _asset_import_rows(fmt: str, data: str) -> list[dict[str, Any]]:
+    """CSV (header row) or JSON (array, or {"assets": [...]}) -> row dicts."""
+    fmt = (fmt or "").lower().strip()
+    text = (data or "").lstrip("﻿").strip()
+    if not text:
+        raise ValueError("data is empty")
+    if fmt == "json":
+        payload = json.loads(text)
+        rows = payload.get("assets") if isinstance(payload, dict) else payload
+        if not isinstance(rows, list):
+            raise ValueError("JSON must be an array of assets or an object with an 'assets' array")
+        return [r if isinstance(r, dict) else {"__invalid__": r} for r in rows]
+    if fmt == "csv":
+        reader = csv.DictReader(io.StringIO(text))
+        if not reader.fieldnames:
+            raise ValueError("CSV has no header row")
+        return [{(k or "").strip().lower(): (v or "").strip() for k, v in row.items() if k} for row in reader]
+    raise ValueError("format must be 'csv' or 'json'")
+
+
+def _as_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if value is None or value == "":
+        return None
+    text = str(value).strip().lower()
+    if text in ("true", "yes", "1", "y"):
+        return True
+    if text in ("false", "no", "0", "n"):
+        return False
+    return None
 
 
 @router.post("/assets/import", response_model=BulkImportResult)
 async def import_assets(
     import_data: BulkAssetImportRequest,
     org_id: OrganizationId,
-    _user: AnalystUser = None,
+    current_user: AnalystUser = None,
+    db: DatabaseSession = None,
 ):
-    """Bulk import assets from CSV or JSON.
+    """Bulk import assets from CSV (header row) or JSON.
 
-    Not implemented: the handler used to iterate a field the request schema
-    does not have and report a successful import of 0 assets. Nothing is
-    parsed or written.
+    Columns / keys: hostname, ip_address (or ip), asset_type, criticality,
+    environment, os_type, os_version, owner, business_unit, location,
+    network_zone, cloud_provider, cloud_region, cloud_resource_id,
+    is_internet_facing, tags (``;``-separated in CSV). A row needs a hostname
+    or an IP; an existing asset (same IP, else same hostname) is updated,
+    otherwise one is created. Rows that cannot be used are reported in
+    ``errors`` with the row number and reason. At most 10,000 rows per
+    request (422 above that).
     """
-    logger.info("exposure_asset_import_not_implemented", organization_id=org_id, format=import_data.format)
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail={
-            "error": "not_implemented",
-            "detail": (
-                "Bulk asset import is not implemented; nothing was imported. "
-                "Create assets with POST /exposure/assets or import scanner results "
-                "with POST /exposure/scans/import."
-            ),
-        },
-    )
+    try:
+        rows = _asset_import_rows(import_data.format, import_data.data)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "asset_import_unreadable", "detail": str(exc)},
+        ) from exc
+    if len(rows) > MAX_ASSET_IMPORT_ROWS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "too_many_rows", "limit": MAX_ASSET_IMPORT_ROWS, "rows": len(rows)},
+        )
+
+    created = updated = skipped = 0
+    errors: list[dict] = []
+    seen: set[str] = set()
+    touched: list[str] = []
+    for number, raw in enumerate(rows, start=1):
+        if "__invalid__" in raw:
+            errors.append({"row": number, "error": "not_an_object"})
+            continue
+        row = {str(k).strip().lower(): v for k, v in raw.items()}
+        if row.get("ip") and not row.get("ip_address"):
+            row["ip_address"] = row["ip"]
+        values = {f: str(row[f]).strip() for f in _ASSET_IMPORT_FIELDS if str(row.get(f) or "").strip()}
+        hostname, ip = values.get("hostname"), values.get("ip_address")
+        if not hostname and not ip:
+            errors.append({"row": number, "error": "hostname_or_ip_required"})
+            continue
+        key = f"ip:{ip}" if ip else f"host:{hostname.lower()}"
+        if key in seen:
+            skipped += 1
+            errors.append({"row": number, "error": "duplicate_in_file", "key": key})
+            continue
+        seen.add(key)
+        if values.get("criticality"):
+            values["criticality"] = values["criticality"].lower()
+            if values["criticality"] not in _CRITICALITIES:
+                errors.append({"row": number, "error": "invalid_criticality", "value": values["criticality"]})
+                continue
+        too_long = sorted(f for f, v in values.items() if len(v) > 255)
+        if too_long:
+            errors.append({"row": number, "error": "value_too_long", "fields": too_long})
+            continue
+        internet = _as_bool(row.get("is_internet_facing"))
+        tags = row.get("tags")
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.split(";") if t.strip()]
+        elif not isinstance(tags, list):
+            tags = None
+
+        stmt = select(ExposureAsset).where(ExposureAsset.organization_id == org_id)
+        stmt = stmt.where(ExposureAsset.ip_address == ip) if ip else stmt.where(ExposureAsset.hostname == hostname)
+        asset = (await db.execute(stmt.limit(1))).scalars().first()
+        if asset is None:
+            values.setdefault("asset_type", "host")
+            asset = ExposureAsset(
+                is_active=True,
+                tags=[str(t) for t in tags] if tags else ["asset-import"],
+                extra_metadata={"discovery_source": "asset_import"},
+                organization_id=org_id,
+                **values,
+            )
+            if internet is not None:
+                asset.is_internet_facing = internet
+            db.add(asset)
+            await db.flush()
+            created += 1
+        else:
+            for k, v in values.items():
+                setattr(asset, k, v)
+            if internet is not None:
+                asset.is_internet_facing = internet
+            if tags:
+                asset.tags = sorted({*(asset.tags or []), *(str(t) for t in tags)})
+            asset.is_active = True
+            updated += 1
+        touched.append(asset.id)
+
+    if touched:
+        await rescore_assets(db, org_id, touched)
+    _audit(db, current_user, org_id, "exposure.asset_import", "exposure_asset", None,
+           f"Asset import ({import_data.format}): {created} created, {updated} updated, {len(errors)} rejected",
+           {"created": created, "updated": updated, "errors": errors[:100]})
+    await db.flush()
+    return {
+        "imported": created + updated,
+        "created": created,
+        "updated": updated,
+        "failed": len(errors) - skipped,
+        "skipped": skipped,
+        "rows_read": len(rows),
+        "errors": errors[:500],
+    }
 
 
 @router.get("/assets/{asset_id}/vulnerabilities", response_model=AssetVulnerabilityListResponse)
@@ -455,12 +700,12 @@ async def get_asset_vulnerabilities(
 
     if severity:
         query = query.join(
-            Vulnerability, AssetVulnerability.vulnerability_id == Vulnerability.id
+            Vulnerability, AssetVulnerability.vulnerability_id == Vulnerability.id,
         ).where(Vulnerability.severity == severity, Vulnerability.organization_id == org_id)
 
     # Get total count
     count_result = await db.execute(
-        select(func.count()).select_from(query.subquery())
+        select(func.count()).select_from(query.subquery()),
     )
     total = count_result.scalar() or 0
 
@@ -529,12 +774,33 @@ async def list_vulnerabilities(
     search: Optional[str] = None,
     severity: Optional[list[str]] = Query(None),
     cve_id: Optional[str] = None,
-    has_exploit: Optional[bool] = None,
+    has_exploit: Optional[str] = Query(None, description="true / false, or 'kev' for exploited-in-the-wild"),
     exploited_in_wild: Optional[bool] = None,
 ):
-    """List vulnerabilities with filtering"""
+    """List catalogue vulnerabilities with filtering.
+
+    ``severity`` accepts repeated values and comma-separated values;
+    ``has_exploit`` accepts true / false or ``kev`` (CISA KEV listed, i.e.
+    exploited in the wild). Each item carries ``affected_assets`` (assets with
+    an open link), ``total_links`` and ``status``.
+    """
     query = select(Vulnerability)
     query = query.where(Vulnerability.organization_id == org_id)
+
+    exploit_flag: Optional[bool] = None
+    if has_exploit is not None and has_exploit != "":
+        flag = has_exploit.strip().lower()
+        if flag == "kev":
+            exploited_in_wild = True
+        elif flag in ("true", "1", "yes"):
+            exploit_flag = True
+        elif flag in ("false", "0", "no"):
+            exploit_flag = False
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error": "invalid_has_exploit", "allowed": ["true", "false", "kev"]},
+            )
 
     if search:
         search_filter = f"%{search}%"
@@ -543,24 +809,24 @@ async def list_vulnerabilities(
                 Vulnerability.title.ilike(search_filter),
                 Vulnerability.description.ilike(search_filter),
                 Vulnerability.cve_id.ilike(search_filter),
-            )
+            ),
         )
 
     if severity:
-        query = query.where(Vulnerability.severity.in_(severity))
+        query = query.where(Vulnerability.severity.in_(_split_csv(severity)))
 
     if cve_id:
         query = query.where(Vulnerability.cve_id == cve_id)
 
-    if has_exploit is not None:
-        query = query.where(Vulnerability.exploit_available == has_exploit)
+    if exploit_flag is not None:
+        query = query.where(Vulnerability.exploit_available == exploit_flag)
 
     if exploited_in_wild is not None:
         query = query.where(Vulnerability.is_exploited_in_wild == exploited_in_wild)
 
     # Get total count
     count_result = await db.execute(
-        select(func.count()).select_from(query.subquery())
+        select(func.count()).select_from(query.subquery()),
     )
     total = count_result.scalar() or 0
 
@@ -571,7 +837,7 @@ async def list_vulnerabilities(
     vulns = list(result.scalars().all())
 
     return {
-        "items": vulns,
+        "items": await _vulnerability_responses(db, org_id, vulns),
         "total": total,
         "page": page,
         "size": size,
@@ -626,9 +892,9 @@ async def get_vulnerability(
     org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
-    """Get a specific vulnerability with affected assets"""
+    """Get a specific vulnerability with its affected-asset counts"""
     vuln = await get_vulnerability_or_404(db, vuln_id, org_id)
-    return vuln
+    return (await _vulnerability_responses(db, org_id, [vuln]))[0]
 
 
 @router.put("/vulnerabilities/{vuln_id}", response_model=VulnerabilityResponse)
@@ -639,7 +905,7 @@ async def update_vulnerability(
     _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
-    """Update vulnerability information"""
+    """Update vulnerability information (linked assets are rescored)."""
     vuln = await get_vulnerability_or_404(db, vuln_id, org_id)
 
     update_data = vuln_data.model_dump(exclude_unset=True, exclude_none=True)
@@ -647,9 +913,21 @@ async def update_vulnerability(
         setattr(vuln, key, value)
 
     await db.flush()
+    asset_ids = list(
+        (
+            await db.execute(
+                select(AssetVulnerability.asset_id).where(
+                    AssetVulnerability.organization_id == org_id,
+                    AssetVulnerability.vulnerability_id == vuln.id,
+                ).distinct(),
+            )
+        ).scalars(),
+    )
+    if asset_ids:
+        await rescore_assets(db, org_id, asset_ids)
     await db.refresh(vuln)
 
-    return vuln
+    return (await _vulnerability_responses(db, org_id, [vuln]))[0]
 
 
 @router.delete("/vulnerabilities/{vuln_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -670,7 +948,7 @@ async def delete_vulnerability(
             select(func.count(AssetVulnerability.id)).where(
                 AssetVulnerability.vulnerability_id == vuln.id,
                 AssetVulnerability.organization_id == org_id,
-            )
+            ),
         )
     ).scalar() or 0
     if linked:
@@ -699,7 +977,7 @@ async def advanced_vulnerability_search(
     Read-only (persists nothing), so any member of the tenant may run it.
     """
     query = select(Vulnerability).where(
-        Vulnerability.organization_id == org_id
+        Vulnerability.organization_id == org_id,
     )
 
     if search_request.query:
@@ -709,18 +987,18 @@ async def advanced_vulnerability_search(
                 Vulnerability.title.ilike(search_filter),
                 Vulnerability.description.ilike(search_filter),
                 Vulnerability.cve_id.ilike(search_filter),
-            )
+            ),
         )
 
     if search_request.severity:
-        query = query.where(Vulnerability.severity.in_(search_request.severity))
+        query = query.where(Vulnerability.severity.in_(_split_csv(search_request.severity)))
 
     if search_request.has_exploits is not None:
         query = query.where(Vulnerability.exploit_available == search_request.has_exploits)
 
     # Get total count
     count_result = await db.execute(
-        select(func.count()).select_from(query.subquery())
+        select(func.count()).select_from(query.subquery()),
     )
     total = count_result.scalar() or 0
 
@@ -731,7 +1009,7 @@ async def advanced_vulnerability_search(
     vulns = list(result.scalars().all())
 
     return {
-        "items": vulns,
+        "items": await _vulnerability_responses(db, org_id, vulns),
         "total": total,
         "page": page,
         "size": size,
@@ -769,6 +1047,7 @@ async def create_asset_vulnerability(
 
     db.add(mapping)
     await db.flush()
+    await rescore_assets(db, org_id, [mapping.asset_id])
     await db.refresh(mapping)
 
     return mapping
@@ -782,14 +1061,29 @@ async def update_asset_vulnerability(
     _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
-    """Update asset-vulnerability status (open, remediated, accepted, false-positive)"""
+    """Update asset-vulnerability status (open, in_progress, remediated,
+    accepted, false_positive, mitigated); "remediated" stamps remediated_at.
+    The asset is rescored."""
     mapping = await get_asset_vulnerability_or_404(db, mapping_id, org_id)
 
     update_data = mapping_data.model_dump(exclude_unset=True, exclude_none=True)
+    new_status = update_data.get("status")
+    if new_status is not None:
+        allowed = {"open", "in_progress", "remediated", "accepted", "false_positive", "mitigated"}
+        if new_status not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error": "invalid_status", "allowed": sorted(allowed)},
+            )
+        if new_status == "remediated" and mapping.status != "remediated":
+            mapping.remediated_at = datetime.now(timezone.utc)
+        elif new_status != "remediated":
+            mapping.remediated_at = None
     for key, value in update_data.items():
         setattr(mapping, key, value)
 
     await db.flush()
+    await rescore_assets(db, org_id, [mapping.asset_id])
     await db.refresh(mapping)
 
     return mapping
@@ -812,6 +1106,9 @@ async def mark_as_remediated(
         mapping.remediation_notes = remediation_notes
 
     await db.flush()
+    # Record-keeping: no rescan verifies the fix; the next scanner import
+    # re-opens the link if the finding is still reported.
+    await rescore_assets(db, org_id, [mapping.asset_id])
     await db.refresh(mapping)
 
     return mapping
@@ -831,7 +1128,7 @@ async def get_prioritized_remediation_list(
         and_(
             AssetVulnerability.organization_id == org_id,
             AssetVulnerability.status == "open",
-        )
+        ),
     )
 
     if criticality:
@@ -846,7 +1143,7 @@ async def get_prioritized_remediation_list(
 
     # Get total count
     count_result = await db.execute(
-        select(func.count()).select_from(query.subquery())
+        select(func.count()).select_from(query.subquery()),
     )
     total = count_result.scalar() or 0
 
@@ -927,7 +1224,7 @@ async def list_scans(
 
     # Get total count
     count_result = await db.execute(
-        select(func.count()).select_from(query.subquery())
+        select(func.count()).select_from(query.subquery()),
     )
     total = count_result.scalar() or 0
 
@@ -987,63 +1284,108 @@ async def import_scan_results(
     current_user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
-    """Import results from external scanners (Nessus, Qualys, Tenable.io,
-    OpenVAS, generic JSON/CSV).
+    """Import results from external scanners (Nessus XML / JSON / CSV, OpenVAS
+    XML / CSV, Qualys CSV / JSON, Tenable.io JSON, generic JSON / CSV; the
+    ``rapid7`` / ``custom`` formats are read with the generic parsers).
 
-    Previously this endpoint dropped the scan_data payload on the floor
-    and returned ``vulnerabilities_imported: 0``. It now parses the
-    payload, upserts ``ExposureVulnerability`` + ``AssetVulnerability``
-    rows (keyed by CVE + asset), and reports real counts plus any
-    per-finding errors.
+    Creates or updates ``exposure_assets`` (matched by IP, then hostname),
+    ``exposure_vulnerabilities`` (by CVE, else title) and one
+    ``asset_vulnerabilities`` link per (asset, vulnerability); a remediated
+    link the scanner still reports is re-opened. Touched assets are rescored.
+    The response reports links created / updated / reopened, catalogue rows
+    and assets created, and skipped findings by reason. An import that reads
+    no finding at all returns 422 ``scan_parse_failed`` and is recorded as a
+    failed scan.
     """
-    from src.exposure.scan_parser import parse_scan_data, ingest_findings
+    from src.exposure.scan_parser import ingest_findings, parse_scan_data
 
     import_id = str(uuid.uuid4())
-
+    started = datetime.now(timezone.utc)
     scan = ExposureScan(
         id=import_id,
         scan_type="vulnerability",
         scan_name=f"Import from {import_data.scanner_name}",
-        status="processing",
+        status="running",
         scanner=import_data.scanner_name,
+        scan_profile=import_data.scan_format,
         target_assets=[],
+        started_at=started,
         initiated_by=current_user.id,
         organization_id=org_id,
     )
     db.add(scan)
     await db.flush()
 
-    findings, parse_errors = parse_scan_data(
-        import_data.scan_format, import_data.scan_data
-    )
-
-    vulnerabilities_imported = 0
-    assets_updated = 0
-    ingest_errors: list[str] = []
-
-    if findings:
-        vulnerabilities_imported, assets_updated, ingest_errors = await ingest_findings(
-            db=db,
-            findings=findings,
-            scanner=import_data.scanner_name,
-            scan_id=import_id,
-            organization_id=org_id,
+    findings, parse_errors = parse_scan_data(import_data.scan_format, import_data.scan_data)
+    if not findings:
+        scan.status = "failed"
+        scan.completed_at = datetime.now(timezone.utc)
+        scan.error_message = "; ".join(parse_errors or ["The scan file contains no findings"])[:4000]
+        _audit(db, current_user, org_id, "exposure.scan_import", "exposure_scan", import_id,
+               f"Scan import from {import_data.scanner_name} failed: {scan.error_message}", success=False)
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "scan_parse_failed",
+                "import_id": import_id,
+                "errors": parse_errors or ["The scan file contains no findings"],
+            },
         )
 
-    scan.status = "completed" if not parse_errors and not ingest_errors else "completed_with_errors"
-    scan.vulnerabilities_found = vulnerabilities_imported
-    scan.hosts_scanned = assets_updated
-    scan.total_hosts = assets_updated
+    result = await ingest_findings(
+        db=db,
+        findings=findings,
+        scanner=import_data.scanner_name,
+        scan_id=import_id,
+        organization_id=org_id,
+    )
+    rescored = await rescore_assets(db, org_id, result["touched_asset_ids"])
+
+    severity_counts: dict[str, int] = {}
+    for f in findings:
+        severity_counts[f.severity] = severity_counts.get(f.severity, 0) + 1
+    errors = parse_errors + result["errors"]
+    assets_touched = len(result["touched_asset_ids"])
+    scan.status = "completed" if not errors else "completed_with_errors"
+    scan.vulnerabilities_found = result["links_created"] + result["links_updated"] + result["links_reopened"]
+    scan.critical_count = severity_counts.get("critical", 0)
+    scan.high_count = severity_counts.get("high", 0)
+    scan.medium_count = severity_counts.get("medium", 0)
+    scan.low_count = severity_counts.get("low", 0)
+    scan.hosts_scanned = assets_touched
+    scan.total_hosts = assets_touched
     scan.completed_at = datetime.now(timezone.utc)
+    scan.error_message = "; ".join(errors)[:4000] if errors else None
+    scan.results_summary = {k: v for k, v in result.items() if k not in ("touched_asset_ids", "errors")}
+    _audit(
+        db, current_user, org_id, "exposure.scan_import", "exposure_scan", import_id,
+        (
+            f"Imported {result['findings_read']} finding(s) from {import_data.scanner_name}: "
+            f"{result['links_created']} new, {result['links_updated']} updated, "
+            f"{result['links_reopened']} reopened, {result['skipped_count']} skipped"
+        ),
+        scan.results_summary,
+    )
     await db.flush()
 
     return {
         "import_id": import_id,
         "scanner_name": import_data.scanner_name,
-        "vulnerabilities_imported": vulnerabilities_imported,
-        "assets_updated": assets_updated,
+        "vulnerabilities_imported": result["links_created"],
+        "assets_updated": assets_touched,
         "status": scan.status,
-        "errors": parse_errors + ingest_errors,
+        "errors": errors,
+        "findings_read": result["findings_read"],
+        "links_created": result["links_created"],
+        "links_updated": result["links_updated"],
+        "links_reopened": result["links_reopened"],
+        "vulnerabilities_created": result["vulnerabilities_created"],
+        "assets_created": result["assets_created"],
+        "assets_matched": result["assets_matched"],
+        "skipped": result["skipped"],
+        "skipped_count": result["skipped_count"],
+        "assets_rescored": rescored["assets_scored"],
     }
 
 
@@ -1109,10 +1451,10 @@ async def list_remediation_tickets(
     query = query.where(RemediationTicket.organization_id == org_id)
 
     if status:
-        query = query.where(RemediationTicket.status == status)
+        query = query.where(RemediationTicket.status.in_(_split_csv([status])))
 
     if priority:
-        query = query.where(RemediationTicket.priority == priority)
+        query = query.where(RemediationTicket.priority.in_(_split_csv([priority])))
 
     if assigned_to:
         query = query.where(RemediationTicket.assigned_to == assigned_to)
@@ -1122,12 +1464,12 @@ async def list_remediation_tickets(
             and_(
                 RemediationTicket.due_date < datetime.now(timezone.utc),
                 RemediationTicket.status.notin_(["closed", "verification"]),
-            )
+            ),
         )
 
     # Get total count
     count_result = await db.execute(
-        select(func.count()).select_from(query.subquery())
+        select(func.count()).select_from(query.subquery()),
     )
     total = count_result.scalar() or 0
 
@@ -1162,12 +1504,12 @@ async def get_overdue_tickets(
             RemediationTicket.organization_id == org_id,
             RemediationTicket.due_date < datetime.now(timezone.utc),
             RemediationTicket.status.notin_(["closed", "verification"]),
-        )
+        ),
     )
 
     # Get total count
     count_result = await db.execute(
-        select(func.count()).select_from(query.subquery())
+        select(func.count()).select_from(query.subquery()),
     )
     total = count_result.scalar() or 0
 
@@ -1205,10 +1547,33 @@ async def update_remediation_ticket(
     _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
-    """Update a remediation ticket"""
+    """Update a remediation ticket.
+
+    ``status`` must be one of open / assigned / in_progress / verification /
+    closed / reopened; moving to closed stamps ``resolved_at`` (MTTR),
+    leaving closed clears it.
+    """
     ticket = await get_ticket_or_404(db, ticket_id, org_id)
 
     update_data = ticket_data.model_dump(exclude_unset=True, exclude_none=True)
+    new_status = update_data.get("status")
+    if new_status is not None:
+        allowed = {"open", "assigned", "in_progress", "verification", "closed", "reopened"}
+        if new_status not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error": "invalid_status", "allowed": sorted(allowed)},
+            )
+        if new_status == "closed" and ticket.status != "closed":
+            ticket.resolved_at = datetime.now(timezone.utc)
+        elif new_status != "closed":
+            ticket.resolved_at = None
+    if "asset_vulnerabilities" in update_data:
+        await _require_ids_in_org(
+            db, AssetVulnerability, update_data["asset_vulnerabilities"], org_id, "asset_vulnerabilities",
+        )
+    if "affected_assets" in update_data:
+        await _require_ids_in_org(db, ExposureAsset, update_data["affected_assets"], org_id, "affected_assets")
     for key, value in update_data.items():
         setattr(ticket, key, value)
 
@@ -1287,17 +1652,25 @@ async def list_attack_surfaces(
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
     surface_type: Optional[str] = None,
+    include_snapshots: bool = False,
 ):
-    """List attack surfaces"""
+    """List attack surfaces.
+
+    The nightly change-detection snapshots (surface_type ``snapshot``) are
+    stored in the same table; they are hidden unless ``include_snapshots=true``
+    or ``surface_type=snapshot``.
+    """
     query = select(AttackSurface)
     query = query.where(AttackSurface.organization_id == org_id)
 
     if surface_type:
         query = query.where(AttackSurface.surface_type == surface_type)
+    elif not include_snapshots:
+        query = query.where(AttackSurface.surface_type != "snapshot")
 
     # Get total count
     count_result = await db.execute(
-        select(func.count()).select_from(query.subquery())
+        select(func.count()).select_from(query.subquery()),
     )
     total = count_result.scalar() or 0
 
@@ -1367,6 +1740,12 @@ async def trigger_assessment(
     Attack Surface card reflects the click.
     """
     surface = await get_attack_surface_or_404(db, surface_id, org_id)
+    if surface.surface_type == "snapshot":
+        # Overwriting a snapshot would corrupt the nightly diff baseline.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"error": "snapshot_not_assessable", "detail": "Snapshot rows are written by the nightly task"},
+        )
 
     # Decide asset filter based on surface_type. 'external' / 'internet'
     # surfaces only count internet-facing assets; others count every
@@ -1381,7 +1760,7 @@ async def trigger_assessment(
         asset_filter.append(ExposureAsset.is_internet_facing == False)
 
     surface_asset_ids_res = await db.execute(
-        select(ExposureAsset.id).where(and_(*asset_filter))
+        select(ExposureAsset.id).where(and_(*asset_filter)),
     )
     surface_asset_ids = [row[0] for row in surface_asset_ids_res.all()]
     total_exposures = len(surface_asset_ids)
@@ -1398,8 +1777,8 @@ async def trigger_assessment(
                     AssetVulnerability.organization_id == org_id,
                     AssetVulnerability.asset_id.in_(surface_asset_ids),
                     AssetVulnerability.status == "open",
-                )
-            )
+                ),
+            ),
         )
         open_exposures = open_res.scalar() or 0
 
@@ -1414,9 +1793,9 @@ async def trigger_assessment(
                     AssetVulnerability.organization_id == org_id,
                     AssetVulnerability.asset_id.in_(surface_asset_ids),
                     AssetVulnerability.status == "open",
-                )
+                ),
             )
-            .group_by(Vulnerability.severity)
+            .group_by(Vulnerability.severity),
         )
         for row in by_sev_res.all():
             sev = (row[0] or "").lower()
@@ -1428,6 +1807,7 @@ async def trigger_assessment(
 
         avg_res = await db.execute(
             select(func.avg(Vulnerability.cvss_v3_score))
+            .select_from(AssetVulnerability)
             .join(
                 Vulnerability,
                 AssetVulnerability.vulnerability_id == Vulnerability.id,
@@ -1437,8 +1817,8 @@ async def trigger_assessment(
                     AssetVulnerability.organization_id == org_id,
                     AssetVulnerability.asset_id.in_(surface_asset_ids),
                     AssetVulnerability.status == "open",
-                )
-            )
+                ),
+            ),
         )
         avg_val = avg_res.scalar()
         avg_cvss = float(avg_val) if avg_val is not None else 0.0
@@ -1465,7 +1845,7 @@ async def trigger_assessment(
             "critical_exposures": critical_exposures,
             "high_exposures": high_exposures,
             "avg_cvss_v3": round(avg_cvss, 2),
-        }
+        },
     ]
 
     # Persist back to the surface so the Attack Surface card is honest.
@@ -1503,153 +1883,165 @@ async def get_dashboard_statistics(
     org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
-    """Get exposure management dashboard statistics"""
+    """Exposure dashboard from stored rows.
 
-    # Total and active assets
-    total_assets_result = await db.execute(
-        select(func.count(ExposureAsset.id)).where(ExposureAsset.organization_id == org_id)
+    * ``total_assets`` / ``internet_facing_assets``: active assets only
+      (``inactive_assets`` counts deactivated ones).
+    * ``critical_vulns`` ... ``info_vulns`` and ``open_exposures``: OPEN asset
+      exposures (open / in-progress links) by catalogue severity;
+      ``total_vulnerabilities`` / ``catalog_vulnerabilities``: catalogue rows.
+    * ``overall_risk_score``: mean stored asset risk over active assets (None
+      without active assets); assets are scored on import / link changes and
+      nightly (src/exposure/scoring.py).
+    * ``exposure_trend`` / ``compliance_trend``: stored daily snapshots
+      (exposure_daily_snapshots); days without a snapshot are absent.
+    * ``mean_time_to_remediate_days``: closed tickets (resolved_at -
+      created_at); None until a ticket is closed.
+    """
+
+    async def _count(stmt: Any) -> int:
+        return int((await db.execute(stmt)).scalar() or 0)
+
+    active = and_(ExposureAsset.organization_id == org_id, ExposureAsset.is_active == True)  # noqa: E712
+    total_assets = await _count(select(func.count(ExposureAsset.id)).where(active))
+    inactive_assets = await _count(
+        select(func.count(ExposureAsset.id)).where(
+            ExposureAsset.organization_id == org_id, ExposureAsset.is_active == False,  # noqa: E712
+        ),
     )
-    total_assets = total_assets_result.scalar() or 0
-
-    active_conditions = [ExposureAsset.is_active == True]
-    active_conditions.append(ExposureAsset.organization_id == org_id)
-    active_assets_result = await db.execute(
-        select(func.count(ExposureAsset.id)).where(and_(*active_conditions))
+    internet_facing_assets = await _count(
+        select(func.count(ExposureAsset.id)).where(active, ExposureAsset.is_internet_facing == True),  # noqa: E712
     )
-    active_assets = active_assets_result.scalar() or 0
-
-    inet_conditions = [ExposureAsset.is_internet_facing == True]
-    inet_conditions.append(ExposureAsset.organization_id == org_id)
-    internet_facing_result = await db.execute(
-        select(func.count(ExposureAsset.id)).where(and_(*inet_conditions))
+    catalog_vulnerabilities = await _count(
+        select(func.count(Vulnerability.id)).where(Vulnerability.organization_id == org_id),
     )
-    internet_facing_assets = internet_facing_result.scalar() or 0
 
-    # Vulnerability counts by severity
-    vuln_query = select(func.count(Vulnerability.id))
-    vuln_query = vuln_query.where(Vulnerability.organization_id == org_id)
-    total_vulns_result = await db.execute(vuln_query)
-    total_vulnerabilities = total_vulns_result.scalar() or 0
-
-    sev_query = select(Vulnerability.severity, func.count(Vulnerability.id))
-    sev_query = sev_query.where(Vulnerability.organization_id == org_id)
-    severity_result = await db.execute(sev_query.group_by(Vulnerability.severity))
-    severity_counts = dict(severity_result.all())
-
-    # Overdue tickets
-    overdue_conditions = [
-        RemediationTicket.due_date < datetime.now(timezone.utc),
-        RemediationTicket.status.notin_(["closed", "verification"]),
-    ]
-    overdue_conditions.append(RemediationTicket.organization_id == org_id)
-    overdue_result = await db.execute(
-        select(func.count(RemediationTicket.id)).where(and_(*overdue_conditions))
+    open_links = and_(
+        AssetVulnerability.organization_id == org_id,
+        AssetVulnerability.status.in_(OPEN_LINK_STATUSES),
     )
-    overdue_tickets = overdue_result.scalar() or 0
-
-    # Assets by criticality
-    crit_query = select(ExposureAsset.criticality, func.count(ExposureAsset.id))
-    crit_query = crit_query.where(ExposureAsset.organization_id == org_id)
-    criticality_result = await db.execute(crit_query.group_by(ExposureAsset.criticality))
-    assets_by_criticality = dict(criticality_result.all())
-
-    # Vulns by status
-    vs_query = select(AssetVulnerability.status, func.count(AssetVulnerability.id))
-    vs_query = vs_query.where(AssetVulnerability.organization_id == org_id)
-    vuln_status_result = await db.execute(vs_query.group_by(AssetVulnerability.status))
-    vulns_by_status = dict(vuln_status_result.all())
-
-    # --- REAL MTTR: average (resolved_at - created_at) over closed tickets ---
-    mttr_query = select(RemediationTicket.created_at, RemediationTicket.resolved_at)
-    mttr_query = mttr_query.where(RemediationTicket.organization_id == org_id)
-    mttr_query = mttr_query.where(
-        RemediationTicket.status == "closed",
-        RemediationTicket.resolved_at.is_not(None),
+    severity_counts = {
+        (sev or "unknown"): int(n)
+        for sev, n in (
+            await db.execute(
+                select(Vulnerability.severity, func.count(AssetVulnerability.id))
+                .join(Vulnerability, AssetVulnerability.vulnerability_id == Vulnerability.id)
+                .where(open_links)
+                .group_by(Vulnerability.severity),
+            )
+        ).all()
+    }
+    open_exposures = sum(severity_counts.values())
+    assets_with_open = await _count(
+        select(func.count(func.distinct(AssetVulnerability.asset_id))).where(open_links),
     )
-    mttr_result = await db.execute(mttr_query)
+
+    overdue_tickets = await _count(
+        select(func.count(RemediationTicket.id)).where(
+            RemediationTicket.organization_id == org_id,
+            RemediationTicket.due_date < datetime.now(timezone.utc),
+            RemediationTicket.status.notin_(["closed", "verification"]),
+        ),
+    )
+    assets_by_criticality = dict(
+        (
+            await db.execute(
+                select(ExposureAsset.criticality, func.count(ExposureAsset.id))
+                .where(active)
+                .group_by(ExposureAsset.criticality),
+            )
+        ).all(),
+    )
+    vulns_by_status = dict(
+        (
+            await db.execute(
+                select(AssetVulnerability.status, func.count(AssetVulnerability.id))
+                .where(AssetVulnerability.organization_id == org_id)
+                .group_by(AssetVulnerability.status),
+            )
+        ).all(),
+    )
+
     durations_days: list[float] = []
-    for created_at, resolved_at in mttr_result.all():
-        if not created_at or not resolved_at:
-            continue
-        delta = (resolved_at - created_at).total_seconds() / 86400.0
-        if delta > 0:
-            durations_days.append(delta)
+    for created_at, resolved_at in (
+        await db.execute(
+            select(RemediationTicket.created_at, RemediationTicket.resolved_at)
+            .where(
+                RemediationTicket.organization_id == org_id,
+                RemediationTicket.status == "closed",
+                RemediationTicket.resolved_at.is_not(None),
+            )
+            .order_by(RemediationTicket.resolved_at.desc())
+            .limit(10_000),
+        )
+    ).all():
+        if created_at and resolved_at:
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            if resolved_at.tzinfo is None:
+                resolved_at = resolved_at.replace(tzinfo=timezone.utc)
+            delta = (resolved_at - created_at).total_seconds() / 86400.0
+            if delta >= 0:
+                durations_days.append(delta)
     mean_time_to_remediate_days = (
         round(sum(durations_days) / len(durations_days), 2) if durations_days else None
     )
 
-    # --- REAL OVERALL RISK SCORE: weighted blend of open vulns by severity ---
-    # Simple FAIR-adjacent heuristic: critical=10, high=5, medium=2, low=1.
-    # Normalize to 0-100 with 100 = "every asset has a critical vuln".
-    severity_weights = {"critical": 10, "high": 5, "medium": 2, "low": 1, "informational": 0}
-    weighted_sum = sum(
-        severity_counts.get(k, 0) * w for k, w in severity_weights.items()
+    top_result = await db.execute(
+        select(ExposureAsset)
+        .where(active, ExposureAsset.risk_score > 0)
+        .order_by(ExposureAsset.risk_score.desc())
+        .limit(10),
     )
-    max_possible = max(total_assets, 1) * 10  # ceiling: every asset critical
-    overall_risk_score = round(min(100.0, (weighted_sum / max_possible) * 100.0), 1) if max_possible > 0 else 0.0
-
-    # --- REAL TOP VULNERABLE ASSETS: top 10 by risk_score ---
-    top_query = select(ExposureAsset).order_by(ExposureAsset.risk_score.desc()).limit(10)
-    top_query = top_query.where(ExposureAsset.organization_id == org_id)
-    top_result = await db.execute(top_query)
     top_vulnerable_assets = [
         {
             "id": a.id,
             "hostname": a.hostname,
+            "ip_address": a.ip_address,
             "asset_type": a.asset_type,
             "criticality": a.criticality,
             "risk_score": float(a.risk_score or 0.0),
+            "vulnerability_count": int(a.vulnerability_count or 0),
             "is_internet_facing": a.is_internet_facing,
         }
         for a in top_result.scalars().all()
     ]
 
-    # --- REAL EXPOSURE TREND: daily new vulns over the last 30 days ---
-    from datetime import timedelta as _td
-    thirty_days_ago = datetime.now(timezone.utc) - _td(days=30)
-    trend_query = select(
-        func.date_trunc("day", Vulnerability.created_at).label("day"),
-        func.count(Vulnerability.id),
-    ).where(Vulnerability.created_at >= thirty_days_ago)
-    trend_query = trend_query.where(Vulnerability.organization_id == org_id)
-    trend_query = trend_query.group_by("day").order_by("day")
-    trend_result = await db.execute(trend_query)
-    trend_by_day = {row[0].date().isoformat(): int(row[1]) for row in trend_result.all()}
-    # Fill any missing day with 0 to keep the chart dense
-    exposure_trend = []
-    for i in range(30):
-        day = (thirty_days_ago + _td(days=i)).date()
-        exposure_trend.append({
-            "date": day.strftime("%b %d"),
-            "exposures": trend_by_day.get(day.isoformat(), 0),
-        })
+    trend = await read_trend(db, org_id, days=30)
+    compliance_trend = [
+        {"date": p["date"], "snapshot_date": p["snapshot_date"], "compliance": p["compliance"]}
+        for p in trend
+        if p["compliance"] is not None
+    ]
 
-    # --- REAL COMPLIANCE SUMMARY: pull aggregates from ComplianceFramework if present ---
     compliance_summary = {}
-    try:
-        from src.compliance.models import ComplianceFramework
-        fw_query = select(
-            ComplianceFramework.short_name,
-            ComplianceFramework.compliance_score,
-            ComplianceFramework.total_controls,
-            ComplianceFramework.implemented_controls,
-        ).where(ComplianceFramework.is_enabled == True)
-        fw_query = fw_query.where(ComplianceFramework.organization_id == org_id)
-        fw_result = await db.execute(fw_query)
-        for short, score, total, implemented in fw_result.all():
-            compliance_summary[short or "unknown"] = {
-                "score": float(score or 0.0),
-                "total_controls": int(total or 0),
-                "implemented_controls": int(implemented or 0),
-            }
-    except Exception:
-        pass  # Compliance module optional — keep the dashboard rendering
+    from src.compliance.models import ComplianceFramework
+
+    for short, score, total, implemented in (
+        await db.execute(
+            select(
+                ComplianceFramework.short_name,
+                ComplianceFramework.compliance_score,
+                ComplianceFramework.total_controls,
+                ComplianceFramework.implemented_controls,
+            ).where(ComplianceFramework.organization_id == org_id, ComplianceFramework.is_enabled == True),  # noqa: E712
+        )
+    ).all():
+        compliance_summary[short or "unknown"] = {
+            "score": float(score) if score is not None else None,
+            "total_controls": int(total or 0),
+            "implemented_controls": int(implemented or 0),
+        }
 
     return {
         "total_assets": total_assets,
-        "active_assets": active_assets,
+        "active_assets": total_assets,
+        "inactive_assets": inactive_assets,
         "internet_facing_assets": internet_facing_assets,
-        "total_vulnerabilities": total_vulnerabilities,
+        "total_vulnerabilities": catalog_vulnerabilities,
+        "catalog_vulnerabilities": catalog_vulnerabilities,
+        "open_exposures": open_exposures,
+        "assets_with_open_exposures": assets_with_open,
         "critical_vulns": severity_counts.get("critical", 0),
         "high_vulns": severity_counts.get("high", 0),
         "medium_vulns": severity_counts.get("medium", 0),
@@ -1657,13 +2049,206 @@ async def get_dashboard_statistics(
         "info_vulns": severity_counts.get("informational", 0),
         "mean_time_to_remediate_days": mean_time_to_remediate_days,
         "overdue_tickets": overdue_tickets,
-        "overall_risk_score": overall_risk_score,
+        "overall_risk_score": await organization_risk(db, org_id),
+        "risk_score_basis": "mean stored asset risk over active assets (src/exposure/scoring.py)",
         "assets_by_criticality": assets_by_criticality,
         "vulns_by_status": vulns_by_status,
         "top_vulnerable_assets": top_vulnerable_assets,
-        "exposure_trend": exposure_trend,
+        "exposure_trend": trend,
+        "compliance_trend": compliance_trend,
+        "trend_source": "exposure_daily_snapshots",
         "compliance_summary": compliance_summary,
     }
+
+
+@router.get("/trend")
+async def get_exposure_trend(
+    org_id: OrganizationId,
+    db: DatabaseSession = None,
+    days: int = Query(30, ge=1, le=365),
+):
+    """Stored daily exposure snapshots for the last ``days`` days (oldest first)."""
+    points = await read_trend(db, org_id, days=days)
+    return {"points": points, "days": days, "source": "exposure_daily_snapshots", "count": len(points)}
+
+
+@router.post("/snapshots/capture")
+async def capture_exposure_snapshot(
+    org_id: OrganizationId,
+    current_user: AnalystUser = None,
+    db: DatabaseSession = None,
+):
+    """Rescore the org's assets and store (or refresh) today's snapshot now.
+
+    The nightly ``snapshot_exposure_daily`` task does the same for every org.
+    """
+    scored = await rescore_organization(db, org_id)
+    snapshot = await capture_daily_snapshot(db, org_id)
+    _audit(db, current_user, org_id, "exposure.snapshot_capture", "exposure_snapshot", None,
+           f"Exposure snapshot captured for {snapshot['snapshot_date']}", snapshot)
+    await db.flush()
+    return {"snapshot": snapshot, "rescored": scored}
+
+
+@router.post("/risk/recalculate")
+async def recalculate_exposure_risk(
+    org_id: OrganizationId,
+    current_user: AnalystUser = None,
+    db: DatabaseSession = None,
+):
+    """Recompute link and asset risk scores for the org from stored rows
+    (keyset windows, at most 50,000 assets per call)."""
+    result = await rescore_organization(db, org_id)
+    result["overall_risk_score"] = await organization_risk(db, org_id)
+    _audit(db, current_user, org_id, "exposure.risk_recalculate", "exposure_asset", None,
+           f"Exposure risk recalculated for {result['assets_scored']} asset(s)", result)
+    await db.flush()
+    return result
+
+
+MAX_GRAPH_ASSETS = 200
+
+
+@router.get("/graph")
+async def get_exposure_graph(
+    org_id: OrganizationId,
+    db: DatabaseSession = None,
+    limit_assets: int = Query(100, ge=1, le=MAX_GRAPH_ASSETS),
+    min_severity: Optional[str] = Query(None, description="informational, low, medium, high, critical"),
+):
+    """Exposure graph computed from stored relations.
+
+    Nodes: the ``internet`` entry point, active assets with open exposures
+    (highest stored risk first, up to ``limit_assets``) and the catalogue
+    vulnerabilities open on them. Edges: ``internet -> asset`` for
+    internet-facing assets (``exposes``) and ``asset -> vulnerability`` for
+    every open / in-progress link (``has_vulnerability``, weighted by the
+    link's stored risk). No asset-to-asset edge exists because no network
+    reachability is stored; see ``GET /exposure/attack-paths``.
+    """
+    order = ["informational", "low", "medium", "high", "critical"]
+    severities: Optional[list[str]] = None
+    if min_severity:
+        if min_severity not in order:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error": "invalid_min_severity", "allowed": order},
+            )
+        severities = order[order.index(min_severity):]
+
+    link_filter = [
+        AssetVulnerability.organization_id == org_id,
+        AssetVulnerability.status.in_(OPEN_LINK_STATUSES),
+    ]
+    if severities:
+        link_filter.append(
+            AssetVulnerability.vulnerability_id.in_(
+                select(Vulnerability.id).where(Vulnerability.organization_id == org_id, Vulnerability.severity.in_(severities)),
+            ),
+        )
+    asset_ids_with_links = select(AssetVulnerability.asset_id).where(*link_filter)
+    assets = list(
+        (
+            await db.execute(
+                select(ExposureAsset)
+                .where(
+                    ExposureAsset.organization_id == org_id,
+                    ExposureAsset.is_active == True,  # noqa: E712
+                    ExposureAsset.id.in_(asset_ids_with_links),
+                )
+                .order_by(ExposureAsset.risk_score.desc(), ExposureAsset.id)
+                .limit(limit_assets + 1),
+            )
+        ).scalars(),
+    )
+    truncated = len(assets) > limit_assets
+    assets = assets[:limit_assets]
+    links = []
+    if assets:
+        links = (
+            await db.execute(
+                select(
+                    AssetVulnerability.id,
+                    AssetVulnerability.asset_id,
+                    AssetVulnerability.vulnerability_id,
+                    AssetVulnerability.risk_score,
+                    AssetVulnerability.status,
+                    Vulnerability.cve_id,
+                    Vulnerability.title,
+                    Vulnerability.severity,
+                    Vulnerability.is_exploited_in_wild,
+                )
+                .join(Vulnerability, AssetVulnerability.vulnerability_id == Vulnerability.id)
+                .where(*link_filter, AssetVulnerability.asset_id.in_([a.id for a in assets])),
+            )
+        ).all()
+
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    internet_facing = [a for a in assets if a.is_internet_facing]
+    if internet_facing:
+        nodes.append({"id": "internet", "type": "entry_point", "label": "Internet"})
+    for a in assets:
+        nodes.append({
+            "id": f"asset:{a.id}",
+            "type": "asset",
+            "label": a.hostname or a.ip_address or a.id,
+            "asset_id": a.id,
+            "criticality": a.criticality,
+            "is_internet_facing": a.is_internet_facing,
+            "risk_score": float(a.risk_score or 0.0),
+            "vulnerability_count": int(a.vulnerability_count or 0),
+        })
+        if a.is_internet_facing:
+            edges.append({"source": "internet", "target": f"asset:{a.id}", "type": "exposes"})
+    seen_vulns: set[str] = set()
+    for link in links:
+        if link.vulnerability_id not in seen_vulns:
+            seen_vulns.add(link.vulnerability_id)
+            nodes.append({
+                "id": f"vuln:{link.vulnerability_id}",
+                "type": "vulnerability",
+                "label": link.cve_id or link.title,
+                "vulnerability_id": link.vulnerability_id,
+                "severity": link.severity,
+                "exploited_in_wild": bool(link.is_exploited_in_wild),
+            })
+        edges.append({
+            "source": f"asset:{link.asset_id}",
+            "target": f"vuln:{link.vulnerability_id}",
+            "type": "has_vulnerability",
+            "link_id": link.id,
+            "status": link.status,
+            "risk_score": float(link.risk_score or 0.0),
+        })
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "truncated": truncated,
+        "basis": "stored exposure_assets and open asset_vulnerabilities links",
+    }
+
+
+@router.get("/attack-paths")
+async def get_attack_paths(_org_id: OrganizationId):
+    """Multi-hop attack paths are not computed.
+
+    A path needs stored reachability between assets (network topology,
+    flows or firewall rules); the exposure store holds assets and
+    asset-to-vulnerability links only. ``GET /exposure/graph`` returns the
+    graph those stored relations support.
+    """
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "detail": (
+                "Attack paths need asset-to-asset reachability (network topology, flows or firewall "
+                "rules), which is not stored. Use GET /exposure/graph for the internet -> asset -> "
+                "vulnerability graph built from stored rows."
+            ),
+        },
+    )
 
 
 @router.get("/risk-matrix", response_model=RiskMatrix)
@@ -1683,14 +2268,14 @@ async def get_risk_matrix(
     total_conditions = [AssetVulnerability.status == "open"]
     total_conditions.append(AssetVulnerability.organization_id == org_id)
     total_result = await db.execute(
-        select(func.count(AssetVulnerability.id)).where(and_(*total_conditions))
+        select(func.count(AssetVulnerability.id)).where(and_(*total_conditions)),
     )
     total_exposures = total_result.scalar() or 0
 
     # Critical exposures (risk_score >= 80 OR vuln.severity == critical)
     critical_conditions = list(total_conditions) + [AssetVulnerability.risk_score >= 80.0]
     critical_result = await db.execute(
-        select(func.count(AssetVulnerability.id)).where(and_(*critical_conditions))
+        select(func.count(AssetVulnerability.id)).where(and_(*critical_conditions)),
     )
     critical_exposures = critical_result.scalar() or 0
 
@@ -1755,7 +2340,7 @@ async def get_compliance_status(
         for fw in frameworks:
             # Count controls per framework
             total_q = select(func.count(ComplianceControl.id)).where(
-                ComplianceControl.framework_id == fw.id
+                ComplianceControl.framework_id == fw.id,
             )
             total_fw = (await db.execute(total_q)).scalar() or 0
 
@@ -1792,7 +2377,7 @@ async def get_compliance_status(
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning(
-            f"Compliance summary partial — compliance module unavailable: {e}"
+            f"Compliance summary partial — compliance module unavailable: {e}",
         )
 
     # Fall back to asset-count if no frameworks exist (fresh install)
@@ -1826,33 +2411,33 @@ async def generate_exposure_report(
 
     # Gather statistics
     total_assets_result = await db.execute(
-        select(func.count(ExposureAsset.id)).where(ExposureAsset.organization_id == org_id)
+        select(func.count(ExposureAsset.id)).where(ExposureAsset.organization_id == org_id),
     )
     total_assets = total_assets_result.scalar() or 0
 
     active_assets_result = await db.execute(
         select(func.count(ExposureAsset.id)).where(
-            and_(ExposureAsset.organization_id == org_id, ExposureAsset.is_active == True)
-        )
+            and_(ExposureAsset.organization_id == org_id, ExposureAsset.is_active == True),
+        ),
     )
     active_assets = active_assets_result.scalar() or 0
 
     internet_facing_result = await db.execute(
         select(func.count(ExposureAsset.id)).where(
-            and_(ExposureAsset.organization_id == org_id, ExposureAsset.is_internet_facing == True)
-        )
+            and_(ExposureAsset.organization_id == org_id, ExposureAsset.is_internet_facing == True),
+        ),
     )
     internet_facing_assets = internet_facing_result.scalar() or 0
 
     total_vulns_result = await db.execute(
-        select(func.count(Vulnerability.id)).where(Vulnerability.organization_id == org_id)
+        select(func.count(Vulnerability.id)).where(Vulnerability.organization_id == org_id),
     )
     total_vulnerabilities = total_vulns_result.scalar() or 0
 
     severity_result = await db.execute(
         select(Vulnerability.severity, func.count(Vulnerability.id))
         .where(Vulnerability.organization_id == org_id)
-        .group_by(Vulnerability.severity)
+        .group_by(Vulnerability.severity),
     )
     severity_counts = dict(severity_result.all())
 
@@ -1862,8 +2447,8 @@ async def generate_exposure_report(
                 RemediationTicket.organization_id == org_id,
                 RemediationTicket.due_date < datetime.now(timezone.utc),
                 RemediationTicket.status.notin_(["closed", "verification"]),
-            )
-        )
+            ),
+        ),
     )
     overdue_tickets = overdue_result.scalar() or 0
 
@@ -1875,15 +2460,15 @@ async def generate_exposure_report(
                 func.extract(
                     "epoch",
                     RemediationTicket.resolved_at - RemediationTicket.created_at,
-                )
-            )
+                ),
+            ),
         ).where(
             and_(
                 RemediationTicket.organization_id == org_id,
                 RemediationTicket.status == "closed",
                 RemediationTicket.resolved_at.is_not(None),
-            )
-        )
+            ),
+        ),
     )
     mttr_seconds = mttr_result.scalar()
     # Unknown (None) until a ticket has been closed, not "0 days".
@@ -1891,16 +2476,9 @@ async def generate_exposure_report(
         round(float(mttr_seconds) / 86400.0, 2) if mttr_seconds is not None else None
     )
 
-    # Composite risk score weighted by severity. Critical=25, High=10,
-    # Medium=3, Low=1 — keeps overall_risk_score bounded roughly 0..100.
-    weighted_sum = (
-        severity_counts.get("critical", 0) * 25
-        + severity_counts.get("high", 0) * 10
-        + severity_counts.get("medium", 0) * 3
-        + severity_counts.get("low", 0) * 1
-    )
-    max_possible = max(total_vulnerabilities * 25, 1)
-    overall_risk_score = round(min(100.0, (weighted_sum / max_possible) * 100.0), 1)
+    # Same figure as the dashboard: mean stored asset risk over active
+    # assets (None without active assets).
+    overall_risk_score = await organization_risk(db, org_id)
 
     # Top 5 most-vulnerable assets by count of open vulns.
     top_assets_res = await db.execute(
@@ -1915,11 +2493,11 @@ async def generate_exposure_report(
             and_(
                 ExposureAsset.organization_id == org_id,
                 AssetVulnerability.status == "open",
-            )
+            ),
         )
         .group_by(ExposureAsset.id, ExposureAsset.ip_address, ExposureAsset.hostname)
         .order_by(func.count(AssetVulnerability.id).desc())
-        .limit(5)
+        .limit(5),
     )
     top_vulnerable_assets = [
         {
@@ -1938,27 +2516,27 @@ async def generate_exposure_report(
     if include_recommendations:
         if severity_counts.get("critical", 0) > 0:
             recommendations.append(
-                f"Patch {severity_counts.get('critical', 0)} critical CVE(s) within 72 hours."
+                f"Patch {severity_counts.get('critical', 0)} critical CVE(s) within 72 hours.",
             )
         if severity_counts.get("high", 0) > 5:
             recommendations.append(
-                f"Open remediation tickets for {severity_counts.get('high', 0)} high-severity vulns."
+                f"Open remediation tickets for {severity_counts.get('high', 0)} high-severity vulns.",
             )
         if internet_facing_assets > 0 and severity_counts.get("critical", 0) > 0:
             recommendations.append(
-                "Review internet-facing assets — at least one critical vuln is publicly reachable."
+                "Review internet-facing assets — at least one critical vuln is publicly reachable.",
             )
         if overdue_tickets > 0:
             recommendations.append(
-                f"{overdue_tickets} remediation ticket(s) are overdue — escalate to ticket owners."
+                f"{overdue_tickets} remediation ticket(s) are overdue — escalate to ticket owners.",
             )
         if mean_time_to_remediate_days is not None and mean_time_to_remediate_days > 30:
             recommendations.append(
-                f"MTTR is {mean_time_to_remediate_days} days — consider SLA tightening or adding remediation automation."
+                f"MTTR is {mean_time_to_remediate_days} days — consider SLA tightening or adding remediation automation.",
             )
         if not recommendations:
             recommendations.append(
-                "Posture looks healthy. Rerun scans weekly to stay ahead of newly disclosed CVEs."
+                "Posture looks healthy. Rerun scans weekly to stay ahead of newly disclosed CVEs.",
             )
 
     top_findings = [
@@ -1996,7 +2574,12 @@ async def generate_exposure_report(
         "summary": (
             f"Exposure report: {total_assets} assets ({internet_facing_assets} internet-facing), "
             f"{total_vulnerabilities} vulnerabilities ({severity_counts.get('critical', 0)} critical, "
-            f"{severity_counts.get('high', 0)} high). Overall risk score: {overall_risk_score}/100. "
+            f"{severity_counts.get('high', 0)} high). "
+            + (
+                f"Overall risk score: {overall_risk_score}/100. "
+                if overall_risk_score is not None
+                else "Overall risk score: unknown (no active assets). "
+            )
             + (
                 f"MTTR: {mean_time_to_remediate_days} days."
                 if mean_time_to_remediate_days is not None

@@ -9,7 +9,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import BaseModel, utc_now
@@ -415,4 +415,39 @@ class AttackSurface(BaseModel):
     __table_args__ = (
         Index("ix_attack_surfaces_surface_type", "surface_type"),
         Index("ix_attack_surfaces_organization_id", "organization_id"),
+    )
+
+
+class ExposureDailySnapshot(BaseModel):
+    """One row per organisation per day of the exposure posture.
+
+    Written by ``src.exposure.tasks.snapshot_exposure_daily`` from aggregate
+    queries over the stored assets, asset-vulnerability links, tickets and
+    compliance frameworks. The dashboard trend charts read these rows; a day
+    without a snapshot is absent from the series rather than filled in.
+    """
+
+    __tablename__ = "exposure_daily_snapshots"
+
+    organization_id: Mapped[str] = mapped_column(String(36), ForeignKey("organizations.id"), nullable=False, index=True)
+    snapshot_date: Mapped[str] = mapped_column(String(10), nullable=False)  # YYYY-MM-DD (UTC)
+    total_assets: Mapped[int] = mapped_column(Integer, default=0)
+    internet_facing_assets: Mapped[int] = mapped_column(Integer, default=0)
+    assets_with_open_exposures: Mapped[int] = mapped_column(Integer, default=0)
+    open_exposures: Mapped[int] = mapped_column(Integer, default=0)
+    critical_open: Mapped[int] = mapped_column(Integer, default=0)
+    high_open: Mapped[int] = mapped_column(Integer, default=0)
+    medium_open: Mapped[int] = mapped_column(Integer, default=0)
+    low_open: Mapped[int] = mapped_column(Integer, default=0)
+    informational_open: Mapped[int] = mapped_column(Integer, default=0)
+    new_exposures: Mapped[int] = mapped_column(Integer, default=0)
+    remediated_exposures: Mapped[int] = mapped_column(Integer, default=0)
+    overdue_tickets: Mapped[int] = mapped_column(Integer, default=0)
+    # None when no active asset exists / no compliance framework is enabled.
+    overall_risk_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    compliance_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    captured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("organization_id", "snapshot_date", name="uq_exposure_daily_snapshots_org_day"),
     )

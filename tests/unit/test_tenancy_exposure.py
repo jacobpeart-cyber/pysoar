@@ -272,12 +272,18 @@ async def test_live_scans_are_admin_only_and_honest(
     assert scans == []
 
 
-async def test_bulk_asset_import_is_honest_501(client: AsyncClient, org_a_headers: dict[str, str]) -> None:
+async def test_bulk_asset_import_is_real_and_stamped(
+    client: AsyncClient, db_session: AsyncSession, org_a: Organization, org_a_headers: dict[str, str],
+) -> None:
+    # Wave 4 (W4-A): the import parses and writes rows (was an honest 501).
+    org_a_id = org_a.id
     resp = await client.post(
         f"{API}/assets/import", json={"format": "csv", "data": "hostname\nweb-9\n"}, headers=org_a_headers,
     )
-    assert resp.status_code == 501, resp.text
-    assert resp.json()["detail"]["error"] == "not_implemented"
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["created"] == 1
+    asset = (await db_session.execute(select(ExposureAsset).where(ExposureAsset.hostname == "web-9"))).scalar_one()
+    assert asset.organization_id == org_a_id
 
 
 WRITE_ROUTES: list[tuple[str, str, dict[str, Any]]] = [

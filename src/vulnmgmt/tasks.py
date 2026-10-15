@@ -1,7 +1,6 @@
 """Celery tasks for vulnerability management background processing"""
 
 import asyncio
-import json
 from typing import Any, Optional
 
 from celery import shared_task
@@ -12,6 +11,7 @@ from src.vulnmgmt.engine import (
     KEVMonitor,
     PatchOrchestrator,
     RiskPrioritizer,
+    ScanImportError,
     VulnerabilityLifecycle,
     VulnerabilityScanner,
 )
@@ -83,6 +83,10 @@ def scheduled_scan_task(
         )
         return result
 
+    except ScanImportError as e:
+        # An unreadable payload will not parse on retry either.
+        logger.error("Scheduled scan import rejected", scan_profile_id=scan_profile_id, errors=e.errors)
+        return {"status": "failed", "errors": e.errors}
     except Exception as e:
         logger.error(
             "Scheduled scan failed",
@@ -278,3 +282,106 @@ def vulnerability_aging_report_task(
             error=str(e),
         )
         raise self.retry(exc=e, countdown=600)
+
+
+# ---------------------------------------------------------------------------
+# Wave 4: scheduled sweeps (beat entries in src/workers/celery_app.py)
+# ---------------------------------------------------------------------------
+# Both walk organisations that have vulnerability rows, one session and one
+# commit per organisation. refresh_instances reads/writes in windows of 500
+# rows and stops at 50,000 instances per organisation per run (the next run
+# continues from the start; the hourly cadence keeps every row fresh for
+# any realistic tenant size).
+MAX_ORGS_PER_SWEEP = 10_000
+
+
+async def _org_ids_with(column) -> list[str]:
+    from sqlalchemy import select
+
+    async with async_session_factory() as db:
+        rows = (await db.execute(select(column).distinct().limit(MAX_ORGS_PER_SWEEP))).scalars().all()
+    return [o for o in rows if o]
+
+
+async def _refresh_scores_sweep(organization_id: Optional[str] = None) -> dict[str, Any]:
+    from src.vulnmgmt.engine import refresh_instances, reopen_expired_exceptions
+    from src.vulnmgmt.models import VulnerabilityInstance
+
+    org_ids = [organization_id] if organization_id else await _org_ids_with(VulnerabilityInstance.organization_id)
+    refreshed = breached = reopened = 0
+    failures: list[dict[str, str]] = []
+    for oid in org_ids:
+        try:
+            async with async_session_factory() as db:
+                reopened += await reopen_expired_exceptions(db, oid)
+                result = await refresh_instances(db, oid)
+                await db.commit()
+            refreshed += result["instances_refreshed"]
+            breached += result["breached"]
+        except Exception as exc:  # one org failing must not stop the sweep
+            logger.error("vulnmgmt score refresh failed", organization_id=oid, error=str(exc))
+            failures.append({"organization_id": oid, "error": str(exc)[:500]})
+    return {
+        "organizations": len(org_ids),
+        "instances_refreshed": refreshed,
+        "breached": breached,
+        "reopened_after_exception_expiry": reopened,
+        "failures": failures,
+    }
+
+
+@shared_task(bind=True, max_retries=1)
+def refresh_instance_scores(self, organization_id: Optional[str] = None) -> dict[str, Any]:
+    """Recompute risk, SLA deadline and SLA status on stored instances and
+    re-open instances whose exceptions have all expired."""
+    try:
+        result = run_async(_refresh_scores_sweep(organization_id))
+        logger.info("vulnmgmt score refresh complete", **{k: v for k, v in result.items() if k != "failures"})
+        return result
+    except Exception as exc:
+        logger.error("vulnmgmt score refresh failed", error=str(exc))
+        raise self.retry(exc=exc, countdown=600) from exc
+
+
+async def _sync_kev_catalog_all() -> dict[str, Any]:
+    from src.vulnmgmt.engine import KEVFeedUnavailable, fetch_kev_catalog
+    from src.vulnmgmt.models import Vulnerability
+
+    try:
+        kev_data = await fetch_kev_catalog()
+    except KEVFeedUnavailable as exc:
+        logger.warning("KEV catalogue sync skipped: feed unavailable", error=str(exc))
+        return {"status": "feed_unavailable", "error": str(exc), "organizations": 0, "matched": 0, "newly_flagged": 0}
+    org_ids = await _org_ids_with(Vulnerability.organization_id)
+    matched = newly = 0
+    failures: list[dict[str, str]] = []
+    for oid in org_ids:
+        try:
+            async with async_session_factory() as db:
+                result = await KEVMonitor(oid).sync_cisa_kev(db, kev_data)
+            matched += result["matched"]
+            newly += result["newly_flagged"]
+        except Exception as exc:  # one org failing must not stop the sweep
+            logger.error("KEV catalogue sync failed for org", organization_id=oid, error=str(exc))
+            failures.append({"organization_id": oid, "error": str(exc)[:500]})
+    return {
+        "status": "completed",
+        "catalog_entries": len(kev_data.get("vulnerabilities") or []),
+        "organizations": len(org_ids),
+        "matched": matched,
+        "newly_flagged": newly,
+        "failures": failures,
+    }
+
+
+@shared_task(bind=True, max_retries=2)
+def sync_kev_catalog(self) -> dict[str, Any]:
+    """Fetch the CISA KEV catalogue once and flag tracked CVEs in every org
+    (never creates vulnerabilities)."""
+    try:
+        result = run_async(_sync_kev_catalog_all())
+        logger.info("KEV catalogue sync complete", **{k: v for k, v in result.items() if k != "failures"})
+        return result
+    except Exception as exc:
+        logger.error("KEV catalogue sync failed", error=str(exc))
+        raise self.retry(exc=exc, countdown=1800) from exc

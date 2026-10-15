@@ -75,10 +75,14 @@ def _run_async(coro):
 # ---------------------------------------------------------------------------
 
 async def _run_asset_discovery_async(
-    organization_id: str, discovery_type: str = "siem",
+    organization_id: str, discovery_type: str = "siem", session: Any = None,
 ) -> dict[str, Any]:
     """Discover assets from observed SIEM log traffic (or honestly decline
-    network discovery, which needs an unconfigured active scanner)."""
+    network discovery, which needs an unconfigured active scanner).
+
+    ``session``: an open AsyncSession to run in (the on-demand API route);
+    the beat task opens its own.
+    """
     now = datetime.now(timezone.utc)
 
     if discovery_type == "network":
@@ -99,85 +103,110 @@ async def _run_asset_discovery_async(
             "timestamp": now.isoformat(),
         }
 
+    if session is not None:
+        return await _discover_assets_from_logs(session, organization_id, now)
+    async with async_session_factory() as own_session:
+        return await _discover_assets_from_logs(own_session, organization_id, now)
+
+
+async def _discover_assets_from_logs(session: Any, organization_id: str, now: datetime) -> dict[str, Any]:
+    """Create an ExposureAsset per unseen source IP in the last 24 h of the
+    org's log_entries and bump ``last_seen`` on known assets seen again."""
     from src.exposure.models import ExposureAsset
     from src.siem.models import LogEntry
 
     cutoff_iso = (now - timedelta(hours=24)).isoformat()
     created = 0
-
     scanned = 0
     row_cap_hit = False
     asset_cap_hit = False
 
-    async with async_session_factory() as session:
-        # Known asset IPs for this org (dedupe target). Streamed: an org can
-        # legitimately have hundreds of thousands of assets and only the IP
-        # strings are needed, never the ORM rows.
-        known_ips: set[str] = set()
-        known_result = await session.stream(
-            select(ExposureAsset.ip_address)
-            .where(ExposureAsset.organization_id == organization_id)
-            .execution_options(yield_per=DISCOVERY_BATCH_SIZE),
-        )
-        async for chunk in known_result.scalars().partitions(DISCOVERY_BATCH_SIZE):
-            known_ips.update(ip for ip in chunk if ip)
+    # Known asset IPs for this org (dedupe target). Streamed: an org can
+    # legitimately have hundreds of thousands of assets and only the IP
+    # strings are needed, never the ORM rows.
+    known_ips: set[str] = set()
+    known_result = await session.stream(
+        select(ExposureAsset.ip_address)
+        .where(ExposureAsset.organization_id == organization_id)
+        .execution_options(yield_per=DISCOVERY_BATCH_SIZE),
+    )
+    async for chunk in known_result.scalars().partitions(DISCOVERY_BATCH_SIZE):
+        known_ips.update(ip for ip in chunk if ip)
 
-        # Distinct source IPs/hostnames observed in the last 24h. Streamed in
-        # fixed windows with a per-window commit — never materialised whole.
-        stmt = (
-            select(
-                LogEntry.source_address,
-                LogEntry.source_ip,
-                LogEntry.hostname,
-            )
-            .where(
-                LogEntry.organization_id == organization_id,
-                LogEntry.received_at >= cutoff_iso,
-            )
-            .distinct()
-            .limit(MAX_DISCOVERY_LOG_ROWS)
-            .execution_options(yield_per=DISCOVERY_BATCH_SIZE)
+    # Distinct source IPs/hostnames observed in the last 24h. Streamed in
+    # fixed windows with a per-window commit — never materialised whole.
+    stmt = (
+        select(
+            LogEntry.source_address,
+            LogEntry.source_ip,
+            LogEntry.hostname,
         )
+        .where(
+            LogEntry.organization_id == organization_id,
+            LogEntry.received_at >= cutoff_iso,
+        )
+        .distinct()
+        .limit(MAX_DISCOVERY_LOG_ROWS)
+        .execution_options(yield_per=DISCOVERY_BATCH_SIZE)
+    )
 
-        seen: set[str] = set()
-        log_result = await session.stream(stmt)
-        async for chunk in log_result.partitions(DISCOVERY_BATCH_SIZE):
-            for source_address, source_ip, hostname in chunk:
-                scanned += 1
-                ip = source_address or source_ip
-                if not ip or ip in known_ips or ip in seen:
-                    continue
-                if created >= MAX_ASSETS_PER_RUN:
-                    asset_cap_hit = True
-                    break
-                seen.add(ip)
-                session.add(
-                    ExposureAsset(
-                        hostname=hostname,
-                        ip_address=ip,
-                        asset_type="host",
-                        is_active=True,
-                        last_seen=now,
-                        tags=["auto-discovered", "siem"],
-                        extra_metadata={
-                            "discovery_source": "siem_logs",
-                            "discovered_at": now.isoformat(),
-                        },
-                        organization_id=organization_id,
-                    ),
-                )
-                created += 1
-            # Drain the pending inserts (and the identity map) every window so
-            # the session never holds more than one batch of ORM objects.
-            await session.commit()
-            session.expunge_all()
-            if asset_cap_hit:
+    seen: set[str] = set()
+    seen_known: set[str] = set()
+    log_result = await session.stream(stmt)
+    async for chunk in log_result.partitions(DISCOVERY_BATCH_SIZE):
+        for source_address, source_ip, hostname in chunk:
+            scanned += 1
+            ip = source_address or source_ip
+            if not ip or ip in seen:
+                continue
+            if ip in known_ips:
+                seen_known.add(ip)
+                continue
+            if created >= MAX_ASSETS_PER_RUN:
+                asset_cap_hit = True
                 break
-
-        if scanned >= MAX_DISCOVERY_LOG_ROWS:
-            row_cap_hit = True
-
+            seen.add(ip)
+            session.add(
+                ExposureAsset(
+                    hostname=hostname,
+                    ip_address=ip,
+                    asset_type="host",
+                    is_active=True,
+                    last_seen=now,
+                    tags=["auto-discovered", "siem"],
+                    extra_metadata={
+                        "discovery_source": "siem_logs",
+                        "discovered_at": now.isoformat(),
+                    },
+                    organization_id=organization_id,
+                ),
+            )
+            created += 1
+        # Drain the pending inserts (and the identity map) every window so
+        # the session never holds more than one batch of ORM objects.
         await session.commit()
+        session.expunge_all()
+        if asset_cap_hit:
+            break
+
+    if scanned >= MAX_DISCOVERY_LOG_ROWS:
+        row_cap_hit = True
+
+    # Known assets observed again: refresh last_seen (bulk, windowed).
+    updated = 0
+    known_seen = sorted(seen_known)
+    for offset in range(0, len(known_seen), DISCOVERY_BATCH_SIZE):
+        res = await session.execute(
+            update(ExposureAsset)
+            .where(
+                ExposureAsset.organization_id == organization_id,
+                ExposureAsset.ip_address.in_(known_seen[offset : offset + DISCOVERY_BATCH_SIZE]),
+            )
+            .values(last_seen=now)
+            .execution_options(synchronize_session=False),
+        )
+        updated += res.rowcount or 0
+    await session.commit()
 
     if row_cap_hit:
         logger.warning(
@@ -198,6 +227,7 @@ async def _run_asset_discovery_async(
         "organization_id": organization_id,
         "discovery_type": "siem",
         "assets_discovered": created,
+        "assets_updated": updated,
         "log_rows_scanned": scanned,
         "truncated": row_cap_hit or asset_cap_hit,
         "timestamp": now.isoformat(),
@@ -744,9 +774,14 @@ KEV_FEED_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_v
 
 
 async def _fetch_kev_catalog() -> dict[str, Any] | None:
-    """Fetch the public KEV JSON; None (logged) on any fetch failure."""
+    """Fetch the public KEV JSON; None (logged) on any fetch failure.
+
+    Outbound through the pinned transport (src/integrations/netguard.py).
+    """
+    from src.integrations.netguard import PinnedTransport
+
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=30.0, transport=PinnedTransport()) as client:
             resp = await client.get(KEV_FEED_URL)
             resp.raise_for_status()
             return resp.json()
@@ -1168,3 +1203,63 @@ async def _detect_attack_surface_changes_async(organization_id: str) -> dict[str
         "details": changes,
         "timestamp": now.isoformat(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Wave 4: daily exposure snapshot (stored time series for the dashboard)
+# ---------------------------------------------------------------------------
+# One aggregate row per organisation per UTC day (exposure_daily_snapshots).
+# Each org is first rescored (asset / link risk written to the rows, keyset
+# windows of 200 assets, at most 50,000 assets per org per run) and then
+# aggregated with COUNT/AVG queries; one session and one commit per org.
+MAX_SNAPSHOT_ORGS_PER_RUN = 10_000
+
+
+async def _snapshot_exposure_daily_async(organization_id: str | None = None) -> dict[str, Any]:
+    from src.exposure.models import ExposureAsset
+    from src.exposure.scoring import rescore_organization
+    from src.exposure.snapshots import capture_daily_snapshot
+
+    if organization_id:
+        org_ids = [organization_id]
+    else:
+        org_ids = (await _distinct_org_ids(ExposureAsset.organization_id))[:MAX_SNAPSHOT_ORGS_PER_RUN]
+    snapshots = 0
+    assets_scored = 0
+    failures: list[dict[str, str]] = []
+    for oid in org_ids:
+        try:
+            async with async_session_factory() as session:
+                scored = await rescore_organization(session, oid)
+                assets_scored += scored["assets_scored"]
+                await capture_daily_snapshot(session, oid)
+                await session.commit()
+                snapshots += 1
+        except Exception as exc:  # one org failing must not stop the sweep
+            logger.error("exposure snapshot failed", organization_id=oid, error=str(exc), exc_info=True)
+            failures.append({"organization_id": oid, "error": str(exc)[:500]})
+    return {
+        "organizations": len(org_ids),
+        "snapshots_written": snapshots,
+        "assets_scored": assets_scored,
+        "failures": failures,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@shared_task(bind=True, max_retries=1)
+def snapshot_exposure_daily(self, organization_id: str | None = None) -> dict:
+    """Rescore assets and store today's exposure snapshot for every org
+    (or one org). Beat-scheduled daily; see celery_app.py."""
+    try:
+        result = _run_async(_snapshot_exposure_daily_async(organization_id))
+        logger.info(
+            "Exposure snapshots written",
+            organizations=result["organizations"],
+            snapshots=result["snapshots_written"],
+            failures=len(result["failures"]),
+        )
+        return result
+    except Exception as exc:
+        logger.error("Exposure snapshot sweep failed", error=str(exc), exc_info=True)
+        raise self.retry(exc=exc, countdown=600) from exc

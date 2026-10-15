@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from src.schemas.base import DBModel
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ============================================================================
@@ -82,9 +82,16 @@ class ExposureAssetResponse(ExposureAssetBase, DBModel):
     compliance_status: Optional[Any] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # "active" / "inactive" (from is_active; DELETE deactivates).
+    status: Optional[str] = None
 
     class Config:
         from_attributes = True
+
+    @model_validator(mode="after")
+    def _derive_status(self) -> "ExposureAssetResponse":
+        self.status = "active" if self.is_active else "inactive"
+        return self
 
 
 class ExposureAssetListResponse(BaseModel):
@@ -151,7 +158,19 @@ class VulnerabilityUpdate(BaseModel):
 
 
 class VulnerabilityResponse(VulnerabilityBase, DBModel):
-    """Schema for vulnerability response"""
+    """Schema for vulnerability response
+
+    ``affected_assets`` (assets with an open / in-progress link),
+    ``total_links`` and ``status`` ("open" when any link is open,
+    "remediated" when every link is closed, "unlinked" without links) are
+    filled by the list / get routes from the stored asset links.
+    """
+
+    affected_assets: Optional[int] = None
+    total_links: Optional[int] = None
+    status: Optional[str] = None
+    epss_percentile: Optional[float] = None
+    published_at: Optional[datetime] = None
 
     id: str = ""
     created_at: Optional[datetime] = None
@@ -319,6 +338,9 @@ class RemediationTicketUpdate(BaseModel):
     remediation_steps: Optional[list[dict]] = None
     due_date: Optional[datetime] = None
     external_ticket_id: Optional[str] = Field(None, max_length=255)
+    # open, assigned, in_progress, verification, closed, reopened. "closed"
+    # stamps resolved_at (MTTR); leaving "closed" clears it.
+    status: Optional[str] = Field(None, max_length=50)
 
 
 class RemediationTicketResponse(RemediationTicketBase, DBModel):
@@ -328,10 +350,19 @@ class RemediationTicketResponse(RemediationTicketBase, DBModel):
     status: str = Field(default="open", max_length=50, description="open, in-progress, completed, cancelled, overdue")
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # ``completed_at`` repeats the stored ``resolved_at``.
     completed_at: Optional[datetime] = None
+    resolved_at: Optional[datetime] = None
+    verification_status: Optional[str] = None
+    sla_breach: Optional[bool] = None
 
     class Config:
         from_attributes = True
+
+    @model_validator(mode="after")
+    def _fill_completed(self) -> "RemediationTicketResponse":
+        self.completed_at = self.resolved_at
+        return self
 
 
 class RemediationTicketListResponse(BaseModel):
@@ -372,7 +403,16 @@ class AttackSurfaceUpdate(BaseModel):
 
 
 class AttackSurfaceResponse(AttackSurfaceBase, DBModel):
-    """Schema for attack surface response"""
+    """Schema for attack surface response.
+
+    The model columns (``total_assets``, ``exposed_assets``,
+    ``critical_exposures``, ``last_assessed_at``) are returned as stored;
+    ``type`` / ``last_assessed`` repeat ``surface_type`` / ``last_assessed_at``
+    and the older ``assets_count`` / ``vulnerabilities_count`` /
+    ``last_assessment_at`` names are filled from the same columns.
+    ``assessed`` is false until an assessment has run (risk_score is then
+    not a measurement).
+    """
 
     id: str = ""
     assets_count: int = 0
@@ -381,9 +421,36 @@ class AttackSurfaceResponse(AttackSurfaceBase, DBModel):
     last_assessment_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    type: Optional[str] = None
+    total_assets: int = 0
+    exposed_assets: int = 0
+    critical_exposures: int = 0
+    last_assessed_at: Optional[datetime] = None
+    last_assessed: Optional[datetime] = None
+    assessed: bool = False
+    findings: list[dict] = Field(default_factory=list)
 
     class Config:
         from_attributes = True
+
+    @model_validator(mode="after")
+    def _fill_aliases(self) -> "AttackSurfaceResponse":
+        self.type = self.surface_type
+        self.assets_count = self.total_assets
+        self.vulnerabilities_count = self.exposed_assets
+        self.last_assessment_at = self.last_assessed_at
+        self.last_assessed = self.last_assessed_at
+        self.assessed = self.last_assessed_at is not None
+        if self.surface_type == "snapshot":
+            # Snapshot rows carry whole key lists; return per-change counts.
+            self.findings = [
+                {"change": f.get("change"), "count": len(f.get("items") or [])}
+                for f in self.findings
+                if isinstance(f, dict)
+            ]
+        else:
+            self.findings = [f for f in self.findings if isinstance(f, dict)][-5:]
+        return self
 
 
 class AttackSurfaceListResponse(BaseModel):
@@ -413,14 +480,23 @@ class ExposureDashboardStats(BaseModel):
     medium_vulns: int = 0
     low_vulns: int = 0
     info_vulns: int = 0
-    mean_time_to_remediate_days: Optional[float] = 0.0
+    mean_time_to_remediate_days: Optional[float] = None
     overdue_tickets: int = 0
-    overall_risk_score: float = 0.0
+    # Mean stored asset risk over active assets; None without active assets.
+    overall_risk_score: Optional[float] = None
     assets_by_criticality: dict = Field(default_factory=dict, description="Distribution of assets by criticality")
     vulns_by_status: dict = Field(default_factory=dict, description="Distribution of vulnerabilities by status")
     top_vulnerable_assets: list[dict] = Field(default_factory=list, description="Top assets with most vulnerabilities")
     exposure_trend: list[dict] = Field(default_factory=list, description="Time-series trend data")
     compliance_summary: dict = Field(default_factory=dict, description="Compliance status by framework")
+    # Wave 4 additions.
+    open_exposures: int = 0
+    assets_with_open_exposures: int = 0
+    inactive_assets: int = 0
+    catalog_vulnerabilities: int = 0
+    compliance_trend: list[dict] = Field(default_factory=list, description="Stored daily compliance points")
+    trend_source: str = "exposure_daily_snapshots"
+    risk_score_basis: str = ""
 
 
 class RiskMatrix(BaseModel):
@@ -488,6 +564,10 @@ class BulkImportResult(BaseModel):
     failed: int = 0
     errors: list[dict] = Field(default_factory=list)
     skipped: int = 0
+    # ``imported`` = created + updated.
+    created: int = 0
+    updated: int = 0
+    rows_read: int = 0
 
 
 # ============================================================================
@@ -511,6 +591,9 @@ class DiscoveryResult(BaseModel):
     new_assets: int = 0
     updated_assets: int = 0
     status: str = ""
+    log_rows_scanned: int = 0
+    truncated: bool = False
+    detail: Optional[str] = None
 
 
 class AssessmentResult(BaseModel):
@@ -571,3 +654,15 @@ class ScannerImportResult(BaseModel):
     assets_updated: int = 0
     status: str = ""
     errors: list[str] = Field(default_factory=list)
+    # Wave 4: what the import did. ``vulnerabilities_imported`` = links
+    # created; ``assets_updated`` = distinct assets that received a finding.
+    findings_read: int = 0
+    links_created: int = 0
+    links_updated: int = 0
+    links_reopened: int = 0
+    vulnerabilities_created: int = 0
+    assets_created: int = 0
+    assets_matched: int = 0
+    skipped: list[dict] = Field(default_factory=list)
+    skipped_count: int = 0
+    assets_rescored: int = 0

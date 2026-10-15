@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import ForeignKey, Index, Integer, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -123,8 +123,11 @@ class Vulnerability(BaseModel):
 
     __tablename__ = "vulnerabilities"
 
-    # CVE and identification
-    cve_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True, unique=True)
+    # CVE and identification. Unique per organisation (see __table_args__),
+    # not across the table: two tenants may track the same CVE. Findings a
+    # scanner reports without a CVE are keyed by the scanner's plugin id
+    # (e.g. ``NESSUS-19506``, ``OPENVAS-1.3.6.1.4...``, ``QUALYS-38173``).
+    cve_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     title: Mapped[str] = mapped_column(String(500), nullable=False, index=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
@@ -175,9 +178,17 @@ class Vulnerability(BaseModel):
         nullable=False,
         index=True,
     )
+    # CISA KEV catalogue dates (ISO dates) when the CVE is listed; the BOD
+    # 22-01 remediation deadline is ``kev_due_date``.
+    kev_date_added: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    kev_due_date: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
     # Multi-tenancy
     organization_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+
+    __table_args__ = (
+        Index("uq_vulnerabilities_org_cve", "organization_id", "cve_id", unique=True),
+    )
 
     # Relationships
     instances: Mapped[list["VulnerabilityInstance"]] = relationship(
@@ -217,6 +228,14 @@ class VulnerabilityInstance(BaseModel):
     )
     scan_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
 
+    # Scanner identity of the finding. An instance is unique per
+    # (organisation, dedupe_key) where dedupe_key = asset + catalog
+    # vulnerability + port/protocol (src/vulnmgmt/engine.py:instance_dedupe_key).
+    port: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    protocol: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    plugin_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    dedupe_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
     # Temporal
     first_seen: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     last_seen: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
@@ -240,9 +259,16 @@ class VulnerabilityInstance(BaseModel):
         default=SLAStatus.WITHIN_SLA.value,
         nullable=False,
     )
+    # Set when the instance moves to patched / mitigated (ISO timestamp);
+    # MTTR is measured first_seen -> remediated_at.
+    remediated_at: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
     # Multi-tenancy
     organization_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+
+    __table_args__ = (
+        Index("uq_vulnerability_instances_org_dedupe", "organization_id", "dedupe_key", unique=True),
+    )
 
     # Relationships
     vulnerability: Mapped["Vulnerability"] = relationship(

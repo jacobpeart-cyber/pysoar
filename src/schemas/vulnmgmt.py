@@ -60,6 +60,15 @@ class VulnerabilityResponse(VulnerabilityBase, DBModel):
     mitre_technique_ids: Optional[list[str]] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # CISA KEV catalogue dates (set by the KEV sync for listed CVEs).
+    kev_date_added: Optional[str] = None
+    kev_due_date: Optional[str] = None
+    # Computed by GET /vulnmgmt/vulnerabilities from the stored instances:
+    # all instances, open ones, and days since the oldest open instance was
+    # first seen (None when nothing is open).
+    affected_instance_count: Optional[int] = None
+    open_instance_count: Optional[int] = None
+    days_open: Optional[int] = None
 
     class Config:
         from_attributes = True
@@ -85,6 +94,10 @@ class VulnerabilityInstanceBase(BaseModel):
     assigned_to: Optional[str] = None
     remediation_deadline: Optional[str] = None
     sla_status: str = "within_sla"
+    # Scanner identity (instances are deduplicated on asset + vulnerability + port/protocol).
+    port: Optional[int] = Field(None, ge=0, le=65535)
+    protocol: Optional[str] = Field(None, max_length=16)
+    plugin_id: Optional[str] = Field(None, max_length=100)
 
 
 class VulnerabilityInstanceCreate(VulnerabilityInstanceBase):
@@ -112,6 +125,12 @@ class VulnerabilityInstanceResponse(VulnerabilityInstanceBase, DBModel):
     organization_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    remediated_at: Optional[str] = None
+    # From the parent catalogue row (filled by the list / get routes).
+    cve_id: Optional[str] = None
+    vulnerability_title: Optional[str] = None
+    severity: Optional[str] = None
+    kev_listed: Optional[bool] = None
 
     class Config:
         from_attributes = True
@@ -203,6 +222,12 @@ class PatchOperationResponse(PatchOperationBase, DBModel):
     organization_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # Filled by GET /patch-operations from the instance and its catalogue row.
+    vulnerability_id: Optional[str] = None
+    cve_id: Optional[str] = None
+    severity: Optional[str] = None
+    asset_name: Optional[str] = None
+    instance_status: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -247,6 +272,12 @@ class VulnerabilityExceptionResponse(VulnerabilityExceptionBase, DBModel):
     organization_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # "expired" once expiry_date has passed, otherwise "active" (computed).
+    status: Optional[str] = None
+    # From the instance and its catalogue row (filled by the routes).
+    vulnerability_id: Optional[str] = None
+    cve_id: Optional[str] = None
+    asset_name: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -358,7 +389,8 @@ class KEVComplianceReport(BaseModel):
     kev_patched: int = 0
     kev_compliant: int = 0
     kev_non_compliant: int = 0
-    compliance_percentage: float = 0.0
+    # None when no instance of a KEV-listed CVE is tracked.
+    compliance_percentage: Optional[float] = None
 
 
 class DashboardMetrics(BaseModel):
@@ -376,6 +408,16 @@ class DashboardMetrics(BaseModel):
     aging: VulnerabilityAging
     top_vulnerabilities: list[VulnerabilityInstanceResponse]
     kev_compliance: KEVComplianceReport
+    # Instance-level figures (wave 4). ``by_severity`` counts OPEN instances
+    # (open / in_progress / deferred) by catalogue severity.
+    by_severity: dict[str, int] = Field(default_factory=dict)
+    open_findings: int = 0
+    total_instances: int = 0
+    assets_affected: int = 0
+    kev_listed_count: int = 0
+    open_kev_instances: int = 0
+    # Same value as ``mttr_days`` (the page also reads this name).
+    mean_time_to_remediate_days: Optional[float] = None
 
 
 class BulkAction(BaseModel):

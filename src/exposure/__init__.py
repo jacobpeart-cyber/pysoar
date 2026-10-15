@@ -17,6 +17,7 @@ from src.exposure.models import (
     AttackSurface,
     AssetVulnerability,
     ExposureAsset,
+    ExposureDailySnapshot,
     ExposureScan,
     RemediationTicket,
     ExposureVulnerability,
@@ -32,4 +33,5 @@ __all__ = [
     "ExposureScan",
     "RemediationTicket",
     "AttackSurface",
+    "ExposureDailySnapshot",
 ]
