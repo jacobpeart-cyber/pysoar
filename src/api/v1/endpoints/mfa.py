@@ -5,6 +5,7 @@ from datetime import timedelta
 
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
+from sqlalchemy.orm.attributes import flag_modified
 
 from src.api.deps import CurrentUser, DatabaseSession, RedisClient
 from src.core.mfa import MFAManager
@@ -200,7 +201,13 @@ async def verify_mfa_login(
 
             # Mark backup code as used
             locked_user.mfa_backup_codes[code_hash_key]["used"] = True
+            # The column is a JSON blob: an in-place edit is invisible to the
+            # session unless flagged. The code is spent now, whatever happens
+            # next (forced password change, a later error), so commit here.
+            flag_modified(locked_user, "mfa_backup_codes")
             await db.flush()
+            await db.commit()
+            await db.refresh(user)
 
             logger.info(f"MFA backup code verification successful for user {user_id}")
 

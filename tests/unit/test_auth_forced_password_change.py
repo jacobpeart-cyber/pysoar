@@ -104,3 +104,36 @@ async def test_mfa_comes_before_the_forced_change_and_mfa_tokens_cannot_be_repla
         CHANGE, json={"current_password": OLD, "new_password": NEW}, headers={"Authorization": f"Bearer {limited}"},
     )
     assert changed.status_code == 200, changed.text
+
+
+async def test_backup_code_spent_on_the_forced_change_path_cannot_be_reused(
+    client: AsyncClient, db_session: AsyncSession, test_user, monkeypatch: pytest.MonkeyPatch, redis_mock: AsyncMock,
+) -> None:
+    """A backup code consumed by /mfa/verify is committed before the forced-change
+    403 is raised (and the JSON edit is flagged), so it cannot be used twice."""
+    from src.core.mfa import MFAManager
+    from tests.unit.test_token_revocation import _stateful
+
+    _stateful(redis_mock)
+    email = test_user.email
+    codes = MFAManager.generate_backup_codes()
+    test_user.force_password_change = True
+    test_user.mfa_enabled = True
+    test_user.mfa_secret = "test-secret"
+    test_user.mfa_backup_codes = MFAManager.hash_backup_codes(codes)
+    await db_session.commit()
+    monkeypatch.setattr(MFAManager, "verify_totp", staticmethod(lambda secret, code: False))
+
+    async def _challenge() -> str:
+        first = await client.post(LOGIN, json={"email": email, "password": OLD})
+        assert first.status_code == 200 and first.json()["mfa_required"] is True, first.text
+        return first.json()["mfa_token"]
+
+    spent = await client.post("/api/v1/mfa/verify", json={"mfa_token": await _challenge(), "code": codes[0]})
+    assert spent.status_code == 403 and spent.headers.get("X-Limited-Token"), spent.text
+
+    reused = await client.post("/api/v1/mfa/verify", json={"mfa_token": await _challenge(), "code": codes[0]})
+    assert reused.status_code == 401, reused.text
+    # Another, unused code still works.
+    fresh = await client.post("/api/v1/mfa/verify", json={"mfa_token": await _challenge(), "code": codes[1]})
+    assert fresh.status_code == 403, fresh.text
