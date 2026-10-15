@@ -314,3 +314,34 @@ async def test_org_run_budget_caps_total_child_time_across_policies(
         select(DLPViolation).where(DLPViolation.organization_id == org_id, DLPViolation.policy_id.in_([p["id"] for p in pols]))
     )).scalars().all()
     assert len(rows) == 3 and all(r.violation_type == "scan_incomplete" for r in rows)
+
+
+async def test_slow_policy_only_exhausts_itself_and_is_marked_degraded(
+    client: AsyncClient, db_session: AsyncSession, org_a, org_a_admin_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Budgets are charged per policy: a slow policy becomes degraded while a
+    fast policy over the same record still produces its finding."""
+    from src.dlp import scanner as mod
+    from src.dlp.models import DLPViolation
+
+    org_id = org_a.id
+    monkeypatch.setattr(mod, "POLICY_WINDOW_BUDGET_SECONDS", 1.0)
+    monkeypatch.setattr(mod, "POLICY_RUN_BUDGET_SECONDS", 1.0)
+    slow = await _policy(client, org_a_admin_headers, name="slow", data_patterns=[r"(a|aa)+$"], channels_monitored=["logs"])
+    fast = await _policy(client, org_a_admin_headers, name="fast", data_patterns=[r"PROJ-\d{4}"], channels_monitored=["logs"])
+    db_session.add(_log(org_id, "PROJ-4242 " + "a" * 48 + "b"))
+    await db_session.commit()
+
+    run = await client.post(f"{BASE}/scan/run", headers=org_a_admin_headers)
+    assert run.status_code == 200, run.text
+    rows = (await db_session.execute(
+        select(DLPViolation).where(DLPViolation.organization_id == org_id)
+    )).scalars().all()
+    by_policy = {r.policy_id: r for r in rows}
+    assert by_policy[fast["id"]].violation_type != "scan_incomplete"
+    assert by_policy[slow["id"]].violation_type == "scan_incomplete"
+    slow_status = (await client.get(f"{BASE}/policies/{slow['id']}", headers=org_a_admin_headers)).json()
+    assert slow_status["evaluation_status"] == "degraded"
+    assert "suspended" in (slow_status.get("evaluation_reason") or "")
+    fast_status = (await client.get(f"{BASE}/policies/{fast['id']}", headers=org_a_admin_headers)).json()
+    assert fast_status["evaluation_status"] == "active"

@@ -136,7 +136,13 @@ POLICY_WINDOW_BUDGET_SECONDS = 10.0
 #: of its policies and windows; past it, remaining custom-pattern work is
 #: recorded as scan_incomplete without spawning (a tenant with hundreds of
 #: slow policies cannot multiply the per-policy budget into hours).
-ORG_RUN_BUDGET_SECONDS = 60.0
+ORG_RUN_BUDGET_SECONDS = 300.0
+#: Child-process time one policy may spend per run. Budgets are charged per
+#: policy so a slow (or deliberately slowed) policy only exhausts itself: it is
+#: then marked ``degraded`` (custom matching suspended until the policy is
+#: edited; built-in detectors keep running) and the other policies are
+#: unaffected. Policies run cheapest-first within a run.
+POLICY_RUN_BUDGET_SECONDS = 20.0
 _RUN_BUDGET: contextvars.ContextVar[dict[str, float] | None] = contextvars.ContextVar("_dlp_run_budget", default=None)
 _NESTED_QUANTIFIER_RE = re.compile(r"(?:\([^()]*[+*][^()]*\)|\[[^\]]*\][+*]|[+*])\s*[+*{]")
 _BACKREF_RE = re.compile(r"\\[1-9]|\(\?P=")
@@ -571,7 +577,7 @@ async def scan_organization(
 
     The caller commits.
     """
-    _RUN_BUDGET.set({"remaining": ORG_RUN_BUDGET_SECONDS})
+    _RUN_BUDGET.set({"remaining": ORG_RUN_BUDGET_SECONDS, "per_policy": {}})
     now = datetime.now(timezone.utc)
     plans = await load_plans(db, org_id)
     active = [p for p in plans if p.status == "active"]
@@ -641,6 +647,9 @@ async def scan_organization(
 
     for plan in active:
         plan.policy.last_evaluated_at = now
+        if plan.status == "degraded":
+            plan.policy.evaluation_status = "degraded"
+            plan.policy.evaluation_reason = plan.reason
     await db.flush()
     return summary
 
@@ -673,23 +682,44 @@ async def _evaluate_window(
     # as scan_incomplete findings rather than silently passed.
     custom_hits: dict[str, dict[str, list[tuple[str, int, int]]]] = {}
     unscanned: dict[str, set[str]] = {}
-    for plan in plans:
+    state = _RUN_BUDGET.get()
+    per_policy: dict[str, float] = state.setdefault("per_policy", {}) if state is not None else {}
+
+    def _consumed(p: PolicyPlan) -> float:
+        return POLICY_RUN_BUDGET_SECONDS - per_policy.get(p.policy.id, POLICY_RUN_BUDGET_SECONDS)
+
+    # Cheapest policies first: a slow one cannot delay the others' window.
+    for plan in sorted(plans, key=_consumed):
         custom = {name: p.pattern for name, p in plan.patterns.items() if name.startswith("custom:")}
-        if not custom:
+        if not custom or plan.policy.evaluation_status == "degraded":
             continue
         todo = [(rid, text) for rid, text in texts.items() if text and (plan.policy.id, rid) not in existing]
-        state = _RUN_BUDGET.get()
-        remaining = state["remaining"] if state is not None else POLICY_WINDOW_BUDGET_SECONDS
-        budget = min(POLICY_WINDOW_BUDGET_SECONDS, remaining)
+        if not todo:
+            continue
+        policy_remaining = per_policy.get(plan.policy.id, POLICY_RUN_BUDGET_SECONDS)
+        org_remaining = state["remaining"] if state is not None else POLICY_WINDOW_BUDGET_SECONDS
+        budget = min(POLICY_WINDOW_BUDGET_SECONDS, policy_remaining, org_remaining)
         if budget <= 0:
-            found, missing, timed_out = {}, [rid for rid, _ in todo], bool(todo)
+            found, missing, timed_out = {}, [rid for rid, _ in todo], True
         else:
             started = time.perf_counter()
             # The child-process call is synchronous: run it in a worker thread so
             # the event loop (and the other tenants' work) keeps moving.
             found, missing, timed_out = await asyncio.to_thread(match_custom_patterns, custom, todo, budget)
+            spent = time.perf_counter() - started
+            per_policy[plan.policy.id] = max(0.0, policy_remaining - spent)
             if state is not None:
-                state["remaining"] = max(0.0, state["remaining"] - (time.perf_counter() - started))
+                state["remaining"] = max(0.0, state["remaining"] - spent)
+        if timed_out and per_policy.get(plan.policy.id, POLICY_RUN_BUDGET_SECONDS) <= 0:
+            # This policy exhausted its own run budget: suspend its custom matching
+            # (visible on the policy) instead of letting it eat the other policies'.
+            plan.policy.evaluation_status = "degraded"
+            plan.policy.evaluation_reason = (
+                f"custom patterns exceeded {POLICY_RUN_BUDGET_SECONDS:.0f}s of matching in one run; "
+                "custom matching is suspended until the policy is edited (built-in detectors still run)"
+            )
+            plan.status = "degraded"
+            plan.reason = plan.policy.evaluation_reason
         custom_hits[plan.policy.id] = found
         unscanned[plan.policy.id] = set(missing)
         if timed_out:
