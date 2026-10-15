@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import textwrap
 import uuid
@@ -127,7 +128,9 @@ def test_container_scan_falls_back_to_grype_and_reports_tool_missing(
     _fake_tools(agent, monkeypatch, {"grype": grype})
     result = agent._handle_scan_container_image({"image_ref": "alpine:3.19", "scanner": "trivy"})
     assert result["status"] == "success", result
-    assert json.loads(Path(grype + ".argv").read_text()) == ["alpine:3.19", "-o", "json"]
+    # grype is always given an explicit registry source: it reads a scheme off
+    # the front of a bare reference (dir:, file:, sbom:, docker-archive:, ...).
+    assert json.loads(Path(grype + ".argv").read_text()) == ["registry:alpine:3.19", "-o", "json"]
     used, vulns = parse_report(_report_from_result(SimpleNamespace(**result)))
     assert used == "grype" and vulns[0]["cve_id"] == "CVE-2024-0002"
 
@@ -352,3 +355,44 @@ def test_poll_loop_dispatches_new_actions_and_posts_results(
     assert parse_report(_report_from_result(SimpleNamespace(**posted["c2"])))[0] == "trivy"
     # Not enrolled with ot_safe_shutdown: refused by the local allowlist.
     assert posted["c3"]["status"] == "rejected" and "not in local allowlist" in posted["c3"]["stderr"]
+
+
+def test_decoy_manifest_is_never_written_through_a_link(agent: Any, tmp_path: Path) -> None:
+    """The manifest is replaced atomically from a fresh O_EXCL temp file; a
+    manifest that is a hard link (or a symlink, where the platform can make
+    one) is refused, so a planted link cannot redirect the write."""
+    decoy_dir = tmp_path / "decoys"
+    decoy_dir.mkdir()
+    agent.AGENT_CONFIG["decoy_dir"] = str(decoy_dir)
+    manifest = decoy_dir / agent.DECOY_MANIFEST
+    payload = {"decoy_id": "d1", "decoy_type": "honeyfile", "configuration": {"filename": "a.txt", "content": "x"}}
+    assert agent._handle_deploy_decoy(payload)["status"] == "success"
+    assert manifest.is_file() and not (decoy_dir / (agent.DECOY_MANIFEST + ".tmp")).exists()
+    assert not [p for p in decoy_dir.iterdir() if p.name.endswith(".tmp")]
+
+    # Hard link elsewhere: the manifest now has two names; writing it is refused.
+    elsewhere = tmp_path / "elsewhere.json"
+    os.link(manifest, elsewhere)
+    second = {"decoy_id": "d2", "decoy_type": "honeyfile", "configuration": {"filename": "b.txt", "content": "y"}}
+    with pytest.raises(OSError):
+        agent._handle_deploy_decoy(second)
+    assert agent._read_manifest(decoy_dir) == {}
+
+
+def test_decoy_manifest_symlink_is_refused(agent: Any, tmp_path: Path) -> None:
+    """A symlink planted where the manifest lives is never followed (skipped
+    where the platform does not let this user create symlinks)."""
+    decoy_dir = tmp_path / "decoys"
+    decoy_dir.mkdir()
+    agent.AGENT_CONFIG["decoy_dir"] = str(decoy_dir)
+    manifest = decoy_dir / agent.DECOY_MANIFEST
+    second = {"decoy_id": "d2", "decoy_type": "honeyfile", "configuration": {"filename": "b.txt", "content": "y"}}
+    target = tmp_path / "victim.json"
+    target.write_text("{}")
+    try:
+        os.symlink(target, manifest)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not available to this user")
+    with pytest.raises(OSError):
+        agent._handle_deploy_decoy(second)
+    assert target.read_text() == "{}"

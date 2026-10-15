@@ -30,6 +30,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
+import stat
 import platform
 import re
 import shutil
@@ -1114,7 +1116,7 @@ def _handle_scan_container_image(payload: dict[str, Any]) -> dict[str, Any]:
     """Run trivy (``trivy image --format json``) or grype (``grype -o json``)
     against the image and return the JSON report on stdout."""
     ref = str(payload.get("image_ref") or "").strip()
-    if not ref or len(ref) > 512 or not IMAGE_REFERENCE_RE.fullmatch(ref):
+    if not ref or len(ref) > 512 or not IMAGE_REFERENCE_RE.fullmatch(ref) or ref.startswith("-"):
         return {"status": "rejected", "exit_code": 2, "stderr": "invalid image reference"}
     preferred = str(payload.get("scanner") or "trivy").lower()
     order = ["grype", "trivy"] if preferred == "grype" else ["trivy", "grype"]
@@ -1129,7 +1131,11 @@ def _handle_scan_container_image(payload: dict[str, Any]) -> dict[str, Any]:
     if scanner == "trivy":
         argv = [*_script_argv(binary), "image", "--format", "json", "--quiet", ref]
     else:
-        argv = [*_script_argv(binary), ref, "-o", "json"]
+        # Explicit registry source: grype otherwise reads a scheme off the front of
+        # the reference (dir:, file:, sbom:, docker-archive:, ...) and would scan a
+        # local path instead; with the prefix, "registry:2" and "docker:dind" stay
+        # ordinary images. trivy image takes no source scheme from its argument.
+        argv = [*_script_argv(binary), "registry:" + ref, "-o", "json"]
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=CONTAINER_SCAN_TIMEOUT)
     except subprocess.TimeoutExpired:
@@ -1220,16 +1226,48 @@ def _decoy_dir() -> Optional[Path]:
     return path if path.is_absolute() and path.is_dir() else None
 
 
-def _read_manifest(directory: Path) -> dict[str, Any]:
+def _manifest_is_regular(path: Path) -> bool:
+    """True when the manifest is absent or a plain, unlinked regular file"""
     try:
-        data = json.loads((directory / DECOY_MANIFEST).read_text())
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and st.st_nlink == 1
+
+
+def _read_manifest(directory: Path) -> dict[str, Any]:
+    path = directory / DECOY_MANIFEST
+    if not _manifest_is_regular(path):
+        return {}
+    try:
+        data = json.loads(path.read_text())
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
 def _write_manifest(directory: Path, manifest: dict[str, Any]) -> None:
-    (directory / DECOY_MANIFEST).write_text(json.dumps(manifest, indent=1))
+    """Atomic, symlink-safe write: a fresh temp file created with O_EXCL (and
+    O_NOFOLLOW where the platform has it) is renamed over the manifest; a
+    manifest that is a symlink or hard-linked elsewhere is refused."""
+    path = directory / DECOY_MANIFEST
+    if not _manifest_is_regular(path):
+        raise OSError(f"{path} is not a regular file; refusing to write the decoy manifest")
+    tmp = directory / f"{DECOY_MANIFEST}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(manifest, indent=1))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _decoy_filename(payload: dict[str, Any]) -> Optional[str]:
