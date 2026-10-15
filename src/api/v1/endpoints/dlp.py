@@ -72,6 +72,7 @@ from src.services.automation import AutomationService
 from src.dlp.scanner import (
     InvalidPattern,
     apply_plan,
+    ScanIncomplete,
     find_matches,
     plan_policy,
     redacted_excerpt,
@@ -407,7 +408,13 @@ async def test_policy(
     plan = plan_policy(policy)
     test_plan = plan if policy.enabled else plan_policy(policy, ignore_enabled=True)
     sample = (test_request.sample_content or "")[:20_000]
-    hits = find_matches(test_plan, sample) if test_plan.patterns else []
+    try:
+        hits = find_matches(test_plan, sample) if test_plan.patterns else []
+    except ScanIncomplete as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "pattern_too_slow", "detail": f"{exc}; simplify the pattern"},
+        ) from None
     kinds = sorted({h[0] for h in hits})
 
     return DLPPolicyTestResponse(

@@ -25,8 +25,6 @@ from __future__ import annotations
 
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
@@ -35,6 +33,7 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.logging import get_logger
+from src.dlp.isolated_match import match_custom_patterns
 from src.dlp.engine import DLPEngine
 from src.dlp.models import DLPPolicy, DLPScanCursor, DLPViolation
 
@@ -126,21 +125,13 @@ def _json_list(value: Any) -> list[Any]:
 # policy is saved, and at run time each custom pattern gets a time budget per
 # record; a pattern that exceeds it deactivates its policy for the run with
 # the reason recorded on the policy.
-PATTERN_TIME_BUDGET_SECONDS = 1.0
+#: Budget for one policy's custom patterns over one window of records; the
+#: matching runs in a killable child process (src/dlp/isolated_match.py) and
+#: records it did not finish are recorded as ``scan_incomplete`` findings.
+POLICY_WINDOW_BUDGET_SECONDS = 10.0
 _NESTED_QUANTIFIER_RE = re.compile(r"(?:\([^()]*[+*][^()]*\)|\[[^\]]*\][+*]|[+*])\s*[+*{]")
 _BACKREF_RE = re.compile(r"\\[1-9]|\(\?P=")
 _HUGE_REPEAT_RE = re.compile(r"\{\s*(\d{4,})(?:\s*,\s*(\d*))?\s*\}|\{\s*\d*\s*,\s*(\d{4,})\s*\}")
-_MATCH_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="dlp-match")
-
-
-class PatternTimeout(Exception):
-    """A custom pattern exceeded its time budget on one record."""
-
-    def __init__(self, name: str, budget: float, chars: int) -> None:
-        super().__init__(f"pattern {name} exceeded {budget:.1f}s on a {chars}-char record")
-        self.name = name
-        self.budget = budget
-        self.chars = chars
 
 
 def reject_catastrophic_pattern(entry: str) -> None:
@@ -154,16 +145,6 @@ def reject_catastrophic_pattern(entry: str) -> None:
         raise InvalidPattern(f"pattern {entry[:40]!r} uses a backreference, which is not allowed")
     if _HUGE_REPEAT_RE.search(entry):
         raise InvalidPattern(f"pattern {entry[:40]!r} uses a counted repeat above 999")
-
-
-def _finditer_with_budget(name: str, pattern: "re.Pattern[str]", text: str, budget: float) -> list["re.Match[str]"]:
-    """Run ``pattern.finditer`` in a worker thread, bounded by ``budget`` seconds."""
-    future = _MATCH_EXECUTOR.submit(lambda: list(pattern.finditer(text)))
-    try:
-        return future.result(timeout=budget)
-    except FuturesTimeout:
-        future.cancel()
-        raise PatternTimeout(name, budget, len(text)) from None
 
 
 def compile_patterns(names: list[str]) -> dict[str, re.Pattern[str]]:
@@ -281,20 +262,51 @@ def _luhn_ok(candidate: str) -> bool:
 
 def find_matches(plan: PolicyPlan, text: str) -> list[tuple[str, int, int]]:
     """(pattern name, start, end) for every match in ``text`` (bounded)."""
+    hits = _builtin_matches(plan, text)
+    custom = {name: pattern.pattern for name, pattern in plan.patterns.items() if name.startswith("custom:")}
+    if custom:
+        found, unscanned, _timed_out = match_custom_patterns(custom, [("one", text)], POLICY_WINDOW_BUDGET_SECONDS)
+        if unscanned:
+            raise ScanIncomplete(POLICY_WINDOW_BUDGET_SECONDS, len(text))
+        hits.extend(_filter_hits(plan, text, found.get("one", [])))
+    hits.sort(key=lambda h: h[1])
+    return hits
+
+
+class ScanIncomplete(Exception):
+    """The custom patterns did not finish within the budget for a record."""
+
+    def __init__(self, budget: float, chars: int) -> None:
+        super().__init__(f"custom pattern scan exceeded {budget:.0f}s on a {chars}-char record")
+        self.budget = budget
+        self.chars = chars
+
+
+def _filter_hits(plan: PolicyPlan, text: str, raw: list[tuple[str, int, int]]) -> list[tuple[str, int, int]]:
+    out: list[tuple[str, int, int]] = []
+    for name, start, end in raw:
+        value = text[start:end]
+        if not value or value in plan.allow_values:
+            continue
+        if name == "credit_card" and not _luhn_ok(value):
+            continue
+        out.append((name, start, end))
+    return out
+
+
+def _builtin_matches(plan: PolicyPlan, text: str) -> list[tuple[str, int, int]]:
+    """Trusted built-in detectors run inline."""
     hits: list[tuple[str, int, int]] = []
     for name, pattern in plan.patterns.items():
         if name.startswith("custom:"):
-            matches = _finditer_with_budget(name, pattern, text, PATTERN_TIME_BUDGET_SECONDS)
-        else:
-            matches = pattern.finditer(text)
-        for m in matches:
+            continue
+        for m in pattern.finditer(text):
             value = m.group(0)
             if not value or value in plan.allow_values:
                 continue
             if name == "credit_card" and not _luhn_ok(value):
                 continue
             hits.append((name, m.start(), m.end()))
-    hits.sort(key=lambda h: h[1])
     return hits
 
 
@@ -630,28 +642,60 @@ async def _evaluate_window(
         ).all()
     )
     created = 0
+    texts = {r.id: (r.text or "")[:MAX_TEXT_CHARS] for r in records}
+    # Custom (tenant-authored) patterns run per policy in a killable child
+    # process over the whole window; records it did not finish are recorded
+    # as scan_incomplete findings rather than silently passed.
+    custom_hits: dict[str, dict[str, list[tuple[str, int, int]]]] = {}
+    unscanned: dict[str, set[str]] = {}
+    for plan in plans:
+        custom = {name: p.pattern for name, p in plan.patterns.items() if name.startswith("custom:")}
+        if not custom:
+            continue
+        todo = [(rid, text) for rid, text in texts.items() if text and (plan.policy.id, rid) not in existing]
+        found, missing, timed_out = match_custom_patterns(custom, todo, POLICY_WINDOW_BUDGET_SECONDS)
+        custom_hits[plan.policy.id] = found
+        unscanned[plan.policy.id] = set(missing)
+        if timed_out:
+            logger.warning(
+                "dlp_custom_scan_incomplete", organization_id=org_id, policy_id=plan.policy.id,
+                unscanned=len(missing), budget=POLICY_WINDOW_BUDGET_SECONDS,
+            )
     for record in records:
-        text = (record.text or "")[:MAX_TEXT_CHARS]
+        text = texts.get(record.id, "")
         if not text:
             continue
         for plan in plans:
             if (plan.policy.id, record.id) in existing:
                 continue
-            try:
-                hits = find_matches(plan, text)
-            except PatternTimeout as exc:
-                plan.status = "inactive"
-                plan.reason = f"{exc}; the policy was deactivated for this run"
-                plan.patterns = {}
-                plan.policy.evaluation_status = plan.status
-                plan.policy.evaluation_reason = plan.reason
-                logger.warning(
-                    "dlp_pattern_timeout", organization_id=org_id, policy_id=plan.policy.id, pattern=exc.name,
-                    chars=exc.chars, budget=exc.budget,
-                )
+            if record.id in unscanned.get(plan.policy.id, set()):
+                db.add(DLPViolation(
+                    organization_id=org_id,
+                    policy_id=plan.policy.id,
+                    violation_type="scan_incomplete",
+                    severity=plan.policy.severity or "medium",
+                    source_user=(record.user or None) and str(record.user)[:255],
+                    source_application=source_label,
+                    sensitive_data_types=json.dumps(["scan_timeout"]),
+                    action_taken="scan_timeout",
+                    status="new",
+                    source_type=source_key,
+                    source_id=record.id,
+                    location=record.location[:2000],
+                    redacted_excerpt=(
+                        f"the policy's custom patterns did not finish within {POLICY_WINDOW_BUDGET_SECONDS:.0f}s "
+                        f"on this {len(text)}-char record; it was NOT scanned. Simplify the pattern or review manually."
+                    ),
+                    detected_by="content_scan",
+                ))
+                existing.add((plan.policy.id, record.id))
+                created += 1
                 continue
+            hits = _builtin_matches(plan, text)
+            hits.extend(_filter_hits(plan, text, custom_hits.get(plan.policy.id, {}).get(record.id, [])))
             if not hits:
                 continue
+            hits.sort(key=lambda h: h[1])
             kinds = sorted({h[0] for h in hits})
             db.add(DLPViolation(
                 organization_id=org_id,

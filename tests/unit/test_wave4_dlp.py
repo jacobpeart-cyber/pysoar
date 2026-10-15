@@ -235,22 +235,51 @@ def test_catastrophic_custom_patterns_are_refused_at_validation() -> None:
     validate_data_patterns([r"AKIA[0-9A-Z]{16}", r"\b\d{3}-\d{2}-\d{4}\b", "ssn"])
 
 
-def test_custom_pattern_time_budget_deactivates_the_policy_for_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
-    import re
+def test_isolated_matcher_kills_a_catastrophic_pattern_and_reports_unscanned_records() -> None:
+    """``(a|aa)+$`` passes the static check (the heuristic is only a filter) but
+    backtracks exponentially; the child process is killed at the budget and the
+    record is reported as unscanned, never as clean."""
     import time
 
+    from src.dlp.isolated_match import match_custom_patterns
+    from src.dlp.scanner import validate_data_patterns
+
+    validate_data_patterns([r"(a|aa)+$"])  # bypasses the static heuristic on purpose
+    t0 = time.perf_counter()
+    hits, unscanned, timed_out = match_custom_patterns(
+        {"custom:evil": r"(a|aa)+$"}, [("fast", "zzz"), ("slow", "a" * 48 + "b")], budget_seconds=1.0,
+    )
+    assert time.perf_counter() - t0 < 6
+    assert timed_out is True
+    assert "slow" in unscanned
+    assert hits.get("fast") == []
+    ok_hits, ok_unscanned, ok_timed_out = match_custom_patterns(
+        {"custom:proj": r"PROJ-\d{4}"}, [("r1", "see PROJ-1234 and PROJ-99")], budget_seconds=5.0,
+    )
+    assert ok_unscanned == [] and ok_timed_out is False
+    assert ok_hits["r1"] == [("custom:proj", 4, 13)]
+
+
+async def test_scan_records_unscanned_records_as_findings_instead_of_passing_them(
+    client: AsyncClient, db_session: AsyncSession, org_a, org_a_admin_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from src.dlp import scanner as mod
+    from src.dlp.models import DLPViolation
 
-    class _Slow:
-        def finditer(self, text):
-            time.sleep(0.5)
-            return iter([])
+    org_id = org_a.id
+    monkeypatch.setattr(mod, "POLICY_WINDOW_BUDGET_SECONDS", 1.0)
+    pol = await _policy(client, org_a_admin_headers, data_patterns=[r"(a|aa)+$"], channels_monitored=["logs"])
+    assert pol["evaluation_status"] == "active"
+    db_session.add(_log(org_id, "a" * 48 + "b"))
+    await db_session.commit()
 
-    plan = mod.PolicyPlan(policy=None, status="active", reason=None, patterns={"custom:slow": _Slow()})  # type: ignore[arg-type]
-    monkeypatch.setattr(mod, "PATTERN_TIME_BUDGET_SECONDS", 0.05)
-    with pytest.raises(mod.PatternTimeout) as exc:
-        mod.find_matches(plan, "x" * 100)
-    assert exc.value.name == "custom:slow"
-    # Built-in detectors are trusted and run inline.
-    fast = mod.PolicyPlan(policy=None, status="active", reason=None, patterns={"ssn": re.compile(r"\d{3}-\d{2}-\d{4}")})  # type: ignore[arg-type]
-    assert mod.find_matches(fast, "ssn 123-45-6789 here") == [("ssn", 4, 15)]
+    run = await client.post(f"{BASE}/scan/run", headers=org_a_admin_headers)
+    assert run.status_code == 200, run.text
+    rows = (await db_session.execute(
+        select(DLPViolation).where(DLPViolation.organization_id == org_id, DLPViolation.policy_id == pol["id"])
+    )).scalars().all()
+    assert [r.violation_type for r in rows] == ["scan_incomplete"]
+    assert rows[0].action_taken == "scan_timeout"
+    assert "NOT scanned" in (rows[0].redacted_excerpt or "")
+    status = (await client.get(f"{BASE}/policies/{pol['id']}", headers=org_a_admin_headers)).json()
+    assert status["evaluation_status"] == "active"
