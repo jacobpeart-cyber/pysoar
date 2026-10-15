@@ -569,6 +569,7 @@ class AutomationService:
             source="container_security",
             status="new",
             category="vulnerability",
+            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
@@ -591,6 +592,7 @@ class AutomationService:
             source="itdr",
             status="new",
             category="identity_threat",
+            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
@@ -614,6 +616,7 @@ class AutomationService:
             source="ot_security",
             status="new",
             category="ot_ics",
+            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
