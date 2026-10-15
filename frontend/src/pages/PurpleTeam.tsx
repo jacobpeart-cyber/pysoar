@@ -14,6 +14,20 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 import LoadErrorBanner from '../components/LoadErrorBanner';
+import ActionErrorBanner from '../components/ActionErrorBanner';
+
+/** POST /simulation/techniques/{id}/test: one atomic run through the BAS agent, scored against detections. */
+interface TechniqueTestResult {
+  simulation_id: string;
+  status: string; // completed | failed (the agent command errored)
+  technique: string;
+  target_host: string | null;
+  actual_target_host: string | null;
+  execution_mode: string; // real | coverage_only (no agent executed it)
+  detected: boolean;
+  tests_executed: number;
+  detection_rate: number | null;
+}
 
 interface AttackTechnique {
   id: string;
@@ -73,7 +87,8 @@ export default function PurpleTeam() {
   const [selectedTechnique, setSelectedTechnique] = useState('');
   const [events, setEvents] = useState<StreamEvent[]>([]);
   const [isFiring, setIsFiring] = useState(false);
-  const [lastResult, setLastResult] = useState<{ detected: boolean; hostname: string; technique: string } | null>(null);
+  const [lastResult, setLastResult] = useState<(TechniqueTestResult & { hostname: string }) | null>(null);
+  const [fireError, setFireError] = useState<unknown>(null);
   // Techniques that have been fired in this session — used to correlate
   // incoming siem_match events against red-team activity. The Set is
   // refilled every time the user fires a new technique and persists
@@ -177,43 +192,20 @@ export default function PurpleTeam() {
     // events can be flagged as correlated red->blue hits.
     firedTechniquesRef.current.add(selectedTechnique);
     try {
-      // Issue a run_atomic_test command via the agents API so it
-      // streams through the WebSocket channel. We pull the command
-      // body from the technique details.
-      const techRes = await api.get<AttackTechnique & { test_command?: string; test_commands?: any[] }>(
-        `/simulation/techniques/${selectedTechnique}`,
-      );
-      const t: any = techRes.data;
-      const cmd =
-        t.test_command ??
-        (Array.isArray(t.test_commands) && t.test_commands[0]?.command) ??
-        'echo "no test command"';
-      const executor =
-        (Array.isArray(t.test_commands) && t.test_commands[0]?.executor) ?? 'sh';
-
-      await api.post(`/agents/${selectedAgent}/commands`, {
-        action: 'run_atomic_test',
-        payload: {
-          command: cmd,
-          executor,
-          mitre_id: selectedTechnique,
-        },
-      });
-
-      // Also fire the simulation's standalone /technique/{id}/test to
-      // score coverage against detection rules in parallel
-      const simRes = await api.post<{ detected: boolean }>(
-        `/simulation/techniques/${selectedTechnique}/test`,
-        {},
-      );
+      // One path: the simulation engine issues run_atomic_test to the chosen
+      // agent (its command events stream over the WebSocket below) and scores
+      // the run against detections in its time window on that host. Firing a
+      // second raw agent command here as well executed the technique twice.
+      setFireError(null);
+      setLastResult(null);
       const hostname = agents?.find((a) => a.id === selectedAgent)?.hostname ?? selectedAgent;
-      setLastResult({
-        detected: simRes.data?.detected ?? false,
-        hostname,
-        technique: selectedTechnique,
-      });
-    } catch (e: any) {
-      alert(e?.response?.data?.detail ?? 'fire failed');
+      const simRes = await api.post<TechniqueTestResult>(
+        `/simulation/techniques/${selectedTechnique}/test`,
+        { target_host: hostname },
+      );
+      setLastResult({ ...simRes.data, hostname });
+    } catch (e: unknown) {
+      setFireError(e);
     } finally {
       setIsFiring(false);
     }
@@ -295,35 +287,8 @@ export default function PurpleTeam() {
           </div>
         </div>
 
-        {lastResult && (
-          <div
-            className={clsx(
-              'mt-4 p-3 rounded border flex items-center gap-2 text-sm',
-              lastResult.detected
-                ? 'bg-green-50 dark:bg-green-900/20 border-green-300 text-green-700 dark:text-green-300'
-                : 'bg-red-50 dark:bg-red-900/20 border-red-300 text-red-700 dark:text-red-300',
-            )}
-          >
-            {lastResult.detected ? (
-              <>
-                <CheckCircle className="w-4 h-4" />
-                <span>
-                  <strong>{lastResult.technique}</strong> fired on {lastResult.hostname} —
-                  DETECTED by at least one active rule.
-                </span>
-              </>
-            ) : (
-              <>
-                <XCircle className="w-4 h-4" />
-                <span>
-                  <strong>{lastResult.technique}</strong> fired on {lastResult.hostname} — NOT
-                  DETECTED. No active detection rule covers this technique. Consider adding a
-                  Sigma rule or SIEM correlation.
-                </span>
-              </>
-            )}
-          </div>
-        )}
+        <div className="mt-4"><ActionErrorBanner what="fire the technique" error={fireError} /></div>
+        {lastResult && <FireResult result={lastResult} />}
       </div>
 
       {/* Live stream */}
@@ -428,6 +393,50 @@ export default function PurpleTeam() {
           })}
         </div>
       </div>
+    </div>
+  );
+}
+
+function FireResult({ result }: { result: TechniqueTestResult & { hostname: string } }) {
+  const host = result.actual_target_host || result.target_host || result.hostname;
+  if (result.status === 'failed') {
+    return (
+      <div className="mt-4 p-3 rounded border text-sm bg-yellow-50 dark:bg-yellow-900/20 border-yellow-300 text-yellow-800 dark:text-yellow-200 flex items-center gap-2">
+        <XCircle className="w-4 h-4" />
+        <span>
+          <strong>{result.technique}</strong> on {host}: the test errored (the agent command failed), so there is no
+          detection result. See the command result in the stream below.
+        </span>
+      </div>
+    );
+  }
+  if (result.execution_mode !== 'real') {
+    return (
+      <div className="mt-4 p-3 rounded border text-sm bg-gray-50 dark:bg-gray-700/40 border-gray-300 text-gray-700 dark:text-gray-200 flex items-center gap-2">
+        <Eye className="w-4 h-4" />
+        <span>
+          <strong>{result.technique}</strong>: no BAS agent executed it (coverage only). The result reflects rule coverage,
+          not a live detection: {result.detected ? 'an active rule claims this technique' : 'no active rule covers this technique'}.
+        </span>
+      </div>
+    );
+  }
+  return (
+    <div
+      className={clsx(
+        'mt-4 p-3 rounded border flex items-center gap-2 text-sm',
+        result.detected
+          ? 'bg-green-50 dark:bg-green-900/20 border-green-300 text-green-700 dark:text-green-300'
+          : 'bg-red-50 dark:bg-red-900/20 border-red-300 text-red-700 dark:text-red-300',
+      )}
+    >
+      {result.detected ? <CheckCircle className="w-4 h-4" /> : <XCircle className="w-4 h-4" />}
+      <span>
+        <strong>{result.technique}</strong> executed on {host}:{' '}
+        {result.detected
+          ? 'DETECTED by the pipeline in the run window on that host.'
+          : 'NOT DETECTED in the run window on that host. Consider adding a Sigma rule or SIEM correlation.'}
+      </span>
     </div>
   );
 }

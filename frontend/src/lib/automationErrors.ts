@@ -72,6 +72,42 @@ function itemsFrom(body: Record<string, unknown>): string[] {
       );
     }
   }
+  // 422 invalid_rule (SIEM rule validate/create/update/import): [{field, message}]
+  if (Array.isArray(body.field_errors)) {
+    for (const raw of body.field_errors) {
+      const fe = asRecord(raw);
+      if (fe) items.push(`${str(fe.field) || 'rule'}: ${str(fe.message)}`);
+      else items.push(str(raw));
+    }
+  }
+  // 422 no_valid_rows (ITDR CSV import): [{line, error}] or plain strings
+  if (Array.isArray(body.errors)) {
+    for (const raw of body.errors) {
+      const e = asRecord(raw);
+      if (e) items.push(e.line !== undefined ? `Line ${str(e.line)}: ${str(e.error)}` : str(e.error ?? e.message));
+      else items.push(str(raw));
+    }
+  }
+  // 502 darkweb_scan_failed: {source: {label, status, reason|error}}
+  const sources = asRecord(body.sources);
+  if (sources) {
+    for (const [key, raw] of Object.entries(sources)) {
+      const src = asRecord(raw);
+      if (!src) continue;
+      const why = str(src.error) || str(src.reason) || str(src.detail);
+      items.push(`${str(src.label) || key}: ${str(src.status)}${why ? ` (${why})` : ''}`);
+    }
+  }
+  // 409 invalid_transition (hunting sessions): the session's current status
+  if (body.error === 'invalid_transition' && typeof body.status === 'string') {
+    items.push(`Current status: ${body.status}`);
+  }
+  // 502 identity_provider_failed (ITDR): the provider's result block
+  const result = asRecord(body.result);
+  if (result) {
+    const why = str(result.error) || str(result.detail);
+    if (why) items.push(`${str(result.provider) || 'Provider'}: ${why}`);
+  }
   return items;
 }
 

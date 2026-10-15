@@ -22,6 +22,7 @@ import {
 import { api } from '../lib/api';
 import clsx from 'clsx';
 import LoadErrorBanner from '../components/LoadErrorBanner';
+import ActionErrorBanner from '../components/ActionErrorBanner';
 
 const severityColors: Record<string, string> = {
   critical: 'bg-red-100 text-red-700 border-red-200',
@@ -62,6 +63,32 @@ const statusColors: Record<string, string> = {
   FAILED: 'text-red-600 bg-red-50 border border-red-200',
   CANCELLED: 'text-gray-600 bg-gray-50 border border-gray-200',
 };
+
+type SessionAction = 'pause' | 'resume' | 'cancel';
+
+// Which lifecycle actions the backend allows from a session status
+// (src/api/v1/endpoints/hunting.py _SESSION_TRANSITIONS): pause from RUNNING,
+// resume from PAUSED, cancel from PENDING / RUNNING / PAUSED.
+const SESSION_ACTIONS_FROM: Record<SessionAction, string[]> = {
+  pause: ['RUNNING'],
+  resume: ['PAUSED'],
+  cancel: ['PENDING', 'RUNNING', 'PAUSED'],
+};
+
+function allowedSessionActions(status: string | undefined): SessionAction[] {
+  const s = (status || '').toUpperCase();
+  return (Object.keys(SESSION_ACTIONS_FROM) as SessionAction[]).filter((a) => SESSION_ACTIONS_FROM[a].includes(s));
+}
+
+// Hypothesis priority levels the backend accepts (1-5; labels per
+// src/schemas/hunting.py HUNT_PRIORITY_LABELS).
+const PRIORITY_LEVELS: { value: string; label: string }[] = [
+  { value: '1', label: 'Critical' },
+  { value: '2', label: 'High' },
+  { value: '3', label: 'Medium' },
+  { value: '4', label: 'Low' },
+  { value: '5', label: 'Info' },
+];
 
 function formatDuration(seconds: number | null | undefined): string {
   if (!seconds) return '-';
@@ -104,15 +131,11 @@ export default function ThreatHunting() {
   const [editHypothesisPriority, setEditHypothesisPriority] = useState(3);
 
   // Error banner for mutation failures
-  const [actionError, setActionError] = useState<string | null>(null);
-  const showError = (err: any) => {
-    const msg =
-      err?.response?.data?.detail ||
-      (typeof err?.response?.data === 'string' ? err.response.data : null) ||
-      err?.message ||
-      'Action failed';
-    setActionError(typeof msg === 'string' ? msg : JSON.stringify(msg));
-  };
+  // The refused action and the server's error object, rendered by
+  // ActionErrorBanner (code, detail and itemised reasons, not a paraphrase).
+  const [sessionActionError, setSessionActionError] = useState<{ what: string; error: unknown } | null>(null);
+  const [actionError, setActionError] = useState<{ what: string; error: unknown } | null>(null);
+  const showError = (what: string, err: unknown) => setActionError({ what, error: err });
 
   // Fetch hunting stats
   const { data: stats, isLoading: statsLoading, error: statsError } = useQuery({
@@ -192,32 +215,37 @@ export default function ThreatHunting() {
     retry: 1,
   });
 
-  // Pause/Resume hunt mutation
-  const toggleHuntMutation = useMutation({
-    mutationFn: async ({ huntId, action }: { huntId: string; action: 'pause' | 'resume' }) => {
-      const response = action === 'pause'
-        ? await api.post(`/hunting/sessions/${huntId}/pause`)
-        : await api.post(`/hunting/sessions/${huntId}/resume`);
+  // Session lifecycle: pause (RUNNING), resume (PAUSED), cancel (PENDING /
+  // RUNNING / PAUSED). The backend refuses anything else with 409
+  // invalid_transition (carrying the current status) and a resume whose
+  // executor died with 409 executor_not_running (session now FAILED).
+  const sessionActionMutation = useMutation({
+    mutationFn: async ({ huntId, action }: { huntId: string; action: SessionAction }) => {
+      // Literal routes (one per action) so each call maps to a declared backend route.
+      const response =
+        action === 'pause'
+          ? await api.post(`/hunting/sessions/${huntId}/pause`)
+          : action === 'resume'
+            ? await api.post(`/hunting/sessions/${huntId}/resume`)
+            : await api.post(`/hunting/sessions/${huntId}/cancel`);
       return response.data;
     },
-    onSuccess: () => {
+    onSuccess: (data: { id?: string }) => {
+      setSessionActionError(null);
+      if (data?.id && selectedHunt?.id === data.id) setSelectedHunt(data);
       queryClient.invalidateQueries({ queryKey: ['hunting-sessions'] });
       queryClient.invalidateQueries({ queryKey: ['hunting-stats'] });
     },
-    onError: (err: any) => showError(err),
-  });
-
-  // Cancel hunt mutation
-  const cancelHuntMutation = useMutation({
-    mutationFn: async (huntId: string) => {
-      const response = await api.post(`/hunting/sessions/${huntId}/cancel`);
-      return response.data;
-    },
-    onSuccess: () => {
+    onError: (err: unknown, variables) => {
+      setSessionActionError({ what: `${variables.action} the hunt session`, error: err });
+      // The refusal carries the session's current status; show it rather
+      // than the stale row, then refetch the list.
+      const detail = (err as { response?: { data?: { detail?: { status?: unknown } } } })?.response?.data?.detail;
+      if (detail && typeof detail.status === 'string' && selectedHunt?.id === variables.huntId) {
+        setSelectedHunt({ ...selectedHunt, status: detail.status });
+      }
       queryClient.invalidateQueries({ queryKey: ['hunting-sessions'] });
-      queryClient.invalidateQueries({ queryKey: ['hunting-stats'] });
     },
-    onError: (err: any) => showError(err),
   });
 
   // Create hunt session mutation
@@ -232,7 +260,7 @@ export default function ThreatHunting() {
       setShowNewHuntModal(false);
       setNewHuntHypothesisId('');
     },
-    onError: (err: any) => showError(err),
+    onError: (err: unknown) => showError('start the hunt session', err),
   });
 
   // Create hypothesis mutation
@@ -249,7 +277,6 @@ export default function ThreatHunting() {
       setNewHypothesisDescription('');
       setNewHypothesisPriority(3);
     },
-    onError: (err: any) => showError(err),
   });
 
   // Instantiate template mutation
@@ -263,7 +290,7 @@ export default function ThreatHunting() {
       queryClient.invalidateQueries({ queryKey: ['hunting-stats'] });
       setActiveTab('hypotheses');
     },
-    onError: (err: any) => showError(err),
+    onError: (err: unknown) => showError('instantiate the template', err),
   });
 
   // Escalate finding mutation
@@ -275,7 +302,7 @@ export default function ThreatHunting() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['hunting-findings'] });
     },
-    onError: (err: any) => showError(err),
+    onError: (err: unknown) => showError('escalate the finding', err),
   });
 
   // Update hypothesis mutation
@@ -288,7 +315,6 @@ export default function ThreatHunting() {
       queryClient.invalidateQueries({ queryKey: ['hunting-hypotheses'] });
       setEditingHypothesis(null);
     },
-    onError: (err: any) => showError(err),
   });
 
   // Delete hypothesis mutation
@@ -299,7 +325,7 @@ export default function ThreatHunting() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['hunting-hypotheses'] });
     },
-    onError: (err: any) => showError(err),
+    onError: (err: unknown) => showError('delete the hypothesis', err),
   });
 
   // Activate hypothesis mutation
@@ -311,7 +337,7 @@ export default function ThreatHunting() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['hunting-hypotheses'] });
     },
-    onError: (err: any) => showError(err),
+    onError: (err: unknown) => showError('activate the hypothesis', err),
   });
 
   // Create notebook mutation
@@ -327,7 +353,7 @@ export default function ThreatHunting() {
       setNewNotebookDescription('');
       setNewNotebookSessionId('');
     },
-    onError: (err: any) => showError(err),
+    onError: (err: unknown) => showError('create the notebook', err),
   });
 
   // Duplicate notebook mutation
@@ -342,7 +368,7 @@ export default function ThreatHunting() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['hunting-notebooks'] });
     },
-    onError: (err: any) => showError(err),
+    onError: (err: unknown) => showError('duplicate the notebook', err),
   });
 
   const updateNotebookMutation = useMutation({
@@ -356,7 +382,7 @@ export default function ThreatHunting() {
       queryClient.invalidateQueries({ queryKey: ['hunting-notebooks'] });
       setSelectedNotebook(data);
     },
-    onError: (err: any) => showError(err),
+    onError: (err: unknown) => showError('save the notebook', err),
   });
 
   const executeNotebookCellMutation = useMutation({
@@ -367,7 +393,7 @@ export default function ThreatHunting() {
       });
       return response.data;
     },
-    onSuccess: (data: any, variables: { cellIndex: number; query: string }) => {
+    onSuccess: (data: any, variables: { notebookId: string; cellIndex: number; query: string }) => {
       if (!selectedNotebook) return;
       const cells = safeArray(selectedNotebook.content);
       const updatedCells = [...cells];
@@ -383,7 +409,7 @@ export default function ThreatHunting() {
       setSelectedNotebook({ ...selectedNotebook, content: updatedCells });
       queryClient.invalidateQueries({ queryKey: ['hunting-notebooks'] });
     },
-    onError: (err: any) => showError(err),
+    onError: (err: unknown) => showError('run the notebook cell', err),
   });
 
   const notebookCells = safeArray(selectedNotebook?.content);
@@ -456,19 +482,15 @@ export default function ThreatHunting() {
         </div>
       </div>
 
-      {/* Error banner */}
+      {/* Error banner: the refused action with the server's reasons */}
       {actionError && (
-        <div className="flex items-start justify-between p-4 rounded-lg border border-red-200 bg-red-50 text-red-800">
-          <div className="flex items-start space-x-2">
-            <AlertCircle className="w-5 h-5 mt-0.5 flex-shrink-0" />
-            <div className="text-sm">
-              <div className="font-semibold">Action failed</div>
-              <div className="mt-0.5 break-words">{actionError}</div>
-            </div>
+        <div className="flex items-start gap-2">
+          <div className="flex-1">
+            <ActionErrorBanner what={actionError.what} error={actionError.error} />
           </div>
           <button
             onClick={() => setActionError(null)}
-            className="text-red-600 hover:text-red-800 ml-4"
+            className="text-red-600 hover:text-red-800 p-1"
             aria-label="Dismiss error"
           >
             <X className="w-4 h-4" />
@@ -531,6 +553,21 @@ export default function ThreatHunting() {
               color="red"
             />
           </div>
+
+          {sessionActionError && (
+            <div className="flex items-start gap-2">
+              <div className="flex-1">
+                <ActionErrorBanner what={sessionActionError.what} error={sessionActionError.error} />
+              </div>
+              <button
+                onClick={() => setSessionActionError(null)}
+                className="text-red-600 hover:text-red-800 p-1"
+                aria-label="Dismiss error"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
 
           {/* Filters and Create */}
           <div className="flex items-center gap-2">
@@ -649,42 +686,14 @@ export default function ThreatHunting() {
                           >
                             View
                           </button>
-                          {(hunt.status === 'RUNNING' || hunt.status === 'active') ? (
-                            <button
-                              onClick={() =>
-                                toggleHuntMutation.mutate({
-                                  huntId: hunt.id,
-                                  action: 'pause',
-                                })
-                              }
-                              className="text-yellow-600 hover:text-yellow-800 p-1"
-                              title="Pause"
-                            >
-                              <Pause className="w-4 h-4" />
-                            </button>
-                          ) : (hunt.status === 'PAUSED' || hunt.status === 'paused') ? (
-                            <button
-                              onClick={() =>
-                                toggleHuntMutation.mutate({
-                                  huntId: hunt.id,
-                                  action: 'resume',
-                                })
-                              }
-                              className="text-green-600 hover:text-green-800 p-1"
-                              title="Resume"
-                            >
-                              <Play className="w-4 h-4" />
-                            </button>
-                          ) : null}
-                          {!['COMPLETED', 'FAILED', 'CANCELLED', 'completed', 'cancelled'].includes(hunt.status) && (
-                            <button
-                              onClick={() => cancelHuntMutation.mutate(hunt.id)}
-                              className="text-red-600 hover:text-red-800 p-1"
-                              title="Cancel"
-                            >
-                              <X className="w-4 h-4" />
-                            </button>
-                          )}
+                          {allowedSessionActions(hunt.status).map((action) => (
+                            <SessionActionButton
+                              key={action}
+                              action={action}
+                              disabled={sessionActionMutation.isPending}
+                              onClick={() => sessionActionMutation.mutate({ huntId: hunt.id, action })}
+                            />
+                          ))}
                         </div>
                       </td>
                     </tr>
@@ -771,6 +780,37 @@ export default function ThreatHunting() {
                       <p className="text-red-600 text-sm">{selectedHunt.error_message}</p>
                     </div>
                   )}
+                  {sessionActionError && (
+                    <div className="flex items-start gap-2">
+                      <div className="flex-1">
+                        <ActionErrorBanner what={sessionActionError.what} error={sessionActionError.error} />
+                      </div>
+                      <button
+                        onClick={() => setSessionActionError(null)}
+                        className="text-red-600 hover:text-red-800 p-1"
+                        aria-label="Dismiss error"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+                  )}
+                  <div className="flex items-center gap-2 pt-2 border-t">
+                    {allowedSessionActions(selectedHunt.status).length === 0 ? (
+                      <p className="text-sm text-gray-500">
+                        No lifecycle actions: a {selectedHunt.status} session cannot be paused, resumed or cancelled.
+                      </p>
+                    ) : (
+                      allowedSessionActions(selectedHunt.status).map((action) => (
+                        <SessionActionButton
+                          key={action}
+                          action={action}
+                          withLabel
+                          disabled={sessionActionMutation.isPending}
+                          onClick={() => sessionActionMutation.mutate({ huntId: selectedHunt.id, action })}
+                        />
+                      ))
+                    )}
+                  </div>
                 </div>
               </div>
             </div>
@@ -882,7 +922,7 @@ export default function ThreatHunting() {
             <div className="h-6 border-r border-gray-300" />
 
             <span className="text-xs text-gray-500 font-medium">Priority:</span>
-            {([{ label: 'High', value: '1' }, { label: 'Medium', value: '3' }, { label: 'Low', value: '4' }]).map((priority) => (
+            {PRIORITY_LEVELS.map((priority) => (
               <button
                 key={priority.value}
                 onClick={() => setPriorityFilterTab(priorityFilterTab === priority.value ? '' : priority.value)}
@@ -891,7 +931,7 @@ export default function ThreatHunting() {
                   priorityFilterTab === priority.value ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
                 )}
               >
-                {priority.label}
+                {priority.value} - {priority.label}
               </button>
             ))}
 
@@ -907,7 +947,11 @@ export default function ThreatHunting() {
           </div>
 
           {/* Hypotheses Grid */}
-          <LoadErrorBanner what="hypotheses" error={hypothesesError} />
+          {(hypothesesError as { response?: { status?: number } } | null)?.response?.status === 422 ? (
+            <ActionErrorBanner what="filter hypotheses" error={hypothesesError} />
+          ) : (
+            <LoadErrorBanner what="hypotheses" error={hypothesesError} />
+          )}
           {hypothesesLoading ? (
             <div className="flex items-center justify-center h-64">
               <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
@@ -1063,9 +1107,10 @@ export default function ThreatHunting() {
                       <option value={5}>5 - Info</option>
                     </select>
                   </div>
+                  <ActionErrorBanner what="create the hypothesis" error={createHypothesisMutation.error} />
                   <div className="flex justify-end gap-2">
                     <button
-                      onClick={() => setShowNewHypothesisModal(false)}
+                      onClick={() => { setShowNewHypothesisModal(false); createHypothesisMutation.reset(); }}
                       className="px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 text-sm font-medium"
                     >
                       Cancel
@@ -1142,9 +1187,10 @@ export default function ThreatHunting() {
                       <option value={5}>5 - Info</option>
                     </select>
                   </div>
+                  <ActionErrorBanner what="update the hypothesis" error={updateHypothesisMutation.error} />
                   <div className="flex justify-end gap-2">
                     <button
-                      onClick={() => setEditingHypothesis(null)}
+                      onClick={() => { setEditingHypothesis(null); updateHypothesisMutation.reset(); }}
                       className="px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 text-sm font-medium"
                     >
                       Cancel
@@ -1546,9 +1592,8 @@ export default function ThreatHunting() {
                           a.download = `notebook-${notebook.id.slice(0, 8)}.json`;
                           a.click();
                           URL.revokeObjectURL(url);
-                        } catch (err: any) {
-                          console.error('Export failed:', err);
-                          showError(err);
+                        } catch (err: unknown) {
+                          showError('export the notebook', err);
                         }
                       }}
                       className="px-3 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50"
@@ -1712,7 +1757,7 @@ export default function ThreatHunting() {
                                   onClick={() => executeCell(idx, String(cell.content || ''))}
                                   className="px-3 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 text-sm"
                                 >
-                                  {executeNotebookCellMutation.isLoading ? 'Running...' : 'Run'}
+                                  {executeNotebookCellMutation.isPending ? 'Running...' : 'Run'}
                                 </button>
                               )}
                               <button
@@ -1760,15 +1805,15 @@ export default function ThreatHunting() {
                     <button
                       type="button"
                       onClick={saveSelectedNotebook}
-                      disabled={updateNotebookMutation.isLoading}
+                      disabled={updateNotebookMutation.isPending}
                       className={clsx(
                         'px-4 py-2 rounded-lg text-sm font-medium text-white',
-                        updateNotebookMutation.isLoading
+                        updateNotebookMutation.isPending
                           ? 'bg-blue-400 cursor-not-allowed'
                           : 'bg-blue-600 hover:bg-blue-700'
                       )}
                     >
-                      {updateNotebookMutation.isLoading ? 'Saving...' : 'Save Notebook'}
+                      {updateNotebookMutation.isPending ? 'Saving...' : 'Save Notebook'}
                     </button>
                   </div>
                 </div>
@@ -1871,5 +1916,41 @@ function StatsCard({ title, value, icon: Icon, color }: any) {
         <Icon className={`w-8 h-8 ${colorClasses[color as keyof typeof colorClasses] || 'text-blue-600'} opacity-10`} />
       </div>
     </div>
+  );
+}
+
+function SessionActionButton({
+  action,
+  onClick,
+  disabled,
+  withLabel = false,
+}: {
+  action: SessionAction;
+  onClick: () => void;
+  disabled: boolean;
+  withLabel?: boolean;
+}) {
+  const Icon = action === 'pause' ? Pause : action === 'resume' ? Play : X;
+  const label = action === 'pause' ? 'Pause' : action === 'resume' ? 'Resume' : 'Cancel';
+  const tone =
+    action === 'pause'
+      ? 'text-yellow-600 hover:text-yellow-800'
+      : action === 'resume'
+        ? 'text-green-600 hover:text-green-800'
+        : 'text-red-600 hover:text-red-800';
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className={clsx(
+        tone,
+        'disabled:opacity-50 flex items-center gap-1',
+        withLabel ? 'px-3 py-1.5 border border-gray-300 rounded-lg text-sm font-medium' : 'p-1',
+      )}
+      title={label}
+    >
+      <Icon className="w-4 h-4" />
+      {withLabel && label}
+    </button>
   );
 }

@@ -750,13 +750,20 @@ export default function AttackSimulation() {
                           const res = await api.post(`/simulation/techniques/${technique.mitre_id}/test`, body);
                           const mode = res.data?.execution_mode;
                           const detected = res.data?.detected;
+                          const runStatus: string | undefined = res.data?.status;
                           const actualHost = res.data?.actual_target_host ?? selectedTargetHost ?? 'auto';
-                          const icon = mode === 'real' ? '🟢' : '⚪';
-                          const detLabel = detected ? 'detected' : 'missed';
-                          showNotification(
-                            `${icon} ${technique.name}: ${mode === 'real' ? `executed on ${actualHost}` : 'coverage-only'} · ${detLabel}`,
-                            detected ? 'success' : 'error',
-                          );
+                          if (runStatus === 'failed') {
+                            // The agent command failed: the test errored, it was neither detected nor missed.
+                            showNotification(`${technique.name}: the test errored on ${actualHost}; no detection result`, 'error');
+                          } else {
+                            const icon = mode === 'real' ? '🟢' : '⚪';
+                            const detLabel = detected ? 'detected' : 'missed';
+                            showNotification(
+                              `${icon} ${technique.name}: ${mode === 'real' ? `executed on ${actualHost}` : 'coverage-only (no agent executed it)'} · ${detLabel}`,
+                              detected ? 'success' : 'error',
+                            );
+                          }
+                          queryClient.invalidateQueries({ queryKey: ['simulationPostureByTactic'] });
                         } catch (error: unknown) {
                           showNotification(`Failed to run test: ${describeLoadError(error)}`, 'error');
                         } finally {
@@ -945,6 +952,8 @@ export default function AttackSimulation() {
               </p>
             </div>
           )}
+
+          <TacticPosturePanel />
         </div>
       )}
       {/* New Simulation Modal */}
@@ -1052,6 +1061,68 @@ export default function AttackSimulation() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/** GET /simulation/posture/by-tactic: detection rate per tactic from completed runs; not_assessed is never 0%. */
+interface TacticPostureItem {
+  tactic: string;
+  status: 'assessed' | 'not_assessed' | string;
+  tests_total: number;
+  tests_detected: number;
+  detection_rate: number | null;
+}
+
+interface TacticPosture {
+  tactics: TacticPostureItem[];
+  assessed_tactics: number;
+  not_assessed_tactics: number;
+}
+
+function TacticPosturePanel() {
+  const { data, isLoading, error } = useQuery({
+    queryKey: ['simulationPostureByTactic'],
+    queryFn: async () => (await api.get<TacticPosture>('/simulation/posture/by-tactic')).data,
+  });
+  return (
+    <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6 space-y-4">
+      <div>
+        <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Detection posture by tactic</h3>
+        <p className="text-sm text-gray-600 dark:text-gray-400">
+          Share of executed tests in completed simulations that the detection pipeline caught.
+          {data && ` ${data.assessed_tactics} assessed, ${data.not_assessed_tactics} not assessed.`}
+        </p>
+      </div>
+      <LoadErrorBanner what="the posture by tactic" error={error} />
+      {isLoading ? (
+        <p className="text-sm text-gray-500 dark:text-gray-400">Loading...</p>
+      ) : data && data.tactics.length === 0 ? (
+        <p className="text-sm text-gray-500 dark:text-gray-400">The technique library has no tactics.</p>
+      ) : data ? (
+        <div className="space-y-2">
+          {data.tactics.map((t) => (
+            <div key={t.tactic} className="grid grid-cols-12 items-center gap-3 text-sm">
+              <span className="col-span-3 capitalize text-gray-900 dark:text-white">{t.tactic.replace(/[-_]/g, ' ')}</span>
+              {t.status === 'assessed' && t.detection_rate != null ? (
+                <>
+                  <div className="col-span-6 h-2 rounded bg-gray-100 dark:bg-gray-700 overflow-hidden">
+                    <div
+                      className={clsx('h-2', t.detection_rate >= 70 ? 'bg-green-500' : t.detection_rate >= 40 ? 'bg-yellow-500' : 'bg-red-500')}
+                      style={{ width: `${Math.min(100, Math.max(0, t.detection_rate))}%` }}
+                    />
+                  </div>
+                  <span className="col-span-3 text-gray-700 dark:text-gray-300">
+                    {t.detection_rate}% ({t.tests_detected}/{t.tests_total} detected)
+                  </span>
+                </>
+              ) : (
+                <span className="col-span-9 text-gray-500 dark:text-gray-400 italic">Not assessed: no test for this tactic has run in a completed simulation</span>
+              )}
+            </div>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }

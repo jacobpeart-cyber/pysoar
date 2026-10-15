@@ -14,6 +14,7 @@ import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContaine
 import clsx from 'clsx';
 import { api } from '../api/client';
 import LoadErrorBanner from '../components/LoadErrorBanner';
+import ActionErrorBanner from '../components/ActionErrorBanner';
 import { describeLoadError } from '../lib/loadError';
 
 // ---------------------------------------------------------------------------
@@ -83,6 +84,32 @@ interface AwarenessScore {
   risk_category: string;
   last_failed_campaign: string | null;
   created_at: string | null;
+}
+
+/** POST /phishing_sim/campaigns/{id}/launch */
+interface LaunchResult {
+  name?: string;
+  status: string;
+  targets_created: number;
+  queued_for_send: number;
+  awaiting_smtp: number;
+  smtp_configured: boolean;
+}
+
+function httpStatusOf(err: unknown): number | undefined {
+  return (err as { response?: { status?: number } } | null)?.response?.status;
+}
+
+/** The backend's reason text of a refusal ({detail: {error, detail}} or {detail: "..."}). */
+function backendReason(err: unknown): string | null {
+  const detail = (err as { response?: { data?: { detail?: unknown } } } | null)?.response?.data?.detail;
+  if (typeof detail === 'string') return detail;
+  if (detail && typeof detail === 'object') {
+    const d = detail as { detail?: unknown; reason?: unknown };
+    if (typeof d.detail === 'string') return d.detail;
+    if (typeof d.reason === 'string') return d.reason;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -229,32 +256,62 @@ export default function PhishingSimulation() {
     }));
   }, [awarenessScores]);
 
-  // Real training modules from /phishing_sim/training/modules.
-  // Previously this derived fake "TR-XXX" training records from email
-  // templates with hardcoded durations ('hard' → 45min, 'medium' →
-  // 25min, 'easy' → 15min) and a synthetic completion count =
-  // template.usage_count divided by 1500. None of that reflected the
-  // actual training catalog.
-  const { data: trainingModulesRaw, error: trainingError } = useQuery({
+  // GET /phishing_sim/training/modules answers 501 not_implemented: there is
+  // no stored training content. The tab shows that reason instead of a catalogue.
+  const { error: trainingError, isLoading: trainingLoading } = useQuery({
     queryKey: ['phishing-training-modules'],
-    queryFn: async () => {
-      const res = await api.get('/phishing_sim/training/modules');
-      return res.data;
+    queryFn: async () => (await api.get('/phishing_sim/training/modules')).data,
+    enabled: activeTab === 'training',
+    retry: false,
+  });
+
+  // Campaign lifecycle actions (launch / pause / resume / end): refusals are shown, never alert()ed away.
+  const [campaignActionError, setCampaignActionError] = useState<{ what: string; error: unknown } | null>(null);
+  const [launchResult, setLaunchResult] = useState<LaunchResult | null>(null);
+  const runCampaignAction = async (campaign: Campaign, action: 'launch' | 'pause' | 'resume' | 'end') => {
+    setCampaignActionError(null);
+    try {
+      // Literal routes (one per action) so each call maps to a declared backend route.
+      const res =
+        action === 'launch'
+          ? await api.post(`/phishing_sim/campaigns/${campaign.id}/launch`, {})
+          : action === 'pause'
+            ? await api.post(`/phishing_sim/campaigns/${campaign.id}/pause`)
+            : action === 'resume'
+              ? await api.post(`/phishing_sim/campaigns/${campaign.id}/resume`)
+              : await api.post(`/phishing_sim/campaigns/${campaign.id}/end`);
+      if (action === 'launch') setLaunchResult({ ...(res.data as LaunchResult), name: campaign.name });
+      queryClient.invalidateQueries({ queryKey: ['phishing-campaigns'] });
+    } catch (err: unknown) {
+      setCampaignActionError({ what: `${action} campaign ${campaign.name}`, error: err });
+    }
+  };
+
+  // Awareness: high-risk filter and recalculation from recorded events
+  const [highRiskOnly, setHighRiskOnly] = useState(false);
+  const { data: highRiskScores = [], error: highRiskError } = useQuery<AwarenessScore[]>({
+    queryKey: ['phishing-awareness-high-risk'],
+    queryFn: async () => (await api.get('/phishing_sim/awareness-scores/high-risk')).data,
+    enabled: activeTab === 'awareness' && highRiskOnly,
+  });
+  const shownAwarenessScores = highRiskOnly ? highRiskScores : awarenessScores;
+  const [calcEmail, setCalcEmail] = useState('');
+  const [calcName, setCalcName] = useState('');
+  const [calcDepartment, setCalcDepartment] = useState('');
+  const calculateScoreMutation = useMutation({
+    mutationFn: async (v: { email: string; name: string; department?: string | null }) =>
+      (
+        await api.post<AwarenessScore>(
+          `/phishing_sim/awareness-scores/${encodeURIComponent(v.email)}/calculate`,
+          undefined,
+          { params: { user_name: v.name, ...(v.department ? { department: v.department } : {}) } },
+        )
+      ).data,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['phishing-awareness-scores'] });
+      queryClient.invalidateQueries({ queryKey: ['phishing-awareness-high-risk'] });
     },
   });
-  const trainingData = useMemo(() => {
-    const items = Array.isArray(trainingModulesRaw)
-      ? trainingModulesRaw
-      : (trainingModulesRaw as any)?.items ?? [];
-    return items.map((m: any) => ({
-      id: m.id,
-      title: m.title ?? m.name ?? 'Training module',
-      completions: m.completion_count ?? m.completions ?? 0,
-      duration: m.duration_minutes ? `${m.duration_minutes} min` : (m.duration ?? '—'),
-      certification: !!(m.is_certification ?? m.certification),
-      difficulty: m.difficulty ?? m.difficulty_level ?? null,
-    }));
-  }, [trainingModulesRaw]);
 
   // ---------------------------------------------------------------------------
   // Render
@@ -350,6 +407,25 @@ export default function PhishingSimulation() {
         {/* ================================================================= */}
         {activeTab === 'campaigns' && (
           <div>
+            {campaignActionError && (
+              <div className="mb-4"><ActionErrorBanner what={campaignActionError.what} error={campaignActionError.error} /></div>
+            )}
+            {launchResult && (
+              <div
+                className={clsx(
+                  'mb-4 rounded-lg border p-4 text-sm flex items-start justify-between gap-4',
+                  launchResult.smtp_configured ? 'border-green-700 bg-green-900/20 text-green-200' : 'border-yellow-700 bg-yellow-900/20 text-yellow-200',
+                )}
+              >
+                <p>
+                  Campaign {launchResult.name} launched: {launchResult.targets_created} recipient(s) staged.{' '}
+                  {launchResult.smtp_configured
+                    ? `${launchResult.queued_for_send} email(s) queued for sending.`
+                    : `SMTP is not configured for this organisation: ${launchResult.awaiting_smtp} recipient(s) are awaiting SMTP configuration and nothing was sent.`}
+                </p>
+                <button onClick={() => setLaunchResult(null)} className="text-gray-400 hover:text-white"><X className="w-4 h-4" /></button>
+              </div>
+            )}
             <div className="mb-6 flex justify-end">
               <button
                 onClick={() => setShowModal(true)}
@@ -406,62 +482,26 @@ export default function PhishingSimulation() {
                       <div className="flex items-center gap-2">
                         {(campaign.status === 'draft' || campaign.status === 'scheduled') && (
                           <button
-                            onClick={async (e) => {
-                              e.stopPropagation();
-                              try {
-                                // Resolve total_targets — either from the campaign's
-                                // linked target group, a prior field, or prompt the user.
-                                let totalTargets = (campaign as any).total_targets || 0;
-                                if (!totalTargets) {
-                                  const entered = window.prompt('How many targets to include in this launch?', '10');
-                                  totalTargets = parseInt(entered || '0', 10);
-                                }
-                                if (!totalTargets || totalTargets < 1) return;
-                                await api.post(`/phishing_sim/campaigns/${campaign.id}/launch`, {
-                                  total_targets: totalTargets,
-                                });
-                                queryClient.invalidateQueries({ queryKey: ['phishing-campaigns'] });
-                              } catch (err: any) {
-                                const msg = err?.response?.data?.detail || err?.message || 'Failed to launch campaign';
-                                alert(msg);
-                              }
-                            }}
+                            onClick={(e) => { e.stopPropagation(); runCampaignAction(campaign, 'launch'); }}
                             className="px-3 py-1 rounded text-xs font-medium bg-green-600 hover:bg-green-700 text-white transition-colors"
+                            title="Sends to every member of the campaign's target group through the organisation's SMTP"
                           >
                             Launch
                           </button>
                         )}
-                        {/* Pause / Resume / End — backend endpoints
-                            have always existed; the UI previously
-                            exposed no way to govern a campaign after
-                            launch, so once running a campaign could
-                            only be watched from the sidelines. */}
                         {(campaign.status === 'active' || campaign.status === 'running') && (
                           <>
                             <button
-                              onClick={async (e) => {
-                                e.stopPropagation();
-                                try {
-                                  await api.post(`/phishing_sim/campaigns/${campaign.id}/pause`);
-                                  queryClient.invalidateQueries({ queryKey: ['phishing-campaigns'] });
-                                } catch (err: any) {
-                                  alert(err?.response?.data?.detail || err?.message || 'Failed to pause');
-                                }
-                              }}
+                              onClick={(e) => { e.stopPropagation(); runCampaignAction(campaign, 'pause'); }}
                               className="px-3 py-1 rounded text-xs font-medium bg-yellow-600 hover:bg-yellow-700 text-white transition-colors"
                             >
                               Pause
                             </button>
                             <button
-                              onClick={async (e) => {
+                              onClick={(e) => {
                                 e.stopPropagation();
                                 if (!window.confirm('End campaign now? No more emails will be sent.')) return;
-                                try {
-                                  await api.post(`/phishing_sim/campaigns/${campaign.id}/end`);
-                                  queryClient.invalidateQueries({ queryKey: ['phishing-campaigns'] });
-                                } catch (err: any) {
-                                  alert(err?.response?.data?.detail || err?.message || 'Failed to end');
-                                }
+                                runCampaignAction(campaign, 'end');
                               }}
                               className="px-3 py-1 rounded text-xs font-medium bg-red-600 hover:bg-red-700 text-white transition-colors"
                             >
@@ -471,15 +511,7 @@ export default function PhishingSimulation() {
                         )}
                         {campaign.status === 'paused' && (
                           <button
-                            onClick={async (e) => {
-                              e.stopPropagation();
-                              try {
-                                await api.post(`/phishing_sim/campaigns/${campaign.id}/resume`);
-                                queryClient.invalidateQueries({ queryKey: ['phishing-campaigns'] });
-                              } catch (err: any) {
-                                alert(err?.response?.data?.detail || err?.message || 'Failed to resume');
-                              }
-                            }}
+                            onClick={(e) => { e.stopPropagation(); runCampaignAction(campaign, 'resume'); }}
                             className="px-3 py-1 rounded text-xs font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors"
                           >
                             Resume
@@ -688,6 +720,42 @@ export default function PhishingSimulation() {
         {/* ================================================================= */}
         {activeTab === 'awareness' && (
           <div>
+            {/* Recalculate a user's score from their recorded campaign events */}
+            <div className="mb-6 bg-gray-800 border border-gray-700 rounded-lg p-4 space-y-3">
+              <div className="flex flex-wrap items-end gap-3">
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">User email</label>
+                  <input value={calcEmail} onChange={(e) => setCalcEmail(e.target.value)} className="px-3 py-2 rounded bg-gray-900 border border-gray-700 text-sm" placeholder="user@example.com" />
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">Name</label>
+                  <input value={calcName} onChange={(e) => setCalcName(e.target.value)} className="px-3 py-2 rounded bg-gray-900 border border-gray-700 text-sm" />
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">Department (optional)</label>
+                  <input value={calcDepartment} onChange={(e) => setCalcDepartment(e.target.value)} className="px-3 py-2 rounded bg-gray-900 border border-gray-700 text-sm" />
+                </div>
+                <button
+                  disabled={!calcEmail.trim() || !calcName.trim() || calculateScoreMutation.isPending}
+                  onClick={() => calculateScoreMutation.mutate({ email: calcEmail.trim(), name: calcName.trim(), department: calcDepartment.trim() || null })}
+                  className="px-4 py-2 rounded bg-blue-600 hover:bg-blue-700 text-sm font-medium disabled:opacity-50"
+                >
+                  {calculateScoreMutation.isPending ? 'Calculating...' : 'Calculate score'}
+                </button>
+                <label className="ml-auto flex items-center gap-2 text-sm text-gray-300">
+                  <input type="checkbox" checked={highRiskOnly} onChange={(e) => setHighRiskOnly(e.target.checked)} />
+                  High-risk users only
+                </label>
+              </div>
+              <p className="text-xs text-gray-500">Scores are derived from the user's recorded opens, clicks, submissions and reports; a user with no recorded events has no score (404).</p>
+              <ActionErrorBanner what="calculate the awareness score" error={calculateScoreMutation.error} />
+              {calculateScoreMutation.data && (
+                <p className="text-sm text-green-300">
+                  {calculateScoreMutation.data.user_email}: score {calculateScoreMutation.data.overall_score} ({calculateScoreMutation.data.risk_category})
+                </p>
+              )}
+            </div>
+            {highRiskOnly && <LoadErrorBanner what="high-risk users" error={highRiskError} />}
             {/* Department Awareness Chart */}
             {departmentRiskData.length > 0 && (
               <div className="mb-8">
@@ -709,10 +777,10 @@ export default function PhishingSimulation() {
             {/* Scores Table */}
             {awarenessError ? (
               <LoadErrorBanner what="awareness scores" error={awarenessError} />
-            ) : awarenessScores.length === 0 ? (
+            ) : shownAwarenessScores.length === 0 ? (
               <div className="text-center py-16 text-gray-500">
                 <TrendingUp className="w-12 h-12 mx-auto mb-4 opacity-50" />
-                <p>No awareness scores calculated yet.</p>
+                <p>{highRiskOnly ? 'No high-risk users.' : 'No awareness scores calculated yet.'}</p>
               </div>
             ) : (
               <div className="bg-gray-800 border border-gray-700 rounded-lg overflow-hidden">
@@ -726,10 +794,11 @@ export default function PhishingSimulation() {
                       <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Campaigns</th>
                       <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Clicked</th>
                       <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Reported</th>
+                      <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300"></th>
                     </tr>
                   </thead>
                   <tbody>
-                    {awarenessScores.map((score) => (
+                    {shownAwarenessScores.map((score) => (
                       <tr key={score.id} className="border-t border-gray-700 hover:bg-gray-700/50">
                         <td className="px-6 py-4 text-sm">
                           <div>
@@ -768,6 +837,15 @@ export default function PhishingSimulation() {
                         <td className="px-6 py-4 text-sm text-gray-300">{score.campaigns_participated}</td>
                         <td className="px-6 py-4 text-sm text-red-400">{score.times_clicked}</td>
                         <td className="px-6 py-4 text-sm text-green-400">{score.times_reported}</td>
+                        <td className="px-6 py-4 text-sm">
+                          <button
+                            disabled={calculateScoreMutation.isPending}
+                            onClick={() => calculateScoreMutation.mutate({ email: score.user_email, name: score.user_name || score.user_email, department: score.department })}
+                            className="px-2 py-1 rounded text-xs bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
+                          >
+                            Recalculate
+                          </button>
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -782,49 +860,20 @@ export default function PhishingSimulation() {
         {/* ================================================================= */}
         {activeTab === 'training' && (
           <div className="space-y-4">
-            {trainingError ? (
-              <LoadErrorBanner what="training modules" error={trainingError} />
-            ) : trainingData.length === 0 ? (
-              <div className="text-center py-16 text-gray-500">
-                <Award className="w-12 h-12 mx-auto mb-4 opacity-50" />
-                <p>No training modules available.</p>
-              </div>
-            ) : (
-              trainingData.map((training) => (
-                <div key={training.id} className="bg-gray-800 border border-gray-700 rounded-lg p-6">
-                  <div className="flex items-start justify-between mb-4">
-                    <div className="flex-1">
-                      <h3 className="text-lg font-semibold text-white mb-2">{training.title}</h3>
-                      <p className="text-sm text-gray-400">Duration: {training.duration}</p>
-                    </div>
-                    {training.certification && (
-                      <span className="px-3 py-1 rounded text-xs font-medium bg-blue-900/40 text-blue-300 flex items-center gap-1">
-                        <Award className="w-3 h-3" />
-                        Certification
-                      </span>
-                    )}
-                  </div>
-
-                  <div className="grid grid-cols-3 gap-4">
-                    <div>
-                      <p className="text-xs text-gray-400 mb-1">Completions</p>
-                      <p className="text-2xl font-bold text-white">{training.completions.toLocaleString()}</p>
-                    </div>
-                    <div className="col-span-2">
-                      <p className="text-xs text-gray-400 mb-2">Completion Rate</p>
-                      <div className="flex items-center gap-2">
-                        <div className="flex-1 h-3 bg-gray-700 rounded-full">
-                          <div
-                            className="h-full bg-green-500 rounded-full"
-                            style={{ width: `${Math.min((training.completions / 1500) * 100, 100)}%` }}
-                          />
-                        </div>
-                        <span className="text-sm text-gray-400">{Math.min(Math.round((training.completions / 1500) * 100), 100)}%</span>
-                      </div>
-                    </div>
-                  </div>
+            {trainingLoading ? (
+              <p className="text-gray-400">Loading...</p>
+            ) : httpStatusOf(trainingError) === 501 ? (
+              <div className="bg-gray-800 border border-gray-700 rounded-lg p-6">
+                <div className="flex items-center gap-2 mb-2">
+                  <Award className="w-5 h-5 text-gray-400" />
+                  <h3 className="text-lg font-semibold text-white">Training catalogue: not available</h3>
                 </div>
-              ))
+                <p className="text-sm text-gray-300">{backendReason(trainingError) ?? 'The server reported 501 not_implemented.'}</p>
+              </div>
+            ) : trainingError ? (
+              <LoadErrorBanner what="the training catalogue" error={trainingError} />
+            ) : (
+              <p className="text-gray-400">The training catalogue answered without the expected 501; no catalogue is rendered because the backend stores no training content.</p>
             )}
           </div>
         )}

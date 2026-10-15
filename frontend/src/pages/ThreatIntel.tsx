@@ -4,24 +4,21 @@ import {
   Search,
   Globe,
   Shield,
-  AlertTriangle,
   Activity,
   ExternalLink,
   RefreshCw,
   Loader2,
-  CheckCircle,
   XCircle,
-  Clock,
   Server,
   Mail,
   Hash,
   FileText,
   TrendingUp,
-  Eye,
   Download,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import LoadErrorBanner from '../components/LoadErrorBanner';
+import ActionErrorBanner from '../components/ActionErrorBanner';
 import { describeLoadError } from '../lib/loadError';
 import clsx from 'clsx';
 
@@ -36,33 +33,170 @@ interface ThreatFeed {
   status: 'active' | 'error' | 'disabled';
 }
 
-// Local sources (intel.py lookup) carry name/verdict/last_seen; external
-// enrichment sources (VirusTotal / AbuseIPDB) carry confidence plus either
-// `raw` (the provider's response excerpt) or `error`.
+// Local sources (intel.py lookup) carry name/verdict/last_seen/platform_intel;
+// external enrichment sources (VirusTotal / AbuseIPDB / OTX, src/intel/providers.py)
+// carry confidence, `details` (the provider's response excerpt) or `error`,
+// plus `cached` and `key_source`.
 interface LookupSource {
   name: string;
   verdict: string;
-  last_seen?: string;
+  last_seen?: string | null;
   confidence?: number;
-  raw?: Record<string, unknown>;
-  error?: string;
+  platform_intel?: boolean;
+  details?: Record<string, unknown> | null;
+  raw?: Record<string, unknown> | null;
+  error?: string | null;
+  cached?: boolean;
+  key_source?: string | null;
 }
+
+// ProviderOutcome.summary(): one row per provider the platform knows.
+interface ProviderOutcome {
+  provider: string;
+  status: 'ok' | 'not_configured' | 'credentials_unreadable' | 'unsupported_type' | 'error' | string;
+  key_source: string | null;
+  cached: boolean;
+  error: string | null;
+  detail: string | null;
+}
+
+type ExternalEnrichmentState =
+  | 'ok'
+  | 'not_configured'
+  | 'enrichment_failed'
+  | 'integration_credentials_unreadable'
+  | 'unsupported_indicator_type';
 
 interface IOCLookupResult {
   indicator: string;
   type: string;
-  reputation: 'malicious' | 'suspicious' | 'clean' | 'unknown';
+  reputation: string;
   confidence: number;
   sources: LookupSource[];
-  // Real enrichment hits from VirusTotal / AbuseIPDB when integrations
-  // are installed. The backend returns these under external_sources —
-  // they were previously declared but never rendered, so free VT data
-  // was silently dropped.
-  external_sources?: LookupSource[];
-  external_errors?: string[];
+  external_sources: LookupSource[];
+  external_errors: string[];
+  external_enrichment: ExternalEnrichmentState | string;
+  providers: ProviderOutcome[];
+  not_configured: string[];
   tags: string[];
   first_seen: string | null;
   last_seen: string | null;
+}
+
+// POST /threat-intel/indicators/{id}/enrich
+interface EnrichResult {
+  status: 'enriched' | ExternalEnrichmentState | string;
+  indicator_id: string;
+  checked_at: string;
+  providers: ProviderOutcome[];
+  external_sources: LookupSource[];
+  external_errors: string[];
+  not_configured: string[];
+}
+
+// GET /threat-intel/dashboard (IntelDashboardStats)
+interface IntelDashboard {
+  total_indicators: number;
+  active_indicators: number;
+  feeds_enabled: number;
+  feeds_total: number;
+  coverage_score: number;
+  coverage_basis: string | null;
+  feeds_polled_24h: number;
+  top_tags: string[];
+  top_tags_sample_size: number;
+}
+
+const ENRICHMENT_STATE_LABELS: Record<string, { label: string; cls: string }> = {
+  ok: { label: 'Enriched by at least one provider', cls: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400' },
+  enriched: { label: 'Enriched by at least one provider', cls: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400' },
+  not_configured: { label: 'Not configured: no provider API key for this indicator type', cls: 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300' },
+  enrichment_failed: { label: 'Enrichment failed: every configured provider returned an error', cls: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400' },
+  integration_credentials_unreadable: { label: 'Installed integration credentials cannot be read', cls: 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400' },
+  unsupported_indicator_type: { label: 'No external provider looks up this indicator type', cls: 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300' },
+};
+
+function EnrichmentStateBadge({ state }: { state: string }) {
+  const meta = ENRICHMENT_STATE_LABELS[state] ?? {
+    label: state,
+    cls: 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300',
+  };
+  return (
+    <span className={clsx('px-2 py-1 text-xs font-medium rounded', meta.cls)} title={state}>
+      {meta.label}
+    </span>
+  );
+}
+
+const PROVIDER_STATUS_CLS: Record<string, string> = {
+  ok: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400',
+  error: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400',
+  credentials_unreadable: 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400',
+};
+
+/** One row per provider: status, where the key came from, cache, and the backend's reason. */
+function ProviderTable({ providers }: { providers: ProviderOutcome[] }) {
+  if (providers.length === 0) {
+    return <p className="text-xs text-gray-500 dark:text-gray-400">The backend reported no providers.</p>;
+  }
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead className="bg-gray-50 dark:bg-gray-700/50">
+          <tr>
+            <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase">Provider</th>
+            <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase">Status</th>
+            <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase">Key source</th>
+            <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase">Cached</th>
+            <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase">Detail</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+          {providers.map((p) => (
+            <tr key={p.provider}>
+              <td className="px-3 py-2 font-medium text-gray-900 dark:text-white">{p.provider}</td>
+              <td className="px-3 py-2">
+                <span
+                  className={clsx(
+                    'px-2 py-0.5 text-xs font-medium rounded',
+                    PROVIDER_STATUS_CLS[p.status] ?? 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300'
+                  )}
+                >
+                  {p.status}
+                </span>
+              </td>
+              <td className="px-3 py-2 text-gray-600 dark:text-gray-300">{p.key_source ?? '—'}</td>
+              <td className="px-3 py-2 text-gray-600 dark:text-gray-300">{p.status === 'ok' ? (p.cached ? 'yes' : 'no') : '—'}</td>
+              <td className="px-3 py-2 text-xs text-gray-600 dark:text-gray-300 break-all">
+                {p.error ?? p.detail ?? '—'}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function verdictCls(verdict: string): string {
+  return verdict === 'malicious'
+    ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400'
+    : verdict === 'suspicious'
+    ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400'
+    : verdict === 'clean'
+    ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400'
+    : verdict === 'error'
+    ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400'
+    : 'bg-gray-100 text-gray-700 dark:bg-gray-600 dark:text-gray-300';
+}
+
+function saveBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 interface ThreatStats {
@@ -93,7 +227,17 @@ const indicatorTypeIcons: Record<string, typeof Server> = {
 };
 
 function IndicatorDetailContent({ indicatorId }: { indicatorId: string }) {
-  const { data, isLoading, error } = useQuery<{
+  const enrichMutation = useMutation<EnrichResult, unknown, void>({
+    mutationFn: async () => {
+      const response = await api.post(`/threat-intel/indicators/${indicatorId}/enrich`);
+      return response.data;
+    },
+    onSuccess: () => {
+      void refetch();
+    },
+  });
+
+  const { data, isLoading, error, refetch } = useQuery<{
     id: string;
     indicator_type: string;
     value: string;
@@ -170,6 +314,50 @@ function IndicatorDetailContent({ indicatorId }: { indicatorId: string }) {
           </div>
         </div>
       )}
+
+      <div className="pt-3 border-t border-gray-200 dark:border-gray-700 space-y-2">
+        <div className="flex items-center justify-between">
+          <span className="font-medium text-gray-700 dark:text-gray-300">External enrichment</span>
+          <button
+            onClick={() => enrichMutation.mutate()}
+            disabled={enrichMutation.isPending}
+            className="flex items-center gap-2 px-3 py-1.5 text-xs bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+          >
+            {enrichMutation.isPending ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+            Enrich now
+          </button>
+        </div>
+        <ActionErrorBanner what="enrich this indicator" error={enrichMutation.error} />
+        {enrichMutation.data && (
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <EnrichmentStateBadge state={enrichMutation.data.status} />
+              <span className="text-xs text-gray-500 dark:text-gray-400">
+                Checked {new Date(enrichMutation.data.checked_at).toLocaleString()}
+              </span>
+            </div>
+            {enrichMutation.data.not_configured.length > 0 && (
+              <p className="text-xs text-gray-600 dark:text-gray-400">
+                Not configured: {enrichMutation.data.not_configured.join(', ')}
+              </p>
+            )}
+            <ProviderTable providers={enrichMutation.data.providers} />
+            {enrichMutation.data.external_sources
+              .filter((s) => s.verdict !== 'error')
+              .map((s, idx) => (
+                <div key={idx} className="flex items-center justify-between text-xs">
+                  <span className="text-gray-900 dark:text-white">{s.name}</span>
+                  <span className={clsx('px-2 py-0.5 rounded font-medium', verdictCls(s.verdict))}>
+                    {s.verdict}{typeof s.confidence === 'number' ? ` (${s.confidence}%)` : ''}
+                  </span>
+                </div>
+              ))}
+            {enrichMutation.data.external_errors.map((err, idx) => (
+              <p key={idx} className="text-xs text-red-600 dark:text-red-400 break-all">{err}</p>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -182,6 +370,22 @@ export default function ThreatIntel() {
   const [iocReputationFilter, setIocReputationFilter] = useState('all');
   const [iocPage, setIocPage] = useState(1);
   const [selectedIndicatorId, setSelectedIndicatorId] = useState<string | null>(null);
+  const [iocTagsInput, setIocTagsInput] = useState('');
+  const [exportNotice, setExportNotice] = useState<string | null>(null);
+
+  const iocTags = useMemo(
+    () => iocTagsInput.split(',').map((t) => t.trim()).filter(Boolean),
+    [iocTagsInput]
+  );
+
+  const { data: dashboard, error: dashboardError } = useQuery<IntelDashboard>({
+    queryKey: ['threat-intel', 'dashboard'],
+    refetchInterval: 60_000,
+    queryFn: async () => {
+      const response = await api.get('/threat-intel/dashboard');
+      return response.data;
+    },
+  });
 
   const { data: stats, error: statsError } = useQuery<ThreatStats>({
     queryKey: ['threat-intel', 'stats'],
@@ -251,6 +455,62 @@ export default function ThreatIntel() {
     return params;
   }, [iocPage, iocTypeFilter, iocReputationFilter]);
 
+  // FastAPI reads repeated ?tags=a&tags=b; axios would send tags[]=, so
+  // build the query string explicitly.
+  const toSearchParams = (base: Record<string, string | number>, tags: string[]) => {
+    const sp = new URLSearchParams();
+    Object.entries(base).forEach(([k, v]) => sp.append(k, String(v)));
+    tags.forEach((t) => sp.append('tags', t));
+    return sp;
+  };
+
+  const exportMutation = useMutation<void, unknown, 'csv' | 'stix' | 'json'>({
+    mutationFn: async (format) => {
+      const sp = new URLSearchParams({ format });
+      if (iocTypeFilter !== 'all') sp.append('indicator_types', iocTypeFilter);
+      if (iocReputationFilter !== 'all') {
+        const sev =
+          iocReputationFilter === 'malicious' ? ['critical', 'high']
+          : iocReputationFilter === 'suspicious' ? ['medium']
+          : ['low', 'informational'];
+        sev.forEach((s) => sp.append('severity', s));
+      }
+      iocTags.forEach((t) => sp.append('tags', t));
+      if (format === 'csv') {
+        const response = await api.get('/threat-intel/export', { params: sp, responseType: 'blob' });
+        saveBlob(response.data as Blob, 'threat-indicators.csv');
+        const truncated = String(response.headers?.['x-pysoar-truncated'] ?? '') === 'true';
+        setExportNotice(
+          truncated
+            ? 'CSV downloaded. Truncated: the export cap was reached, so not every matching indicator is in the file.'
+            : 'CSV downloaded (complete, not truncated).'
+        );
+        return;
+      }
+      const response = await api.get('/threat-intel/export', { params: sp });
+      const body = response.data as Record<string, unknown>;
+      saveBlob(
+        new Blob([JSON.stringify(body, null, 2)], { type: 'application/json' }),
+        format === 'stix' ? 'threat-indicators.stix.json' : 'threat-indicators.json'
+      );
+      if (format === 'stix') {
+        const objects = Array.isArray(body.objects) ? body.objects.length : 0;
+        const skipped = Number(body.x_pysoar_skipped_untyped ?? 0);
+        setExportNotice(
+          `STIX 2.1 bundle downloaded: ${objects} indicator objects` +
+            (skipped > 0 ? `, ${skipped} skipped (no STIX pattern for their type)` : '') +
+            (body.x_pysoar_truncated === true ? '. Truncated: the export cap was reached.' : '.')
+        );
+      } else {
+        setExportNotice(
+          `JSON downloaded: ${Number(body.count ?? 0)} indicators` +
+            (body.truncated === true ? '. Truncated: the export cap was reached.' : ' (not truncated).')
+        );
+      }
+    },
+    onMutate: () => setExportNotice(null),
+  });
+
   const { data: iocData, isLoading: iocLoading, error: iocError } = useQuery<{
     items: Array<{
       id: string;
@@ -267,15 +527,17 @@ export default function ThreatIntel() {
     page: number;
     pages: number;
   }>({
-    queryKey: ['threat-intel', 'ioc-database', iocQueryParams],
+    queryKey: ['threat-intel', 'ioc-database', iocQueryParams, iocTags],
     queryFn: async () => {
-      const response = await api.get('/threat-intel/indicators', { params: iocQueryParams });
+      const response = await api.get('/threat-intel/indicators', {
+        params: toSearchParams(iocQueryParams, iocTags),
+      });
       return response.data;
     },
     enabled: activeTab === 'iocs',
   });
 
-  const lookupMutation = useMutation<IOCLookupResult, Error, { indicator: string; type: string }>({
+  const lookupMutation = useMutation<IOCLookupResult, unknown, { indicator: string; type: string }>({
     mutationFn: async ({ indicator, type }) => {
       const response = await api.post('/threat-intel/lookup', { indicator, type });
       return response.data;
@@ -397,6 +659,47 @@ export default function ThreatIntel() {
           </div>
         </div>
       </div>
+
+      {/* Feed coverage (GET /threat-intel/dashboard) */}
+      <LoadErrorBanner what="threat intel dashboard" error={dashboardError} />
+      {dashboard && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
+            <p className="text-sm text-gray-500 dark:text-gray-400">Feed coverage</p>
+            <p className="text-xl font-semibold text-gray-900 dark:text-white">
+              {dashboard.feeds_enabled > 0 ? `${dashboard.coverage_score}%` : 'Not available'}
+            </p>
+            <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+              {dashboard.feeds_enabled > 0
+                ? `${dashboard.feeds_polled_24h} of ${dashboard.feeds_enabled} enabled feeds polled in the last 24h`
+                : 'No enabled feeds, so there is nothing to measure'}
+              {dashboard.coverage_basis ? ` — basis: ${dashboard.coverage_basis}` : ''}
+            </p>
+          </div>
+          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
+            <p className="text-sm text-gray-500 dark:text-gray-400">Top tags</p>
+            {dashboard.top_tags.length > 0 ? (
+              <div className="flex flex-wrap gap-1 mt-1">
+                {dashboard.top_tags.map((tag) => (
+                  <button
+                    key={tag}
+                    onClick={() => { setIocTagsInput(tag); setIocPage(1); setActiveTab('iocs'); }}
+                    title="Filter the IOC database by this tag"
+                    className="px-2 py-0.5 text-xs bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 rounded hover:bg-gray-200 dark:hover:bg-gray-600"
+                  >
+                    {tag}
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">No tags on the sampled indicators</p>
+            )}
+            <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+              Counted over the newest {dashboard.top_tags_sample_size.toLocaleString()} indicators
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="border-b border-gray-200 dark:border-gray-700">
@@ -552,13 +855,18 @@ export default function ThreatIntel() {
                 )}
               </div>
 
-              {/* Sources */}
+              {/* Local sources (own + platform intel) */}
               <div className="p-6">
                 <h4 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-4">
-                  Intelligence Sources ({lookupMutation.data?.sources?.length})
+                  Local Intelligence Matches ({lookupMutation.data.sources.length})
                 </h4>
+                {lookupMutation.data.sources.length === 0 && (
+                  <p className="text-sm text-gray-500 dark:text-gray-400">
+                    No indicator with this value in your intel or the platform intel.
+                  </p>
+                )}
                 <div className="space-y-3">
-                  {lookupMutation.data?.sources?.map((source, idx) => (
+                  {lookupMutation.data.sources.map((source, idx) => (
                     <div
                       key={idx}
                       className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg"
@@ -566,26 +874,18 @@ export default function ThreatIntel() {
                       <div className="flex items-center gap-3">
                         <Shield className="w-5 h-5 text-gray-400" />
                         <div>
-                          <p className="text-sm font-medium text-gray-900 dark:text-white">
+                          <p className="text-sm font-medium text-gray-900 dark:text-white flex items-center gap-2">
                             {source.name}
+                            <span className="px-1.5 py-0.5 text-[10px] uppercase rounded bg-gray-200 dark:bg-gray-600 text-gray-600 dark:text-gray-300">
+                              {source.platform_intel ? 'Platform intel' : 'Your intel'}
+                            </span>
                           </p>
                           <p className="text-xs text-gray-500 dark:text-gray-400">
-                            Last seen: {new Date(source.last_seen || "").toLocaleDateString()}
+                            Last seen: {source.last_seen ? new Date(source.last_seen).toLocaleDateString() : 'Not recorded'}
                           </p>
                         </div>
                       </div>
-                      <span
-                        className={clsx(
-                          'px-2 py-1 text-xs font-medium rounded',
-                          source.verdict === 'malicious'
-                            ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400'
-                            : source.verdict === 'suspicious'
-                            ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400'
-                            : source.verdict === 'clean'
-                            ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400'
-                            : 'bg-gray-100 text-gray-700 dark:bg-gray-600 dark:text-gray-300'
-                        )}
-                      >
+                      <span className={clsx('px-2 py-1 text-xs font-medium rounded', verdictCls(source.verdict))}>
                         {source.verdict}
                       </span>
                     </div>
@@ -593,17 +893,22 @@ export default function ThreatIntel() {
                 </div>
               </div>
 
-              {/* External enrichment (VirusTotal, AbuseIPDB, etc.) —
-                  only rendered when the installed integrations actually
-                  returned data, so the panel is honest about coverage. */}
-              {((lookupMutation.data?.external_sources?.length ?? 0) > 0 ||
-                (lookupMutation.data?.external_errors?.length ?? 0) > 0) && (
-                <div className="p-6 border-t border-gray-200 dark:border-gray-700">
-                  <h4 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-4">
-                    External Enrichment ({lookupMutation.data?.external_sources?.length ?? 0})
-                  </h4>
-                  <div className="space-y-3">
-                    {lookupMutation.data?.external_sources?.map((source, idx) => (
+              {/* External enrichment: state, per-provider outcomes, answers */}
+              <div className="p-6 border-t border-gray-200 dark:border-gray-700 space-y-4">
+                <div className="flex flex-wrap items-center gap-3">
+                  <h4 className="text-sm font-medium text-gray-700 dark:text-gray-300">External Enrichment</h4>
+                  <EnrichmentStateBadge state={lookupMutation.data.external_enrichment} />
+                </div>
+                {lookupMutation.data.not_configured.length > 0 && (
+                  <p className="text-xs text-gray-600 dark:text-gray-400">
+                    Not configured: {lookupMutation.data.not_configured.join(', ')} (see the Detail column for the key each one needs)
+                  </p>
+                )}
+                <ProviderTable providers={lookupMutation.data.providers} />
+                <div className="space-y-3">
+                  {lookupMutation.data.external_sources.map((source, idx) => {
+                    const details = source.details ?? source.raw;
+                    return (
                       <div
                         key={`ext-${idx}`}
                         className="p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-100 dark:border-blue-900 rounded-lg"
@@ -611,57 +916,42 @@ export default function ThreatIntel() {
                         <div className="flex items-center justify-between">
                           <p className="text-sm font-medium text-gray-900 dark:text-white">
                             {source.name}
+                            <span className="ml-2 text-xs font-normal text-gray-500 dark:text-gray-400">
+                              key: {source.key_source ?? 'unknown'}
+                              {source.verdict !== 'error' ? (source.cached ? ' · cached result' : ' · live result') : ''}
+                            </span>
                           </p>
-                          <span
-                            className={clsx(
-                              'px-2 py-1 text-xs font-medium rounded',
-                              source.verdict === 'malicious'
-                                ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400'
-                                : source.verdict === 'suspicious'
-                                ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400'
-                                : source.verdict === 'clean'
-                                ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400'
-                                : 'bg-gray-100 text-gray-700 dark:bg-gray-600 dark:text-gray-300'
-                            )}
-                          >
+                          <span className={clsx('px-2 py-1 text-xs font-medium rounded', verdictCls(source.verdict))}>
                             {source.verdict}
+                            {source.verdict !== 'error' && typeof source.confidence === 'number' ? ` (${source.confidence}%)` : ''}
                           </span>
                         </div>
-                        {source.raw && Object.keys(source.raw).length > 0 && (
+                        {details && Object.keys(details).length > 0 && (
                           <pre className="mt-2 text-xs text-gray-600 dark:text-gray-400 whitespace-pre-wrap break-all">
-                            {JSON.stringify(source.raw, null, 2)}
+                            {JSON.stringify(details, null, 2)}
                           </pre>
                         )}
                         {source.error && (
                           <p className="mt-2 text-xs text-red-600 dark:text-red-400 break-all">{source.error}</p>
                         )}
                       </div>
-                    ))}
-                    {lookupMutation.data?.external_errors?.map((err: string, idx: number) => (
-                      <div
-                        key={`err-${idx}`}
-                        className="p-3 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-100 dark:border-yellow-900 rounded-lg text-xs text-yellow-800 dark:text-yellow-300"
-                      >
-                        {err}
-                      </div>
-                    ))}
-                  </div>
+                    );
+                  })}
+                  {lookupMutation.data.external_errors.map((err, idx) => (
+                    <div
+                      key={`err-${idx}`}
+                      className="p-3 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-100 dark:border-yellow-900 rounded-lg text-xs text-yellow-800 dark:text-yellow-300"
+                    >
+                      {err}
+                    </div>
+                  ))}
                 </div>
-              )}
+              </div>
             </div>
           )}
 
           {/* Error State */}
-          {lookupMutation.isError && (
-            <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-4">
-              <div className="flex items-center gap-3">
-                <XCircle className="w-5 h-5 text-red-600 dark:text-red-400" />
-                <p className="text-sm text-red-700 dark:text-red-300">
-                  Failed to lookup indicator. {describeLoadError(lookupMutation.error)}
-                </p>
-              </div>
-            </div>
-          )}
+          <ActionErrorBanner what="look up this indicator" error={lookupMutation.error} />
         </div>
       )}
 
@@ -746,6 +1036,12 @@ export default function ThreatIntel() {
       {activeTab === 'iocs' && (
         <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
           <LoadErrorBanner what="IOC database" error={iocError} />
+          <div className="px-4 pt-2 space-y-2">
+            <ActionErrorBanner what="export indicators" error={exportMutation.error} />
+            {exportNotice && (
+              <p className="text-sm text-gray-700 dark:text-gray-300">{exportNotice}</p>
+            )}
+          </div>
           <div className="p-4 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between">
             <h3 className="font-medium text-gray-900 dark:text-white">IOC Database</h3>
             <div className="flex items-center gap-2">
@@ -772,26 +1068,29 @@ export default function ThreatIntel() {
                 <option value="suspicious">Suspicious</option>
                 <option value="clean">Clean</option>
               </select>
-              <button
-                onClick={() => {
-                  const items = iocData?.items || [];
-                  if (items.length === 0) return;
-                  const headers = ['Indicator', 'Type', 'Severity', 'Source', 'Last Seen'];
-                  const rows = items.map((i) => [i.value, i.indicator_type, i.severity || '', i.source || '', i.last_seen || '']);
-                  const csv = [headers.join(','), ...rows.map((r) => r.map((c) => `"${c}"`).join(','))].join('\n');
-                  const blob = new Blob([csv], { type: 'text/csv' });
-                  const url = URL.createObjectURL(blob);
-                  const a = document.createElement('a');
-                  a.href = url;
-                  a.download = 'ioc-export.csv';
-                  a.click();
-                  URL.revokeObjectURL(url);
-                }}
-                className="flex items-center gap-2 px-3 py-1.5 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg"
-              >
-                <Download className="w-4 h-4" />
-                Export
-              </button>
+              <input
+                type="text"
+                value={iocTagsInput}
+                onChange={(e) => { setIocTagsInput(e.target.value); setIocPage(1); }}
+                placeholder="Tags (comma-separated, all must match)"
+                className="text-sm border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 rounded-lg px-3 py-1.5 text-gray-700 dark:text-gray-300 w-64"
+              />
+              {(['csv', 'stix', 'json'] as const).map((fmt) => (
+                <button
+                  key={fmt}
+                  onClick={() => exportMutation.mutate(fmt)}
+                  disabled={exportMutation.isPending}
+                  title="Server export of active indicators matching the type, reputation and tag filters"
+                  className="flex items-center gap-2 px-3 py-1.5 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg disabled:opacity-50"
+                >
+                  {exportMutation.isPending && exportMutation.variables === fmt ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Download className="w-4 h-4" />
+                  )}
+                  {fmt === 'stix' ? 'STIX 2.1' : fmt.toUpperCase()}
+                </button>
+              ))}
             </div>
           </div>
           <div className="overflow-x-auto">

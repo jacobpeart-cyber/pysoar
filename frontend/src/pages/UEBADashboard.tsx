@@ -1,5 +1,5 @@
 import { useState, FormEvent } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/api';
 import {
   Users,
@@ -12,10 +12,13 @@ import {
   X,
   Loader2,
   ArrowUpRight,
+  Database,
+  Play,
 } from 'lucide-react';
 import { XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar } from 'recharts';
 import clsx from 'clsx';
 import LoadErrorBanner from '../components/LoadErrorBanner';
+import ActionErrorBanner from '../components/ActionErrorBanner';
 
 // UEBADashboardStats (src/schemas/ueba.py)
 interface UEBADashboard {
@@ -29,6 +32,29 @@ interface UEBADashboard {
   anomalies_last_7d: number;
   anomalies_last_30d: number;
   updated_at: string;
+  // Every entity with risk_score >= 70 (high_risk_entities is only the top 10).
+  high_risk_entity_count: number;
+  siem_bridge?: SiemBridgeStatus | null;
+}
+
+// SiemBridgeStatus (src/schemas/ueba.py; src/ueba/siem_bridge.py cursor_status)
+interface SiemBridgeStatus {
+  consumer: string;
+  // never_run, ok, partial (per-run cap deferred rows), idle, failed
+  status: string;
+  last_run_at?: string | null;
+  last_received_at?: string | null;
+  rows_processed_total: number;
+  last_run_rows: number;
+  last_error?: string | null;
+  last_run_summary: Record<string, unknown>;
+}
+
+// POST /ueba/siem-bridge/run (src/ueba/siem_bridge.py run_bridge_for_org)
+interface SiemBridgeRunResult {
+  organization_id: string;
+  status: string;
+  [key: string]: unknown;
 }
 
 // HighRiskEntity (src/schemas/ueba.py): the dashboard's top-10 projection.
@@ -40,6 +66,9 @@ interface HighRiskEntity {
   risk_level: 'critical' | 'high' | 'medium' | 'low';
   latest_alert?: string | null;
   last_anomaly_at?: string | null;
+  display_name?: string | null;
+  anomaly_count_30d: number;
+  last_activity_at?: string | null;
 }
 
 // EntityProfileResponse: there is no `name`; display_name is optional and
@@ -126,6 +155,7 @@ export default function UEBADashboard() {
   const [riskLevelFilter, setRiskLevelFilter] = useState('all');
   const [expandedEntity, setExpandedEntity] = useState<string | null>(null);
   const [escalateAlert, setEscalateAlert] = useState<RiskAlert | null>(null);
+  const [actionError, setActionError] = useState<{ what: string; error: unknown } | null>(null);
 
   // Fetch UEBA dashboard
   const { data: dashboard, error: dashboardError } = useQuery({
@@ -193,7 +223,7 @@ export default function UEBADashboard() {
             return (
               <button
                 key={tab.id}
-                onClick={() => setActiveTab(tab.id as any)}
+                onClick={() => { setActiveTab(tab.id as any); setActionError(null); }}
                 className={clsx(
                   'px-4 py-3 border-b-2 font-medium text-sm transition-colors flex items-center gap-2',
                   activeTab === tab.id
@@ -223,11 +253,8 @@ export default function UEBADashboard() {
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
               <p className="text-gray-600 dark:text-gray-400 text-sm">High-Risk Entities</p>
-              <p className="text-3xl font-bold text-red-600 dark:text-red-400 mt-2">{Array.isArray(dashboard?.risk_distribution)
-                ? dashboard.risk_distribution
-                    .filter((r) => r.level === 'critical' || r.level === 'high')
-                    .reduce((sum, r) => sum + r.count, 0)
-                : 'not available'}</p>
+              <p className="text-3xl font-bold text-red-600 dark:text-red-400 mt-2">{dashboard?.high_risk_entity_count ?? 'not available'}</p>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">Risk score 70 or higher</p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
               <p className="text-gray-600 dark:text-gray-400 text-sm">Alerts (7d)</p>
@@ -238,6 +265,32 @@ export default function UEBADashboard() {
               <p className="text-3xl font-bold text-blue-600 dark:text-blue-400 mt-2">{dashboard?.anomalies_last_7d ?? 'not available'}</p>
             </div>
           </div>
+
+          <SiemBridgePanel
+            dashboardStatus={dashboard?.siem_bridge ?? null}
+            onRan={() => {
+              queryClient.invalidateQueries({ queryKey: ['uebaDashboard'] });
+              queryClient.invalidateQueries({ queryKey: ['ueba-entities'] });
+              queryClient.invalidateQueries({ queryKey: ['ueba-alerts'] });
+            }}
+          />
+
+          {/* Alert Distribution by severity */}
+          {Array.isArray(dashboard?.alert_distribution) && dashboard.alert_distribution.length > 0 && (
+            <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
+              <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Alerts by Severity</h3>
+              <div className="flex flex-wrap gap-4">
+                {dashboard.alert_distribution.map((a) => (
+                  <div key={a.severity} className="px-4 py-2 rounded-lg bg-gray-50 dark:bg-gray-700">
+                    <p className={clsx('text-sm font-medium capitalize', severityColors[a.severity as keyof typeof severityColors] ?? 'text-gray-700 dark:text-gray-300')}>
+                      {a.severity}
+                    </p>
+                    <p className="text-2xl font-bold text-gray-900 dark:text-white">{a.count}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* Risk Distribution Chart */}
           {Array.isArray(dashboard?.risk_distribution) && dashboard.risk_distribution.length > 0 && (
@@ -266,6 +319,11 @@ export default function UEBADashboard() {
           <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
             <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
               <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Top 10 Highest Risk Entities</h3>
+              {dashboard && (
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                  Showing {dashboard.high_risk_entities?.length ?? 0} of {dashboard.high_risk_entity_count} entities with risk score 70 or higher
+                </p>
+              )}
             </div>
             <table className="w-full">
               <thead>
@@ -274,14 +332,21 @@ export default function UEBADashboard() {
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Type</th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Risk Score</th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Level</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Anomalies (30d)</th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Latest Alert</th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Last Anomaly</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Last Activity</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
                 {(Array.isArray(dashboard?.high_risk_entities) && dashboard.high_risk_entities.length > 0) ? dashboard.high_risk_entities.slice(0, 10).map((entity) => (
                   <tr key={entity.id} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
-                    <td className="px-6 py-4 font-medium text-gray-900 dark:text-white">{entity.entity_id || '—'}</td>
+                    <td className="px-6 py-4 font-medium text-gray-900 dark:text-white">
+                      {entityLabel(entity) || '—'}
+                      {entity.display_name && entity.entity_id && entity.display_name !== entity.entity_id && (
+                        <p className="text-xs font-normal text-gray-500 dark:text-gray-400">{entity.entity_id}</p>
+                      )}
+                    </td>
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 capitalize">{entity.entity_type ?? '—'}</td>
                     <td className="px-6 py-4">
                       <div className="flex items-center gap-2">
@@ -304,15 +369,19 @@ export default function UEBADashboard() {
                         </span>
                       ) : '—'}
                     </td>
+                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{entity.anomaly_count_30d ?? '—'}</td>
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{entity.latest_alert || '—'}</td>
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
                       {entity.last_anomaly_at ? new Date(entity.last_anomaly_at).toLocaleString() : '—'}
                     </td>
+                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
+                      {entity.last_activity_at ? new Date(entity.last_activity_at).toLocaleString() : '—'}
+                    </td>
                   </tr>
                 )) : (
                   <tr>
-                    <td colSpan={6} className="px-6 py-8 text-center text-gray-500 dark:text-gray-400">
-                      No high-risk entities found.
+                    <td colSpan={8} className="px-6 py-8 text-center text-gray-500 dark:text-gray-400">
+                      {dashboardError ? 'High-risk entities not available.' : dashboard === undefined ? 'Loading...' : 'No entities with risk score 70 or higher.'}
                     </td>
                   </tr>
                 )}
@@ -401,7 +470,7 @@ export default function UEBADashboard() {
                         <span className="text-sm font-medium text-gray-900 dark:text-white">{(entity.risk_score ?? 0).toFixed(0)}</span>
                       </div>
                     </td>
-                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{entity.anomaly_count_30d ?? 0}</td>
+                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{entity.anomaly_count_30d ?? '—'}</td>
                     <td className="px-6 py-4">
                       {entity.is_watched && (
                         <Eye className="w-5 h-5 text-blue-600 dark:text-blue-400" />
@@ -425,6 +494,7 @@ export default function UEBADashboard() {
       )}
 
       {/* Risk Alerts Tab */}
+      {actionError && <ActionErrorBanner what={actionError.what} error={actionError.error} />}
       {activeTab === 'alerts' && <LoadErrorBanner what="risk alerts" error={alertsError} />}
       {activeTab === 'alerts' && (
         <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
@@ -472,7 +542,7 @@ export default function UEBADashboard() {
                           await api.put(`/ueba/alerts/${alert.id}/status`, { status: 'investigating' });
                           queryClient.invalidateQueries({ queryKey: ['ueba-alerts'] });
                         } catch (err) {
-                          console.error('Failed to update alert status:', err);
+                          setActionError({ what: 'mark the alert as investigating', error: err });
                         }
                       }}
                       className="text-xs px-2 py-1 rounded bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 hover:bg-blue-100 dark:hover:bg-blue-900/40 transition-colors"
@@ -509,7 +579,7 @@ export default function UEBADashboard() {
                 await api.post('/ueba/peer-groups/auto-cluster');
                 queryClient.invalidateQueries({ queryKey: ['ueba-peer-groups'] });
               } catch (err) {
-                console.error('Failed to auto-cluster peer groups:', err);
+                setActionError({ what: 'auto-cluster peer groups', error: err });
               }
             }}
             className="px-4 py-2 rounded-lg bg-purple-600 dark:bg-purple-700 text-white hover:bg-purple-700 dark:hover:bg-purple-600 font-medium transition-colors"
@@ -561,6 +631,167 @@ export default function UEBADashboard() {
             queryClient.invalidateQueries({ queryKey: ['incidents'] });
           }}
         />
+      )}
+    </div>
+  );
+}
+
+const BRIDGE_STATUS_TEXT: Record<string, { label: string; reason: string; cls: string }> = {
+  never_run: {
+    label: 'Never run',
+    reason: 'The bridge has not read any stored SIEM log entries for this organisation yet.',
+    cls: 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300',
+  },
+  ok: {
+    label: 'OK',
+    reason: 'The last run read new log entries and folded them into UEBA entities.',
+    cls: 'bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-300',
+  },
+  partial: {
+    label: 'Partial',
+    reason: 'The last run hit its per-run cap; the remaining log rows are read by the next run.',
+    cls: 'bg-yellow-50 dark:bg-yellow-900/20 text-yellow-700 dark:text-yellow-300',
+  },
+  idle: {
+    label: 'Idle',
+    reason: 'The last run found no new stored log entries to read.',
+    cls: 'bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-300',
+  },
+  failed: {
+    label: 'Failed',
+    reason: 'The last run failed; see the error below.',
+    cls: 'bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300',
+  },
+};
+
+const humanKey = (k: string) => k.replace(/_/g, ' ');
+
+const renderSummaryValue = (v: unknown): string => {
+  if (v === null || v === undefined) return '—';
+  if (typeof v === 'boolean') return v ? 'yes' : 'no';
+  if (typeof v === 'object') return JSON.stringify(v);
+  return String(v);
+};
+
+// Where UEBA's entities come from: the job that reads stored SIEM log entries
+// (GET /ueba/siem-bridge/status) and an admin "Run now" (POST /ueba/siem-bridge/run).
+function SiemBridgePanel({
+  dashboardStatus,
+  onRan,
+}: {
+  dashboardStatus: SiemBridgeStatus | null;
+  onRan: () => void;
+}) {
+  const queryClient = useQueryClient();
+  const { data: statusData, error: statusError } = useQuery({
+    queryKey: ['ueba-siem-bridge-status'],
+    queryFn: async () => (await api.get<SiemBridgeStatus>('/ueba/siem-bridge/status')).data,
+  });
+  const runMutation = useMutation({
+    mutationFn: async () => (await api.post<SiemBridgeRunResult>('/ueba/siem-bridge/run')).data,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['ueba-siem-bridge-status'] });
+      onRan();
+    },
+  });
+  const status = statusData ?? dashboardStatus;
+  const meta = status ? BRIDGE_STATUS_TEXT[status.status] : undefined;
+  const summaryEntries = Object.entries(status?.last_run_summary ?? {});
+  const runResult = runMutation.data;
+
+  return (
+    <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6 space-y-4">
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex items-center gap-2">
+          <Database className="w-5 h-5 text-purple-600 dark:text-purple-400" />
+          <div>
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white">SIEM Bridge</h3>
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              Builds UEBA entities, hourly baselines and anomaly alerts from stored SIEM log entries.
+            </p>
+          </div>
+        </div>
+        <button
+          onClick={() => runMutation.mutate()}
+          disabled={runMutation.isPending}
+          className="px-3 py-2 rounded-lg bg-purple-600 text-white text-sm font-medium hover:bg-purple-700 disabled:opacity-50 inline-flex items-center gap-2"
+        >
+          {runMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+          Run now
+        </button>
+      </div>
+
+      <LoadErrorBanner what="the SIEM bridge status" error={statusError} />
+      <ActionErrorBanner what="run the SIEM bridge" error={runMutation.error} />
+
+      {status ? (
+        <>
+          <div className="flex flex-wrap items-center gap-2 text-sm">
+            <span className={clsx('px-2 py-0.5 rounded-full text-xs font-medium', meta?.cls ?? 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300')}>
+              {meta?.label ?? status.status}
+            </span>
+            <span className="text-gray-600 dark:text-gray-400">{meta?.reason ?? `Bridge state: ${status.status}`}</span>
+          </div>
+          <dl className="grid grid-cols-2 md:grid-cols-3 gap-3 text-sm">
+            <div>
+              <dt className="text-xs text-gray-500 dark:text-gray-400">Consumer</dt>
+              <dd className="text-gray-900 dark:text-white font-mono">{status.consumer}</dd>
+            </div>
+            <div>
+              <dt className="text-xs text-gray-500 dark:text-gray-400">Last run</dt>
+              <dd className="text-gray-900 dark:text-white">{status.last_run_at ? new Date(status.last_run_at).toLocaleString() : 'Never'}</dd>
+            </div>
+            <div>
+              <dt className="text-xs text-gray-500 dark:text-gray-400">Read up to (log received at)</dt>
+              <dd className="text-gray-900 dark:text-white">{status.last_received_at ? new Date(status.last_received_at).toLocaleString() : '—'}</dd>
+            </div>
+            <div>
+              <dt className="text-xs text-gray-500 dark:text-gray-400">Rows in last run</dt>
+              <dd className="text-gray-900 dark:text-white">{status.last_run_rows}</dd>
+            </div>
+            <div>
+              <dt className="text-xs text-gray-500 dark:text-gray-400">Rows processed (total)</dt>
+              <dd className="text-gray-900 dark:text-white">{status.rows_processed_total}</dd>
+            </div>
+          </dl>
+          {status.last_error && (
+            <p className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 rounded p-2">
+              Last error: {status.last_error}
+            </p>
+          )}
+          {summaryEntries.length > 0 && (
+            <div>
+              <p className="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase mb-1">Last run summary</p>
+              <dl className="grid grid-cols-2 md:grid-cols-5 gap-2 text-sm">
+                {summaryEntries.map(([k, v]) => (
+                  <div key={k} className="p-2 rounded bg-gray-50 dark:bg-gray-700">
+                    <dt className="text-xs text-gray-500 dark:text-gray-400 capitalize">{humanKey(k)}</dt>
+                    <dd className="text-gray-900 dark:text-white font-medium">{renderSummaryValue(v)}</dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
+          )}
+        </>
+      ) : !statusError && (
+        <p className="text-sm text-gray-500 dark:text-gray-400">Loading bridge status...</p>
+      )}
+
+      {runResult && (
+        <div className="text-sm rounded border border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-900/20 p-3">
+          <p className="font-medium text-green-800 dark:text-green-300">
+            Run finished: {BRIDGE_STATUS_TEXT[runResult.status]?.label ?? runResult.status}
+          </p>
+          <ul className="mt-1 grid grid-cols-2 md:grid-cols-4 gap-x-4 text-green-900 dark:text-green-200">
+            {Object.entries(runResult)
+              .filter(([k]) => k !== 'organization_id' && k !== 'status')
+              .map(([k, v]) => (
+                <li key={k}>
+                  <span className="capitalize">{humanKey(k)}</span>: {renderSummaryValue(v)}
+                </li>
+              ))}
+          </ul>
+        </div>
       )}
     </div>
   );

@@ -20,9 +20,170 @@ import clsx from 'clsx';
 import { darkwebApi } from '../api/endpoints';
 import { api } from '../api/client';
 import LoadErrorBanner from '../components/LoadErrorBanner';
+import ActionErrorBanner from '../components/ActionErrorBanner';
 import { describeLoadError } from '../lib/loadError';
 
 const NA = 'not available';
+
+const splitList = (v: string): string[] => v.split(',').map((k) => k.trim()).filter(Boolean);
+const asStringList = (v: unknown): string[] =>
+  Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+
+// POST /darkweb/monitors/{id}/trigger-scan (ScanStatusResponse)
+interface ScanSourceEntry {
+  label?: string;
+  status?: string; // ok | not_configured | error | skipped
+  checked?: number;
+  matched?: number;
+  error?: string;
+  reason?: string;
+  [k: string]: unknown;
+}
+interface ScanResult {
+  scan_id: string;
+  status: string; // completed | no_terms
+  start_time: string;
+  completion_time: string | null;
+  findings: number; // matched
+  new_findings: number; // created
+  detail: string | null;
+  terms_searched: string[];
+  sources: Record<string, ScanSourceEntry>;
+  skipped_duplicate: number;
+  credential_leaks_created: number;
+  critical_fired: number;
+}
+
+// GET /darkweb/dashboard (DarkWebDashboard), fields this page reads.
+interface DarkWebDashboardData {
+  scan_frequency: string;
+  scan_interval_minutes: number | null;
+  sources: Record<string, { label: string; configured: boolean; requires: string | null }>;
+  source_platform_labels: Record<string, string>;
+}
+
+// POST /darkweb/credentials/bulk-remediate (CredentialRemediationReport)
+interface RemediationReport {
+  total_affected: number;
+  recorded: number;
+  execution: string;
+  detail: string | null;
+  remediation_date: string;
+}
+
+const FINDING_TYPE_LABELS: Record<string, string> = {
+  threat_feed_match: 'Threat intel feed match',
+};
+
+const SCAN_STATUS_CLS: Record<string, string> = {
+  ok: 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-100',
+  not_configured: 'bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-100',
+  error: 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-100',
+  skipped: 'bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-100',
+};
+
+/** The backend's own explanation inside an HTTP error body ({detail: {detail}}). */
+const backendDetail = (err: unknown): string | null => {
+  const data = (err as { response?: { data?: { detail?: unknown } } })?.response?.data;
+  const d = data?.detail;
+  if (typeof d === 'string') return d;
+  if (d && typeof d === 'object' && typeof (d as Record<string, unknown>).detail === 'string') {
+    return (d as Record<string, string>).detail;
+  }
+  return null;
+};
+const httpStatus = (err: unknown): number | undefined =>
+  (err as { response?: { status?: number } })?.response?.status;
+
+function ScanResultPanel({ result }: { result: ScanResult }) {
+  return (
+    <div className="mt-3 border-t border-gray-200 dark:border-gray-700 pt-3 text-sm space-y-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="font-medium">Last scan: {result.status}</span>
+        <span className="text-gray-600 dark:text-gray-400">
+          {fmtDate(result.start_time)}{result.completion_time ? ` → ${fmtDate(result.completion_time)}` : ''}
+        </span>
+      </div>
+      {result.detail && <p className="text-gray-700 dark:text-gray-300">{result.detail}</p>}
+      {result.status !== 'no_terms' && (
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-xs">
+          <div><p className="text-gray-500 dark:text-gray-400">Matched</p><p className="font-semibold">{result.findings}</p></div>
+          <div><p className="text-gray-500 dark:text-gray-400">New findings created</p><p className="font-semibold">{result.new_findings}</p></div>
+          <div><p className="text-gray-500 dark:text-gray-400">Skipped (duplicates)</p><p className="font-semibold">{result.skipped_duplicate}</p></div>
+          <div><p className="text-gray-500 dark:text-gray-400">Credential leaks created</p><p className="font-semibold">{result.credential_leaks_created}</p></div>
+          <div><p className="text-gray-500 dark:text-gray-400">Critical automations fired</p><p className="font-semibold">{result.critical_fired}</p></div>
+        </div>
+      )}
+      {result.terms_searched.length > 0 && (
+        <p className="text-xs text-gray-600 dark:text-gray-400">
+          Terms searched: <span className="font-mono">{result.terms_searched.join(', ')}</span>
+        </p>
+      )}
+      {Object.keys(result.sources).length > 0 && (
+        <ul className="space-y-1 text-xs">
+          {Object.entries(result.sources).map(([key, src]) => {
+            const why = src.error ?? src.reason;
+            return (
+              <li key={key} className="flex flex-wrap items-start gap-2">
+                <span className={clsx('px-2 py-0.5 rounded font-medium', SCAN_STATUS_CLS[src.status ?? ''] ?? SCAN_STATUS_CLS.not_configured)}>
+                  {src.status ?? 'unknown'}
+                </span>
+                <span className="flex-1">
+                  {src.label ?? key}
+                  {typeof src.checked === 'number' ? ` · checked ${src.checked}` : ''}
+                  {typeof src.matched === 'number' ? ` · matched ${src.matched}` : ''}
+                  {why ? <span className="text-gray-600 dark:text-gray-400"> — {String(why)}</span> : null}
+                </span>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/** affected_assets: {source, matched_terms, email|domain|url|...} */
+function AffectedAssets({ assets }: { assets: unknown }) {
+  if (Array.isArray(assets)) {
+    if (assets.length === 0) return <span className="text-xs text-gray-500 dark:text-gray-400">None recorded</span>;
+    return (
+      <div className="flex flex-wrap gap-2">
+        {assets.map((a, idx) => (
+          <span key={idx} className="px-2 py-1 bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-100 rounded text-xs">{String(a)}</span>
+        ))}
+      </div>
+    );
+  }
+  if (!assets || typeof assets !== 'object') {
+    return <span className="text-xs text-gray-500 dark:text-gray-400">None recorded</span>;
+  }
+  const rec = assets as Record<string, unknown>;
+  const matched = asStringList(rec.matched_terms);
+  const rest = Object.entries(rec).filter(([k]) => k !== 'source' && k !== 'matched_terms');
+  return (
+    <div className="space-y-1 text-xs">
+      {typeof rec.source === 'string' && (
+        <p><span className="text-gray-600 dark:text-gray-400">Source:</span> {rec.source}</p>
+      )}
+      {matched.length > 0 && (
+        <p>
+          <span className="text-gray-600 dark:text-gray-400">Matched terms:</span>{' '}
+          <span className="font-mono">{matched.join(', ')}</span>
+        </p>
+      )}
+      {rest.length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {rest.map(([k, v]) => (
+            <span key={k} className="px-2 py-1 bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-100 rounded break-all">
+              {k}: {Array.isArray(v) ? v.map(String).join(', ') : typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v)}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 const fmtDate = (v: unknown): string => {
   if (!v) return NA;
@@ -106,6 +267,69 @@ export default function DarkWebMonitor() {
   const [selectedCredential, setSelectedCredential] = useState<any | null>(null);
   const [newMonitorName, setNewMonitorName] = useState('');
   const [newMonitorKeywords, setNewMonitorKeywords] = useState('');
+  const [newMonitorDomains, setNewMonitorDomains] = useState('');
+  const [newMonitorEmails, setNewMonitorEmails] = useState('');
+  const [createError, setCreateError] = useState<unknown>(null);
+  const [editError, setEditError] = useState<unknown>(null);
+  const [dashboard, setDashboard] = useState<DarkWebDashboardData | null>(null);
+  const [dashboardError, setDashboardError] = useState<unknown>(null);
+  const [scanType, setScanType] = useState<'full' | 'quick'>('full');
+  const [scanningId, setScanningId] = useState<string | null>(null);
+  const [scanResults, setScanResults] = useState<Record<string, ScanResult>>({});
+  const [scanErrors, setScanErrors] = useState<Record<string, unknown>>({});
+  const [takedownErrors, setTakedownErrors] = useState<Record<string, unknown>>({});
+  const [selectedCredIds, setSelectedCredIds] = useState<string[]>([]);
+  const [remediationAction, setRemediationAction] = useState('password_reset');
+  const [remediating, setRemediating] = useState(false);
+  const [remediationReport, setRemediationReport] = useState<RemediationReport | null>(null);
+  const [remediationError, setRemediationError] = useState<unknown>(null);
+
+  const platformLabel = (platform: string | null | undefined): string => {
+    if (!platform) return NA;
+    return dashboard?.source_platform_labels?.[platform] ?? platform;
+  };
+
+  const runScan = async (monitorId: string) => {
+    setScanningId(monitorId);
+    setScanErrors((prev) => ({ ...prev, [monitorId]: null }));
+    try {
+      const res = await api.post(`/darkweb/monitors/${monitorId}/trigger-scan`, { scan_type: scanType });
+      const result = res.data as ScanResult;
+      setScanResults((prev) => ({ ...prev, [monitorId]: result }));
+      if (result.status === 'completed') {
+        setMonitors((prev) => prev.map((m) => (m.id === monitorId ? { ...m, lastScan: result.completion_time ?? result.start_time } : m)));
+      }
+    } catch (err) {
+      setScanErrors((prev) => ({ ...prev, [monitorId]: err }));
+    } finally {
+      setScanningId(null);
+    }
+  };
+
+  const remediateSelected = async () => {
+    if (selectedCredIds.length === 0) return;
+    setRemediating(true);
+    setRemediationError(null);
+    setRemediationReport(null);
+    try {
+      const res = await api.post('/darkweb/credentials/bulk-remediate', {
+        credential_ids: selectedCredIds,
+        action: remediationAction,
+      });
+      const report = res.data as RemediationReport;
+      setRemediationReport(report);
+      setCredentials((prev) =>
+        prev.map((c) =>
+          selectedCredIds.includes(c.id) ? { ...c, status: 'remediated', remediation: remediationAction } : c,
+        ),
+      );
+      setSelectedCredIds([]);
+    } catch (err) {
+      setRemediationError(err);
+    } finally {
+      setRemediating(false);
+    }
+  };
 
   React.useEffect(() => {
     const loadData = async () => {
@@ -113,24 +337,28 @@ export default function DarkWebMonitor() {
       // size=100 so the user sees real findings beyond the default first
       // page (20). A failed source is recorded and shown, never coerced
       // into an empty list.
-      const [alertsRes, credentialsRes, brandRes, monitorsRes] = await Promise.allSettled([
+      const [alertsRes, credentialsRes, brandRes, monitorsRes, dashboardRes] = await Promise.allSettled([
         darkwebApi.getAlerts({ size: 100 }),
         darkwebApi.getCredentialLeaks({ size: 100 }),
         darkwebApi.getBrandMonitors(),
         darkwebApi.getMonitors(),
+        api.get('/darkweb/dashboard'),
       ]);
+      if (dashboardRes.status === 'fulfilled') {
+        setDashboard(dashboardRes.value.data as DarkWebDashboardData);
+        setDashboardError(null);
+      } else {
+        setDashboardError(dashboardRes.reason);
+      }
       const asList = (d: any): any[] => (Array.isArray(d) ? d : (d?.items ?? []));
       // Findings: DarkWebFindingResponse
       const normFinding = (f: any) => ({
         ...f,
         discoveryDate: f.discovered_date ?? f.created_at ?? null,
-        title: f.title ?? f.finding_type ?? '—',
+        title: f.title ?? FINDING_TYPE_LABELS[f.finding_type] ?? f.finding_type ?? '—',
+        kindLabel: FINDING_TYPE_LABELS[f.finding_type] ?? f.finding_type ?? null,
         platform: f.source_platform ?? null,
-        affectedAssets: Array.isArray(f.affected_assets)
-          ? f.affected_assets
-          : f.affected_assets && typeof f.affected_assets === 'object'
-            ? Object.entries(f.affected_assets).map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : String(v)}`)
-            : [],
+        affectedAssets: f.affected_assets ?? null,
       });
       // Credentials: CredentialLeakResponse has no severity field.
       const normCred = (c: any) => ({
@@ -232,6 +460,45 @@ export default function DarkWebMonitor() {
             <p className="text-xs text-purple-600 dark:text-purple-300 mt-1">active threats</p>
           </div>
         </div>
+
+        {/* Scan schedule + sources (GET /darkweb/dashboard) */}
+        <div className="mt-4 space-y-2">
+          <LoadErrorBanner what="dark web scan sources" error={dashboardError} />
+          {dashboard && (
+            <div className="border border-gray-200 dark:border-gray-700 rounded-lg p-4">
+              <div className="flex flex-wrap items-baseline justify-between gap-2 mb-3">
+                <h2 className="font-semibold">Scan sources</h2>
+                <p className="text-sm text-gray-600 dark:text-gray-400">
+                  Scheduled sweep: {dashboard.scan_frequency || NA}
+                  {dashboard.scan_interval_minutes != null ? ` (interval ${dashboard.scan_interval_minutes} min)` : ''}
+                </p>
+              </div>
+              <ul className="grid grid-cols-1 md:grid-cols-2 gap-2 text-sm">
+                {Object.entries(dashboard.sources).map(([key, src]) => (
+                  <li key={key} className="flex items-start gap-2">
+                    <span
+                      className={clsx(
+                        'mt-0.5 px-2 py-0.5 rounded text-xs font-medium whitespace-nowrap',
+                        src.configured ? SCAN_STATUS_CLS.ok : SCAN_STATUS_CLS.not_configured,
+                      )}
+                    >
+                      {src.configured ? 'configured' : 'not configured'}
+                    </span>
+                    <span>
+                      {src.label}
+                      {!src.configured && src.requires ? (
+                        <span className="text-gray-600 dark:text-gray-400"> — requires {src.requires}</span>
+                      ) : null}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-3 text-xs text-gray-500 dark:text-gray-400">
+                Tor forums, Telegram, Discord and ransomware leak sites are not scanned; findings from them can only be recorded manually.
+              </p>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Tabs */}
@@ -270,13 +537,29 @@ export default function DarkWebMonitor() {
             {activeTab === 'monitors' && (
               <div className="space-y-6">
                 <LoadErrorBanner what="monitors" error={loadErrors.monitors} />
+                <div className="flex items-center gap-2 text-sm">
+                  <label htmlFor="dw-scan-type" className="text-gray-600 dark:text-gray-400">Scan type</label>
+                  <select
+                    id="dw-scan-type"
+                    value={scanType}
+                    onChange={(e) => setScanType(e.target.value === 'quick' ? 'quick' : 'full')}
+                    className="px-2 py-1 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700"
+                  >
+                    <option value="full">Full (every source)</option>
+                    <option value="quick">Quick (Have I Been Pwned sources only)</option>
+                  </select>
+                </div>
                 <div className="grid grid-cols-1 gap-4">
                   {filteredMonitors.map((monitor) => (
                     <div key={monitor.id} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition">
                       <div className="flex justify-between items-start mb-3">
                         <div className="flex-1">
                           <h3 className="font-semibold text-lg">{monitor.name}</h3>
-                          <p className="text-sm font-mono text-gray-600 dark:text-gray-400 mt-1">{monitor.keyword}</p>
+                          <div className="text-sm text-gray-600 dark:text-gray-400 mt-1 space-y-0.5">
+                            <p>Search terms: <span className="font-mono">{asStringList(monitor.search_terms).join(', ') || 'none'}</span></p>
+                            <p>Domains: <span className="font-mono">{asStringList(monitor.domains_watched).join(', ') || 'none'}</span></p>
+                            <p>Emails: <span className="font-mono">{asStringList(monitor.emails_watched).join(', ') || 'none'}</span></p>
+                          </div>
                         </div>
                         <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(monitor.status)}`}>
                           {monitor.status}
@@ -301,6 +584,14 @@ export default function DarkWebMonitor() {
                         </div>
                       </div>
                       <div className="flex gap-2">
+                        <button
+                          onClick={() => runScan(monitor.id)}
+                          disabled={scanningId !== null}
+                          className="flex-1 flex items-center justify-center gap-2 px-3 py-2 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded transition disabled:opacity-50"
+                        >
+                          <Zap className="w-4 h-4" />
+                          {scanningId === monitor.id ? 'Scanning…' : `Scan now (${scanType})`}
+                        </button>
                         <button
                           onClick={() => { setActiveTab('findings'); }}
                           className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
@@ -330,6 +621,12 @@ export default function DarkWebMonitor() {
                           <Trash2 className="w-4 h-4" />
                         </button>
                       </div>
+                      {scanErrors[monitor.id] ? (
+                        <div className="mt-3">
+                          <ActionErrorBanner what="scan this monitor" error={scanErrors[monitor.id]} />
+                        </div>
+                      ) : null}
+                      {scanResults[monitor.id] && <ScanResultPanel result={scanResults[monitor.id]} />}
                     </div>
                   ))}
                 </div>
@@ -361,26 +658,23 @@ export default function DarkWebMonitor() {
                           <div className="flex items-center gap-2 mb-2">
                             <AlertOctagon className="w-5 h-5 text-orange-600" />
                             <h3 className="font-semibold">{finding.title}</h3>
+                            {finding.kindLabel && finding.kindLabel !== finding.title && (
+                              <span className="px-2 py-0.5 rounded text-xs bg-gray-100 dark:bg-gray-700">{finding.kindLabel}</span>
+                            )}
                             <span className={`px-3 py-1 rounded-full text-xs font-medium ${getSeverityColor(finding.severity)}`}>
                               {finding.severity ? String(finding.severity).toUpperCase() : NA}
                             </span>
                           </div>
                           <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">{finding.description}</p>
                           <div className="flex gap-4 text-sm">
-                            <span className="text-gray-600 dark:text-gray-400">Source platform: {finding.platform ?? NA}</span>
+                            <span className="text-gray-600 dark:text-gray-400">Source platform: {platformLabel(finding.platform)}</span>
                             <span className="text-gray-600 dark:text-gray-400">Discovered: {fmtDate(finding.discoveryDate)}</span>
                           </div>
                         </div>
                       </div>
                       <div className="border-t border-gray-200 dark:border-gray-700 pt-3 mt-3">
                         <p className="text-xs text-gray-600 dark:text-gray-400 mb-2">Affected Assets:</p>
-                        <div className="flex flex-wrap gap-2">
-                          {(finding.affectedAssets || []).map((asset: any, idx: number) => (
-                            <span key={idx} className="px-2 py-1 bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-100 rounded text-xs">
-                              {asset}
-                            </span>
-                          ))}
-                        </div>
+                        <AffectedAssets assets={finding.affectedAssets} />
                       </div>
                       <div className="flex gap-2 mt-4">
                         <button
@@ -419,10 +713,49 @@ export default function DarkWebMonitor() {
                 </div>
 
                 <LoadErrorBanner what="credential leaks" error={loadErrors.credentials} />
+                <div className="flex flex-wrap items-center gap-2 text-sm">
+                  <span className="text-gray-600 dark:text-gray-400">{selectedCredIds.length} selected</span>
+                  <select
+                    value={remediationAction}
+                    onChange={(e) => setRemediationAction(e.target.value)}
+                    className="px-2 py-1 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700"
+                  >
+                    <option value="password_reset">Password reset</option>
+                    <option value="account_disabled">Account disabled</option>
+                    <option value="mfa_enforced">MFA enforced</option>
+                  </select>
+                  <button
+                    onClick={remediateSelected}
+                    disabled={remediating || selectedCredIds.length === 0}
+                    className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded disabled:opacity-50"
+                    title="Records the remediation decision on the selected leaks; nothing is executed in your identity provider"
+                  >
+                    {remediating ? 'Recording…' : 'Record remediation'}
+                  </button>
+                </div>
+                <ActionErrorBanner what="record the remediation" error={remediationError} />
+                {remediationReport && (
+                  <div className="text-sm bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded p-3">
+                    <p className="font-medium">
+                      Recorded on {remediationReport.recorded} of {remediationReport.total_affected} leak(s) — execution: {remediationReport.execution === 'recorded_only' ? 'recorded only (nothing was executed)' : remediationReport.execution}
+                    </p>
+                    {remediationReport.detail && <p className="mt-1">{remediationReport.detail}</p>}
+                  </div>
+                )}
                 <div className="bg-white dark:bg-gray-800 rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700">
                   <table className="w-full">
                     <thead>
                       <tr className="border-b border-gray-200 dark:border-gray-700">
+                        <th className="px-4 py-4 text-left">
+                          <input
+                            type="checkbox"
+                            aria-label="Select all open leaks"
+                            checked={filteredCredentials.some((c) => c.status === 'open') && filteredCredentials.filter((c) => c.status === 'open').every((c) => selectedCredIds.includes(c.id))}
+                            onChange={(e) =>
+                              setSelectedCredIds(e.target.checked ? filteredCredentials.filter((c) => c.status === 'open').map((c) => c.id) : [])
+                            }
+                          />
+                        </th>
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Email</th>
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Source Breach</th>
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Breach Date</th>
@@ -435,6 +768,17 @@ export default function DarkWebMonitor() {
                     <tbody>
                       {filteredCredentials.map((cred) => (
                         <tr key={cred.id} className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 transition">
+                          <td className="px-4 py-4">
+                            <input
+                              type="checkbox"
+                              aria-label={`Select ${cred.email}`}
+                              disabled={cred.status !== 'open'}
+                              checked={selectedCredIds.includes(cred.id)}
+                              onChange={(e) =>
+                                setSelectedCredIds((prev) => (e.target.checked ? [...prev, cred.id] : prev.filter((id) => id !== cred.id)))
+                              }
+                            />
+                          </td>
                           <td className="px-6 py-4 text-sm font-medium">{cred.email}</td>
                           <td className="px-6 py-4 text-sm">{cred.source ?? NA}</td>
                           <td className="px-6 py-4 text-sm">{cred.breachDate ?? NA}</td>
@@ -524,17 +868,15 @@ export default function DarkWebMonitor() {
                         <button
                           onClick={async () => {
                             if (threat.status === 'identified' || threat.status === 'failed') {
-                              if (confirm('Initiate takedown request for this threat?')) {
-                                try {
-                                  const res = await darkwebApi.requestTakedown(threat.id);
-                                  setThreats(prev => prev.map(t => t.id === threat.id ? { ...t, status: res?.status ?? 'takedown_requested' } : t));
-                                  if (res?.execution === 'recorded_only') {
-                                    alert('Takedown request recorded. No takedown provider is configured, so nothing was sent to a registrar or host.');
-                                  }
-                                } catch (error) {
-                                  console.error('Error initiating takedown:', error);
-                                  alert(`Failed to initiate takedown: ${describeLoadError(error)}`);
+                              setTakedownErrors(prev => ({ ...prev, [threat.id]: null }));
+                              try {
+                                const res = await darkwebApi.requestTakedown(threat.id);
+                                // Only a real backend answer changes the status.
+                                if (res?.status) {
+                                  setThreats(prev => prev.map(t => t.id === threat.id ? { ...t, status: res.status } : t));
                                 }
+                              } catch (error) {
+                                setTakedownErrors(prev => ({ ...prev, [threat.id]: error }));
                               }
                             } else {
                               setSelectedFinding(threat);
@@ -558,6 +900,20 @@ export default function DarkWebMonitor() {
                           Full Report
                         </button>
                       </div>
+                      {takedownErrors[threat.id] ? (
+                        httpStatus(takedownErrors[threat.id]) === 501 ? (
+                          <div role="status" className="mt-3 text-sm bg-gray-50 dark:bg-gray-900/40 border border-gray-200 dark:border-gray-700 rounded p-3">
+                            <p className="font-medium">Takedown: Not available</p>
+                            <p className="mt-1 text-gray-700 dark:text-gray-300">
+                              {backendDetail(takedownErrors[threat.id]) ?? describeLoadError(takedownErrors[threat.id])}
+                            </p>
+                          </div>
+                        ) : (
+                          <div className="mt-3">
+                            <ActionErrorBanner what="initiate a takedown" error={takedownErrors[threat.id]} />
+                          </div>
+                        )
+                      ) : null}
                     </div>
                   ))}
                 </div>
@@ -576,7 +932,8 @@ export default function DarkWebMonitor() {
               <div><span className="font-medium">Title:</span> {selectedFinding.title || selectedFinding.threat}</div>
               {selectedFinding.description && <div><span className="font-medium">Description:</span> {selectedFinding.description}</div>}
               {selectedFinding.severity && <div><span className="font-medium">Severity:</span> {selectedFinding.severity}</div>}
-              {selectedFinding.platform && <div><span className="font-medium">Platform:</span> {selectedFinding.platform}</div>}
+              {selectedFinding.platform && <div><span className="font-medium">Platform:</span> {platformLabel(selectedFinding.platform)}</div>}
+              {selectedFinding.affectedAssets && <div><span className="font-medium">Affected assets:</span> <AffectedAssets assets={selectedFinding.affectedAssets} /></div>}
               {selectedFinding.source && <div><span className="font-medium">Source:</span> {selectedFinding.source}</div>}
             </div>
             <button onClick={() => setSelectedFinding(null)} className="mt-6 w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Close</button>
@@ -707,18 +1064,22 @@ export default function DarkWebMonitor() {
             <form onSubmit={async (e) => {
               e.preventDefault();
               const formData = new FormData(e.currentTarget);
-              const name = formData.get('name') as string;
-              const keyword = formData.get('keyword') as string;
+              const name = String(formData.get('name') ?? '');
+              const keyword = String(formData.get('keyword') ?? '');
+              const domains = String(formData.get('domains') ?? '');
+              const emails = String(formData.get('emails') ?? '');
+              setEditError(null);
               try {
-                const updated = await darkwebApi.updateMonitor(editingMonitor.id, {
+                const res = await api.patch(`/darkweb/monitors/${editingMonitor.id}`, {
                   name,
-                  search_terms: keyword.split(',').map((k: string) => k.trim()).filter(Boolean),
+                  search_terms: splitList(keyword),
+                  domains_watched: splitList(domains),
+                  emails_watched: splitList(emails),
                 });
-                setMonitors(prev => prev.map(m => m.id === editingMonitor.id ? normMonitor({ ...m, ...updated }) : m));
+                setMonitors(prev => prev.map(m => m.id === editingMonitor.id ? normMonitor({ ...m, ...res.data }) : m));
                 setEditingMonitor(null);
               } catch (error) {
-                console.error('Error updating monitor:', error);
-                alert(`Failed to update monitor: ${describeLoadError(error)}`);
+                setEditError(error);
               }
             }} className="space-y-4">
               <div>
@@ -726,11 +1087,20 @@ export default function DarkWebMonitor() {
                 <input type="text" name="name" defaultValue={editingMonitor.name} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
-                <label className="block text-sm font-medium mb-1">Keywords</label>
-                <textarea name="keyword" defaultValue={editingMonitor.keyword} rows={3} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <label className="block text-sm font-medium mb-1">Search terms</label>
+                <textarea name="keyword" defaultValue={asStringList(editingMonitor.search_terms).join(', ')} rows={2} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Domains watched</label>
+                <textarea name="domains" defaultValue={asStringList(editingMonitor.domains_watched).join(', ')} rows={2} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Emails watched</label>
+                <textarea name="emails" defaultValue={asStringList(editingMonitor.emails_watched).join(', ')} rows={2} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <ActionErrorBanner what="update the monitor" error={editError} />
               <div className="flex gap-2 mt-6">
-                <button type="button" onClick={() => setEditingMonitor(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+                <button type="button" onClick={() => { setEditingMonitor(null); setEditError(null); }} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
                 <button type="submit" className="flex-1 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition">Save</button>
               </div>
             </form>
@@ -749,12 +1119,21 @@ export default function DarkWebMonitor() {
                 <input type="text" placeholder="e.g., Company Name Mentions" value={newMonitorName} onChange={(e) => setNewMonitorName(e.target.value)} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
-                <label className="block text-sm font-medium mb-1">Keywords</label>
-                <textarea placeholder="Comma-separated, e.g. acme.com, Acme Corp" rows={3} value={newMonitorKeywords} onChange={(e) => setNewMonitorKeywords(e.target.value)} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <label className="block text-sm font-medium mb-1">Search terms</label>
+                <textarea placeholder="Comma-separated, e.g. acme corp, acmecloud" rows={2} value={newMonitorKeywords} onChange={(e) => setNewMonitorKeywords(e.target.value)} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Domains watched</label>
+                <textarea placeholder="Comma-separated, e.g. acme.com" rows={2} value={newMonitorDomains} onChange={(e) => setNewMonitorDomains(e.target.value)} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Emails watched</label>
+                <textarea placeholder="Comma-separated; checked against Have I Been Pwned when HIBP_API_KEY is set" rows={2} value={newMonitorEmails} onChange={(e) => setNewMonitorEmails(e.target.value)} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <ActionErrorBanner what="create the monitor" error={createError} />
               <div className="flex gap-2 mt-6">
                 <button
-                  onClick={() => setShowNewMonitorModal(false)}
+                  onClick={() => { setShowNewMonitorModal(false); setCreateError(null); }}
                   className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
                 >
                   Cancel
@@ -762,22 +1141,25 @@ export default function DarkWebMonitor() {
                 <button
                   onClick={async () => {
                     if (!newMonitorName.trim()) return;
+                    setCreateError(null);
                     try {
-                      // DarkWebMonitorCreate takes `search_terms` (src/schemas/darkweb.py);
-                      // darkwebApi.createMonitor sends `keywords` + an invalid
-                      // monitor_type, which the backend silently drops.
-                      // monitor_type is left to the backend default.
+                      // DarkWebMonitorCreate (src/schemas/darkweb.py): search_terms,
+                      // domains_watched, emails_watched are lists; monitor_type
+                      // is left to the backend default.
                       const res = await api.post('/darkweb/monitors', {
                         name: newMonitorName.trim(),
-                        search_terms: newMonitorKeywords.split(',').map(k => k.trim()).filter(Boolean),
+                        search_terms: splitList(newMonitorKeywords),
+                        domains_watched: splitList(newMonitorDomains),
+                        emails_watched: splitList(newMonitorEmails),
                       });
                       setMonitors(prev => [...prev, normMonitor(res.data)]);
                       setNewMonitorName('');
                       setNewMonitorKeywords('');
+                      setNewMonitorDomains('');
+                      setNewMonitorEmails('');
                       setShowNewMonitorModal(false);
                     } catch (error) {
-                      console.error('Error creating monitor:', error);
-                      alert(`Failed to create monitor: ${describeLoadError(error)}`);
+                      setCreateError(error);
                     }
                   }}
                   className="flex-1 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition"
