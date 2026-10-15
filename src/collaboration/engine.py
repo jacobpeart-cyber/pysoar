@@ -494,17 +494,6 @@ class ArtifactManager:
         artifact.access_restricted_to = json.dumps(user_ids)
         return True
 
-    async def track_downloads(self, artifact_id: str) -> bool:
-        """Track artifact download"""
-        result = await self.db.execute(
-            select(SharedArtifact).where(SharedArtifact.id == artifact_id)
-        )
-        artifact = result.scalar_one_or_none()
-        if not artifact:
-            return False
-        artifact.download_count += 1
-        return True
-
     async def generate_artifact_index(self, room_id: str) -> dict[str, Any]:
         """Generate index of all artifacts in room"""
         result = await self.db.execute(

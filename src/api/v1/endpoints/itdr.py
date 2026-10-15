@@ -77,14 +77,10 @@ from src.schemas.itdr import (
     PrivilegedAccessEventUpdate,
     PrivilegedAccessEventResponse,
     PrivilegedAccessEventListResponse,
-    ThreatInvestigationRequest,
     ThreatResponseAction,
     CredentialRemediationRequest,
     ElevationRequest,
-    ElevationApprovalRequest,
-    AnomalyReviewRequest,
     ITDRDashboardMetrics,
-    ITDRRiskOverview,
     IdentityActionRequest,
     IdentityImportResult,
 )
@@ -474,29 +470,6 @@ async def update_threat(
     await db.refresh(threat)
     logger.info(f"Identity threat updated: {threat.threat_type} -> {threat.status}")
     return IdentityThreatResponse.model_validate(threat)
-
-
-@router.post("/threats/{threat_id}/investigate")
-async def investigate_threat(
-    threat_id: str,
-    data: ThreatInvestigationRequest,
-    _caller: AnalystUser = None,
-    org_id: OrganizationId = None,
-    db: DatabaseSession = None,
-):
-    """Start threat investigation"""
-    threat = await get_threat_or_404(
-        db, threat_id, org_id
-    )
-    threat.status = "investigating"
-    await db.commit()
-    await db.refresh(threat)
-    logger.info(f"Threat investigation started: {threat_id}")
-    return {
-        "threat_id": threat_id,
-        "status": threat.status,
-        "investigation_notes": data.investigation_notes,
-    }
 
 
 #: ``action_type`` -> the guarded tools that carry it out. Everything here is
@@ -1376,39 +1349,6 @@ async def get_anomaly(
     return AccessAnomalyResponse.model_validate(anomaly)
 
 
-@router.post("/anomalies/{anomaly_id}/review")
-async def review_anomaly(
-    anomaly_id: str,
-    data: AnomalyReviewRequest,
-    _caller: AnalystUser = None,
-    org_id: OrganizationId = None,
-    db: DatabaseSession = None,
-):
-    """Review anomaly as legitimate or suspicious"""
-    stmt = select(AccessAnomaly).where(AccessAnomaly.id == anomaly_id)
-    stmt = stmt.where(AccessAnomaly.organization_id == org_id)
-    result = await db.execute(stmt)
-    anomaly = result.scalar_one_or_none()
-    if not anomaly:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Access anomaly not found",
-        )
-
-    anomaly.is_reviewed = True
-    anomaly.reviewer_notes = data.reviewer_notes
-    await db.commit()
-    await db.refresh(anomaly)
-
-    logger.info(f"Anomaly reviewed: {anomaly_id} - legitimate={data.is_legitimate}")
-
-    return {
-        "anomaly_id": anomaly_id,
-        "is_legitimate": data.is_legitimate,
-        "status": "reviewed",
-    }
-
-
 # ============================================================================
 # Privileged Access Endpoints
 # ============================================================================
@@ -1498,75 +1438,6 @@ async def request_elevation(
         "identity_id": data.identity_id,
         "status": "pending_approval",
         "created_at": event.created_at,
-    }
-
-
-@router.post("/privileged-access/{event_id}/approve")
-async def approve_elevation(
-    event_id: str,
-    data: ElevationApprovalRequest,
-    current_user: AdminRoleUser = None,
-    org_id: OrganizationId = None,
-    db: DatabaseSession = None,
-):
-    """Approve privilege elevation request"""
-    stmt = select(PrivilegedAccessEvent).where(PrivilegedAccessEvent.id == event_id)
-    stmt = stmt.where(PrivilegedAccessEvent.organization_id == org_id)
-    result = await db.execute(stmt)
-    event = result.scalar_one_or_none()
-    if not event:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Privileged access event not found",
-        )
-
-    if data.approved:
-        event.approved_by = current_user.id
-        event.approval_timestamp = datetime.now(timezone.utc).isoformat()
-        logger.info(f"Elevation request approved: {event_id}")
-    else:
-        logger.info(f"Elevation request denied: {event_id}")
-
-    await db.commit()
-    await db.refresh(event)
-
-    return {
-        "event_id": event_id,
-        "approved": data.approved,
-        "approval_notes": data.approver_notes,
-    }
-
-
-@router.post("/privileged-access/{event_id}/revoke")
-async def revoke_access(
-    event_id: str,
-    revocation_reason: str,
-    _caller: AdminRoleUser = None,
-    org_id: OrganizationId = None,
-    db: DatabaseSession = None,
-):
-    """Revoke privileged access"""
-    stmt = select(PrivilegedAccessEvent).where(PrivilegedAccessEvent.id == event_id)
-    stmt = stmt.where(PrivilegedAccessEvent.organization_id == org_id)
-    result = await db.execute(stmt)
-    event = result.scalar_one_or_none()
-    if not event:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Privileged access event not found",
-        )
-
-    event.was_revoked = True
-    event.revocation_reason = revocation_reason
-    await db.commit()
-    await db.refresh(event)
-
-    logger.warning(f"Privileged access revoked: {event_id} - {revocation_reason}")
-
-    return {
-        "event_id": event_id,
-        "status": "revoked",
-        "revocation_reason": revocation_reason,
     }
 
 
@@ -1693,114 +1564,6 @@ async def get_dashboard_metrics(
         last_directory_sync_at=max(sync_runs) if sync_runs else None,
         identity_integrations=integrations,
         jobs=jobs,
-    )
-
-
-@router.get("/dashboard/risk-overview")
-async def get_risk_overview(
-    org_id: OrganizationId = None,
-    db: DatabaseSession = None,
-):
-    """Get ITDR risk overview with real trend + compliance data.
-
-    Previous version returned hardcoded ``risk_trends: {"trend":
-    "stable", "30day_change": "-5%"}`` and
-    ``compliance_status: {pci_dss: compliant, sox: compliant,
-    hipaa: compliant}`` regardless of actual posture. A compliance
-    officer seeing "everything compliant" on a tenant that hasn't
-    even loaded a framework would have caught the lie immediately.
-
-    Now:
-      - ``risk_trends.30day_change`` compares threat count in the
-        last 30 days vs the prior 30 days and reports real delta.
-      - ``compliance_status`` queries ComplianceFramework rows scoped
-        to this org and reports each framework's real ``status``
-        column value. If no framework is loaded, the key is absent
-        rather than falsely claiming compliant.
-    """
-
-    threat_base = select(func.count()).select_from(IdentityThreat)
-    threat_base = threat_base.where(IdentityThreat.organization_id == org_id)
-
-    critical_threats_result = await db.execute(
-        threat_base.where(IdentityThreat.severity == "critical")
-    )
-    critical_count = critical_threats_result.scalar() or 0
-
-    high_threats_result = await db.execute(
-        threat_base.where(IdentityThreat.severity == "high")
-    )
-    high_count = high_threats_result.scalar() or 0
-
-    critical_findings = []
-    if critical_count > 0:
-        critical_findings.append(f"{critical_count} critical threats detected")
-    if high_count > 0:
-        critical_findings.append(f"{high_count} high-severity threats")
-
-    # --- Real 30-day trend comparison ---
-    now = datetime.now(timezone.utc)
-    last_30_start = now - timedelta(days=30)
-    prior_30_start = now - timedelta(days=60)
-
-    last_30_q = threat_base.where(
-        IdentityThreat.created_at >= last_30_start
-    )
-    prior_30_q = threat_base.where(
-        and_(
-            IdentityThreat.created_at >= prior_30_start,
-            IdentityThreat.created_at < last_30_start,
-        )
-    )
-    last_30_count = (await db.execute(last_30_q)).scalar() or 0
-    prior_30_count = (await db.execute(prior_30_q)).scalar() or 0
-
-    if prior_30_count == 0 and last_30_count == 0:
-        trend_label = "stable"
-        change_pct_str = "0%"
-    elif prior_30_count == 0:
-        trend_label = "rising"
-        change_pct_str = "+new"  # no prior baseline to compare against
-    else:
-        delta = last_30_count - prior_30_count
-        change = (delta / prior_30_count) * 100.0
-        change_pct_str = f"{'+' if change >= 0 else ''}{change:.0f}%"
-        if change > 10:
-            trend_label = "rising"
-        elif change < -10:
-            trend_label = "improving"
-        else:
-            trend_label = "stable"
-
-    # --- Real compliance_status ---
-    from src.compliance.models import ComplianceFramework
-
-    compliance_status: dict[str, str] = {}
-    fw_q = select(ComplianceFramework).where(ComplianceFramework.organization_id == org_id)
-    for fw in (await db.execute(fw_q)).scalars().all():
-        if fw.short_name:
-            compliance_status[fw.short_name] = fw.status or "unknown"
-
-    return ITDRRiskOverview(
-        summary=(
-            f"Identity security posture: {len(critical_findings)} critical issues"
-            if critical_findings
-            else "Identity security posture: healthy"
-        ),
-        critical_findings=critical_findings,
-        risk_trends={
-            "trend": trend_label,
-            "30day_change": change_pct_str,
-            "threats_last_30d": last_30_count,
-            "threats_prior_30d": prior_30_count,
-        },
-        recommendations=[
-            "Review and revoke excessive privileges",
-            "Enforce MFA on all identities",
-            "Rotate exposed credentials immediately",
-            "Remediate detected threats",
-        ],
-        compliance_status=compliance_status,
     )
 
 

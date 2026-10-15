@@ -3,10 +3,9 @@
 
 * every ``/ai`` route requires an organisation (``OrganizationId``); an
   org-less platform superuser gets 403 ``organization_required``;
-* ``/ai/triage/alert/{id}`` no longer skips the org filter and no longer
-  fabricates a "medium" triage for a missing or foreign alert: 404;
-* ``/ai/query`` reads only the caller's alerts (it used to read every tenant's
-  and fall back to "the first organisation");
+* ``/ai/triage/batch`` triages only the caller's alerts: a foreign alert id is
+  skipped, never triaged (the single-alert ``/ai/triage/alert/{id}``, the
+  ``/ai/alerts/triage`` alias and ``/ai/query`` were deleted in wave 5);
 * writes acting on alerts/incidents are analyst+ (viewer 403); model
   administration is admin only (analyst 403);
 * ``POST /ai/models/train`` (the AgenticSOC "Train New Model" button) is an
@@ -50,7 +49,7 @@ async def _model(db: AsyncSession, org_id: str) -> str:
     return model.id
 
 
-async def test_single_triage_is_tenant_scoped_and_404s_outside(
+async def test_batch_triage_is_tenant_scoped(
     client: AsyncClient,
     db_session: AsyncSession,
     org_a: Organization,
@@ -61,10 +60,13 @@ async def test_single_triage_is_tenant_scoped_and_404s_outside(
 ) -> None:
     a_id = org_a.id
     alert_id = await _alert(db_session, a_id, "A brute force")
-    path = f"{AI}/triage/alert/{alert_id}"
-    body = {"alert_id": alert_id}
+    path = f"{AI}/triage/batch"
+    body = {"alert_ids": [alert_id], "limit": 5}
 
-    await assert_tenant_isolated(client, "POST", path, org_b_headers, json=body)
+    # Another tenant naming A's alert triages nothing.
+    resp = await client.post(path, headers=org_b_headers, json=body)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["alerts_triaged"] == 0
     resp = await client.post(path, headers=viewer_headers, json=body)
     assert resp.status_code == 403, resp.text
     resp = await client.post(path, headers=superuser_headers, json=body)
@@ -77,11 +79,7 @@ async def test_single_triage_is_tenant_scoped_and_404s_outside(
 
     resp = await client.post(path, headers=org_a_headers, json=body)
     assert resp.status_code == 200, resp.text
-    assert resp.json()["alert_id"] == alert_id
-
-    # A nonexistent id is 404, not a fabricated "medium" triage.
-    resp = await client.post(f"{AI}/triage/alert/does-not-exist", headers=org_a_headers, json={"alert_id": "does-not-exist"})
-    assert resp.status_code == 404, resp.text
+    assert [t["alert_id"] for t in resp.json()["triaged_alerts"]] == [alert_id]
 
 
 async def test_triaged_list_and_feedback_isolated(
@@ -94,7 +92,7 @@ async def test_triaged_list_and_feedback_isolated(
 ) -> None:
     alert_id = await _alert(db_session, org_a.id, "A triage me")
     resp = await client.post(
-        f"{AI}/triage/alert/{alert_id}", headers=org_a_headers, json={"alert_id": alert_id}
+        f"{AI}/triage/batch", headers=org_a_headers, json={"alert_ids": [alert_id], "limit": 5}
     )
     assert resp.status_code == 200, resp.text
 
@@ -113,16 +111,14 @@ async def test_triaged_list_and_feedback_isolated(
     assert (await client.post(f"{AI}/feedback", headers=org_a_headers, json=body)).status_code == 200
 
 
-async def test_batch_triage_and_alias_viewer_forbidden(
+async def test_batch_triage_viewer_forbidden(
     client: AsyncClient, viewer_headers: dict[str, str]
 ) -> None:
     resp = await client.post(f"{AI}/triage/batch", headers=viewer_headers, json={"limit": 5})
     assert resp.status_code == 403, resp.text
-    resp = await client.post(f"{AI}/alerts/triage", headers=viewer_headers)
-    assert resp.status_code == 403, resp.text
 
 
-async def test_alerts_triage_alias_stays_in_tenant(
+async def test_batch_triage_without_ids_stays_in_tenant(
     client: AsyncClient,
     db_session: AsyncSession,
     org_a: Organization,
@@ -131,32 +127,11 @@ async def test_alerts_triage_alias_stays_in_tenant(
 ) -> None:
     own = await _alert(db_session, org_a.id, "A own")
     foreign = await _alert(db_session, org_b.id, "B foreign")
-    resp = await client.post(f"{AI}/alerts/triage", headers=org_a_headers)
+    resp = await client.post(f"{AI}/triage/batch", headers=org_a_headers, json={"limit": 10})
     assert resp.status_code == 200, resp.text
     ids = {t["alert_id"] for t in resp.json()["triaged_alerts"]}
     assert own in ids
     assert foreign not in ids
-
-
-async def test_nl_query_reads_only_callers_alerts(
-    client: AsyncClient,
-    db_session: AsyncSession,
-    org_a: Organization,
-    org_b: Organization,
-    org_a_headers: dict[str, str],
-    org_b_headers: dict[str, str],
-) -> None:
-    own = await _alert(db_session, org_a.id, "A latest alert")
-    foreign = await _alert(db_session, org_b.id, "B latest alert")
-    resp = await client.post(f"{AI}/query", headers=org_a_headers, json={"natural_language": "show recent alerts"})
-    assert resp.status_code == 200, resp.text
-    ids = {r["id"] for r in resp.json()["results"]}
-    assert own in ids
-    assert foreign not in ids
-
-    history_b = await client.get(f"{AI}/queries", headers=org_b_headers)
-    assert history_b.status_code == 200
-    assert history_b.json() == []
 
 
 async def test_model_routes_isolated_and_admin_only(

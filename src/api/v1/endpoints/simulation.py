@@ -509,36 +509,6 @@ async def list_techniques(
         raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
 
 
-@router.get("/techniques/coverage")
-async def get_coverage_map(
-    org_id: OrganizationId,
-    session: DatabaseSession = None,
-) -> dict:
-    """
-    Get detection coverage map of techniques.
-
-    Returns which techniques are detected by existing rules.
-
-    Args:
-        session: Database session
-        current_user: Current user ID
-
-    Returns:
-        Coverage map by tactic and technique
-    """
-    # Previously "detected" meant the hardcoded catalogue row lists any
-    # detection_sources, a static field that says nothing about this
-    # tenant's detection rules, so every technique looked covered.
-    raise HTTPException(
-        status_code=501,
-        detail={
-            "error": "not_implemented",
-            "detail": "technique coverage is not computed against the organisation's "
-            "detection rules; run a simulation and use /posture/gaps instead",
-        },
-    )
-
-
 @router.get("/techniques/{mitre_id}", response_model=AttackTechniqueSchema)
 async def get_technique(
     mitre_id: str,

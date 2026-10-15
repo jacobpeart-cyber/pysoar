@@ -550,21 +550,6 @@ async def get_artifact(
     return artifact
 
 
-@router.post("/artifacts/{artifact_id}/download")
-async def download_artifact(
-    org_id: OrganizationId,
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
-    artifact_id: str = Path(...),
-):
-    """Track artifact download"""
-    artifact = await get_artifact_or_404(db, artifact_id, org_id)
-    manager = ArtifactManager(db)
-    await manager.track_downloads(artifact_id)
-    await db.commit()
-    return {"status": "tracked", "download_count": artifact.download_count + 1}
-
-
 @router.get("/rooms/{room_id}/artifacts/index")
 async def get_artifact_index(
     org_id: OrganizationId,

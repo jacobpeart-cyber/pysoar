@@ -399,26 +399,6 @@ async def update_case(
     return ForensicCaseResponse.model_validate(case)
 
 
-@router.post("/cases/{case_id}/close", response_model=ForensicCaseResponse)
-async def close_case(
-    case_id: str,
-    _current_user: User = Depends(require_role(_ANALYST_ROLES)),
-    org_id: OrganizationId = None,
-    db: DatabaseSession = None,
-    conclusion: Optional[str] = None,
-):
-    """Close a forensic case"""
-    case = await get_case_or_404(db, case_id, org_id)
-
-    case.status = CaseStatus.CLOSED.value
-    case.updated_at = datetime.now(timezone.utc)
-
-    await db.flush()
-    await db.refresh(case)
-
-    return ForensicCaseResponse.model_validate(case)
-
-
 # ============================================================================
 # Evidence Management Endpoints
 # ============================================================================

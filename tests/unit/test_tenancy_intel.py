@@ -215,7 +215,6 @@ async def test_platform_feed_visible_but_read_only(client, db_session, org_a_adm
     for method, path, body in [
         ("PUT", f"/feeds/{feed_id}", {"description": "x"}),
         ("DELETE", f"/feeds/{feed_id}", None),
-        ("POST", f"/feeds/{feed_id}/poll", None),
         ("POST", f"/feeds/{feed_id}/sync", None),
     ]:
         resp = await client.request(method, f"{BASE}{path}", json=body, headers=org_a_admin_headers)
@@ -286,7 +285,6 @@ async def test_deduplicate_indicator_is_per_org(db_session, org_a, org_b):
         ("POST", "/feeds", {"name": "v", "feed_type": "plain", "provider": "p"}),
         ("PUT", "/feeds/x", {}),
         ("DELETE", "/feeds/x", None),
-        ("POST", "/feeds/x/poll", None),
         ("POST", "/feeds/x/sync", None),
         ("POST", "/feeds/register-builtins", None),
         ("POST", "/feeds/poll-all", None),
@@ -320,7 +318,6 @@ async def test_viewer_cannot_write(client, viewer_headers, method, path, body):
         ("POST", "/feeds", {"name": "v", "feed_type": "plain", "provider": "p"}),
         ("PUT", "/feeds/x", {}),
         ("DELETE", "/feeds/x", None),
-        ("POST", "/feeds/x/poll", None),
         ("POST", "/feeds/x/sync", None),
         ("POST", "/feeds/register-builtins", None),
         ("POST", "/feeds/poll-all", None),

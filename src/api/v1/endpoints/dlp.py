@@ -60,10 +60,8 @@ from src.schemas.dlp import (
     DLPViolationResolveRequest,
     DLPViolationUpdate,
     DiscoveryScanListResponse,
-    DiscoveryScanTriggerRequest,
     DocumentClassificationRequest,
     DocumentClassificationResponse,
-    NotificationTrackingResponse,
     SensitiveDataDiscoveryResponse,
     ViolationTrendResponse,
 )
@@ -807,35 +805,6 @@ async def get_handling_requirements(
 # ==================== DATA DISCOVERY ====================
 
 
-@router.post("/discovery/scan", response_model=SensitiveDataDiscoveryResponse, status_code=status.HTTP_201_CREATED)
-async def trigger_discovery_scan(
-    scan_request: DiscoveryScanTriggerRequest,
-    org_id: OrganizationId,
-    _user: AnalystUser = None,
-):
-    """Trigger a sensitive data discovery scan.
-
-    Not implemented: no discovery scanner (agent or connector) exists to
-    process a scan, so this used to insert a ``pending`` row that nothing
-    ever picked up. Refuse honestly instead of faking a queued scan.
-    """
-    logger.info(
-        "dlp_discovery_scan_not_implemented",
-        organization_id=org_id,
-        scan_type=scan_request.scan_type,
-    )
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail={
-            "error": "not_implemented",
-            "detail": (
-                "Sensitive data discovery scans are not implemented: no DLP agent "
-                "or storage connector exists to run them."
-            ),
-        },
-    )
-
-
 @router.get("/discovery/scans", response_model=DiscoveryScanListResponse)
 async def list_discovery_scans(
     org_id: OrganizationId,
@@ -1112,35 +1081,6 @@ async def assess_breach(
         regulatory_obligations=assessment["regulatory_obligations"],
         notification_deadline=assessment["notification_deadline"],
         notification_required=assessment["notification_required"],
-    )
-
-
-@router.get(
-    "/incidents/{incident_id}/notification-tracking",
-    response_model=NotificationTrackingResponse,
-)
-async def get_notification_tracking(
-    incident_id: str,
-    org_id: OrganizationId,
-    db: DatabaseSession = None,
-):
-    """Get notification compliance tracking.
-
-    Not implemented: breach notifications are not recorded anywhere, so this
-    used to echo caller-supplied ``notified_count`` / ``total_required`` back
-    as "tracking". The incident is still looked up (tenant-scoped) so a
-    foreign id is a 404, then the route refuses honestly.
-    """
-    await get_incident_or_404(db, incident_id, org_id)
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail={
-            "error": "not_implemented",
-            "detail": (
-                "Breach notification delivery is not tracked: no notification "
-                "records exist for DLP incidents."
-            ),
-        },
     )
 
 

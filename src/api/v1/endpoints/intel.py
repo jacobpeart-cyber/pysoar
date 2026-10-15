@@ -109,7 +109,6 @@ from src.schemas.intel import (
     IntelReportListResponse,
     IntelReportResponse,
     IntelReportUpdate,
-    IntelSearchRequest,
     IndicatorSightingCreate,
     IndicatorSightingResponse,
     ThreatActorCreate,
@@ -573,7 +572,6 @@ async def delete_threat_feed(
     await db.flush()
 
 
-@router.post("/feeds/{feed_id}/poll", response_model=None, operation_id="poll_threat_feed")
 async def poll_threat_feed(
     background_tasks: BackgroundTasks,
     current_user: AdminRoleUser = None,
@@ -581,7 +579,8 @@ async def poll_threat_feed(
     db: DatabaseSession = None,
     feed_id: str = Path(...),
 ) -> dict:
-    """Trigger a real poll of a threat feed.
+    """Trigger a real poll of a threat feed (the body of ``POST /feeds/{id}/sync``;
+    the duplicate ``/poll`` route was deleted in wave 5).
 
     Previously this only stamped ``last_poll_at`` without actually
     fetching. The frontend Sync button was a no-op; ``total_indicators``
@@ -1081,55 +1080,6 @@ async def get_indicator_timeline(
     # Sort by timestamp descending
     timeline.sort(key=lambda x: x["timestamp"] or "", reverse=True)
     return timeline
-
-
-@router.post("/indicators/search", response_model=ThreatIndicatorListResponse, operation_id="advanced_search_indicators")
-async def advanced_search_indicators(
-    search_request: IntelSearchRequest,
-    current_user: CurrentUser = None,
-    org_id: OrganizationId = None,
-    db: DatabaseSession = None,
-    page: int = Query(1, ge=1),
-    size: int = Query(50, ge=1, le=200),
-) -> ThreatIndicatorListResponse:
-    """
-    Perform advanced search on threat indicators.
-    """
-    query = select(ThreatIndicator)
-
-    query = query.where(_visible_to(ThreatIndicator, org_id))
-
-    if search_request.query:
-        query = query.where(
-            or_(
-                ThreatIndicator.value.ilike(f"%{search_request.query}%"),
-                ThreatIndicator.source.ilike(f"%{search_request.query}%"),
-            )
-        )
-    if search_request.indicator_types:
-        query = query.where(ThreatIndicator.indicator_type.in_(search_request.indicator_types))
-    if search_request.severity:
-        query = query.where(ThreatIndicator.severity.in_(search_request.severity))
-    if search_request.tlp:
-        query = query.where(ThreatIndicator.tlp.in_(search_request.tlp))
-    if search_request.is_active is not None:
-        query = query.where(ThreatIndicator.is_active == search_request.is_active)
-    if search_request.min_confidence is not None:
-        query = query.where(ThreatIndicator.confidence >= search_request.min_confidence)
-    if search_request.date_from:
-        query = query.where(ThreatIndicator.created_at >= search_request.date_from)
-    if search_request.date_to:
-        query = query.where(ThreatIndicator.created_at <= search_request.date_to)
-
-    count_query = select(func.count()).select_from(query.subquery())
-    total = (await db.execute(count_query)).scalar() or 0
-    pages = math.ceil(total / size) if total > 0 else 0
-
-    query = query.offset((page - 1) * size).limit(size).order_by(desc(ThreatIndicator.created_at))
-    result = await db.execute(query)
-    items = result.scalars().all()
-
-    return ThreatIndicatorListResponse(items=items, total=total, page=page, size=size, pages=pages)
 
 
 # ============================================================================

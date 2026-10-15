@@ -34,7 +34,6 @@ from src.threat_modeling.models import (
 )
 from src.threat_modeling.engine import (
     STRIDEAnalyzer,
-    PASTAEngine,
     AttackTreeGenerator,
     MitigationRecommender,
     ThreatModelValidator,
@@ -61,8 +60,6 @@ from src.schemas.threat_modeling import (
     AttackTreeListResponse,
     STRIDEAnalysisRequest,
     STRIDEAnalysisResponse,
-    PASTAAnalysisRequest,
-    PASTAAnalysisResponse,
     ValidationRequest,
     ValidationResponse,
     ThreatModelDashboard,
@@ -229,23 +226,6 @@ async def list_threat_models(
         page=page,
         size=size,
         pages=pages,
-    )
-
-
-@router.get("/models", response_model=ThreatModelListResponse)
-async def list_threat_models_alias(
-    org_id: OrganizationId,
-    db: DatabaseSession = None,
-    page: int = Query(1, ge=1),
-    size: int = Query(20, ge=1, le=100),
-):
-    """Alias for `GET /threat-modeling` — some frontend callers use
-    `/threat-modeling/models`. Must be declared before `/{model_id}` so
-    FastAPI doesn't treat the literal string "models" as a UUID."""
-    return await list_threat_models(
-        org_id=org_id, db=db, page=page, size=size,
-        search=None, status=None, methodology=None,
-        sort_by="created_at", sort_order="desc",
     )
 
 
@@ -725,50 +705,6 @@ async def run_stride_analysis(
         status="success",
         model_id=model_id,
         threats_generated=threats_count,
-        timestamp=datetime.utcnow().isoformat(),
-    )
-
-
-@router.post("/{model_id}/analyze/pasta", response_model=PASTAAnalysisResponse)
-async def run_pasta_analysis(
-    org_id: OrganizationId,
-    _user: AnalystUser = None,
-    db: DatabaseSession = None,
-    model_id: str = Path(...),
-    request: PASTAAnalysisRequest = Body(default_factory=PASTAAnalysisRequest),
-):
-    """Run PASTA analysis on threat model"""
-    model = await get_threat_model_or_404(model_id, org_id, db)
-
-    pasta = PASTAEngine()
-    components_result = await db.execute(
-        select(ThreatModelComponent).where(
-            ThreatModelComponent.model_id == model_id,
-            ThreatModelComponent.organization_id == org_id,
-        )
-    )
-    components = components_result.scalars().all()
-
-    threats_result = await db.execute(
-        select(IdentifiedThreat).where(
-            IdentifiedThreat.model_id == model_id,
-            IdentifiedThreat.organization_id == org_id,
-        )
-    )
-    threats = threats_result.scalars().all()
-
-    analysis_result = pasta.run_full_pasta(model, components, threats)
-
-    # Count stages that returned non-empty results
-    stages_completed = sum(
-        1 for key, value in analysis_result.items()
-        if key.startswith("stage_") and value
-    )
-
-    return PASTAAnalysisResponse(
-        status="success",
-        model_id=model_id,
-        stages_completed=stages_completed,
         timestamp=datetime.utcnow().isoformat(),
     )
 

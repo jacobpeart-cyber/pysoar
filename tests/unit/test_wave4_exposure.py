@@ -323,9 +323,9 @@ async def test_graph_from_stored_relations_and_attack_paths_501(
     other = (await client.get(f"{API}/graph", headers=org_b_headers)).json()
     assert other["nodes"] == [] and other["edges"] == []
 
+    # The 501 attack-paths stub was deleted in wave 5; the graph above is the real view.
     paths = await client.get(f"{API}/attack-paths", headers=org_a_headers)
-    assert paths.status_code == 501
-    assert paths.json()["detail"]["error"] == "not_implemented"
+    assert paths.status_code == 404
 
 
 async def test_attack_surface_fields_and_snapshot_rows(

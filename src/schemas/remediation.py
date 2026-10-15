@@ -94,21 +94,6 @@ class RemediationActionBase(BaseModel):
     tags: list[str] = Field(default_factory=list)
 
 
-class RemediationActionCreate(RemediationActionBase):
-    """Create request."""
-    pass
-
-
-class RemediationActionResponse(RemediationActionBase):
-    """Response with metadata."""
-    id: str = ""
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-    organization_id: str = ""
-
-    model_config = ConfigDict(from_attributes=True)
-
-
 class ActionParameterSpec(BaseModel):
     """One parameter a registry action accepts."""
     name: str

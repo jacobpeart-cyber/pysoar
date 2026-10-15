@@ -151,15 +151,6 @@ class IdentityThreatResponse(IdentityThreatBase, DBModel):
         from_attributes = True
 
 
-class ThreatInvestigationRequest(BaseModel):
-    """Schema for threat investigation action"""
-
-    threat_id: str = ""
-    investigation_notes: str = ""
-    new_status: str = "investigating"
-    evidence_summary: Optional[dict[str, Any]] = None
-
-
 class ThreatResponseAction(BaseModel):
     """Schema for threat response action"""
 
@@ -277,14 +268,6 @@ class AccessAnomalyResponse(AccessAnomalyBase, DBModel):
         from_attributes = True
 
 
-class AnomalyReviewRequest(BaseModel):
-    """Schema for anomaly review action"""
-
-    anomaly_id: str = ""
-    is_legitimate: bool = False
-    reviewer_notes: str = ""
-
-
 class IdentityBaseline(BaseModel):
     """Schema for identity baseline"""
 
@@ -354,15 +337,6 @@ class ElevationRequest(BaseModel):
     require_mfa: bool = True
 
 
-class ElevationApprovalRequest(BaseModel):
-    """Schema for elevation approval"""
-
-    request_id: str = ""
-    approved: bool = False
-    approver_notes: Optional[str] = None
-    approval_duration_minutes: Optional[int] = Field(None, ge=15, le=480)
-
-
 class PrivilegedAccessAuditRequest(BaseModel):
     """Schema for privileged access audit request"""
 
@@ -417,16 +391,6 @@ class ITDRDashboardMetrics(BaseModel):
     last_directory_sync_at: Optional[datetime] = None
     identity_integrations: list[dict[str, Any]] = Field(default_factory=list)
     jobs: list[dict[str, Any]] = Field(default_factory=list)
-
-
-class ITDRRiskOverview(BaseModel):
-    """Schema for ITDR risk overview"""
-
-    summary: str = ""
-    critical_findings: list[str]
-    risk_trends: dict[str, Any]
-    recommendations: list[str]
-    compliance_status: dict[str, Any]
 
 
 class ThreatDetectionReport(BaseModel):

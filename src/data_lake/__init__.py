@@ -6,7 +6,6 @@ patterns with federated querying, automated catalog, and tiered storage manageme
 """
 
 from src.data_lake.engine import (
-    DataCatalog,
     DataIngestionEngine,
     PipelineOrchestrator,
     QueryEngine,
@@ -30,5 +29,4 @@ __all__ = [
     "StorageManager",
     "QueryEngine",
     "PipelineOrchestrator",
-    "DataCatalog",
 ]

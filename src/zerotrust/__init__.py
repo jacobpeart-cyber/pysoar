@@ -9,7 +9,6 @@ This module implements Zero Trust principles for comprehensive security:
 """
 
 from src.zerotrust.engine import (
-    ContinuousAuthEngine,
     DeviceTrustAssessor,
     MicroSegmentationEngine,
     PolicyDecisionPoint,
@@ -32,6 +31,5 @@ __all__ = [
     "PolicyDecisionPoint",
     "DeviceTrustAssessor",
     "MicroSegmentationEngine",
-    "ContinuousAuthEngine",
     "ZeroTrustScorer",
 ]

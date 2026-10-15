@@ -236,26 +236,6 @@ class IdentityVerificationBase(BaseModel):
     geo_location: Optional[dict[str, Any]] = None
 
 
-class IdentityVerificationCreate(IdentityVerificationBase):
-    """Schema for creating identity verification"""
-
-    pass
-
-
-class IdentityVerificationResponse(IdentityVerificationBase, DBModel):
-    """Schema for identity verification response"""
-
-    id: str = ""
-    result: str = Field(..., description="success, failure, timeout, cancelled")
-    risk_score_before: float = 0.0
-    risk_score_after: float = 0.0
-    session_id: Optional[str] = None
-    created_at: Optional[datetime] = None
-
-    class Config:
-        from_attributes = True
-
-
 class ZeroTrustMaturityResponse(BaseModel):
     """Schema for Zero Trust maturity assessment"""
 

@@ -308,20 +308,6 @@ class STRIDEAnalysisResponse(BaseModel):
     timestamp: str = ""
 
 
-class PASTAAnalysisRequest(BaseModel):
-    """Request for PASTA analysis"""
-    model_id: str = ""
-    include_attack_trees: bool = True
-
-
-class PASTAAnalysisResponse(BaseModel):
-    """Response from PASTA analysis"""
-    status: str = ""
-    model_id: str = ""
-    stages_completed: int = 0
-    timestamp: str = ""
-
-
 # Validation schemas
 class ValidationRequest(BaseModel):
     """Request for model validation"""

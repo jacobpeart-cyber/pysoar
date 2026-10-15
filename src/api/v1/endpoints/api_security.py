@@ -1049,34 +1049,6 @@ async def get_risk_trend(
 # ============================================================================
 
 
-@router.post("/scan/discover")
-async def trigger_api_discovery(
-    org_id: OrganizationId,
-    _user: AnalystUser = None,
-    traffic_logs: Optional[List[dict]] = Body(None),
-):
-    """Trigger API discovery scan from traffic (not implemented).
-
-    This used to queue an in-memory discovery whose results were thrown away
-    and answer ``scan_queued`` with hardcoded zero counts. Nothing was
-    discovered or saved, so it now says so. ``POST /scan/shadows`` persists
-    shadow APIs found in posted traffic logs.
-    """
-    logger.info(
-        "api_security_discovery_not_implemented",
-        organization_id=org_id,
-        traffic_log_count=len(traffic_logs or []),
-    )
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail={
-            "error": "not_implemented",
-            "detail": "API discovery results are not persisted yet; nothing was scanned. "
-            "Use POST /api-security/scan/shadows to record shadow APIs from traffic logs.",
-        },
-    )
-
-
 @router.post("/scan/security/{endpoint_id}")
 async def trigger_security_scan(
     endpoint_id: str,

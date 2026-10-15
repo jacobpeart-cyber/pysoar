@@ -262,9 +262,9 @@ async def revoke_all_tokens(
 # ---------------------------------------------------------------------------
 # MFA alias routes
 #
-# The frontend SettingsPage calls POST /auth/mfa/enable and POST /auth/mfa/verify,
-# while the real MFA implementation is mounted at /mfa/setup and /mfa/verify-setup.
-# These aliases forward to the existing MFAManager to avoid duplicating logic.
+# The Profile page calls POST /auth/mfa/enable; the real MFA implementation is
+# mounted at /mfa/setup and /mfa/verify-setup. The /auth/mfa/verify alias, a
+# duplicate of /mfa/verify-setup, was deleted in wave 5.
 # ---------------------------------------------------------------------------
 
 
@@ -278,7 +278,7 @@ async def mfa_enable_alias(
     Mirrors /mfa/setup. Returns ``secret``, ``provisioning_uri`` (otpauth URL
     the frontend renders as a QR code), and a set of plaintext ``backup_codes``
     shown exactly once. The secret is NOT persisted until the user confirms
-    via POST /auth/mfa/verify with a valid 6-digit code.
+    via POST /mfa/verify-setup with a valid 6-digit code.
     """
     from src.core.mfa import MFAManager
 
@@ -297,48 +297,6 @@ async def mfa_enable_alias(
     return {
         "secret": secret,
         "provisioning_uri": provisioning_uri,
-        "backup_codes": backup_codes,
-    }
-
-
-@router.post("/mfa/verify")
-async def mfa_verify_alias(
-    payload: dict,
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
-):
-    """Validate a 6-digit TOTP code against a provisioned secret and enable MFA.
-
-    Accepts ``{"secret": "<base32>", "code": "123456"}``.
-    """
-    from src.core.mfa import MFAManager
-
-    secret = payload.get("secret")
-    code = payload.get("code")
-    if not secret or not code:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Both 'secret' and 'code' are required",
-        )
-
-    if not MFAManager.verify_totp(secret, code):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid verification code",
-        )
-
-    backup_codes = MFAManager.generate_backup_codes()
-    hashed_backup_codes = MFAManager.hash_backup_codes(backup_codes)
-
-    user_service = UserService(db)
-    await user_service.update(
-        current_user.id,
-        mfa_secret=secret,
-        mfa_backup_codes=hashed_backup_codes,
-        mfa_enabled=True,
-    )
-    return {
-        "message": "MFA successfully enabled",
         "backup_codes": backup_codes,
     }
 

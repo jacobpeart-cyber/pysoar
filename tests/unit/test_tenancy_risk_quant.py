@@ -273,7 +273,7 @@ async def test_viewer_cannot_write(
 
 async def test_viewer_can_read(client: AsyncClient, viewer_headers: dict[str, str]) -> None:
     for path in ("scenarios", "fair-analyses", "risk-registers", "controls", "bias", "dashboard",
-                 "heatmap", "loss-exceedance"):
+                 "loss-exceedance"):
         resp = await client.get(f"{API}/{path}", headers=viewer_headers)
         assert resp.status_code == 200, (path, resp.text)
 

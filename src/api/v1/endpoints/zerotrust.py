@@ -16,8 +16,6 @@ from src.schemas.zerotrust import (
     AccessRequestSchema,
     DeviceComplianceUpdate,
     DeviceTrustProfileResponse,
-    IdentityVerificationCreate,
-    IdentityVerificationResponse,
     MicroSegmentCreate,
     MicroSegmentResponse,
     MicroSegmentUpdate,
@@ -31,7 +29,6 @@ from src.schemas.zerotrust import (
 )
 from src.services.automation import AutomationService
 from src.zerotrust.engine import (
-    ContinuousAuthEngine,
     DeviceTrustAssessor,
     MicroSegmentationEngine,
     PolicyDecisionPoint,
@@ -41,7 +38,6 @@ from src.zerotrust.engine import (
 from src.zerotrust.models import (
     AccessDecision,
     DeviceTrustProfile,
-    IdentityVerification,
     MicroSegment,
     ZeroTrustPolicy,
 )
@@ -1017,98 +1013,6 @@ async def get_segment_topology(
 # ============================================================================
 # IDENTITY VERIFICATION ENDPOINTS
 # ============================================================================
-
-
-@router.post("/verify", response_model=IdentityVerificationResponse)
-async def initiate_verification(
-    verification: IdentityVerificationCreate,
-    org_id: OrganizationId,
-    db: DatabaseSession = None,
-    _user: AnalystUser = None,
-) -> IdentityVerificationResponse:
-    """Initiate identity verification"""
-    auth_engine = ContinuousAuthEngine(db, org_id)
-
-    v = await auth_engine.initiate_verification(
-        user_id=verification.user_id,
-        verification_type=verification.verification_type,
-        trigger_reason=verification.trigger_reason,
-        context={
-            "device_id": verification.device_id,
-            "source_ip": verification.source_ip,
-        },
-    )
-
-    return IdentityVerificationResponse.model_validate(v)
-
-
-@router.post("/step-up/{session_id}", response_model=None)
-async def step_up_authentication(
-    session_id: str,
-    org_id: OrganizationId,
-    _user: AnalystUser = None,
-    required_level: str = Query(..., description="mfa, biometric, password"),
-) -> dict[str, Any]:
-    """Initiate step-up authentication (not implemented).
-
-    This used to return ``challenge_<session_id>`` as if a challenge had been
-    issued; no challenge was ever sent to the user and nothing could verify a
-    response. It now says so instead of faking success.
-    """
-    logger.info(
-        "api_step_up_not_implemented",
-        organization_id=org_id,
-        session_id=session_id,
-        required_level=required_level,
-    )
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail={
-            "error": "not_implemented",
-            "detail": "step-up authentication challenges are not issued yet; no challenge was sent",
-        },
-    )
-
-
-@router.get("/verifications", response_model=None)
-async def list_verifications(
-    org_id: OrganizationId,
-    db: DatabaseSession = None,
-    user_id: str = Query(None),
-    skip: int = Query(0, ge=0),
-    limit: int = Query(20, ge=1, le=100),
-) -> dict[str, Any]:
-    """Get verification history"""
-
-    query = select(IdentityVerification).where(
-        IdentityVerification.organization_id == org_id,
-    )
-
-    if user_id:
-        query = query.where(IdentityVerification.user_id == user_id)
-
-    # Get total count
-    count_result = await db.execute(
-        select(func.count(IdentityVerification.id)).where(
-            IdentityVerification.organization_id == org_id,
-        ),
-    )
-    total = count_result.scalar_one()
-
-    # Get paginated results
-    result = await db.execute(
-        query.order_by(desc(IdentityVerification.created_at))
-        .offset(skip)
-        .limit(limit),
-    )
-    verifications = result.scalars().all()
-
-    return {
-        "total": total,
-        "skip": skip,
-        "limit": limit,
-        "verifications": [IdentityVerificationResponse.model_validate(v) for v in verifications],
-    }
 
 
 # ============================================================================

@@ -86,7 +86,6 @@ async def test_deception_routes_are_tenant_isolated(
         ("POST", f"{BASE}/interactions/{interaction_id}/investigate", {}),
         ("GET", f"{BASE}/campaigns/{campaign_id}", None),
         ("PUT", f"{BASE}/campaigns/{campaign_id}/status", {"status": "paused"}),
-        ("GET", f"{BASE}/campaigns/{campaign_id}/effectiveness", None),
     ]:
         await assert_tenant_isolated(client, method, path, org_b_headers, json=body)
 
@@ -246,13 +245,11 @@ async def test_viewers_cannot_write(
         ("POST", f"{BASE}/decoys", _decoy_body()),
         ("PUT", f"{BASE}/decoys/{decoy_id}", _decoy_body()),
         ("POST", f"{BASE}/decoys/{decoy_id}/disable", None),
-        ("POST", f"{BASE}/decoys/{decoy_id}/rotate", None),
         ("POST", f"{BASE}/decoys/{decoy_id}/interactions", {"source_ip": "198.51.100.2"}),
         ("DELETE", f"{BASE}/decoys/{decoy_id}", None),
         ("POST", f"{BASE}/tokens", {"token_type": "api_key"}),
         ("POST", f"{BASE}/tokens/{token_id}/check", None),
         ("DELETE", f"{BASE}/tokens/{token_id}", None),
-        ("POST", f"{BASE}/tokens/rotate?token_type=api_key", None),
         ("POST", f"{BASE}/interactions/{interaction_id}/investigate", {}),
         ("POST", f"{BASE}/campaigns", {"name": "v", "objective": "general_detection"}),
         ("PUT", f"{BASE}/campaigns/{campaign_id}/status", {"status": "paused"}),
@@ -275,10 +272,8 @@ async def test_decoy_configuration_and_deletion_are_admin_only(
     for method, path, body in [
         ("POST", f"{BASE}/decoys", _decoy_body()),
         ("PUT", f"{BASE}/decoys/{decoy_id}", _decoy_body()),
-        ("POST", f"{BASE}/decoys/{decoy_id}/rotate", None),
         ("DELETE", f"{BASE}/decoys/{decoy_id}", None),
         ("DELETE", f"{BASE}/tokens/{token_id}", None),
-        ("POST", f"{BASE}/tokens/rotate?token_type=api_key", None),
     ]:
         resp = await client.request(method, path, json=body, headers=org_a_headers)
         assert resp.status_code == 403, f"{method} {path}: {resp.status_code} {resp.text[:200]}"
@@ -303,23 +298,16 @@ async def test_orgless_superuser_is_refused(client: AsyncClient, superuser_heade
         assert _error_key(resp) == "organization_required"
 
 
-async def test_rotation_routes_are_honest_501s(
-    client: AsyncClient, db_session: AsyncSession, org_a_admin_headers: dict[str, str], org_b_headers: dict[str, str]
+async def test_fake_routes_are_retired(
+    client: AsyncClient, org_a_admin_headers: dict[str, str]
 ) -> None:
+    """Wave 5 deleted the 501 rotation stubs and the fabricated coverage and
+    campaign-effectiveness figures (no page called them)."""
     decoy_id = await _decoy(client, org_a_admin_headers)
-
-    resp = await client.post(f"{BASE}/decoys/{decoy_id}/rotate", headers=org_a_admin_headers)
-    assert resp.status_code == 501, resp.text
-    assert _error_key(resp) == "not_implemented"
-    # Rotation no longer wipes evidence counters or touches the row.
-    row = (await db_session.execute(select(Decoy).where(Decoy.id == decoy_id))).scalar_one()
-    # Wave 3: with no deception agent a honeyfile is honestly "not_deployed" (it used to be
-    # stored as "active" with nothing deployed); rotation leaves that untouched.
-    assert row.status == "not_deployed"
-
-    resp = await client.post(f"{BASE}/tokens/rotate", params={"token_type": "api_key"}, headers=org_a_admin_headers)
-    assert resp.status_code == 501, resp.text
-    assert _error_key(resp) == "not_implemented"
-
-    # Another tenant still gets 403/404 before the 501.
-    await assert_tenant_isolated(client, "POST", f"{BASE}/decoys/{decoy_id}/rotate", org_b_headers)
+    for method, path in (
+        ("POST", f"{BASE}/decoys/{decoy_id}/rotate"),
+        ("POST", f"{BASE}/tokens/rotate?token_type=api_key"),
+        ("GET", f"{BASE}/coverage"),
+    ):
+        resp = await client.request(method, path, headers=org_a_admin_headers)
+        assert resp.status_code in (404, 405), f"{method} {path}: {resp.status_code}"

@@ -271,8 +271,9 @@ async def test_pia_stores_form_fields_and_patch(
     assert patched.status_code == 200, patched.text
     assert patched.json()["mitigations"] == ["pseudonymise exports"]
     assert patched.json()["cross_border_transfers"] == ["US"]
+    # The boilerplate-mitigations route (a 501 since wave 4) was deleted in wave 5.
     removed = await client.post(f"{BASE}/pia/assessments/{pia['id']}/mitigations", headers=org_a_headers)
-    assert removed.status_code == 501
+    assert removed.status_code in (404, 405)
 
 
 @pytest.mark.asyncio

@@ -21,7 +21,6 @@ from src.risk_quant.engine import (
     ControlEffectivenessAnalyzer,
     FAIREngine,
     FAIRInputError,
-    RiskAggregator,
     simulate_analysis,
     simulate_portfolio,
     store_result,
@@ -51,7 +50,6 @@ from src.schemas.risk_quant import (
     RiskControlResponse,
     RiskControlUpdate,
     RiskDashboardResponse,
-    RiskHeatmapResponse,
     RiskRegisterCreate,
     RiskRegisterListResponse,
     RiskRegisterResponse,
@@ -1055,34 +1053,6 @@ async def get_risk_dashboard(
         control_effectiveness_avg=avg_effectiveness * 100,
         **fair_fields,
     )
-
-
-@router.get("/heatmap", response_model=RiskHeatmapResponse)
-async def get_risk_heatmap(
-    org_id: OrganizationId,
-    db: DatabaseSession = None,
-):
-    """Get risk heatmap (impact vs likelihood)"""
-    aggregator = RiskAggregator()
-
-    # Query all risks
-    query = select(RiskRegister).where(
-        RiskRegister.organization_id == org_id
-    )
-    result = await db.execute(query)
-    registers = list(result.scalars().all())
-
-    # Convert to aggregator format
-    risks = [
-        {
-            "likelihood": min(register.inherent_risk_score / 100, 1.0),
-            "impact": min(register.ale_annual_usd / 1000000, 1.0),
-        }
-        for register in registers
-    ]
-
-    heatmap_data = aggregator.generate_risk_heatmap(risks)
-    return RiskHeatmapResponse(**heatmap_data)
 
 
 # ---------------------------------------------------------------------------

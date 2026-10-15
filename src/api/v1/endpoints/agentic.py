@@ -38,7 +38,6 @@ from src.agentic.models import (
     AgentAction,
     AgentChatMessage,
     AgentChatSession,
-    AgentMemory,
     Investigation,
     InvestigationStatus,
     SOCAgent,
@@ -100,11 +99,8 @@ from src.llm.models import LLMCallLog, LLMUsageDaily, actor_key_for
 from src.llm.quota import CircuitOpen, QuotaBackendUnavailable, TokenQuota
 from src.models.user import User
 from src.schemas.agentic import (
-    AccuracyStats,
     ActionPendingApproval,
     AgentActionApproval,
-    AgentMemoryListResponse,
-    AgentMemoryResponse,
     AgentProposal,
     AlertExplanation,
     ChatMessageListResponse,
@@ -116,21 +112,15 @@ from src.schemas.agentic import (
     InvestigationCorrection,
     InvestigationCreate,
     InvestigationExplanation,
-    InvestigationFeedback,
     InvestigationListResponse,
     InvestigationMetrics,
     InvestigationResponse,
-    InvestigationUpdate,
-    MemoryStats,
     NaturalLanguageQuery,
     NaturalLanguageResponse,
     SOCAgentCreate,
     SOCAgentListResponse,
-    SOCAgentPerformance,
     SOCAgentResponse,
     SOCAgentUpdate,
-    ThreatHuntRequest,
-    ThreatHuntResult,
     TrustAcknowledgeRequest,
 )
 from src.services.agent_tools import AgentToolRegistry, render_json_schema
@@ -773,76 +763,6 @@ async def update_agent(
     return SOCAgentResponse.model_validate(agent)
 
 
-@router.post("/agents/{agent_id}/start")
-async def start_agent(
-    org_id: OrganizationId,
-    _current_user: AgentAdminUser = None,
-    db: DatabaseSession = None,
-    agent_id: str = Path(...),
-):
-    """Start agent operation"""
-    agent = await db.get(SOCAgent, agent_id)
-
-    if not agent or agent.organization_id != org_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Agent not found",
-        )
-
-    agent.status = "idle"
-    await db.commit()
-
-    return {"status": "started", "agent_id": agent_id}
-
-
-@router.post("/agents/{agent_id}/stop")
-async def stop_agent(
-    org_id: OrganizationId,
-    _current_user: AgentAdminUser = None,
-    db: DatabaseSession = None,
-    agent_id: str = Path(...),
-):
-    """Stop agent operation"""
-    agent = await db.get(SOCAgent, agent_id)
-
-    if not agent or agent.organization_id != org_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Agent not found",
-        )
-
-    agent.status = "paused"
-    await db.commit()
-
-    return {"status": "stopped", "agent_id": agent_id}
-
-
-@router.get("/agents/{agent_id}/performance", response_model=SOCAgentPerformance)
-async def get_agent_performance(
-    org_id: OrganizationId,
-    db: DatabaseSession = None,
-    agent_id: str = Path(...),
-):
-    """Get agent performance metrics"""
-    agent = await db.get(SOCAgent, agent_id)
-
-    if not agent or agent.organization_id != org_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Agent not found",
-        )
-
-    return SOCAgentPerformance(
-        agent_id=agent.id,
-        name=agent.name,
-        total_investigations=agent.total_investigations,
-        avg_resolution_time_minutes=agent.avg_resolution_time_minutes,
-        accuracy_score=agent.accuracy_score,
-        false_positive_rate=agent.false_positive_rate,
-        status=agent.status,
-    )
-
-
 # ============================================================================
 # Investigation Endpoints
 # ============================================================================
@@ -984,42 +904,6 @@ async def start_investigation(
     return InvestigationResponse.model_validate(investigation)
 
 
-@router.put("/investigations/{investigation_id}", response_model=InvestigationResponse)
-async def update_investigation(
-    org_id: OrganizationId,
-    inv_data: InvestigationUpdate,
-    _current_user: AgentAnalystUser = None,
-    db: DatabaseSession = None,
-    investigation_id: str = Path(...),
-):
-    """Update investigation"""
-    investigation = await db.get(Investigation, investigation_id)
-
-    if not investigation or investigation.organization_id != org_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Investigation not found",
-        )
-
-    if inv_data.title:
-        investigation.title = inv_data.title
-    if inv_data.hypothesis:
-        investigation.hypothesis = inv_data.hypothesis
-    if inv_data.priority:
-        investigation.priority = inv_data.priority
-    if inv_data.status:
-        investigation.status = inv_data.status
-    if inv_data.human_feedback:
-        investigation.human_feedback = inv_data.human_feedback
-    if inv_data.feedback_rating:
-        investigation.feedback_rating = inv_data.feedback_rating
-
-    await db.commit()
-    await db.refresh(investigation)
-
-    return InvestigationResponse.model_validate(investigation)
-
-
 @router.get("/investigations/{investigation_id}/reasoning-chain")
 async def get_reasoning_chain(
     org_id: OrganizationId,
@@ -1055,62 +939,6 @@ async def get_reasoning_chain(
         "investigation_id": investigation_id,
         "total_steps": len(steps),
         "steps": steps,
-    }
-
-
-@router.get("/investigations/{investigation_id}/timeline")
-async def get_investigation_timeline(
-    org_id: OrganizationId,
-    db: DatabaseSession = None,
-    investigation_id: str = Path(...),
-):
-    """Get timeline view of investigation"""
-    investigation = await db.get(Investigation, investigation_id)
-
-    if not investigation or investigation.organization_id != org_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Investigation not found",
-        )
-
-    return {
-        "investigation_id": investigation_id,
-        "title": investigation.title,
-        "status": investigation.status,
-        "confidence_score": investigation.confidence_score,
-        "start_time": investigation.created_at,
-        "steps_count": len(investigation.reasoning_steps),
-        "actions_count": len(investigation.actions),
-        "findings": investigation.findings_summary,
-    }
-
-
-@router.post("/investigations/{investigation_id}/feedback")
-async def submit_investigation_feedback(
-    org_id: OrganizationId,
-    feedback: InvestigationFeedback,
-    _current_user: AgentAnalystUser = None,
-    db: DatabaseSession = None,
-    investigation_id: str = Path(...),
-):
-    """Submit quality-rating feedback on an investigation."""
-    investigation = await db.get(Investigation, investigation_id)
-
-    if not investigation or investigation.organization_id != org_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Investigation not found",
-        )
-
-    investigation.feedback_rating = feedback.rating
-    investigation.human_feedback = feedback.feedback
-
-    await db.commit()
-
-    return {
-        "status": "feedback_recorded",
-        "investigation_id": investigation_id,
-        "rating": feedback.rating,
     }
 
 
@@ -2808,393 +2636,14 @@ async def get_investigation_metrics(
     )
 
 
-@router.get("/dashboard/accuracy-stats", response_model=AccuracyStats)
-async def get_accuracy_stats(
-    org_id: OrganizationId,
-    db: DatabaseSession = None,
-):
-    """Get accuracy and false positive statistics from real database data"""
-    base_filter = Investigation.organization_id == org_id
-
-    # Total investigations
-    total_result = await db.execute(
-        select(func.count()).select_from(Investigation).where(base_filter),
-    )
-    total = total_result.scalar() or 0
-
-    # Count by resolution type
-    resolution_result = await db.execute(
-        select(Investigation.resolution_type, func.count())
-        .where(base_filter, Investigation.resolution_type.isnot(None))
-        .group_by(Investigation.resolution_type),
-    )
-    resolution_counts = {row[0]: row[1] for row in resolution_result.all()}
-
-    true_positives = resolution_counts.get("true_positive", 0)
-    false_positives = resolution_counts.get("false_positive", 0)
-    inconclusive = resolution_counts.get("inconclusive", 0)
-    escalated = resolution_counts.get("escalated", 0)
-
-    # Calculate rates
-    resolved_total = true_positives + false_positives + inconclusive + escalated
-    accuracy_score = (
-        round((true_positives / resolved_total) * 100, 1) if resolved_total > 0 else 0.0
-    )
-    false_positive_rate = (
-        round((false_positives / resolved_total) * 100, 1) if resolved_total > 0 else 0.0
-    )
-
-    return AccuracyStats(
-        total_investigations=total,
-        true_positives=true_positives,
-        false_positives=false_positives,
-        inconclusive=inconclusive,
-        escalated=escalated,
-        accuracy_score=accuracy_score,
-        false_positive_rate=false_positive_rate,
-    )
-
-
 # ============================================================================
 # Threat Hunting Endpoints
 # ============================================================================
 
 
-@router.post("/threat-hunts", response_model=ThreatHuntResult)
-async def start_threat_hunt(
-    org_id: OrganizationId,
-    hunt_request: ThreatHuntRequest,
-    _current_user: AgentAnalystUser = None,
-    db: DatabaseSession = None,
-):
-    """Run a threat hunt against real platform data.
-
-    Previously returned a fake ``hunt_id=hunt_<timestamp>`` with every
-    count set to 0 and ``status=initiated`` — the button claimed a
-    hunt started, nothing ran, no Investigation rows were created,
-    and the dashboard stayed empty forever.
-
-    Now performs a real, synchronous multi-source hunt:
-      1. Resolve the agent (specified or first in org)
-      2. Query Alerts (status != resolved, severity high/critical)
-      3. Query open IdentityThreats
-      4. Query open CredentialLeaks
-      5. Query unresolved HuntFindings from the SIEM module
-      6. Create a real Investigation row that consolidates the count
-         with a reasoning_chain entry per source, confidence scored
-         from the cross-source overlap
-      7. Return real counts from the aggregation
-
-    Hunt profiles ("credential_theft", "lateral_movement", "exfil",
-    "apt", "ransomware", "default") filter which sources are queried.
-    """
-    import time
-
-    from src.darkweb.models import CredentialLeak
-    from src.hunting.models import HuntFinding
-    from src.itdr.models import IdentityThreat
-    from src.models.alert import Alert
-
-    start_t = time.time()
-
-    # Resolve the agent (always one of the caller's organisation's agents)
-    agent_id = hunt_request.agent_id
-    if agent_id:
-        agent = await db.get(SOCAgent, agent_id)
-        if not agent or agent.organization_id != org_id:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Agent not found",
-            )
-    else:
-        result = await db.execute(
-            select(SOCAgent).where(SOCAgent.organization_id == org_id),
-        )
-        agent = result.scalars().first()
-        if not agent:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="No agents available",
-            )
-        agent_id = agent.id
-
-    profile = (hunt_request.hunt_profile or "default").lower()
-
-    # Source filters by profile
-    want_alerts = True
-    want_identity = profile in ("credential_theft", "apt", "default")
-    want_credentials = profile in ("credential_theft", "exfil", "default")
-    want_hunt_findings = profile in ("lateral_movement", "apt", "ransomware", "default")
-
-    reasoning_chain: list[dict] = []
-    affected_assets: list[str] = []
-    indicators_found = 0
-    high_confidence_findings = 0
-
-    # 1. Alerts (tenant-scoped)
-    if want_alerts:
-        alert_query = select(Alert).where(
-            and_(
-                Alert.organization_id == org_id,
-                Alert.severity.in_(["critical", "high"]),
-                Alert.status.in_(["new", "investigating"]),
-            ),
-        )
-        alerts = list((await db.execute(alert_query)).scalars().all())
-        reasoning_chain.append({
-            "source": "alerts",
-            "query": "severity in (critical, high), status unresolved",
-            "count": len(alerts),
-        })
-        indicators_found += len(alerts)
-        high_confidence_findings += sum(1 for a in alerts if a.severity == "critical")
-        for a in alerts[:10]:
-            if a.source_ip:
-                affected_assets.append(f"ip:{a.source_ip}")
-            if getattr(a, "hostname", None):
-                affected_assets.append(f"host:{a.hostname}")
-
-    # 2. IdentityThreats
-    if want_identity:
-        id_query = select(IdentityThreat).where(
-            and_(
-                IdentityThreat.organization_id == org_id,
-                IdentityThreat.status.in_(["detected", "investigating"]),
-            ),
-        )
-        threats = list((await db.execute(id_query)).scalars().all())
-        reasoning_chain.append({
-            "source": "identity_threats",
-            "query": "status in (detected, investigating)",
-            "count": len(threats),
-        })
-        indicators_found += len(threats)
-        high_confidence_findings += sum(1 for t in threats if t.severity == "critical")
-
-    # 3. CredentialLeaks
-    if want_credentials:
-        cred_query = select(CredentialLeak).where(
-            and_(
-                CredentialLeak.organization_id == org_id,
-                CredentialLeak.is_remediated == False,  # noqa: E712
-            ),
-        )
-        creds = list((await db.execute(cred_query)).scalars().all())
-        reasoning_chain.append({
-            "source": "credential_leaks",
-            "query": "is_remediated=false",
-            "count": len(creds),
-        })
-        indicators_found += len(creds)
-
-    # 4. Hunt findings (SIEM hunting module)
-    # Scoped on the finding's own organization_id (stamped by the hunting
-    # module); a failure here surfaces instead of reading as "no findings".
-    if want_hunt_findings:
-        hf_query = select(HuntFinding).where(
-            and_(
-                HuntFinding.organization_id == org_id,
-                HuntFinding.severity.in_(["critical", "high"]),
-            ),
-        )
-        hfs = list((await db.execute(hf_query)).scalars().all())
-        reasoning_chain.append({
-            "source": "hunt_findings",
-            "query": "severity in (critical, high), organization-scoped",
-            "count": len(hfs),
-        })
-        indicators_found += len(hfs)
-        high_confidence_findings += sum(1 for h in hfs if h.severity == "critical")
-
-    # Confidence: scale by how many sources returned hits
-    sources_with_hits = sum(1 for r in reasoning_chain if r["count"] > 0)
-    confidence = min(100.0, sources_with_hits * 25.0 + min(indicators_found * 2, 20))
-
-    # Create a real Investigation row documenting the hunt
-    from src.agentic.models import InvestigationStatus
-    investigation = Investigation(
-        agent_id=agent_id,
-        organization_id=org_id,
-        trigger_type="threat_hunt",
-        trigger_source_id=None,
-        title=f"Threat hunt: {profile}",
-        hypothesis=(
-            f"Hunt profile '{profile}' looking for active indicators "
-            f"across alerts, identity threats, credential leaks, "
-            f"and hunt findings."
-        ),
-        status=(
-            InvestigationStatus.COMPLETED.value
-            if indicators_found > 0
-            else InvestigationStatus.INITIATED.value
-        ),
-        priority=1 if high_confidence_findings > 0 else 3,
-        confidence_score=confidence,
-        reasoning_chain=reasoning_chain,
-        evidence_collected={
-            "sources_scanned": [r["source"] for r in reasoning_chain],
-            "total_indicators": indicators_found,
-        },
-        affected_assets=affected_assets[:20] if affected_assets else None,
-        findings_summary=(
-            f"Hunt '{profile}' found {indicators_found} indicator(s) "
-            f"across {sources_with_hits} source(s), "
-            f"{high_confidence_findings} of which are high-confidence."
-        ),
-    )
-    db.add(investigation)
-    await db.flush()
-    await db.refresh(investigation)
-
-    hunt_id = investigation.id
-    elapsed = (time.time() - start_t) / 60.0
-
-    logger.info(
-        f"Threat hunt completed: profile={profile} agent={agent_id} "
-        f"indicators={indicators_found} high_conf={high_confidence_findings} "
-        f"elapsed_min={elapsed:.2f}",
-    )
-
-    return ThreatHuntResult(
-        hunt_id=hunt_id,
-        agent_id=agent_id,
-        profile=profile,
-        status="completed",
-        indicators_found=indicators_found,
-        investigations_created=1,
-        high_confidence_findings=high_confidence_findings,
-        execution_time_minutes=round(elapsed, 2),
-        timestamp=datetime.now(timezone.utc),
-    )
-
-
 # ============================================================================
 # Memory Management Endpoints
 # ============================================================================
-
-
-@router.get("/agents/{agent_id}/memory", response_model=AgentMemoryListResponse)
-async def list_agent_memory(
-    org_id: OrganizationId,
-    db: DatabaseSession = None,
-    agent_id: str = Path(...),
-    page: int = Query(1, ge=1),
-    size: int = Query(20, ge=1, le=100),
-    memory_type: Optional[str] = None,
-):
-    """List agent memory entries"""
-    agent = await db.get(SOCAgent, agent_id)
-
-    if not agent or agent.organization_id != org_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Agent not found",
-        )
-
-    query = select(AgentMemory).where(
-        AgentMemory.agent_id == agent_id, AgentMemory.organization_id == org_id,
-    )
-
-    if memory_type:
-        query = query.where(AgentMemory.memory_type == memory_type)
-
-    # Get total
-    count_result = await db.execute(
-        select(func.count()).select_from(query.subquery()),
-    )
-    total = count_result.scalar() or 0
-
-    # Apply pagination
-    query = query.order_by(AgentMemory.access_count.desc())
-    query = query.offset((page - 1) * size).limit(size)
-
-    result = await db.execute(query)
-    memories = list(result.scalars().all())
-
-    return AgentMemoryListResponse(
-        items=[AgentMemoryResponse.model_validate(m) for m in memories],
-        total=total,
-        page=page,
-        size=size,
-        pages=math.ceil(total / size) if total > 0 else 0,
-    )
-
-
-@router.get("/agents/{agent_id}/memory/stats", response_model=MemoryStats)
-async def get_memory_stats(
-    org_id: OrganizationId,
-    db: DatabaseSession = None,
-    agent_id: str = Path(...),
-):
-    """Get agent memory statistics"""
-    agent = await db.get(SOCAgent, agent_id)
-
-    if not agent or agent.organization_id != org_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Agent not found",
-        )
-
-    query = select(AgentMemory).where(
-        AgentMemory.agent_id == agent_id, AgentMemory.organization_id == org_id,
-    )
-    result = await db.execute(query)
-    memories = list(result.scalars().all())
-
-    by_type = {}
-    for memory in memories:
-        by_type[memory.memory_type] = by_type.get(memory.memory_type, 0) + 1
-
-    avg_confidence = sum(m.confidence for m in memories) / len(memories) if memories else 0
-    high_confidence = len([m for m in memories if m.confidence > 0.7])
-    decaying = len([m for m in memories if m.confidence < 0.5])
-
-    return MemoryStats(
-        agent_id=agent_id,
-        total_memories=len(memories),
-        by_type=by_type,
-        avg_confidence=avg_confidence,
-        memories_decaying=decaying,
-        memories_high_confidence=high_confidence,
-    )
-
-
-@router.delete("/agents/{agent_id}/memory")
-async def clear_agent_memory(
-    org_id: OrganizationId,
-    _current_user: AgentAdminUser = None,
-    db: DatabaseSession = None,
-    agent_id: str = Path(...),
-    memory_type: Optional[str] = None,
-):
-    """Clear agent memory (optional filter by type)"""
-    agent = await db.get(SOCAgent, agent_id)
-
-    if not agent or agent.organization_id != org_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Agent not found",
-        )
-
-    query = select(AgentMemory).where(
-        AgentMemory.agent_id == agent_id, AgentMemory.organization_id == org_id,
-    )
-
-    if memory_type:
-        query = query.where(AgentMemory.memory_type == memory_type)
-
-    result = await db.execute(query)
-    memories = result.scalars().all()
-
-    for memory in memories:
-        await db.delete(memory)
-
-    await db.commit()
-
-    return {
-        "status": "cleared",
-        "memories_deleted": len(memories),
-    }
 
 
 # ============================================================================

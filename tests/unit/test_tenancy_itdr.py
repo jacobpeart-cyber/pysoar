@@ -138,7 +138,6 @@ async def test_threat_create_is_stamped_and_cannot_use_another_tenants_identity(
     for method, path, body in (
         ("GET", f"{API}/threats/{threat_id}", None),
         ("PUT", f"{API}/threats/{threat_id}", {"status": "resolved"}),
-        ("POST", f"{API}/threats/{threat_id}/investigate", {"investigation_notes": "x"}),
     ):
         await assert_tenant_isolated(client, method, path, org_b_headers, json=body)
     listed = await client.get(f"{API}/threats", headers=org_b_headers)
@@ -160,7 +159,6 @@ async def test_child_records_are_tenant_isolated(
         ("PUT", f"{API}/credential-exposures/{ids['exposure']}", {"is_remediated": True}),
         ("GET", f"{API}/anomalies/{ids['anomaly']}", None),
         ("PUT", f"{API}/anomalies/{ids['anomaly']}", {"is_reviewed": True}),
-        ("POST", f"{API}/anomalies/{ids['anomaly']}/review", {"is_legitimate": True}),
     ):
         await assert_tenant_isolated(client, method, path, org_b_headers, json=body)
 
@@ -179,8 +177,6 @@ async def test_child_records_are_tenant_isolated(
     assert metrics.status_code == 200
     body = metrics.json()
     assert body["total_identities"] == 0 and body["high_threats_active"] == 0
-    overview = await client.get(f"{API}/dashboard/risk-overview", headers=org_b_headers)
-    assert overview.status_code == 200 and overview.json()["critical_findings"] == []
 
     db_session.expire_all()
     exposure = await db_session.get(CredentialExposure, ids["exposure"])
@@ -202,17 +198,14 @@ async def test_privileged_access_admin_routes_are_isolated(
     identity_id = await _identity(db_session, org_a_id, "dan")
     ids = await _seed_children(db_session, org_a_id, identity_id)
 
-    for method, path, params, body in (
-        ("POST", f"{API}/privileged-access/{ids['event']}/approve", None, {"approved": True}),
-        ("POST", f"{API}/privileged-access/{ids['event']}/revoke", {"revocation_reason": "x"}, None),
-        ("PUT", f"{API}/privileged-access/{ids['event']}", None, {"was_revoked": True}),
-    ):
-        await assert_tenant_isolated(client, method, path, admin_b_headers, json=body, params=params)
-
-    approved = await client.post(
-        f"{API}/privileged-access/{ids['event']}/approve", json={"approved": True}, headers=org_a_admin_headers
+    await assert_tenant_isolated(
+        client, "PUT", f"{API}/privileged-access/{ids['event']}", admin_b_headers, json={"was_revoked": True},
     )
-    assert approved.status_code == 200, approved.text[:300]
+
+    revoked = await client.put(
+        f"{API}/privileged-access/{ids['event']}", json={"was_revoked": True}, headers=org_a_admin_headers
+    )
+    assert revoked.status_code == 200, revoked.text[:300]
 
 
 async def test_scan_only_reads_and_writes_the_callers_org(
@@ -245,17 +238,13 @@ WRITE_ROUTES: list[tuple[str, str, Any, Any]] = [
     ("PUT", "/identities/{identity}", None, {"display_name": "x"}),
     ("POST", "/threats", None, {"threat_type": "x", "severity": "high"}),
     ("PUT", "/threats/{threat}", None, {"status": "investigating"}),
-    ("POST", "/threats/{threat}/investigate", None, {"investigation_notes": "x"}),
     ("POST", "/threats/{threat}/respond", None, {"action_type": "contain", "action_details": {}}),
     ("POST", "/threats/scan", None, None),
     ("POST", "/credential-exposures/check", {"identity_id": "{identity}"}, None),
     ("POST", "/credential-exposures/remediate", None, {"exposure_ids": ["x"], "remediation_type": "password_reset"}),
     ("PUT", "/credential-exposures/{exposure}", None, {"is_remediated": True}),
-    ("POST", "/anomalies/{anomaly}/review", None, {"is_legitimate": True}),
     ("PUT", "/anomalies/{anomaly}", None, {"is_reviewed": True}),
     ("POST", "/privileged-access/request", None, {"identity_id": "{identity}", "target_resource": "x"}),
-    ("POST", "/privileged-access/{event}/approve", None, {"approved": True}),
-    ("POST", "/privileged-access/{event}/revoke", {"revocation_reason": "x"}, None),
     ("PUT", "/privileged-access/{event}", None, {"was_revoked": True}),
 ]
 
@@ -294,8 +283,6 @@ async def test_viewer_cannot_write(
     "method,path,params,body",
     [
         ("POST", "/threats/{threat}/respond", None, {"action_type": "contain", "action_details": {}}),
-        ("POST", "/privileged-access/{event}/approve", None, {"approved": True}),
-        ("POST", "/privileged-access/{event}/revoke", {"revocation_reason": "x"}, None),
         ("PUT", "/privileged-access/{event}", None, {"was_revoked": True}),
     ],
 )
@@ -323,7 +310,7 @@ async def test_response_and_access_decisions_are_admin_only(
 @pytest.mark.parametrize(
     "path",
     ["/identities", "/threats", "/credential-exposures", "/anomalies", "/privileged-access",
-     "/dashboard/metrics", "/dashboard/risk-overview"],
+     "/dashboard/metrics"],
 )
 async def test_org_less_superuser_needs_an_organisation(
     client: AsyncClient, superuser_headers: dict[str, str], path: str

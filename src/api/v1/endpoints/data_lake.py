@@ -48,7 +48,6 @@ from src.schemas.data_lake import (
     DataSourceUpdate,
     IngestionMetrics,
     QueryExecutionResult,
-    QueryJobCreate,
     QueryJobListResponse,
     QueryJobResponse,
     QueryPerformance,
@@ -668,57 +667,6 @@ async def update_data_source(
         raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
 
 
-@router.post("/sources/{source_id}/start")
-async def start_data_source_ingestion(
-    org_id: OrganizationId,
-    _user: AdminRoleUser = None,
-    db: DatabaseSession = None,
-    source_id: str = Path(...),
-):
-    """Start ingestion for a data source"""
-    result = await db.execute(
-        select(DataSource).where(
-            (DataSource.id == source_id)
-            & (DataSource.organization_id == org_id)
-        )
-    )
-    source = result.scalar_one_or_none()
-    if not source:
-        raise HTTPException(status_code=404, detail="Data source not found")
-
-    # Not implemented: no ingestion worker exists for registered sources (the
-    # in-memory DataIngestionEngine registry was always empty, so this
-    # always 400'd and would have stamped a fabricated last_event_received).
-    raise _not_implemented(
-        "Starting ingestion is not implemented: no connector ingests registered "
-        "data sources. Built-in sources are fed by the platform itself."
-    )
-
-
-@router.post("/sources/{source_id}/stop")
-async def stop_data_source_ingestion(
-    org_id: OrganizationId,
-    _user: AdminRoleUser = None,
-    db: DatabaseSession = None,
-    source_id: str = Path(...),
-):
-    """Stop ingestion for a data source"""
-    result = await db.execute(
-        select(DataSource).where(
-            (DataSource.id == source_id)
-            & (DataSource.organization_id == org_id)
-        )
-    )
-    source = result.scalar_one_or_none()
-    if not source:
-        raise HTTPException(status_code=404, detail="Data source not found")
-
-    raise _not_implemented(
-        "Stopping ingestion is not implemented: no connector ingests registered "
-        "data sources, so there is nothing to stop."
-    )
-
-
 # ==================== DATA PARTITION ENDPOINTS ====================
 
 
@@ -1212,32 +1160,6 @@ async def update_unified_model(
 # ==================== QUERY ENGINE ENDPOINTS ====================
 
 
-@router.post("/queries", response_model=QueryJobResponse, status_code=status.HTTP_201_CREATED)
-async def submit_query(
-    query_in: QueryJobCreate,
-    org_id: OrganizationId,
-    current_user: AnalystUser = None,
-    db: DatabaseSession = None,
-):
-    """Submit a query job.
-
-    Not implemented: the QueryEngine never ran the query text. It summed
-    partition metadata across every tenant (no org filter), marked the job
-    ``completed`` and fired a data-lake "anomaly" automation for each query.
-    Saved-query history is written by ``POST /data-lake/query``.
-    """
-    logger.info(
-        "data_lake_query_job_not_implemented",
-        organization_id=org_id,
-        user_id=str(current_user.id),
-        query_language=query_in.query_language,
-    )
-    raise _not_implemented(
-        "Queued query jobs are not implemented: nothing executes them. Use "
-        "POST /data-lake/query (catalog filter) instead."
-    )
-
-
 @router.get("/queries", response_model=QueryJobListResponse)
 async def list_queries(
     org_id: OrganizationId,
@@ -1293,33 +1215,6 @@ async def get_query(
     if not job:
         raise HTTPException(status_code=404, detail="Query not found")
     return job
-
-
-@router.post("/queries/{query_id}/estimate-cost")
-async def estimate_query_cost(
-    org_id: OrganizationId,
-    _user: AnalystUser = None,
-    db: DatabaseSession = None,
-    query_id: str = Path(...),
-    data_scanned_gb: int = Query(..., ge=1),
-):
-    """Estimate query execution cost.
-
-    Not implemented: the estimate was hardcoded BigQuery $/TB pricing for a
-    Postgres store. The job is looked up (tenant-scoped, 404 otherwise) and
-    the route then refuses honestly.
-    """
-    job = (await db.execute(
-        select(QueryJob.id).where(
-            QueryJob.id == query_id, QueryJob.organization_id == org_id
-        )
-    )).scalar_one_or_none()
-    if job is None:
-        raise HTTPException(status_code=404, detail="Query job not found")
-    raise _not_implemented(
-        f"Cost estimation for {data_scanned_gb} GB is not implemented: the data "
-        "lake is Postgres and has no per-scan pricing."
-    )
 
 
 # ==================== DATA CATALOG ENDPOINTS ====================
@@ -1870,22 +1765,6 @@ async def run_catalog_filter_query(
         "job_id": getattr(job, "id", None),
         "timestamp": now.isoformat(),
     }
-
-
-@router.get("/catalog/datasets")
-async def search_datasets(
-    _org_id: OrganizationId,
-    search: str = Query(..., min_length=1),
-):
-    """Search datasets in data catalog.
-
-    Not implemented: this searched a fresh in-memory ``DataCatalog`` on every
-    call, so it always returned no results. ``GET /data-lake/catalog`` is the
-    real (tenant-scoped) catalog.
-    """
-    raise _not_implemented(
-        f"Dataset search for {search!r} is not implemented; use GET /data-lake/catalog."
-    )
 
 
 @router.get("/catalog/lineage/{dataset_id}")

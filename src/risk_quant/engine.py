@@ -484,30 +484,6 @@ class RiskAggregator:
             "risks_by_category": category_totals,
         }
 
-    def generate_risk_heatmap(self, risks: list[dict]) -> dict:
-        """
-        Generate risk heatmap (impact vs likelihood matrix).
-
-        Args:
-            risks: List of risk dictionaries
-
-        Returns:
-            Heatmap data for visualization
-        """
-        # 5x5 matrix: likelihood (rows) x impact (columns)
-        heatmap = [[0 for _ in range(5)] for _ in range(5)]
-
-        for risk in risks:
-            likelihood = min(4, int(risk.get("likelihood", 1) * 5))
-            impact = min(4, int(risk.get("impact", 1) * 5))
-            heatmap[likelihood][impact] += 1
-
-        return {
-            "matrix": heatmap,
-            "likelihood_labels": ["Very Low", "Low", "Medium", "High", "Very High"],
-            "impact_labels": ["Very Low", "Low", "Medium", "High", "Very High"],
-        }
-
     def calculate_portfolio_var(
         self, ale_samples: list[list[float]], confidence: float = 0.95
     ) -> float:

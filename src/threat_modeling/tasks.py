@@ -24,7 +24,6 @@ from src.threat_modeling.models import (
 )
 from src.threat_modeling.engine import (
     STRIDEAnalyzer,
-    PASTAEngine,
     AttackTreeGenerator,
     MitigationRecommender,
     ThreatModelValidator,
@@ -38,7 +37,6 @@ AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=F
 
 __all__ = [
     "auto_stride_analysis",
-    "pasta_analysis",
     "attack_tree_generation",
     "model_staleness_check",
     "mitigation_deadline_reminder",
@@ -72,45 +70,6 @@ def auto_stride_analysis(self, model_id: str, org_id: str) -> Dict[str, Any]:
 
     except Exception as exc:
         logger.error(f"STRIDE analysis failed: {str(exc)}")
-        raise self.retry(exc=exc, countdown=60)
-
-
-@shared_task(bind=True, max_retries=3)
-def pasta_analysis(self, model_id: str, org_id: str) -> Dict[str, Any]:
-    """
-    Run full PASTA (Process for Attack Simulation and Threat Analysis) workflow
-
-    Stages:
-    1. Define objectives
-    2. Define technical scope
-    3. Decompose application
-    4. Threat analysis
-    5. Vulnerability analysis
-    6. Attack modeling
-    7. Risk and impact
-
-    Args:
-        model_id: ID of threat model
-        org_id: Organization ID
-
-    Returns:
-        PASTA analysis results
-    """
-    try:
-        logger.info(f"Starting PASTA analysis for model {model_id}")
-
-        engine_instance = PASTAEngine()
-
-        return {
-            "status": "success",
-            "model_id": model_id,
-            "methodology": "pasta",
-            "stages_completed": 7,
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-
-    except Exception as exc:
-        logger.error(f"PASTA analysis failed: {str(exc)}")
         raise self.retry(exc=exc, countdown=60)
 
 

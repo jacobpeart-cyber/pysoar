@@ -23,7 +23,6 @@ from src.threat_modeling.models import (
 )
 from src.threat_modeling.engine import (
     STRIDEAnalyzer,
-    PASTAEngine,
     AttackTreeGenerator,
     MitigationRecommender,
     ThreatModelValidator,
@@ -45,7 +44,6 @@ __all__ = [
     "MitigationType",
     "ImplementationStatus",
     "STRIDEAnalyzer",
-    "PASTAEngine",
     "AttackTreeGenerator",
     "MitigationRecommender",
     "ThreatModelValidator",

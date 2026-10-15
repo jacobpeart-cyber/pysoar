@@ -38,7 +38,6 @@ from src.remediation.actions import (
 )
 from src.remediation.engine import RemediationEngine
 from src.remediation.models import (
-    RemediationAction,
     RemediationExecution,
     RemediationPlaybook,
     RemediationPolicy,
@@ -56,8 +55,6 @@ from src.schemas.remediation import (
     QuickIsolateHostRequest,
     QuickQuarantineFileRequest,
     RejectionRequest,
-    RemediationActionCreate,
-    RemediationActionResponse,
     RemediationActionSpecResponse,
     RemediationDashboardStats,
     RemediationExecutionResponse,
@@ -288,74 +285,6 @@ async def list_actions(
         spec = resolve_action(action_type)
         return [spec.to_dict()] if spec else []
     return registry_actions()
-
-
-@router.post("/actions", response_model=RemediationActionResponse, status_code=status.HTTP_201_CREATED, dependencies=_ADMIN_WRITE)
-async def create_action(
-    request: RemediationActionCreate,
-    org_id: OrganizationId,
-    db: DatabaseSession = None,
-    current_user: CurrentUser = None,
-):
-    """Create a custom remediation action."""
-    action = RemediationAction(
-        name=request.name,
-        description=request.description,
-        action_type=request.action_type,
-        target_type=request.target_type,
-        parameters=request.parameters,
-        integration=request.integration,
-        integration_config=request.integration_config,
-        timeout_seconds=request.timeout_seconds,
-        retry_count=request.retry_count,
-        is_reversible=request.is_reversible,
-        reverse_action_type=request.reverse_action_type,
-        reverse_parameters=request.reverse_parameters,
-        risk_level=request.risk_level,
-        requires_confirmation=request.requires_confirmation,
-        tags=request.tags,
-        organization_id=org_id,
-    )
-    db.add(action)
-    await db.commit()
-    await db.refresh(action)
-    return action
-
-
-@router.get("/actions/{action_id}", response_model=RemediationActionResponse)
-async def get_action(
-    action_id: str,
-    org_id: OrganizationId,
-    db: DatabaseSession = None,
-    current_user: CurrentUser = None,
-):
-    """Get a specific action."""
-    action = await db.get(RemediationAction, action_id)
-    if not action or action.organization_id != org_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    return action
-
-
-@router.post("/actions/{action_id}/test", dependencies=_ANALYST_WRITE)
-async def test_action(
-    action_id: str,
-    target: str,
-    org_id: OrganizationId,
-    db: DatabaseSession = None,
-    current_user: CurrentUser = None,
-):
-    """Test an action: not implemented (it used to report success without doing anything)."""
-    action = await db.get(RemediationAction, action_id)
-    if not action or action.organization_id != org_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail={
-            "error": "not_implemented",
-            "detail": "remediation actions cannot be dry-run yet; nothing was executed",
-        },
-    )
 
 
 # ============================================================================

@@ -784,18 +784,6 @@ async def disconnect_nodes(
 
 
 # Execution endpoints
-@router.post("/{playbook_id}/execute", response_model=PlaybookExecutionResponse, dependencies=_ANALYST_WRITE)
-async def execute_playbook(
-    playbook_id: str,
-    request: PlaybookExecutionTrigger,
-    org_id: OrganizationId,
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
-):
-    """Trigger playbook execution (same as ``/run``)."""
-    playbook = await _get_playbook_or_404(db, playbook_id, org_id)
-    execution = await _start_execution(playbook, request, current_user, db)
-    return _execution_to_response(execution)
 
 
 @router.post(

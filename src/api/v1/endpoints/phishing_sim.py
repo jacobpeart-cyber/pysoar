@@ -36,16 +36,11 @@ from src.phishing_sim.models import (
     TargetGroup,
 )
 from src.schemas.phishing_sim import (
-    CampaignComparisonResponse,
     CampaignDetailResponse,
     CampaignEventCreateRequest,
     CampaignEventResponse,
     CampaignLaunchRequest,
     CampaignMetrics,
-    CampaignScheduleRequest,
-    DashboardResponse,
-    DepartmentStats,
-    IndustryBenchmark,
     PhishingCampaignCreateRequest,
     PhishingCampaignResponse,
     PhishingCampaignUpdateRequest,
@@ -58,7 +53,6 @@ from src.schemas.phishing_sim import (
     TargetGroupCreateRequest,
     TargetGroupResponse,
     TargetGroupUpdateRequest,
-    TemplateEffectivenessResponse,
     TemplateValidationResult,
     TrainingAssignmentRequest,
     TrainingCompletionRequest,
@@ -354,39 +348,6 @@ async def validate_template(
         issues=issues,
         placeholders_found=placeholders,
         links_found=links,
-    )
-
-
-@router.get(
-    "/templates/{template_id}/effectiveness",
-    response_model=TemplateEffectivenessResponse,
-)
-async def get_template_effectiveness(
-    template_id: UUID,
-    db: DatabaseSession,
-    org_id: OrganizationId,
-):
-    """Get historical effectiveness metrics for a template."""
-    result = await db.execute(
-        select(PhishingTemplate).where(
-            PhishingTemplate.id == str(template_id),
-            PhishingTemplate.organization_id == org_id,
-        )
-    )
-    template = result.scalar_one_or_none()
-
-    if not template:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Template not found",
-        )
-
-    # usage_count and average_click_rate are stamped 0 at creation and
-    # nothing ever updates them, so a rating derived from them would rate
-    # every template "low_effectiveness" regardless of real results.
-    raise _not_implemented(
-        "template effectiveness is not computed: per-template usage and click "
-        "rates are never aggregated from campaign events",
     )
 
 
@@ -1131,37 +1092,6 @@ async def clone_campaign(
     )
 
     return cloned
-
-
-@router.post("/campaigns/{campaign_id}/schedule", response_model=dict[str, Any])
-async def schedule_campaign(
-    campaign_id: UUID,
-    request: CampaignScheduleRequest,
-    db: DatabaseSession,
-    current_user: AnalystUser,
-    org_id: OrganizationId,
-):
-    """Schedule a campaign to launch at specific time."""
-    result = await db.execute(
-        select(PhishingCampaign).where(
-            PhishingCampaign.id == str(campaign_id),
-            PhishingCampaign.organization_id == org_id,
-        )
-    )
-    campaign = result.scalar_one_or_none()
-
-    if not campaign:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Campaign not found",
-        )
-
-    # Previously this flipped status to "scheduled" and returned success,
-    # but nothing (no beat entry, no eta task) ever launched the campaign.
-    raise _not_implemented(
-        "scheduled launch is not implemented: nothing would launch the campaign "
-        "at start_time; launch it directly with POST /campaigns/{id}/launch",
-    )
 
 
 @router.get("/campaigns/{campaign_id}/results", response_model=dict[str, Any])
@@ -2157,169 +2087,6 @@ async def generate_certificate(
 # ============================================================================
 # DASHBOARD & REPORTING ENDPOINTS
 # ============================================================================
-
-
-@router.get("/dashboard", response_model=DashboardResponse)
-async def get_dashboard(
-    db: DatabaseSession,
-    org_id: OrganizationId,
-):
-    """Get comprehensive phishing simulation dashboard."""
-    # Fetch all campaigns for this org
-    campaign_result = await db.execute(
-        select(PhishingCampaign).where(
-            PhishingCampaign.organization_id == org_id
-        )
-    )
-    campaigns = campaign_result.scalars().all()
-
-    active = len([c for c in campaigns if c.status == "active"])
-    completed = len([c for c in campaigns if c.status == "completed"])
-
-    # Calculate average metrics
-    click_rates = [
-        (c.links_clicked / max(c.emails_sent, 1)) * 100
-        for c in campaigns
-        if c.emails_sent > 0
-    ]
-    avg_click = (
-        sum(click_rates) / len(click_rates) if click_rates else 0.0
-    )
-
-    submission_rates = [
-        (c.credentials_submitted / max(c.emails_sent, 1)) * 100
-        for c in campaigns
-        if c.emails_sent > 0
-    ]
-    avg_submission = (
-        sum(submission_rates) / len(submission_rates)
-        if submission_rates
-        else 0.0
-    )
-
-    # Fetch awareness scores
-    score_result = await db.execute(
-        select(SecurityAwarenessScore).where(
-            SecurityAwarenessScore.organization_id == org_id
-        )
-    )
-    users = score_result.scalars().all()
-
-    high_risk = len([u for u in users if u.risk_category == "high_risk"])
-    critical = len(
-        [u for u in users if u.risk_category == "critical_risk"]
-    )
-
-    risk_dist = {
-        cat: len([u for u in users if u.risk_category == cat])
-        for cat in [
-            "champion",
-            "low_risk",
-            "moderate_risk",
-            "high_risk",
-            "critical_risk",
-        ]
-    }
-
-    # Build recent campaigns
-    sorted_campaigns = sorted(
-        campaigns, key=lambda c: c.created_at, reverse=True
-    )[:5]
-    recent = [
-        CampaignComparisonResponse(
-            campaign_id=c.id,
-            campaign_name=c.name,
-            status=c.status,
-            click_rate=round(
-                (c.links_clicked / max(c.emails_sent, 1)) * 100, 2
-            ),
-            submission_rate=round(
-                (c.credentials_submitted / max(c.emails_sent, 1)) * 100, 2
-            ),
-            report_rate=round(
-                (c.reported_count / max(c.emails_sent, 1)) * 100, 2
-            ),
-            difficulty_level=c.difficulty_level,
-            target_count=c.total_targets,
-        )
-        for c in sorted_campaigns
-    ]
-
-    # Department stats
-    departments: dict[str, list] = {}
-    for u in users:
-        dept = u.department or "Unknown"
-        departments.setdefault(dept, []).append(u)
-
-    dept_stats = []
-    for dept_name, dept_users in departments.items():
-        dept_risk: dict[str, int] = {}
-        for u in dept_users:
-            dept_risk[u.risk_category] = (
-                dept_risk.get(u.risk_category, 0) + 1
-            )
-        dept_stats.append(
-            DepartmentStats(
-                department=dept_name,
-                user_count=len(dept_users),
-                avg_score=round(
-                    sum(u.overall_score for u in dept_users)
-                    / len(dept_users),
-                    2,
-                ),
-                avg_phishing_score=round(
-                    sum(u.phishing_score for u in dept_users)
-                    / len(dept_users),
-                    2,
-                ),
-                min_score=float(
-                    min(u.overall_score for u in dept_users)
-                ),
-                max_score=float(
-                    max(u.overall_score for u in dept_users)
-                ),
-                risk_distribution=dept_risk,
-            )
-        )
-
-    # Industry benchmark (static comparison)
-    org_click_rate = round(avg_click, 2)
-    industry_avg = 18.0
-    benchmark = IndustryBenchmark(
-        organization_click_rate=org_click_rate,
-        industry_average=industry_avg,
-        vs_industry=(
-            "below_average"
-            if org_click_rate > industry_avg
-            else "above_average"
-        ),
-        percentile=(
-            "top_25"
-            if org_click_rate < 10
-            else (
-                "top_50"
-                if org_click_rate < 18
-                else (
-                    "bottom_50" if org_click_rate < 30 else "bottom_25"
-                )
-            )
-        ),
-    )
-
-    return DashboardResponse(
-        total_campaigns=len(campaigns),
-        active_campaigns=active,
-        completed_campaigns=completed,
-        avg_click_rate=round(avg_click, 2),
-        avg_submission_rate=round(avg_submission, 2),
-        total_users_at_risk=high_risk + critical,
-        high_risk_count=high_risk,
-        critical_risk_count=critical,
-        recent_campaigns=recent,
-        department_stats=dept_stats,
-        risk_distribution=risk_dist,
-        industry_benchmark=benchmark,
-    )
 
 
 @router.get("/reports/risk", response_model=dict[str, Any])

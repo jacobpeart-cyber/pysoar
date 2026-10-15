@@ -233,12 +233,6 @@ class CampaignLaunchRequest(BaseModel):
     total_targets: int | None = Field(default=None, ge=0)
 
 
-class CampaignScheduleRequest(BaseModel):
-    """Request schema for scheduling a campaign."""
-
-    start_time: datetime
-
-
 # ============================================================================
 # CAMPAIGN EVENT SCHEMAS
 # ============================================================================
@@ -413,15 +407,6 @@ class RiskReport(BaseModel):
     top_departments: list[DepartmentStats]
 
 
-class IndustryBenchmark(BaseModel):
-    """Industry benchmark comparison."""
-
-    organization_click_rate: float = 0.0
-    industry_average: float = 0.0
-    vs_industry: str  # below_average, above_average
-    percentile: str  # top_25, top_50, bottom_50, bottom_25
-
-
 class CampaignComparisonResponse(BaseModel):
     """Campaign comparison data."""
 
@@ -433,23 +418,6 @@ class CampaignComparisonResponse(BaseModel):
     report_rate: float = 0.0
     difficulty_level: str = ""
     target_count: int = 0
-
-
-class DashboardResponse(BaseModel):
-    """Phishing simulation dashboard data."""
-
-    total_campaigns: int = 0
-    active_campaigns: int = 0
-    completed_campaigns: int = 0
-    avg_click_rate: float = 0.0
-    avg_submission_rate: float = 0.0
-    total_users_at_risk: int = 0
-    high_risk_count: int = 0
-    critical_risk_count: int = 0
-    recent_campaigns: list[CampaignComparisonResponse]
-    department_stats: list[DepartmentStats]
-    risk_distribution: dict[str, int]
-    industry_benchmark: IndustryBenchmark
 
 
 # ============================================================================
@@ -474,15 +442,3 @@ class TemplateValidationResult(BaseModel):
     issues: list[str]
     placeholders_found: list[str]
     links_found: int = 0
-
-
-class TemplateEffectivenessResponse(BaseModel):
-    """Template effectiveness metrics."""
-
-    template_id: str = ""
-    name: str = ""
-    usage_count: int = 0
-    average_click_rate: float = 0.0
-    category: str = ""
-    difficulty: str = ""
-    effectiveness_rating: str = ""

@@ -312,24 +312,6 @@ class CampaignStatusUpdateRequest(BaseModel):
     status: str = Field(..., description="active, paused, completed")
 
 
-class CampaignEffectivenessResponse(BaseModel):
-    """Response for campaign effectiveness assessment."""
-
-    campaign_id: UUID
-    name: str = ""
-    objective: str = ""
-    status: str = ""
-    effectiveness_score: float = 0.0
-    coverage_percentage: float = 0.0
-    total_interactions: int = 0
-    unique_attackers: int = 0
-    attacks_detected: int = 0
-    false_positives: int = 0
-    detection_rate: float = 0.0
-    mean_time_to_detection: float = 0.0
-    recommendations: list[str]
-
-
 # Dashboard Schemas
 
 
@@ -364,27 +346,6 @@ class DeceptionDashboardResponse(BaseModel):
 
 
 # Coverage Schemas
-
-
-class CoverageZoneInfo(BaseModel):
-    """Information about deception coverage in a zone."""
-
-    zone_name: str = ""
-    covered: bool = False
-    decoy_count: int = 0
-    decoy_types: list[str] = Field(default_factory=list)
-    last_interaction: datetime | None = None
-
-
-class CoverageMapResponse(BaseModel):
-    """Network coverage map for deception infrastructure."""
-
-    zones: dict[str, CoverageZoneInfo]
-    total_zones: int = 0
-    covered_zones: int = 0
-    total_coverage_percentage: float = 0.0
-    gaps: list[str] = Field(default_factory=list)
-    recommendations: list[str] = Field(default_factory=list)
 
 
 # Recommendations Schemas

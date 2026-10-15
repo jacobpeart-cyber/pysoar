@@ -394,14 +394,6 @@ class RiskDashboardResponse(BaseModel):
     fair_total_ale_mean: Optional[float] = None
 
 
-class RiskHeatmapResponse(BaseModel):
-    """Risk heatmap visualization data"""
-
-    matrix: list[list[int]]
-    likelihood_labels: list[str]
-    impact_labels: list[str]
-
-
 class ComparisonResponse(BaseModel):
     """Risk scenario comparison response"""
 

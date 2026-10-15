@@ -410,20 +410,6 @@ class IndicatorSightingResponse(DBModel):
 # ============================================================================
 
 
-class IntelSearchRequest(BaseModel):
-    """Schema for advanced intel search"""
-
-    query: Optional[str] = None
-    indicator_types: Optional[list[str]] = None
-    severity: Optional[list[str]] = None
-    tlp: Optional[list[str]] = None
-    is_active: Optional[bool] = None
-    tags: Optional[list[str]] = None
-    date_from: Optional[datetime] = None
-    date_to: Optional[datetime] = None
-    min_confidence: Optional[int] = Field(None, ge=0, le=100)
-
-
 class IntelDashboardStats(BaseModel):
     """Schema for intel dashboard statistics"""
 

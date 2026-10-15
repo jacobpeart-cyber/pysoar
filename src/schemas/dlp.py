@@ -298,14 +298,6 @@ class SensitiveDataDiscoveryBase(BaseModel):
     status: str = Field(default="pending", max_length=50)
 
 
-class DiscoveryScanTriggerRequest(BaseModel):
-    """Schema for triggering a discovery scan"""
-
-    scan_type: str = Field(..., max_length=50)
-    target: str = Field(..., max_length=255)
-    schedule: Optional[str] = None
-
-
 class SensitiveDataDiscoveryResponse(SensitiveDataDiscoveryBase, DBModel):
     """Schema for discovery scan response"""
 
@@ -438,17 +430,6 @@ class BreachAssessmentResponse(BaseModel):
     regulatory_obligations: dict[str, bool]
     notification_deadline: Optional[datetime] = None
     notification_required: bool = False
-
-
-class NotificationTrackingResponse(BaseModel):
-    """Schema for notification tracking"""
-
-    incident_id: str = ""
-    notified_count: int = 0
-    total_required: int = 0
-    completion_percentage: float = 0.0
-    status: str = ""
-    last_updated: Optional[datetime] = None
 
 
 # Dashboard Schemas

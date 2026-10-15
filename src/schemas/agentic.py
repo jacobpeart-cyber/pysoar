@@ -68,18 +68,6 @@ class SOCAgentListResponse(BaseModel):
     pages: int = 0
 
 
-class SOCAgentPerformance(BaseModel):
-    """Agent performance metrics"""
-
-    agent_id: str = ""
-    name: str = ""
-    total_investigations: int = 0
-    avg_resolution_time_minutes: float = 0.0
-    accuracy_score: float = 0.0
-    false_positive_rate: float = 0.0
-    status: str = ""
-
-
 # ============================================================================
 # Investigation Schemas
 # ============================================================================
@@ -119,17 +107,6 @@ class InvestigationCreate(InvestigationBase):
     agent_id: str = ""
     hypothesis: Optional[str] = None
     initial_context: Optional[dict[str, Any]] = None
-
-
-class InvestigationUpdate(BaseModel):
-    """Schema for updating investigation"""
-
-    title: Optional[str] = Field(None, min_length=1, max_length=500)
-    hypothesis: Optional[str] = None
-    priority: Optional[int] = Field(None, ge=1, le=5)
-    status: Optional[str] = None
-    human_feedback: Optional[str] = None
-    feedback_rating: Optional[int] = Field(None, ge=1, le=5)
 
 
 class InvestigationResponse(InvestigationBase, DBModel):
@@ -329,44 +306,6 @@ class ActionHistory(BaseModel):
 # ============================================================================
 
 
-class AgentMemoryResponse(DBModel):
-    """Agent memory entry"""
-
-    id: str = ""
-    memory_type: str = ""
-    key: str = ""
-    value: Optional[dict[str, Any]] = None
-    confidence: float = 0.0
-    access_count: int = 0
-    last_accessed: Optional[datetime] = None
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-
-    class Config:
-        from_attributes = True
-
-
-class AgentMemoryListResponse(BaseModel):
-    """Paginated memory list"""
-
-    items: list[AgentMemoryResponse]
-    total: int = 0
-    page: int = 0
-    size: int = 0
-    pages: int = 0
-
-
-class MemoryStats(BaseModel):
-    """Agent memory statistics"""
-
-    agent_id: str = ""
-    total_memories: int = 0
-    by_type: dict[str, int]
-    avg_confidence: float = 0.0
-    memories_decaying: int = 0
-    memories_high_confidence: int = 0
-
-
 # ============================================================================
 # Natural Language Interface
 # ============================================================================
@@ -526,18 +465,6 @@ class InvestigationMetrics(BaseModel):
     avg_resolution_time_minutes: float = 0.0
 
 
-class AccuracyStats(BaseModel):
-    """Accuracy statistics"""
-
-    total_investigations: int = 0
-    true_positives: int = 0
-    false_positives: int = 0
-    inconclusive: int = 0
-    escalated: int = 0
-    accuracy_score: float = 0.0
-    false_positive_rate: float = 0.0
-
-
 class ResolutionTimes(BaseModel):
     """Investigation resolution time stats"""
 
@@ -583,29 +510,6 @@ class FeedbackImpact(BaseModel):
 # ============================================================================
 # Threat Hunting
 # ============================================================================
-
-
-class ThreatHuntRequest(BaseModel):
-    """Request for threat hunt"""
-
-    agent_id: Optional[str] = None
-    hunt_profile: str = "standard"  # standard, aggressive, etc
-    scope: Optional[str] = None
-    time_window_days: int = 7
-
-
-class ThreatHuntResult(BaseModel):
-    """Threat hunt results"""
-
-    hunt_id: str = ""
-    agent_id: str = ""
-    profile: str = ""
-    status: str = ""
-    indicators_found: int = 0
-    investigations_created: int = 0
-    high_confidence_findings: int = 0
-    execution_time_minutes: float = 0.0
-    timestamp: datetime
 
 
 # ============================================================================

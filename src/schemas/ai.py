@@ -12,59 +12,7 @@ from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
-# Natural Language Queries
-
-class NLQueryRequest(BaseModel):
-    """Natural language query request from user."""
-
-    natural_language: str = Field(..., description="Natural language query", min_length=1, max_length=1000)
-    include_history: bool = Field(
-        default=False, description="Include query execution history"
-    )
-    user_context: dict[str, Any] | None = Field(
-        default=None, description="Optional user context for better results"
-    )
-
-
-class NLQueryResponse(DBModel):
-    """Natural language query response with results and summary."""
-
-    id: str = Field(..., description="Query ID")
-    interpreted_intent: str = Field(..., description="Classified query intent")
-    generated_query: str = Field(..., description="Generated underlying query")
-    results_count: int = Field(..., description="Number of results returned")
-    results: list[dict] = Field(default=[], description="Query results (top 10)")
-    summary: str = Field(..., description="Natural language summary of results")
-    execution_time_ms: int = Field(..., description="Query execution time in milliseconds")
-    created_at: datetime = Field(..., description="Query creation timestamp")
-
-    class Config:
-        from_attributes = True
-
-
-class QueryHistoryResponse(DBModel):
-    """Query history entry."""
-
-    id: str = ""
-    natural_language: str = ""
-    interpreted_intent: str = ""
-    results_count: int = 0
-    created_at: Optional[datetime] = None
-    was_helpful: bool | None = None
-
-    class Config:
-        from_attributes = True
-
-
 # Alert Triage
-
-class AlertTriageRequest(BaseModel):
-    """Alert triage request."""
-
-    alert_id: str = Field(..., description="Alert ID to triage")
-    include_context: bool = Field(
-        default=False, description="Include related alerts and context"
-    )
 
 
 class AlertTriageResponse(DBModel):
@@ -103,18 +51,6 @@ class BatchTriageResponse(BaseModel):
     average_false_positive_probability: float = 0.0
     triaged_alerts: list[AlertTriageResponse]
     timestamp: Optional[datetime] = None
-
-
-class TriageStatsResponse(BaseModel):
-    """Alert triage statistics."""
-
-    total_triaged: int = 0
-    average_confidence: float = 0.0
-    accuracy_rate: float = Field(..., description="Percentage of correct triages")
-    false_positive_reduction: float = Field(
-        ..., description="Reduction in false positives from AI triage"
-    )
-    time_saved_hours: float = Field(..., description="Estimated analyst time saved")
 
 
 # Incident Analysis

@@ -2124,7 +2124,7 @@ async def get_exposure_graph(
     internet-facing assets (``exposes``) and ``asset -> vulnerability`` for
     every open / in-progress link (``has_vulnerability``, weighted by the
     link's stored risk). No asset-to-asset edge exists because no network
-    reachability is stored; see ``GET /exposure/attack-paths``.
+    reachability is stored, so multi-hop attack paths are not computed.
     """
     order = ["informational", "low", "medium", "high", "critical"]
     severities: Optional[list[str]] = None
@@ -2227,28 +2227,6 @@ async def get_exposure_graph(
         "truncated": truncated,
         "basis": "stored exposure_assets and open asset_vulnerabilities links",
     }
-
-
-@router.get("/attack-paths")
-async def get_attack_paths(_org_id: OrganizationId):
-    """Multi-hop attack paths are not computed.
-
-    A path needs stored reachability between assets (network topology,
-    flows or firewall rules); the exposure store holds assets and
-    asset-to-vulnerability links only. ``GET /exposure/graph`` returns the
-    graph those stored relations support.
-    """
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail={
-            "error": "not_implemented",
-            "detail": (
-                "Attack paths need asset-to-asset reachability (network topology, flows or firewall "
-                "rules), which is not stored. Use GET /exposure/graph for the internet -> asset -> "
-                "vulnerability graph built from stored rows."
-            ),
-        },
-    )
 
 
 @router.get("/risk-matrix", response_model=RiskMatrix)

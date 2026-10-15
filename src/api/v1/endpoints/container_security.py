@@ -27,7 +27,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, delete, desc, func, select
 
 from src.api.deps import DatabaseSession, OrganizationId, require_role
-from src.container_security.engine import ImageScanner, K8sRemediator
+from src.container_security.engine import K8sRemediator
 from src.container_security.kube import (
     CIS_BENCHMARK,
     KubeCredentialError,
@@ -466,29 +466,6 @@ async def get_image_vulnerabilities(
     stmt = stmt.order_by(desc(ImageVulnerability.cvss_score), ImageVulnerability.id).offset(skip).limit(limit)
     result = await db.execute(stmt)
     return result.scalars().all()
-
-
-@router.post("/images/{image_id}/verify-signature")
-async def verify_image_signature(
-    image_id: str,
-    org_id: OrganizationId,
-    db: DatabaseSession = None,
-    _user: AdminRoleUser = None,
-):
-    """
-    Report an image's signature state.
-
-    No cosign/notary verifier is configured, so the signature is NOT checked:
-    the response carries ``status: no_verifier_backend`` and repeats the
-    recorded fields. The stored verification flags are left untouched.
-    """
-    image = await _image_or_404(db, image_id, org_id)
-
-    scanner = ImageScanner()
-    verification = await scanner.verify_image_signature(image)
-    verification["image_id"] = image_id
-
-    return verification
 
 
 @router.get("/images/{image_id}/risk-assessment")
@@ -1050,45 +1027,6 @@ async def investigate_alert(
         "alert_id": alert_id,
         "timestamp": datetime.now(timezone.utc),
     }
-
-
-@router.post("/runtime-alerts/{alert_id}/quarantine-pod")
-async def quarantine_pod_from_alert(
-    alert_id: str,
-    org_id: OrganizationId,
-    db: DatabaseSession = None,
-    _user: AdminRoleUser = None,
-):
-    """Quarantine the pod named by a runtime alert: not implemented.
-
-    PySOAR's Kubernetes access is read-only (CIS checks), so no NetworkPolicy
-    can be applied. The previous version returned ``quarantined`` and marked
-    the alert ``contained`` without touching the cluster. It returns 501 and
-    leaves the alert unchanged.
-    """
-    alert = (await db.execute(
-        select(RuntimeAlert).where(
-            and_(
-                RuntimeAlert.id == alert_id,
-                RuntimeAlert.organization_id == org_id,
-            )
-        )
-    )).scalar_one_or_none()
-
-    if not alert:
-        raise HTTPException(status_code=404, detail="Alert not found")
-
-    raise HTTPException(
-        status_code=501,
-        detail={
-            "error": "not_implemented",
-            "detail": (
-                "Pod quarantine needs write access to the cluster, which PySOAR does "
-                "not use (its Kubernetes access is read-only). No NetworkPolicy was "
-                "applied and the alert status was not changed."
-            ),
-        },
-    )
 
 
 # ============================================================================

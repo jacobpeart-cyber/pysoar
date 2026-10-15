@@ -778,24 +778,6 @@ async def assess_pia_risks(
         )
 
 
-@router.post("/pia/assessments/{assessment_id}/mitigations")
-async def recommend_mitigations(
-    assessment_id: str,
-    org_id: OrganizationId,
-    db: DatabaseSession = None,
-    _user: AnalystUser = None,
-):
-    """Get recommended mitigations for PIA.
-
-    Not implemented: this used to write the same boilerplate mitigation list
-    into every PIA, which then lowered its risk score.
-    """
-    await _get_pia_or_404(db, assessment_id, org_id)
-    raise _not_implemented(
-        "Assessment-specific mitigation recommendations are not implemented."
-    )
-
-
 @router.post("/pia/assessments/{assessment_id}/submit-dpo-review")
 async def submit_pia_for_dpo_review(
     assessment_id: str,

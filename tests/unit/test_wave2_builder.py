@@ -266,7 +266,7 @@ async def test_dispatch_failure_marks_execution_failed(client, db_session, org_a
     pb_id = pb.id
     with patch(DISPATCH) as task:
         task.delay.side_effect = ConnectionError("broker down")
-        resp = await client.post(f"/api/v1/playbook-builder/{pb_id}/execute", headers=org_a_headers, json={})
+        resp = await client.post(f"/api/v1/playbook-builder/{pb_id}/run", headers=org_a_headers, json={})
     assert resp.status_code == 503 and resp.json()["detail"]["error"] == "dispatch_failed"
     ex = (await db_session.execute(select(VisualPlaybookExecution))).scalars().one()
     await db_session.refresh(ex)

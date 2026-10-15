@@ -1,15 +1,18 @@
-"""Wave 1: the flat aliases that front the detection routers (intel, SIEM, ITDR).
+"""Wave 1: the flat aliases (aliases.py), and the wave 5 retirement of the
+detection duplicates.
 
 * ``_safe_list`` propagates query failures instead of returning an empty list.
-* Tenant scoping is mandatory: org-less callers get 403 ``organization_required``.
-* ``/intel/iocs`` lists the caller's indicators plus platform-scope ones
-  (``organization_id IS NULL``) and never another tenant's.
+* Tenant scoping is mandatory: org-less callers get 403 ``organization_required``
+  on every alias that remains.
+* Wave 5 deleted the detection duplicates ``/intel/iocs``, ``/intel/feeds``,
+  ``/siem/dashboard`` and ``/itdr/access-anomalies`` (no page called them); the
+  canonical routes keep the scoping the aliases were tested for: the caller's
+  indicators plus platform-scope ones, never another tenant's.
 """
 
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
 
 import pytest
 from fastapi import HTTPException
@@ -20,9 +23,15 @@ from src.api.v1.endpoints.aliases import _safe_list
 from src.intel.models import ThreatIndicator
 from src.itdr.models import AccessAnomaly, IdentityProfile
 from src.models.organization import Organization
-from src.siem.models import LogEntry
 
 ALIAS_PATHS = [
+    "/api/v1/dfir/evidence",
+    "/api/v1/dfir/legal-holds",
+    "/api/v1/playbooks/executions/recent",
+    "/api/v1/integrations/executions",
+    "/api/v1/integrations/webhooks",
+]
+RETIRED_PATHS = [
     "/api/v1/intel/iocs",
     "/api/v1/intel/feeds",
     "/api/v1/siem/dashboard",
@@ -34,20 +43,6 @@ def _indicator(value: str, org_id: str | None) -> ThreatIndicator:
     return ThreatIndicator(indicator_type="ipv4", value=value, organization_id=org_id)
 
 
-def _log(org_id: str) -> LogEntry:
-    now = datetime.now(timezone.utc).isoformat()
-    return LogEntry(
-        timestamp=now,
-        received_at=now,
-        source_type="syslog",
-        source_name="fw-01",
-        source_ip="10.0.0.1",
-        log_type="network",
-        raw_log="test",
-        organization_id=org_id,
-    )
-
-
 @pytest.mark.parametrize("path", ALIAS_PATHS)
 async def test_orgless_superuser_refused(
     client: AsyncClient, superuser_headers: dict[str, str], path: str,
@@ -55,6 +50,14 @@ async def test_orgless_superuser_refused(
     resp = await client.get(path, headers=superuser_headers)
     assert resp.status_code == 403, resp.text
     assert resp.json()["detail"]["error"] == "organization_required"
+
+
+@pytest.mark.parametrize("path", RETIRED_PATHS)
+async def test_retired_detection_aliases_are_gone(
+    client: AsyncClient, org_a_headers: dict[str, str], path: str,
+) -> None:
+    resp = await client.get(path, headers=org_a_headers)
+    assert resp.status_code == 404, resp.text
 
 
 async def test_safe_list_raises_instead_of_empty() -> None:
@@ -73,7 +76,7 @@ async def test_safe_list_requires_org_for_tenant_models() -> None:
     assert exc.value.detail["error"] == "organization_required"
 
 
-async def test_intel_iocs_scoped_with_platform_rows(
+async def test_indicators_scoped_with_platform_rows(
     client: AsyncClient,
     db_session: AsyncSession,
     org_a: Organization,
@@ -91,36 +94,17 @@ async def test_intel_iocs_scoped_with_platform_rows(
     )
     await db_session.commit()
 
-    resp = await client.get("/api/v1/intel/iocs", headers=org_a_headers)
+    resp = await client.get("/api/v1/threat-intel/indicators", headers=org_a_headers)
     assert resp.status_code == 200, resp.text
     values = {item["value"] for item in resp.json()["items"]}
     assert values == {"198.51.100.1", "198.51.100.3"}
 
-    resp = await client.get("/api/v1/intel/iocs", headers=org_b_headers)
+    resp = await client.get("/api/v1/threat-intel/indicators", headers=org_b_headers)
     values = {item["value"] for item in resp.json()["items"]}
     assert values == {"198.51.100.2", "198.51.100.3"}
 
 
-async def test_siem_dashboard_counts_only_own_logs(
-    client: AsyncClient,
-    db_session: AsyncSession,
-    org_a: Organization,
-    org_b: Organization,
-    org_a_headers: dict[str, str],
-    org_b_headers: dict[str, str],
-) -> None:
-    org_a_id, org_b_id = org_a.id, org_b.id
-    db_session.add_all([_log(org_a_id), _log(org_a_id), _log(org_b_id)])
-    await db_session.commit()
-
-    resp_a = await client.get("/api/v1/siem/dashboard", headers=org_a_headers)
-    resp_b = await client.get("/api/v1/siem/dashboard", headers=org_b_headers)
-    assert resp_a.status_code == 200, resp_a.text
-    assert resp_a.json()["total_logs"] == 2
-    assert resp_b.json()["total_logs"] == 1
-
-
-async def test_itdr_access_anomalies_scoped(
+async def test_itdr_anomalies_scoped(
     client: AsyncClient,
     db_session: AsyncSession,
     org_a: Organization,
@@ -145,8 +129,8 @@ async def test_itdr_access_anomalies_scoped(
     )
     await db_session.commit()
 
-    resp_a = await client.get("/api/v1/itdr/access-anomalies", headers=org_a_headers)
-    resp_b = await client.get("/api/v1/itdr/access-anomalies", headers=org_b_headers)
+    resp_a = await client.get("/api/v1/itdr/anomalies", headers=org_a_headers)
+    resp_b = await client.get("/api/v1/itdr/anomalies", headers=org_b_headers)
     assert resp_a.status_code == 200, resp_a.text
     assert resp_a.json()["total"] == 1
     assert resp_b.json()["total"] == 0

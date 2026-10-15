@@ -302,12 +302,6 @@ class QueryJobBase(BaseModel):
     time_range_end: Optional[str] = None
 
 
-class QueryJobCreate(QueryJobBase):
-    """Schema for creating a query job"""
-
-    pass
-
-
 class QueryJobResponse(QueryJobBase, DBModel):
     """Schema for query job response"""
 

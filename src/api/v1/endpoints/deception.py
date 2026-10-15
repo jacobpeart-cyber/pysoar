@@ -24,10 +24,7 @@ from src.deception.models import (
     HoneyTokenTrigger,
 )
 from src.schemas.deception import (
-    CampaignEffectivenessResponse,
     CampaignStatusUpdateRequest,
-    CoverageMapResponse,
-    CoverageZoneInfo,
     DeceptionCampaignCreateRequest,
     DeceptionCampaignDetailResponse,
     DeceptionCampaignResponse,
@@ -487,29 +484,6 @@ async def disable_decoy(
         )
 
 
-@router.post("/decoys/{decoy_id}/rotate", response_model=DecoyResponse)
-async def rotate_decoy(
-    decoy_id: UUID,
-    db: DatabaseSession = None,
-    _current_user: User = Depends(require_role(_ADMIN_ROLES)),
-    org_id: OrganizationId = None,
-):
-    """Rotate/refresh a decoy to avoid fingerprinting.
-
-    Not implemented: rotation previously only reset ``status`` and wiped
-    ``interaction_count`` without re-fingerprinting anything on the agent.
-    """
-    await get_decoy_or_404(db, decoy_id, org_id)
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail={
-            "error": "not_implemented",
-            "detail": "decoy rotation is not implemented: nothing re-fingerprints "
-            "the decoy on its agent, so the route no longer reports success",
-        },
-    )
-
-
 @router.post(
     "/decoys/{decoy_id}/interactions",
     status_code=status.HTTP_201_CREATED,
@@ -916,28 +890,6 @@ async def delete_token(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to delete token",
         )
-
-
-@router.post("/tokens/rotate", status_code=status.HTTP_200_OK)
-async def rotate_tokens(
-    _db: DatabaseSession = None,
-    _token_type: str = Query(..., alias="token_type"),
-    _current_user: User = Depends(require_role(_ADMIN_ROLES)),
-    _org_id: OrganizationId = None,
-):
-    """Rotate all tokens of a specific type.
-
-    Not implemented: rotation previously replaced token values that were
-    never returned or re-deployed, and wiped the trigger evidence.
-    """
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail={
-            "error": "not_implemented",
-            "detail": "honeytoken rotation is not implemented: new token values "
-            "are not deployed anywhere, so the route no longer reports success",
-        },
-    )
 
 
 # ============================================================================
@@ -1608,128 +1560,6 @@ async def update_campaign_status(
         )
 
 
-@router.get(
-    "/campaigns/{campaign_id}/effectiveness",
-    response_model=CampaignEffectivenessResponse,
-)
-async def get_campaign_effectiveness(
-    campaign_id: UUID,
-    db: DatabaseSession = None,
-    org_id: OrganizationId = None,
-):
-    """Get effectiveness assessment of a campaign."""
-    try:
-        campaign = await get_campaign_or_404(
-            db, campaign_id, org_id
-        )
-
-        # Count interactions across campaign decoys
-        total_interactions = 0
-        unique_attackers = 0
-        if campaign.decoy_ids:
-            interaction_count_result = await db.execute(
-                select(func.count(DecoyInteraction.id)).where(
-                    DecoyInteraction.decoy_id.in_(campaign.decoy_ids),
-                    DecoyInteraction.organization_id == org_id,
-                )
-            )
-            total_interactions = interaction_count_result.scalar() or 0
-
-            attacker_count_result = await db.execute(
-                select(
-                    func.count(func.distinct(DecoyInteraction.source_ip))
-                ).where(
-                    DecoyInteraction.decoy_id.in_(campaign.decoy_ids),
-                    DecoyInteraction.organization_id == org_id,
-                )
-            )
-            unique_attackers = attacker_count_result.scalar() or 0
-
-        # Compute effectiveness_score from real interaction data rather
-        # than reading the stored column (which nothing ever wrote to,
-        # so every card showed 0.0 regardless of actual activity).
-        # Weighted formula: 40% interaction volume (saturated at 100),
-        # 30% unique attacker diversity (saturated at 10 distinct IPs),
-        # 30% coverage (decoys in campaign / 5 decoys-target).
-        decoy_count = len(campaign.decoy_ids or [])
-        interaction_component = min(total_interactions / 1.0, 100.0) * 0.4 if total_interactions <= 100 else 40.0
-        diversity_component = min(unique_attackers / 10.0, 1.0) * 30.0
-        coverage_component = min(decoy_count / 5.0, 1.0) * 30.0
-        effectiveness_score = round(interaction_component + diversity_component + coverage_component, 2)
-
-        # Persist back so the Campaigns list card reflects the score
-        # without every client having to recompute.
-        campaign.effectiveness_score = effectiveness_score
-        await db.flush()
-
-        # Real MTTD from first interaction after campaign start, if any.
-        mttd_seconds = 0.0
-        if campaign.decoy_ids and campaign.start_date:
-            first_hit_res = await db.execute(
-                select(func.min(DecoyInteraction.created_at)).where(
-                    DecoyInteraction.decoy_id.in_(campaign.decoy_ids),
-                    DecoyInteraction.organization_id == org_id,
-                )
-            )
-            first_hit = first_hit_res.scalar()
-            if first_hit:
-                mttd_seconds = max(
-                    0.0,
-                    (first_hit - campaign.start_date).total_seconds(),
-                )
-
-        recommendations: list[str] = []
-        if total_interactions == 0 and decoy_count > 0:
-            recommendations.append(
-                "No interactions yet — verify the campaign's decoys are reachable from the attacker path."
-            )
-        if decoy_count < 3:
-            recommendations.append(
-                f"Campaign only covers {decoy_count} decoy(s). Add more to increase coverage."
-            )
-        if unique_attackers == 1 and total_interactions > 10:
-            recommendations.append(
-                "All interactions came from a single source — investigate whether this is a scanner or a real adversary."
-            )
-
-        logger.info(
-            f"Assessed campaign effectiveness: {campaign_id}",
-            extra={
-                "campaign_id": str(campaign_id),
-                "score": effectiveness_score,
-                "interactions": total_interactions,
-                "attackers": unique_attackers,
-            },
-        )
-
-        return CampaignEffectivenessResponse(
-            campaign_id=campaign_id,
-            name=campaign.name,
-            objective=campaign.objective,
-            status=campaign.status,
-            effectiveness_score=effectiveness_score,
-            coverage_percentage=len(campaign.coverage_zones) * 10.0
-            if campaign.coverage_zones
-            else 0.0,
-            total_interactions=total_interactions,
-            unique_attackers=unique_attackers,
-            attacks_detected=total_interactions,
-            false_positives=0,
-            detection_rate=100.0 if total_interactions > 0 else 0.0,
-            mean_time_to_detection=round(mttd_seconds / 60.0, 2),  # minutes
-            recommendations=recommendations,
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to assess campaign effectiveness: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to assess effectiveness",
-        )
-
-
 # ============================================================================
 # DASHBOARD ENDPOINTS
 # ============================================================================
@@ -1998,69 +1828,6 @@ async def get_dashboard(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve dashboard",
-        )
-
-
-@router.get("/coverage", response_model=CoverageMapResponse)
-async def get_coverage_map(
-    db: DatabaseSession = None,
-    org_id: OrganizationId = None,
-):
-    """Get network coverage map for deception infrastructure.
-
-    Authenticated and org-scoped. No client-supplied organization_id.
-    """
-    try:
-        organization_id = org_id
-        query = select(Decoy).where(Decoy.status == "active")
-        query = query.where(Decoy.organization_id == organization_id)
-
-        result = await db.execute(query)
-        decoys = list(result.scalars().all())
-
-        # Build zone map from active decoys
-        zones: dict[str, CoverageZoneInfo] = {}
-        for decoy in decoys:
-            zone = decoy.deployment_target or "default"
-            if zone not in zones:
-                zones[zone] = CoverageZoneInfo(
-                    zone_name=zone,
-                    covered=True,
-                    decoy_count=0,
-                    decoy_types=[],
-                    last_interaction=None,
-                )
-            zones[zone].decoy_count += 1
-            if decoy.decoy_type not in zones[zone].decoy_types:
-                zones[zone].decoy_types.append(decoy.decoy_type)
-            if decoy.last_interaction_at:
-                if (
-                    zones[zone].last_interaction is None
-                    or decoy.last_interaction_at > zones[zone].last_interaction
-                ):
-                    zones[zone].last_interaction = decoy.last_interaction_at
-
-        total_zones = max(len(zones), 1)
-        covered_zones = len(zones)
-
-        logger.info("Retrieved coverage map")
-
-        return CoverageMapResponse(
-            zones=zones,
-            total_zones=total_zones,
-            covered_zones=covered_zones,
-            total_coverage_percentage=(covered_zones / total_zones) * 100.0
-            if total_zones > 0
-            else 0.0,
-            gaps=[],
-            recommendations=[],
-        )
-
-    except Exception as e:
-        logger.error(f"Failed to get coverage map: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve coverage map",
         )
 
 

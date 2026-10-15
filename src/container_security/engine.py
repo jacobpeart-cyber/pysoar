@@ -149,34 +149,6 @@ class ImageScanner:
             ),
         }
 
-    async def verify_image_signature(
-        self, image: ContainerImage,
-    ) -> Dict[str, Any]:
-        """Report the recorded signature state; no verification is performed.
-
-        PySOAR has no cosign/notary integration and does not contact the
-        registry, so nothing is verified here. The previous version echoed the
-        stored booleans as if they were a verification result and fabricated a
-        ``key_id`` from a hash of the digest. Now the response says plainly
-        that no verifier ran and only repeats what is recorded on the row.
-        """
-        ref = f"{image.registry}/{image.repository}:{image.tag}"
-        return {
-            "status": "no_verifier_backend",
-            "verification_performed": False,
-            "message": (
-                "No image-signature verifier (e.g. cosign or notary) is "
-                "configured; the signature was not checked. The fields below "
-                "repeat the values recorded on the image."
-            ),
-            "image": ref,
-            "is_signed": bool(image.is_signed),
-            "signature_verified": bool(image.signature_verified),
-            "signature_tool": None,
-            "key_id": None,
-            "verification_timestamp": None,
-        }
-
     async def check_image_provenance(self, image: ContainerImage) -> Dict[str, Any]:
         """Derive provenance data from actual image properties."""
         has_sbom = bool(image.sbom_generated)

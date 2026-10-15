@@ -6,7 +6,8 @@ sessions across organisations; any user could override a device's
 compliance posture (a PDP device-trust bypass) or rewrite access policies
 and segments; assessing an unknown device created a phantom "blocked"
 profile; and ``/step-up`` returned a challenge id although no challenge was
-ever issued. The ``/evaluate-access`` alias must pass the caller's
+ever issued (wave 1 made it a 501; wave 5 deleted it with ``/verify`` and
+``/verifications``, whose pending rows nothing ever completed). The ``/evaluate-access`` alias must pass the caller's
 organisation into the PDP so decisions are recorded for, and policies are
 drawn from, the caller's tenant only.
 """
@@ -293,7 +294,6 @@ ANALYST_WRITES = [
     ("POST", "policies/x/test", ACCESS_REQUEST),
     ("POST", "assess-devices", {}),
     ("POST", "devices/x/assess", None),
-    ("POST", "verify", {"user_id": "u", "verification_type": "mfa"}),
 ]
 ADMIN_WRITES = [
     ("POST", "policies", POLICY_BODY),
@@ -345,7 +345,7 @@ async def test_viewer_can_read_and_evaluate_traffic(
 ) -> None:
     segment_id = await _segment(db_session, org_a.id)
     for path in ("decisions", "policies", "devices", "device-stats", "segments", "topology",
-                 "verifications", "maturity", "dashboard"):
+                 "maturity", "dashboard"):
         resp = await client.get(f"{API}/{path}", headers=viewer_headers)
         assert resp.status_code == 200, (path, resp.text)
     # Read-only computation: persists nothing.
@@ -363,11 +363,12 @@ async def test_orgless_superuser_is_refused(client: AsyncClient, superuser_heade
 
 
 # ---------------------------------------------------------------------------
-# honest 501
+# retired routes (wave 5)
 # ---------------------------------------------------------------------------
 
 
-async def test_step_up_is_honest_not_implemented(client: AsyncClient, org_a_headers: dict[str, str]) -> None:
+async def test_step_up_and_verification_stubs_are_gone(client: AsyncClient, org_a_headers: dict[str, str]) -> None:
     resp = await client.post(f"{API}/step-up/s1", params={"required_level": "mfa"}, headers=org_a_headers)
-    assert resp.status_code == 501, resp.text
-    assert resp.json()["detail"]["error"] == "not_implemented"
+    assert resp.status_code == 404, resp.text
+    resp = await client.get(f"{API}/verifications", headers=org_a_headers)
+    assert resp.status_code == 404, resp.text

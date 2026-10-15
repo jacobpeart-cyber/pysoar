@@ -85,7 +85,6 @@ async def test_dfir_routes_are_tenant_isolated(
     for method, path, body in [
         ("GET", f"{BASE}/cases/{case_id}", None),
         ("PUT", f"{BASE}/cases/{case_id}", {"title": "stolen"}),
-        ("POST", f"{BASE}/cases/{case_id}/close", None),
         ("GET", f"{BASE}/cases/{case_id}/evidence", None),
         ("POST", f"{BASE}/evidence", {"case_id": case_id, "evidence_type": "file", "source_device": "x"}),
         ("GET", f"{BASE}/evidence/{evidence_id}", None),
@@ -230,7 +229,6 @@ async def test_viewers_cannot_write(
     for method, path, body in [
         ("POST", f"{BASE}/cases", {"case_number": _case_number(), "title": "v"}),
         ("PUT", f"{BASE}/cases/{case_id}", {"title": "v"}),
-        ("POST", f"{BASE}/cases/{case_id}/close", None),
         ("POST", f"{BASE}/evidence", {"case_id": case_id, "evidence_type": "file", "source_device": "x"}),
         ("POST", f"{BASE}/evidence/{evidence_id}/verify", {"evidence_hash": "a" * 64}),
         ("POST", f"{BASE}/evidence/{evidence_id}/chain-of-custody", {"action": "x"}),

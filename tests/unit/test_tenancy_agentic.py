@@ -70,17 +70,11 @@ async def test_by_id_routes_are_isolated(
 
     for method, path, json in (
         ("GET", f"{API}/agents/{agent}", None),
-        ("GET", f"{API}/agents/{agent}/performance", None),
-        ("GET", f"{API}/agents/{agent}/memory", None),
-        ("GET", f"{API}/agents/{agent}/memory/stats", None),
         ("GET", f"{API}/investigations/{inv}", None),
         ("GET", f"{API}/investigations/{inv}/reasoning-chain", None),
-        ("GET", f"{API}/investigations/{inv}/timeline", None),
         ("GET", f"{API}/investigations/{inv}/feedback", None),
         ("GET", f"{API}/investigations/{inv}/explain", None),
         ("GET", f"{API}/chat/sessions/{sess}/messages", None),
-        ("PUT", f"{API}/investigations/{inv}", {"title": "pwned"}),
-        ("POST", f"{API}/investigations/{inv}/feedback", {"rating": 1}),
         ("POST", f"{API}/investigations/{inv}/correct", {"corrected_verdict": "benign"}),
         ("DELETE", f"{API}/chat/sessions/{sess}", None),
         ("POST", f"{API}/investigations", {"title": "x", "trigger_type": "manual", "agent_id": agent}),
@@ -92,9 +86,6 @@ async def test_by_id_routes_are_isolated(
     # tenant check, not the role gate).
     for method, path, json in (
         ("PUT", f"{API}/agents/{agent}", {"name": "pwned"}),
-        ("POST", f"{API}/agents/{agent}/start", None),
-        ("POST", f"{API}/agents/{agent}/stop", None),
-        ("DELETE", f"{API}/agents/{agent}/memory", None),
     ):
         resp = await assert_tenant_isolated(client, method, path, b_admin, json=json)
         assert resp.status_code == 404, (method, path, resp.text)
@@ -128,22 +119,6 @@ async def test_lists_and_dashboards_do_not_leak(
     assert metrics.json()["total_agents"] == 0
 
 
-async def test_threat_hunt_refuses_another_tenants_agent(
-    client: AsyncClient,
-    db_session: AsyncSession,
-    org_a: Organization,
-    org_a_user,
-    org_b_headers: dict[str, str],
-) -> None:
-    ids = await _seed(db_session, org_a.id, org_a_user.id)
-    resp = await client.post(
-        f"{API}/threat-hunts", headers=org_b_headers, json={"agent_id": ids["agent"], "hunt_profile": "default"},
-    )
-    assert resp.status_code == 404, resp.text
-    count = (await db_session.execute(select(Investigation).where(Investigation.agent_id == ids["agent"]))).scalars().all()
-    assert len(count) == 1  # only the seeded one: no hunt investigation was filed under A's agent
-
-
 # ---------------------------------------------------------------------------
 # roles
 # ---------------------------------------------------------------------------
@@ -153,10 +128,7 @@ ANALYST_WRITES = [
     ("POST", "/chat/sessions", {"title": "t"}),
     ("DELETE", f"/chat/sessions/{MISSING}", None),
     ("POST", "/hunts", {"hypothesis": "lateral movement via smb"}),
-    ("POST", "/threat-hunts", {"hunt_profile": "default"}),
     ("POST", "/investigations", {"title": "x", "trigger_type": "manual", "agent_id": MISSING}),
-    ("PUT", f"/investigations/{MISSING}", {"title": "x"}),
-    ("POST", f"/investigations/{MISSING}/feedback", {"rating": 3}),
     ("POST", f"/investigations/{MISSING}/correct", {"corrected_verdict": "benign"}),
     ("POST", "/tools/list_alerts/execute", {"limit": 1}),
     ("POST", "/trust/acknowledge", {"session_id": MISSING, "reason": "reviewed"}),
@@ -164,9 +136,6 @@ ANALYST_WRITES = [
 ADMIN_WRITES = [
     ("POST", "/agents", {"name": "a", "agent_type": "triage_analyst"}),
     ("PUT", f"/agents/{MISSING}", {"name": "x"}),
-    ("POST", f"/agents/{MISSING}/start", None),
-    ("POST", f"/agents/{MISSING}/stop", None),
-    ("DELETE", f"/agents/{MISSING}/memory", None),
     ("POST", f"/actions/{MISSING}/approve", {"approved": False}),
     ("POST", f"/actions/{MISSING}/rollback", None),
 ]
@@ -210,7 +179,7 @@ async def test_viewer_can_read(
     for path in (
         "/agents", f"/agents/{ids['agent']}", "/investigations", f"/investigations/{ids['investigation']}",
         "/chat/sessions", f"/chat/sessions/{ids['session']}/messages", "/dashboard/metrics",
-        "/dashboard/investigation-metrics", "/dashboard/accuracy-stats", f"/agents/{ids['agent']}/memory",
+        "/dashboard/investigation-metrics",
     ):
         resp = await client.get(f"{API}{path}", headers=viewer_headers)
         assert resp.status_code == 200, (path, resp.text)
@@ -240,13 +209,6 @@ async def test_creates_are_stamped_with_the_callers_org(
     assert resp.status_code == 200, resp.text
     session_id = resp.json()["id"]
     assert (await db_session.get(AgentChatSession, session_id)).organization_id == a_id
-
-    resp = await client.post(
-        f"{API}/threat-hunts", headers=org_a_headers, json={"agent_id": agent_id, "hunt_profile": "default"},
-    )
-    assert resp.status_code == 200, resp.text
-    hunts = (await db_session.execute(select(Investigation).where(Investigation.agent_id == agent_id))).scalars().all()
-    assert hunts and all(h.organization_id == a_id for h in hunts)
 
 
 # ---------------------------------------------------------------------------
@@ -282,44 +244,9 @@ async def test_usage_explicit_scope_for_orgless_superuser(
 
 
 # ---------------------------------------------------------------------------
-# Adjacent wave-1 gates owned by the same change: POST /ai/query (analyst+,
-# org-scoped) and POST /attack/sync (platform superuser only).
+# Adjacent wave-1 gate owned by the same change: POST /attack/sync (platform
+# superuser only). POST /ai/query was deleted in wave 5 (agentic chat replaces it).
 # ---------------------------------------------------------------------------
-
-
-async def test_ai_query_needs_analyst_and_an_organisation(
-    client: AsyncClient, viewer_headers: dict[str, str], orgless_headers: dict[str, str],
-) -> None:
-    body = {"natural_language": "show critical alerts"}
-    resp = await client.post("/api/v1/ai/query", headers=viewer_headers, json=body)
-    assert resp.status_code == 403, resp.text
-    resp = await client.post("/api/v1/ai/query", headers=orgless_headers, json=body)
-    assert resp.status_code == 403, resp.text
-    assert resp.json()["detail"]["error"] == "organization_required"
-
-
-async def test_ai_query_results_are_tenant_scoped(
-    client: AsyncClient,
-    db_session: AsyncSession,
-    org_a: Organization,
-    org_b_headers: dict[str, str],
-) -> None:
-    from src.ai.models import NLQuery
-    from src.models.alert import Alert
-
-    db_session.add(Alert(
-        title="org a secret alert", severity="critical", status="new", source="test",
-        organization_id=org_a.id,
-    ))
-    await db_session.commit()
-
-    resp = await client.post(
-        "/api/v1/ai/query", headers=org_b_headers, json={"natural_language": "show critical alerts"},
-    )
-    assert resp.status_code == 200, resp.text
-    assert "org a secret alert" not in resp.text
-    rows = (await db_session.execute(select(NLQuery))).scalars().all()
-    assert rows and all(r.organization_id != org_a.id for r in rows)
 
 
 async def test_attack_sync_is_platform_superuser_only(
