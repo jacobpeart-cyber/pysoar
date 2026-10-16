@@ -228,7 +228,8 @@ async def verify_mfa_login(
     generation = await blacklist.current_generation(user.id)
 
     # Both factors done: a forced password change is offered now, never before.
-    if getattr(user, "force_password_change", False):
+    # Never for an account its identity provider manages (no PySOAR password).
+    if getattr(user, "force_password_change", False) and getattr(user, "identity_source", "local") == "local":
         from src.api.v1.endpoints.auth import forced_password_change
 
         logger.info(f"User {user.id} required to change password after MFA")

@@ -286,6 +286,19 @@ async def revoke_all_tokens(
     return {"message": "All tokens have been revoked"}
 
 
+def _sso_managed() -> HTTPException:
+    """409 for a password reset on an account whose identity provider (OIDC or
+    SCIM) owns the credentials: it has no usable PySOAR password."""
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "error": "sso_managed",
+            "detail": "this account signs in through the organisation's identity provider; "
+            "reset the password there",
+        },
+    )
+
+
 class PasswordResetTokenRequest(BaseModel):
     token: str = Field(min_length=48, max_length=256)
 
@@ -311,6 +324,8 @@ async def password_reset_validate(
     user = (await db.execute(stmt)).scalars().first()
     if user is None:
         raise HTTPException(status_code=404, detail="Invalid or expired token")
+    if getattr(user, "identity_source", "local") != "local":
+        raise _sso_managed()
     now_utc = datetime.now(timezone.utc)
     expires_at = user.password_reset_token_expires_at
     # SQLite returns naive datetimes from tz-aware columns; Postgres returns
@@ -359,6 +374,8 @@ async def password_reset_consume(
     user = (await db.execute(stmt)).scalars().first()
     if user is None:
         raise HTTPException(status_code=404, detail="Invalid or expired token")
+    if getattr(user, "identity_source", "local") != "local":
+        raise _sso_managed()
 
     # SQLite returns naive datetime from tz-aware columns; Postgres returns
     # aware. Normalize so the comparison works on both backends without
