@@ -11,6 +11,15 @@ Which dependency to use:
 * ``PlatformSuperUser``: platform operator only (``is_superuser``). Use this for
   anything that touches every tenant or the host (backups, raw SQL, ...).
 
+Custom roles (identity package, ``src.identity.roles``): for a user holding a
+custom role (``User.custom_role_id``) the gates above are judged per *area*
+(first path segment under ``/api/v1``) by the role's tiers instead of
+``User.role``: ``get_current_user`` refuses tier ``none`` (403 ``area_denied``,
+outside the exempt areas), ``require_role([ADMIN])`` / ``AdminUser`` /
+``get_current_superuser`` need tier ``admin`` and ``require_role([ADMIN,
+ANALYST])`` needs ``write`` (403 ``insufficient_tier``). Users without a custom
+role take exactly the code paths they always did.
+
 Tenancy (wave 1, see docs/audit/2026-10-08/PLAN.md):
 
 * ``OrganizationId``: the caller's organisation id, or 403
@@ -31,10 +40,12 @@ from redis import asyncio as aioredis
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.requests import HTTPConnection
 
 from src.core.config import settings
 from src.core.database import get_db
 from src.core.security import decode_token_full
+from src.identity import roles as identity_roles
 from src.models.user import User, UserRole
 from src.services.user_service import UserService
 
@@ -71,11 +82,47 @@ async def get_current_user(
     credentials: Annotated[Optional[HTTPAuthorizationCredentials], Depends(security)],
     db: Annotated[AsyncSession, Depends(get_db)],
     redis: Annotated[aioredis.Redis, Depends(get_redis_client)],
+    connection: HTTPConnection = None,  # type: ignore[assignment]
 ) -> User:
     """Get the current authenticated user from JWT token with enhanced security"""
     if not credentials:
         raise _not_authenticated()
-    return await _user_from_token(credentials.credentials, db, redis, allowed=frozenset({"access"}))
+    user = await _user_from_token(credentials.credentials, db, redis, allowed=frozenset({"access"}))
+    if identity_roles.has_custom_role(user):
+        await _enforce_custom_role_area(user, db, connection)
+    return user
+
+
+async def _enforce_custom_role_area(user: User, db: AsyncSession, connection: Optional[HTTPConnection]) -> None:
+    """Custom-role holders only: load the role for this request (cached on the
+    user instance for the role gates below) and refuse tier ``none`` in the
+    request's area with 403 ``area_denied``. Exempt areas and the caller's own
+    ``/users/<id>`` are never denied; a role that cannot be loaded or belongs
+    to another organisation grants nothing."""
+    from src.identity.models import Role
+
+    role = await db.get(Role, str(user.custom_role_id))
+    if role is not None and str(role.organization_id) != str(user.organization_id or ""):
+        role = None
+    setattr(user, identity_roles.CUSTOM_ROLE_ATTR, role)
+    path = connection.url.path if connection is not None else ""
+    area = identity_roles.area_of_path(path)
+    if area is None or area in identity_roles.EXEMPT_AREAS or identity_roles.is_self_route(path, str(user.id)):
+        return
+    if identity_roles.effective_tier(user, area, role) == "none":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=identity_roles.area_denied_detail(area))
+
+
+def _custom_role_gate(user: User, connection: Optional[HTTPConnection], required: str) -> None:
+    """403 ``insufficient_tier`` unless the custom-role holder ``user`` holds
+    ``required`` in the request's area."""
+    area = identity_roles.area_of_path(connection.url.path) if connection is not None else None
+    held = identity_roles.effective_tier(user, area)
+    if not identity_roles.tier_at_least(held, required):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=identity_roles.insufficient_tier_detail(area, required, held),
+        )
 
 
 async def get_password_change_user(
@@ -203,8 +250,12 @@ async def get_current_active_user(
 
 async def get_current_admin_user(
     current_user: Annotated[User, Depends(get_current_user)],
+    connection: HTTPConnection = None,  # type: ignore[assignment]
 ) -> User:
     """Get the current user if they are an admin"""
+    if identity_roles.has_custom_role(current_user):
+        _custom_role_gate(current_user, connection, "admin")
+        return current_user
     if not current_user.is_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -215,14 +266,22 @@ async def get_current_admin_user(
 
 async def get_current_superuser(
     current_user: Annotated[User, Depends(get_current_user)],
+    connection: HTTPConnection = None,  # type: ignore[assignment]
 ) -> User:
     """Get the current user if they are a superuser"""
+    if identity_roles.has_custom_role(current_user):
+        _custom_role_gate(current_user, connection, "admin")
+        return current_user
     if not current_user.is_superuser and not current_user.is_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Superuser access required",
         )
     return current_user
+
+
+setattr(get_current_admin_user, identity_roles.REQUIRED_TIER_ATTR, "admin")
+setattr(get_current_superuser, identity_roles.REQUIRED_TIER_ATTR, "admin")
 
 
 async def get_platform_superuser(
@@ -314,12 +373,22 @@ async def get_optional_user(
 
 
 def require_role(allowed_roles: list[UserRole]):
-    """Dependency factory for role-based access control"""
+    """Dependency factory for role-based access control.
+
+    A custom-role holder is judged by tier in the request's area instead: the
+    gate needs the lowest built-in tier among ``allowed_roles`` (``[ADMIN]`` ->
+    admin, ``[ADMIN, ANALYST]`` -> write)."""
+    required_tier = identity_roles.required_tier_for_roles(allowed_roles)
 
     async def check_role(
         current_user: Annotated[User, Depends(get_current_user)],
+        connection: HTTPConnection = None,  # type: ignore[assignment]
     ) -> User:
         if current_user.is_superuser:
+            return current_user
+
+        if identity_roles.has_custom_role(current_user):
+            _custom_role_gate(current_user, connection, required_tier)
             return current_user
 
         if current_user.role not in [role.value for role in allowed_roles]:
@@ -329,6 +398,7 @@ def require_role(allowed_roles: list[UserRole]):
             )
         return current_user
 
+    setattr(check_role, identity_roles.REQUIRED_TIER_ATTR, required_tier)
     return check_role
 
 

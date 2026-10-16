@@ -11,16 +11,26 @@ Tenancy and RBAC (wave 1):
 * A tenant admin can never touch a platform superuser account, and no route
   here can set ``is_superuser`` (it is not part of any request schema).
 * ``role`` must be one of ``admin`` / ``analyst`` / ``viewer``.
+* ``custom_role_id`` (create / patch, admin only) assigns a custom role of the
+  caller's organisation (422 ``role_not_found`` otherwise; never to a platform
+  superuser, 422 ``superuser_custom_role``; never broader than the caller's own
+  tiers, 403 ``tier_exceeds_caller``); ``null`` clears it. Assigning stores
+  ``role`` as ``viewer`` (src/identity/roles.py, built-in role floor). Every
+  assignment change is audited (``user_custom_role_changed``). Nobody changes
+  their own custom role (403 ``privileged_field``).
+* "admin" here means tier admin in the ``users`` area: the built-in admin role,
+  or a custom role granting it.
 * Self-service stays ``CurrentUser``: anyone can read their own record and edit
   their own profile fields. Password changes go through
   ``/auth/change-password`` (which verifies the current password and revokes
   tokens), and the email address cannot be changed through this router.
 """
 
+import json
 import math
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from src.api.deps import (
     CurrentUser,
@@ -31,6 +41,9 @@ from src.api.deps import (
 )
 from src.core.exceptions import NotFoundError, ValidationError
 from src.core.logging import get_logger
+from src.identity import roles as identity_roles
+from src.identity.models import Role
+from src.models.audit import AuditLog
 from src.models.user import User, UserRole
 from src.schemas.user import (
     UserCreate,
@@ -57,6 +70,74 @@ def _validate_role(role: Optional[str]) -> None:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"role must be one of {sorted(_VALID_ROLES)}",
         )
+
+
+def _is_user_admin(user: User) -> bool:
+    """Tier admin in the ``users`` area (``is_admin`` for users without a custom role)."""
+    return identity_roles.has_tier(user, "users", "admin")
+
+
+async def _resolve_custom_role(
+    db, role_id: str, org_id: str, target: Optional[User], caller: User, areas: set[str],
+) -> Role:
+    """The custom role ``role_id`` of ``org_id``, checked for assignment to
+    ``target`` (``None`` while creating) by ``caller``."""
+    role = await db.get(Role, role_id)
+    if role is None or str(role.organization_id) != org_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "role_not_found", "detail": "custom role not found in this organisation"},
+        )
+    if target is not None:
+        problem = identity_roles.assignment_error(target, role, org_id)
+        if problem:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=problem)
+    over = identity_roles.escalation_areas(
+        caller, role.default_tier, dict(role.area_tiers or {}), set(role.area_tiers or {}) | areas,
+    )
+    if over:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "tier_exceeds_caller",
+                "areas": over,
+                "detail": "you cannot assign a role that grants more than you hold yourself",
+            },
+        )
+    return role
+
+
+def _check_builtin_role_grant(caller: User, role: Optional[str], areas: set[str]) -> None:
+    """A custom-role holder cannot hand out a built-in role broader than the
+    tiers they hold themselves (403 ``tier_exceeds_caller``). Built-in admins
+    and superusers always pass."""
+    if not role or not identity_roles.has_custom_role(caller):
+        return
+    over = identity_roles.escalation_areas(caller, identity_roles.BUILTIN_ROLE_TIERS.get(role, "admin"), {}, areas)
+    if over:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "tier_exceeds_caller",
+                "areas": over,
+                "detail": f"you cannot grant the built-in {role} role: it exceeds your own access",
+            },
+        )
+
+
+def _audit_custom_role(db, caller: User, org_id: str, target_id: str, old: Optional[str], new: Optional[Role]) -> None:
+    db.add(AuditLog(
+        user_id=str(caller.id),
+        organization_id=org_id,
+        action="user_custom_role_changed",
+        resource_type="user",
+        resource_id=target_id,
+        description=(f"Custom role {new.name!r} assigned" if new is not None else "Custom role cleared"),
+        old_value=json.dumps({"custom_role_id": old}),
+        new_value=json.dumps({"custom_role_id": str(new.id) if new is not None else None,
+                              "role": "viewer" if new is not None else None}),
+        success=True,
+    ))
 
 
 async def _get_tenant_user(
@@ -109,6 +190,7 @@ async def list_users(
 @router.post("", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def create_user(
     user_data: UserCreate,
+    request: Request,
     org_id: OrganizationId,
     current_user: User = Depends(require_role([UserRole.ADMIN])),
     db: DatabaseSession = None,
@@ -116,6 +198,14 @@ async def create_user(
     """Create a user in the caller's organisation (admin only, never a superuser)."""
     _validate_role(user_data.role)
     user_service = UserService(db)
+    custom_role = (
+        await _resolve_custom_role(
+            db, user_data.custom_role_id, org_id, None, current_user, identity_roles.known_areas(request.app),
+        )
+        if user_data.custom_role_id else None
+    )
+    if custom_role is None:
+        _check_builtin_role_grant(current_user, user_data.role, identity_roles.known_areas(request.app))
 
     try:
         user = await user_service.create(
@@ -132,6 +222,12 @@ async def create_user(
             detail="Operation failed. Please try again or contact support.",
         )
 
+    if custom_role is not None:
+        identity_roles.apply_custom_role(user, custom_role)
+        _audit_custom_role(db, current_user, org_id, str(user.id), None, custom_role)
+        await db.flush()
+        await db.refresh(user)
+
     logger.info("user_created", user_id=user.id, organization_id=org_id, actor_id=current_user.id)
     return UserResponse.model_validate(user)
 
@@ -146,7 +242,7 @@ async def get_user(
     if user_id == current_user.id:
         return UserResponse.model_validate(current_user)
 
-    if not current_user.is_admin:
+    if not _is_user_admin(current_user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied",
@@ -162,6 +258,7 @@ async def get_user(
 async def update_user(
     user_id: str,
     user_data: UserUpdate,
+    request: Request,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     organization_id: Optional[str] = Query(
@@ -180,6 +277,13 @@ async def update_user(
     """
     user_service = UserService(db)
     update_data = user_data.model_dump(exclude_unset=True, exclude_none=True)
+    # ``custom_role_id: null`` means "clear", so it is read from the unset-only dump.
+    custom_role_sent = "custom_role_id" in user_data.model_fields_set
+    new_custom_role_id = user_data.custom_role_id
+    update_data.pop("custom_role_id", None)
+    custom_role: Optional[Role] = None
+    target: Optional[User] = None
+    org_id: Optional[str] = None
 
     if user_id == current_user.id:
         # Self-service profile edit. Role and active status are never
@@ -190,6 +294,9 @@ async def update_user(
             for field in ("role", "is_active")
             if field in update_data and update_data[field] != getattr(current_user, field)
         )
+        if custom_role_sent and (new_custom_role_id or None) != (current_user.custom_role_id or None):
+            changed_privileged = sorted([*changed_privileged, "custom_role_id"])
+        custom_role_sent = False
         if changed_privileged:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -212,14 +319,23 @@ async def update_user(
                 detail="The email address cannot be changed here",
             )
     else:
-        if not current_user.is_admin:
+        if not _is_user_admin(current_user):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access denied",
             )
         org_id = resolve_organization_scope(current_user, organization_id)
         _validate_role(update_data.get("role"))
-        await _get_tenant_user(user_service, user_id, org_id, current_user)
+        target = await _get_tenant_user(user_service, user_id, org_id, current_user)
+        if custom_role_sent and new_custom_role_id:
+            custom_role = await _resolve_custom_role(
+                db, new_custom_role_id, org_id, target, current_user, identity_roles.known_areas(request.app),
+            )
+        if custom_role_sent and (new_custom_role_id or None) == (target.custom_role_id or None):
+            custom_role_sent = False  # unchanged (the admin UI posts the whole row)
+        keeps_custom_role = bool(new_custom_role_id) if custom_role_sent else bool(target.custom_role_id)
+        if "role" in update_data and update_data["role"] != target.role and not keeps_custom_role:
+            _check_builtin_role_grant(current_user, update_data["role"], identity_roles.known_areas(request.app))
 
     try:
         user = await user_service.update(user_id, **update_data)
@@ -230,6 +346,19 @@ async def update_user(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Operation failed. Please try again or contact support.",
         )
+
+    if custom_role_sent and org_id is not None:
+        old_custom_role_id = user.custom_role_id
+        identity_roles.apply_custom_role(user, custom_role)
+        _audit_custom_role(db, current_user, org_id, str(user.id), old_custom_role_id, custom_role)
+        await db.flush()
+        await db.refresh(user)
+    if user.custom_role_id and user.role != UserRole.VIEWER.value:
+        # Built-in role floor: a custom-role holder's ``role`` stays viewer
+        # whatever the request sent (src/identity/roles.py).
+        user.role = UserRole.VIEWER.value
+        await db.flush()
+        await db.refresh(user)
 
     if user_id != current_user.id:
         logger.info(
