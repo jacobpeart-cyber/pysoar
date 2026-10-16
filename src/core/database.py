@@ -1,5 +1,6 @@
 """Database configuration and connection pooling"""
 
+import os
 from typing import AsyncGenerator
 
 from sqlalchemy import text
@@ -39,6 +40,27 @@ def _create_engine():
             echo=settings.debug and not settings.is_production,
             future=True,
             poolclass=NullPool,
+        )
+    elif os.environ.get("PYSOAR_DB_POOL", "").lower() == "null":
+        # Celery worker and beat processes (docker-compose.yml sets
+        # PYSOAR_DB_POOL=null for them). Each task runs its coroutine on a
+        # fresh event loop; a pooled asyncpg connection created under an
+        # earlier loop cannot be reused by the next one ("attached to a
+        # different loop" / "Event loop is closed" on the second async task
+        # of every worker child). NullPool ties a connection's life to the
+        # session that opened it, so it never outlives its loop.
+        return create_async_engine(
+            settings.database_url,
+            echo=settings.debug and not settings.is_production,
+            future=True,
+            poolclass=NullPool,
+            connect_args={
+                "server_settings": {
+                    "application_name": "pysoar-worker",
+                    "jit": "off",
+                },
+                "timeout": 30,
+            },
         )
     else:
         # asyncpg manages its own internal pool; do not pass a poolclass

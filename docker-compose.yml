@@ -104,6 +104,12 @@ services:
       --max-memory-per-child=300000 --max-tasks-per-child=50
     env_file:
       - .env
+    environment:
+      # Celery tasks run their coroutines on a fresh event loop each; a pooled
+      # asyncpg connection from an earlier loop breaks the next task
+      # ("attached to a different loop"). NullPool: one connection per
+      # session, closed with it. See src/core/database.py.
+      PYSOAR_DB_POOL: "null"
     volumes:
       - ./src:/app/src:ro
       - pysoar-uploads:/app/uploads
@@ -136,6 +142,8 @@ services:
     command: celery -A src.workers.celery_app beat --loglevel=info
     env_file:
       - .env
+    environment:
+      PYSOAR_DB_POOL: "null"  # same reason as the worker
     volumes:
       - ./src:/app/src:ro
     depends_on:
