@@ -14,6 +14,7 @@ from src.api.v1.endpoints import (
     audit,
     audit_evidence,
     auth,
+    sso,
     mfa,
     case_management,
     collaboration,
@@ -59,14 +60,21 @@ from src.api.v1.endpoints import (
     reports,
     websocket,
 )
+from src.api.v1.endpoints import roles as roles_endpoints
+from src.api.v1.endpoints import scim as scim_endpoints
+from src.api.v1.endpoints import scim_admin as scim_admin_endpoints
 
 api_router = APIRouter()
 
 # Include all endpoint routers
 api_router.include_router(health.router)
 api_router.include_router(auth.router)
+api_router.include_router(sso.router)
 api_router.include_router(mfa.router)
 api_router.include_router(users.router)
+api_router.include_router(roles_endpoints.router)
+api_router.include_router(scim_endpoints.router)
+api_router.include_router(scim_admin_endpoints.router)
 api_router.include_router(alerts.router)
 api_router.include_router(incidents.router)
 api_router.include_router(playbooks.router)

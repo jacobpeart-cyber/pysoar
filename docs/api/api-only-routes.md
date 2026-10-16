@@ -6,7 +6,7 @@ Roles: `viewer` < `analyst` < `admin` inside an organisation; `platform superuse
 
 Classified in wave 5 (W5-B, 2026-10-15) from the uncalled-route tables in `docs/audit/2026-10-08/` and the code as it stands after waves 1-4. Routes graded FAKE, duplicates and superseded aliases were deleted, not listed. Rows are one per method and path; to add a route, add a row in the right section.
 
-## KEEP-API (500 routes)
+## KEEP-API (501 routes)
 
 Real routes with no UI control, kept for integrations, scripts, endpoint agents, probes and API clients.
 
@@ -77,6 +77,7 @@ Real routes with no UI control, kept for integrations, scripts, endpoint agents,
 | POST | `/api/v1/attack/sync` | Download + load the pinned ATT&CK dataset (Enterprise + ICS). | platform superuser | platform ATT&CK knowledge base |
 | GET | `/api/v1/attack/techniques` | List ATT&CK techniques (tactic / platform filters). | any authenticated user | platform ATT&CK knowledge base |
 | GET | `/api/v1/attack/techniques/{external_id}` | Full context for one technique (tactics, mitigations, groups, software, data sources). | any authenticated user | platform ATT&CK knowledge base |
+| GET | `/api/v1/auth/sso/callback` | OIDC redirect target the identity provider sends the browser to (code + state); answers 302 to `/login?sso=<one-time code>` or `/login?sso_error=<reason>`. | public (single-use state from `/auth/sso/{org_slug}/start`) | the organisation named by the stored state |
 | GET | `/api/v1/audit-evidence/audit/export` | Export audit trail | any authenticated user | org-scoped |
 | POST | `/api/v1/audit-evidence/audit/log` | Log an audit event as the calling user. | analyst, admin | org-scoped |
 | GET | `/api/v1/audit-evidence/audit/suspicious-activity` | Detect suspicious activity for actor | any authenticated user | org-scoped |
@@ -512,6 +513,23 @@ Real routes with no UI control, kept for integrations, scripts, endpoint agents,
 | POST | `/api/v1/zerotrust/segments/{segment_id}/evaluate-traffic` | Evaluate if traffic is allowed within segment | any authenticated user | org-scoped |
 | GET | `/api/v1/zerotrust/segments/{segment_id}/violations` | Get policy violations for segment | any authenticated user | org-scoped |
 | GET | `/api/v1/zerotrust/topology` | Get network topology visualization | any authenticated user | org-scoped |
+| GET | `/api/v1/scim/v2/ServiceProviderConfig` | SCIM 2.0 discovery: patch and filter supported; bulk, sort, etag, changePassword not (I-C). | SCIM bearer token (identity provider) | the token's organisation |
+| GET | `/api/v1/scim/v2/ResourceTypes` | SCIM 2.0 discovery: User and Group resource types (I-C). | SCIM bearer token (identity provider) | the token's organisation |
+| GET | `/api/v1/scim/v2/ResourceTypes/{name}` | SCIM 2.0 discovery: one resource type (I-C). | SCIM bearer token (identity provider) | the token's organisation |
+| GET | `/api/v1/scim/v2/Schemas` | SCIM 2.0 discovery: the User, Group and enterprise-extension attributes PySOAR stores (I-C). | SCIM bearer token (identity provider) | the token's organisation |
+| GET | `/api/v1/scim/v2/Schemas/{schema_id}` | SCIM 2.0 discovery: one schema (I-C). | SCIM bearer token (identity provider) | the token's organisation |
+| GET | `/api/v1/scim/v2/Users` | SCIM list/filter users (`userName`, `externalId`, `emails.value`, `id` eq; startIndex/count, cap 200); superuser never listed (I-C). | SCIM bearer token (identity provider) | the token's organisation |
+| POST | `/api/v1/scim/v2/Users` | SCIM provision a user (identity_source `scim`, no usable password, default role from the SSO configuration else viewer); 409 `uniqueness` (I-C). | SCIM bearer token (identity provider) | the token's organisation |
+| GET | `/api/v1/scim/v2/Users/{user_id}` | SCIM read one user; another organisation's id answers 404 (I-C). | SCIM bearer token (identity provider) | the token's organisation |
+| PUT | `/api/v1/scim/v2/Users/{user_id}` | SCIM replace a user; `active: false` deactivates and revokes the user's tokens (I-C). | SCIM bearer token (identity provider) | the token's organisation |
+| PATCH | `/api/v1/scim/v2/Users/{user_id}` | SCIM PatchOp (Okta / Entra shapes: active, userName, name.*, displayName, externalId, emails, phoneNumbers, enterprise department); deactivation revokes tokens (I-C). | SCIM bearer token (identity provider) | the token's organisation |
+| DELETE | `/api/v1/scim/v2/Users/{user_id}` | SCIM delete = deactivate + revoke tokens (204); never a hard delete (I-C). | SCIM bearer token (identity provider) | the token's organisation |
+| GET | `/api/v1/scim/v2/Groups` | SCIM list/filter groups (`displayName`, `externalId`, `id` eq); groups are role mappings kept in `Organization.settings["scim_groups"]` (I-C). | SCIM bearer token (identity provider) | the token's organisation |
+| POST | `/api/v1/scim/v2/Groups` | SCIM create a group (members must be users of the organisation); 409 `uniqueness` on displayName (I-C). | SCIM bearer token (identity provider) | the token's organisation |
+| GET | `/api/v1/scim/v2/Groups/{group_id}` | SCIM read one group (I-C). | SCIM bearer token (identity provider) | the token's organisation |
+| PUT | `/api/v1/scim/v2/Groups/{group_id}` | SCIM replace a group; members' roles recomputed from mapped groups (I-C). | SCIM bearer token (identity provider) | the token's organisation |
+| PATCH | `/api/v1/scim/v2/Groups/{group_id}` | SCIM PatchOp on a group (displayName, externalId, members add/remove/replace, `members[value eq "id"]` remove); roles recomputed (I-C). | SCIM bearer token (identity provider) | the token's organisation |
+| DELETE | `/api/v1/scim/v2/Groups/{group_id}` | SCIM delete a group record; members' roles recomputed (I-C). | SCIM bearer token (identity provider) | the token's organisation |
 
 ## Called dynamically (8 routes)
 
@@ -534,3 +552,24 @@ Real routes the UI should call. They stay in the contract diff's "never called" 
 
 | Method | Route | Note | Roles | Tenancy |
 |---|---|---|---|---|
+| GET | `/api/v1/roles` | Settings > Identity > Roles editor: built-in roles (tier, holder count) and the organisation's custom roles (I-B; I-D calls it). | admin (tier admin in `roles`) | org-scoped |
+| GET | `/api/v1/roles/areas` | Roles editor grid rows: the area catalogue derived from the served routes, with labels, exempt flags and built-in tiers (I-B; I-D calls it). | admin (tier admin in `roles`) | org-scoped |
+| POST | `/api/v1/roles` | Roles editor: create a custom role (I-B; I-D calls it). | admin (tier admin in `roles`) | org-scoped |
+| GET | `/api/v1/roles/{role_id}` | Roles editor: one custom role (I-B; I-D calls it). | admin (tier admin in `roles`) | org-scoped |
+| PUT | `/api/v1/roles/{role_id}` | Roles editor: replace a custom role's name, description and tiers (I-B; I-D calls it). | admin (tier admin in `roles`) | org-scoped |
+| DELETE | `/api/v1/roles/{role_id}` | Roles editor: delete a custom role nobody holds (409 `role_in_use` with the count otherwise) (I-B; I-D calls it). | admin (tier admin in `roles`) | org-scoped |
+| GET | `/api/v1/roles/{role_id}/members` | Roles editor: users holding the role (I-B; I-D calls it). | admin (tier admin in `roles`) | org-scoped |
+| GET | `/api/v1/settings/sso` | Settings > Identity > SSO form: the organisation's OIDC configuration (`client_secret_set`, never the secret; `redirect_uri` to register; last test result); 404 `sso_not_configured` (I-A; I-D calls it). | admin | org-scoped |
+| PUT | `/api/v1/settings/sso` | SSO form save (upsert; `saml` 501 `not_implemented`; enabling needs a passing test) (I-A; I-D calls it). | admin | org-scoped |
+| DELETE | `/api/v1/settings/sso` | SSO form: remove the configuration (I-A; I-D calls it). | admin | org-scoped |
+| POST | `/api/v1/settings/sso/test` | SSO form "Test connection": discovery + JWKS through netguard; 502 `sso_test_failed` with the reason (I-A; I-D calls it). | admin | org-scoped |
+| POST | `/api/v1/auth/sso/discover` | Login page "Sign in with SSO": email -> `{available, organization_slug, display_name, login_url}` (I-A; I-D calls it). | public | resolves the organisation from the email domain |
+| GET | `/api/v1/auth/sso/{org_slug}/start` | Login page navigates the browser (`window.location`) to `login_url` from discover; 302 to the IdP. I-D moves this row to "Called dynamically" (I-A). | public | the organisation named by the slug |
+| POST | `/api/v1/auth/sso/exchange` | Login page on `?sso=<code>`: trade the one-time code for tokens or the MFA challenge (I-A; I-D calls it). | public (one-time code) | the code's organisation |
+| GET | `/api/v1/settings/scim/tokens` | Settings > Identity > SCIM tokens: list (prefix, status, last used, expiry; never the token) and the SCIM base URL (I-C; I-D calls it). | admin | org-scoped |
+| POST | `/api/v1/settings/scim/tokens` | SCIM tokens: issue one (shown once; optional `expires_in_days`); 403 `full_admin_required` for custom-role holders (I-C; I-D calls it). | admin (built-in admin only) | org-scoped |
+| DELETE | `/api/v1/settings/scim/tokens/{token_id}` | SCIM tokens: revoke; 404 `scim_token_not_found` (I-C; I-D calls it). | admin | org-scoped |
+| GET | `/api/v1/settings/scim/groups` | Settings > Identity > SCIM groups: pushed groups with member count and the role each maps to (I-C; I-D calls it). | admin | org-scoped |
+| PUT | `/api/v1/settings/scim/groups/{group_id}` | SCIM groups: map a group to a role (`{role}` built-in, custom id or name; null unmaps); members recomputed; 422 `unknown_role` (I-C; I-D calls it). | admin (built-in admin only) | org-scoped |
+| POST | `/api/v1/settings/scim/users/{user_id}/link` | Users / SCIM: hand a local account to the identity provider (identity_source `scim`, optional `external_id`); 404 for the superuser, 409 `user_inactive` / `not_local_account` (I-C; I-D calls it). | admin (built-in admin only) | org-scoped |
+| DELETE | `/api/v1/settings/scim/users/{user_id}/link` | Users / SCIM: return a SCIM-managed account to local management (keeps email and activity); 409 `not_scim_managed` / `self_unlink` (I-C; I-D calls it). | admin (built-in admin only) | org-scoped |
