@@ -33,6 +33,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from src.api.deps import (
+    RedisClient,
     CurrentUser,
     DatabaseSession,
     OrganizationId,
@@ -41,6 +42,8 @@ from src.api.deps import (
 )
 from src.core.exceptions import NotFoundError, ValidationError
 from src.core.logging import get_logger
+from src.core.password_policy import PasswordValidator
+from src.core.token_blacklist import TokenBlacklist
 from src.identity import roles as identity_roles
 from src.identity.models import Role
 from src.models.audit import AuditLog
@@ -292,6 +295,7 @@ async def update_user(
     request: Request,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    redis: RedisClient = None,
     organization_id: Optional[str] = Query(
         None, description="platform superuser only: the tenant whose user is edited"
     ),
@@ -361,6 +365,32 @@ async def update_user(
         outranks = await _target_escalation_areas(db, current_user, target, identity_roles.known_areas(request.app))
         if outranks:
             raise _target_outranks_caller(outranks)
+        provider_managed = (target.identity_source or "local") != "local"
+        if provider_managed and (
+            "password" in update_data or ("email" in update_data and update_data["email"].lower() != target.email.lower())
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": "sso_managed",
+                    "detail": "this account signs in through the organisation's identity provider; "
+                    "its password and email are managed there",
+                },
+            )
+        if "password" in update_data:
+            is_valid, errors = PasswordValidator.validate(update_data["password"], settings={"email": target.email})
+            if not is_valid:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "error": "password_policy",
+                        "detail": "Password does not meet requirements: " + "; ".join(errors),
+                        "errors": list(errors),
+                    },
+                )
+            # An administrator-set password is temporary: the user chooses their
+            # own at the next sign-in, and every existing session is revoked.
+            update_data["force_password_change"] = True
         if custom_role_sent and new_custom_role_id:
             custom_role = await _resolve_custom_role(
                 db, new_custom_role_id, org_id, target, current_user, identity_roles.known_areas(request.app),
@@ -381,6 +411,18 @@ async def update_user(
             detail="Operation failed. Please try again or contact support.",
         )
 
+    if "password" in update_data and user_id != current_user.id and redis is not None:
+        await TokenBlacklist(redis).revoke_all_user_tokens(str(user.id))
+        db.add(AuditLog(
+            user_id=str(current_user.id),
+            organization_id=org_id,
+            action="user_password_set_by_admin",
+            resource_type="user",
+            resource_id=str(user.id),
+            description="administrator set a temporary password; sessions revoked; change required at next sign-in",
+            success=True,
+        ))
+        await db.flush()
     if custom_role_sent and org_id is not None:
         old_custom_role_id = user.custom_role_id
         identity_roles.apply_custom_role(user, custom_role)
