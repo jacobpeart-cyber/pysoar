@@ -30,7 +30,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Optional
 from urllib.parse import quote, urlencode, urlsplit
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 
@@ -122,6 +122,26 @@ def _public_origin(request: Request) -> str:
     proto = (request.headers.get("x-forwarded-proto") or request.url.scheme).split(",")[0].strip()
     host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc)
     return f"{proto}://{host.split(',')[0].strip()}"
+
+
+def _cookie_path() -> str:
+    return f"{settings.api_v1_prefix}/auth/sso"
+
+
+def _set_browser_cookie(response: Response, request: Request, value: str) -> None:
+    """``pysoar_sso``: HttpOnly, SameSite=Lax (sent on the IdP's top-level redirect
+    back), Secure on https, scoped to the SSO routes, 10 minutes like the state."""
+    response.set_cookie(
+        oidc.BROWSER_COOKIE, value, max_age=oidc.STATE_TTL_SECONDS, path=_cookie_path(),
+        httponly=True, samesite="lax", secure=_public_origin(request).startswith("https://"),
+    )
+
+
+def _clear_browser_cookie(response: Response, request: Request) -> None:
+    response.set_cookie(
+        oidc.BROWSER_COOKIE, "", max_age=0, path=_cookie_path(),
+        httponly=True, samesite="lax", secure=_public_origin(request).startswith("https://"),
+    )
 
 
 def _redirect_uri(request: Request) -> str:
@@ -580,8 +600,9 @@ async def start_sso(
 ) -> RedirectResponse:
     """Redirect the browser to the organisation's identity provider.
 
-    Stores ``{organization_id, nonce, code_verifier, redirect_uri, created}``
-    under ``sso:state:<state>`` for 10 minutes. An unknown organisation or a
+    Stores ``{organization_id, nonce, code_verifier, redirect_uri, browser, created}``
+    under ``sso:state:<state>`` for 10 minutes and sets the ``pysoar_sso``
+    cookie whose SHA-256 is ``browser``: only this browser can finish the login. An unknown organisation or a
     disabled configuration redirects to ``/login?sso_error=sso_unavailable``.
     """
     org = (await db.execute(
@@ -604,7 +625,9 @@ async def start_sso(
     nonce = secrets.token_urlsafe(32)
     verifier, challenge = oidc.new_pkce_pair()
     redirect_uri = _redirect_uri(request)
+    browser_secret = oidc.new_browser_secret()
     await oidc.put_json(redis, oidc.STATE_KEY.format(state), oidc.STATE_TTL_SECONDS, {
+        "browser": oidc.browser_binding(browser_secret),
         "organization_id": org.id,
         "nonce": nonce,
         "code_verifier": verifier,
@@ -615,7 +638,9 @@ async def start_sso(
         metadata, client_id=config.client_id, redirect_uri=redirect_uri, scopes=config.scopes,
         state=state, nonce=nonce, code_challenge=challenge, login_hint=login_hint,
     )
-    return RedirectResponse(url, status_code=status.HTTP_302_FOUND)
+    response = RedirectResponse(url, status_code=status.HTTP_302_FOUND)
+    _set_browser_cookie(response, request, browser_secret)
+    return response
 
 
 class _LoginRefused(Exception):  # noqa: N818 (control flow inside the callback)
@@ -741,6 +766,16 @@ async def sso_callback(
     ``/login?sso_error=<reason>`` with the cause in the audit row.
     """
     pending = await oidc.take_json(redis, oidc.STATE_KEY.format(state)) if state else None
+    cookie = request.cookies.get(oidc.BROWSER_COOKIE)
+    if pending is not None and not oidc.binding_matches(cookie, pending.get("browser")):
+        # Someone else's login handed to this browser (login CSRF): refuse it.
+        _audit(db, action="sso_login_failed", organization_id=str(pending.get("organization_id") or "") or None,
+               user_id=None, success=False, request=request,
+               error_message="state is not bound to this browser (pysoar_sso cookie missing or different)",
+               description="SSO callback refused: invalid_state")
+        await db.commit()
+        logger.warning("sso_callback_browser_mismatch", organization_id=pending.get("organization_id"))
+        return _fail_redirect("invalid_state")
     if pending is None:
         _audit(db, action="sso_login_failed", organization_id=None, user_id=None, success=False,
                request=request, error_message="unknown, expired or replayed state",
@@ -803,7 +838,7 @@ async def sso_callback(
 
     login_code = secrets.token_urlsafe(32)
     await oidc.put_json(redis, oidc.LOGIN_KEY.format(login_code), oidc.LOGIN_CODE_TTL_SECONDS,
-                        {"user_id": user.id, "organization_id": org_id})
+                        {"user_id": user.id, "organization_id": org_id, "browser": pending.get("browser")})
     _audit(db, action="sso_callback", organization_id=org_id, user_id=user.id, resource_type="user",
            resource_id=user.id, request=request,
            description=f"SSO identity verified for {user.email} ({how}); one-time login code issued")
@@ -815,6 +850,7 @@ async def sso_callback(
 async def sso_exchange(
     payload: SSOExchangeRequest,
     request: Request,
+    response: Response,
     db: DatabaseSession = None,
     redis: RedisClient = None,
 ) -> TokenResponse | MFARequiredResponse:
@@ -823,11 +859,13 @@ async def sso_exchange(
     Same response as password login: ``TokenResponse`` (``gen`` claim,
     organisation session timeout), or ``MFARequiredResponse`` when the
     organisation does not trust the IdP's MFA and the user has MFA enabled
-    (finish with ``POST /mfa/verify``). 401 ``invalid_sso_code`` otherwise.
+    (finish with ``POST /mfa/verify``). 401 ``invalid_sso_code`` otherwise,
+    including when the request lacks the ``pysoar_sso`` cookie the login was
+    started with. The cookie is cleared once the code is redeemed.
     """
     entry = await oidc.take_json(redis, oidc.LOGIN_KEY.format(payload.code))
     invalid = _error(status.HTTP_401_UNAUTHORIZED, "invalid_sso_code", "unknown, expired or already used SSO login code")
-    if entry is None:
+    if entry is None or not oidc.binding_matches(request.cookies.get(oidc.BROWSER_COOKIE), entry.get("browser")):
         raise invalid
     user = (await db.execute(
         select(User).where(User.id == str(entry.get("user_id")), User.organization_id == str(entry.get("organization_id")))
@@ -849,6 +887,7 @@ async def sso_exchange(
         mfa_token = create_access_token(
             subject=user.id, expires_delta=timedelta(minutes=5), extra_claims={"type": "mfa", "gen": generation},
         )
+        _clear_browser_cookie(response, request)
         return MFARequiredResponse(mfa_required=True, mfa_token=mfa_token, expires_in=300)
 
     if user.identity_source == IdentitySource.LOCAL.value and user.force_password_change:
@@ -866,4 +905,5 @@ async def sso_exchange(
     _audit(db, action="sso_login", organization_id=org_id, user_id=user.id, resource_type="user",
            resource_id=user.id, request=request, description=f"User {user.email} signed in through SSO")
     await db.commit()
+    _clear_browser_cookie(response, request)
     return TokenResponse(access_token=access_token, refresh_token=refresh_token, expires_in=session_minutes * 60)

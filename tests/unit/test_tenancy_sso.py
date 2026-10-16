@@ -128,8 +128,12 @@ async def test_state_from_one_org_cannot_be_redeemed_with_another_provider_code(
     await configure(db_session, org_b.id, idps[1], domains=("b-corp.io",))
     resp_a = await start(client, slug_a)
     _code_a, state_a = idps[0].authorize(resp_a.headers["location"], sub="a", email="a@a-corp.io")
+    browser_a = client.cookies.get("pysoar_sso")
     resp_b = await start(client, slug_b)
     code_b, _state_b = idps[1].authorize(resp_b.headers["location"], sub="b", email="b@b-corp.io")
+    # Back in the browser that started A's login (B's start replaced the cookie).
+    client.cookies.clear()
+    client.cookies.set("pysoar_sso", browser_a)
     # A's state with B's code: the exchange runs at A's provider, which never issued that code.
     cb = await client.get("/api/v1/auth/sso/callback", params={"code": code_b, "state": state_a}, follow_redirects=False)
     assert cb.headers["location"] == "/login?sso_error=token_exchange_failed"

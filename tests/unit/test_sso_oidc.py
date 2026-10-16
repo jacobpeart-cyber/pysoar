@@ -667,3 +667,65 @@ async def test_email_verified_never_vouches_for_another_claim(
     await configure(db_session, org_a.id, idp, email_claim="upn", require_email_verified=True)
     result = await _login(client, idp, org_a.slug, sub="u", email=f"x@{DOMAIN}", upn=f"boss@{DOMAIN}")
     assert result == {"sso_error": "email_not_verified"}
+
+
+# ---------------------------------------------------------------------------
+# Browser binding (login CSRF): the pysoar_sso cookie
+# ---------------------------------------------------------------------------
+
+
+async def test_start_sets_the_browser_cookie(client: AsyncClient, db_session, org_a, idp: FakeIdP, store) -> None:
+    await configure(db_session, org_a.id, idp)
+    resp = await start(client, org_a.slug)
+    cookie = resp.headers["set-cookie"]
+    assert cookie.startswith("pysoar_sso=")
+    lowered = cookie.lower()
+    assert "httponly" in lowered and "samesite=lax" in lowered and "path=/api/v1/auth/sso" in lowered
+    assert "max-age=600" in lowered and "secure" not in lowered  # the test client speaks http
+    value = cookie.split(";", 1)[0].split("=", 1)[1]
+    state = query(resp.headers["location"])["state"]
+    pending = json.loads(store[oidc.STATE_KEY.format(state)])
+    assert pending["browser"] == hashlib.sha256(value.encode()).hexdigest() and value not in json.dumps(pending)
+
+    https = await client.get(f"/api/v1/auth/sso/{org_a.slug}/start", headers={"X-Forwarded-Proto": "https"},
+                             follow_redirects=False)
+    assert "secure" in https.headers["set-cookie"].lower()
+
+
+@pytest.mark.parametrize("cookie", [None, "a-different-browser"])
+async def test_callback_needs_the_starting_browser(
+    client: AsyncClient, db_session, org_a, idp: FakeIdP, store, cookie,
+) -> None:
+    org_id, slug = org_a.id, org_a.slug
+    await configure(db_session, org_id, idp)
+    resp = await start(client, slug)
+    code, state = idp.authorize(resp.headers["location"], sub="v", email=f"v@{DOMAIN}")
+    client.cookies.clear()
+    if cookie:
+        client.cookies.set("pysoar_sso", cookie)
+    cb = await client.get("/api/v1/auth/sso/callback", params={"code": code, "state": state}, follow_redirects=False)
+    assert cb.headers["location"] == "/login?sso_error=invalid_state"
+    rows = await _audit_rows(db_session, "sso_login_failed", org_id)
+    assert rows and "not bound to this browser" in rows[-1].error_message
+    assert (await db_session.execute(select(User).where(User.email == f"v@{DOMAIN}"))).scalar_one_or_none() is None
+
+
+async def test_exchange_needs_the_starting_browser_and_clears_the_cookie(
+    client: AsyncClient, db_session, org_a, idp: FakeIdP, store,
+) -> None:
+    slug = org_a.slug
+    await configure(db_session, org_a.id, idp)
+    result = await _login(client, idp, slug, sub="c", email=f"c@{DOMAIN}")
+    browser = client.cookies.get("pysoar_sso")
+    assert browser
+    # An attacker's code handed to another browser (no cookie) is refused, and burnt.
+    client.cookies.clear()
+    resp = await client.post("/api/v1/auth/sso/exchange", json={"code": result["sso"]})
+    assert resp.status_code == 401 and resp.json()["detail"]["error"] == "invalid_sso_code"
+
+    # The same browser that started the flow succeeds, and the cookie is cleared.
+    result = await _login(client, idp, slug, sub="c", email=f"c@{DOMAIN}")
+    resp = await client.post("/api/v1/auth/sso/exchange", json={"code": result["sso"]})
+    assert resp.status_code == 200 and "access_token" in resp.json()
+    cleared = resp.headers["set-cookie"].lower()
+    assert cleared.startswith("pysoar_sso=") and "max-age=0" in cleared and "path=/api/v1/auth/sso" in cleared

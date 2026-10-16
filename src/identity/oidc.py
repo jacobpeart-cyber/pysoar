@@ -60,6 +60,10 @@ ALLOWED_ID_TOKEN_ALGS: frozenset[str] = frozenset(
     {"RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512", "EdDSA"}
 )
 
+#: Browser-binding cookie set by ``start``: the state and the one-time login
+#: code are only redeemable by the browser holding it (login CSRF defence).
+BROWSER_COOKIE = "pysoar_sso"
+
 STATE_KEY = "sso:state:{}"
 LOGIN_KEY = "sso:login:{}"
 JWKS_KEY = "sso:jwks:{}"
@@ -487,6 +491,23 @@ async def take_json(redis: Any, key: str) -> Optional[dict[str, Any]]:
     except ValueError:
         return None
     return value if isinstance(value, dict) else None
+
+
+def new_browser_secret() -> str:
+    """The ``pysoar_sso`` cookie value: 32 random URL-safe bytes."""
+    return secrets.token_urlsafe(32)
+
+
+def browser_binding(cookie: str) -> str:
+    """What the Redis records store for the cookie: its SHA-256, never the value."""
+    return hashlib.sha256(cookie.encode("utf-8")).hexdigest()
+
+
+def binding_matches(cookie: Optional[str], stored: Any) -> bool:
+    """Whether the request's cookie is the one the record was bound to (constant time)."""
+    if not cookie or not isinstance(stored, str) or not stored:
+        return False
+    return hmac.compare_digest(browser_binding(cookie), stored)
 
 
 def claim(claims: dict[str, Any], name: Optional[str]) -> Any:
