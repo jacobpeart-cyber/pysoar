@@ -8,11 +8,19 @@ type TokenState =
   | { kind: 'missing' }
   | { kind: 'valid'; expiresAt: string }
   | { kind: 'invalid'; reason: string }
+  | { kind: 'sso_managed' }
   | { kind: 'done' };
 
 function statusOf(err: unknown): number | null {
   const s = (err as { response?: { status?: number } } | null)?.response?.status;
   return typeof s === 'number' ? s : null;
+}
+
+/** 409 sso_managed: the account's identity provider (SSO or SCIM) owns its credentials. */
+function isSsoManaged(err: unknown): boolean {
+  const d = (err as { response?: { status?: number; data?: { detail?: unknown } } } | null)?.response;
+  const detail = d?.data?.detail as { error?: unknown } | undefined;
+  return d?.status === 409 && Boolean(detail) && typeof detail === 'object' && detail.error === 'sso_managed';
 }
 
 function detailOf(err: unknown): string {
@@ -53,6 +61,10 @@ export default function ResetPassword() {
       })
       .catch((err) => {
         if (cancelled) return;
+        if (isSsoManaged(err)) {
+          setState({ kind: 'sso_managed' });
+          return;
+        }
         const s = statusOf(err);
         setState({
           kind: 'invalid',
@@ -85,6 +97,10 @@ export default function ResetPassword() {
       await publicAuthApi.consumeResetToken(token, password);
       setState({ kind: 'done' });
     } catch (err) {
+      if (isSsoManaged(err)) {
+        setState({ kind: 'sso_managed' });
+        return;
+      }
       const s = statusOf(err);
       setError(
         s === 410 || s === 404
@@ -125,6 +141,16 @@ export default function ResetPassword() {
           {state.kind === 'invalid' && (
             <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg">
               <p className="text-sm text-red-400">{state.reason}</p>
+            </div>
+          )}
+          {state.kind === 'sso_managed' && (
+            <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-lg space-y-1">
+              <p className="text-sm text-amber-300">
+                This account signs in through your organisation&apos;s identity provider (single sign-on), so it has no
+                PySOAR password to reset. Reset your password at the identity provider, then use &quot;Sign in with
+                SSO&quot; on the sign-in page.
+              </p>
+              <p className="text-xs text-gray-400">[sso_managed] The reset link was not used.</p>
             </div>
           )}
           {state.kind === 'done' && (

@@ -18,6 +18,7 @@ import {
   Bot,
   AlertTriangle,
   RefreshCw,
+  Fingerprint,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
@@ -32,6 +33,8 @@ import type {
   LLMHealth,
 } from '../api/endpoints';
 import { useAuth } from '../contexts/AuthContext';
+import IdentitySettings from '../components/identity/IdentitySettings';
+import { ADMIN_ONLY_REASON, roleGate } from '../lib/roles';
 
 interface SettingsData {
   general: {
@@ -76,12 +79,18 @@ const tabs = [
   // for everyone else rather than rendered and then rejected by the API.
   { id: 'ai', name: 'AI Provider', icon: Bot, adminOnly: true },
   { id: 'security', name: 'Security', icon: Shield, adminOnly: false },
+  // SSO, SCIM and roles are admin routes. Shown to everyone, disabled with the
+  // reason for members without the admin role (a custom-role holder may hold
+  // admin tier, which only the server knows, so the tab opens for them).
+  { id: 'identity', name: 'Identity', icon: Fingerprint, adminOnly: false },
 ];
 
 export default function Settings() {
   const { user } = useAuth();
   const isAdmin = Boolean(user?.is_superuser) || user?.role === 'admin';
   const visibleTabs = tabs.filter((t) => !t.adminOnly || isAdmin);
+  const gate = roleGate(user?.role, user?.is_superuser, user?.custom_role_id);
+  const identityLocked = !gate.isAdmin && !gate.hasCustomRole;
   const [activeTab, setActiveTab] = useState('general');
   const [globalError, setGlobalError] = useState<string | null>(null);
   const queryClient = useQueryClient();
@@ -158,8 +167,10 @@ export default function Settings() {
               <button
                 key={tab.id}
                 onClick={() => setActiveTab(tab.id)}
+                disabled={tab.id === 'identity' && identityLocked}
+                title={tab.id === 'identity' && identityLocked ? ADMIN_ONLY_REASON : undefined}
                 className={clsx(
-                  'w-full flex items-center gap-2 px-3 py-2 text-sm font-medium rounded-lg transition-colors',
+                  'w-full flex items-center gap-2 px-3 py-2 text-sm font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed',
                   activeTab === tab.id
                     ? 'bg-blue-50 text-blue-700'
                     : 'text-gray-600 hover:bg-gray-50'
@@ -174,7 +185,15 @@ export default function Settings() {
 
         {/* Content */}
         <div className="flex-1 bg-white rounded-lg border border-gray-200 p-6">
-          {activeTab !== 'ai' && <LoadErrorBanner what="settings" error={settingsError} />}
+          {activeTab !== 'ai' && activeTab !== 'identity' && <LoadErrorBanner what="settings" error={settingsError} />}
+          {activeTab === 'identity' &&
+            (identityLocked ? (
+              <p className="text-sm text-gray-500 dark:text-gray-400">
+                Single sign-on, SCIM provisioning and roles are configured by an administrator. {ADMIN_ONLY_REASON}
+              </p>
+            ) : (
+              <IdentitySettings />
+            ))}
           {activeTab === 'general' && settings && (
             <GeneralSettings settings={settings.general} />
           )}

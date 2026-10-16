@@ -1811,3 +1811,270 @@ export const healthApi = {
     return response.data;
   },
 };
+
+// ============================================================================
+// Identity: SSO (OIDC), SCIM token management, custom roles.
+// Contracts: src/schemas/identity.py, src/api/v1/endpoints/sso.py, roles.py,
+// scim_admin.py. The login-side SSO calls live in api/publicAuth.ts (bare client).
+// ============================================================================
+
+export type IdentityTier = 'none' | 'read' | 'write' | 'admin';
+
+export interface SSOConfig {
+  id: string;
+  organization_id: string;
+  organization_slug: string;
+  protocol: string;
+  display_name: string | null;
+  issuer: string;
+  client_id: string;
+  /** The secret itself is never returned. */
+  client_secret_set: boolean;
+  scopes: string;
+  discovery_url: string | null;
+  effective_discovery_url: string;
+  /** Register this redirect URI at the identity provider. */
+  redirect_uri: string;
+  login_url: string;
+  email_claim: string;
+  name_claim: string;
+  groups_claim: string | null;
+  group_role_map: Record<string, string>;
+  jit_provisioning: boolean;
+  default_role: string;
+  allowed_email_domains: string[];
+  require_email_verified: boolean;
+  trust_idp_mfa: boolean;
+  enabled: boolean;
+  last_tested_at: string | null;
+  last_test_status: string | null;
+  last_test_detail: string | null;
+  updated_by: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+/** PUT /settings/sso body (full replace). client_secret: omitted/null keeps, "" clears. */
+export interface SSOConfigUpdate {
+  protocol: string;
+  display_name: string | null;
+  issuer: string;
+  client_id: string;
+  client_secret?: string | null;
+  scopes: string;
+  discovery_url: string | null;
+  email_claim: string;
+  name_claim: string;
+  groups_claim: string | null;
+  group_role_map: Record<string, string>;
+  jit_provisioning: boolean;
+  default_role: string;
+  allowed_email_domains: string[];
+  require_email_verified: boolean;
+  trust_idp_mfa: boolean;
+  enabled: boolean;
+}
+
+export interface SSOTestResult {
+  status: string;
+  tested_at: string;
+  issuer: string;
+  authorization_endpoint: string;
+  token_endpoint: string;
+  jwks_uri: string;
+  userinfo_endpoint: string | null;
+  key_count: number;
+  key_ids: string[];
+  scopes_supported: string[];
+  token_endpoint_auth_methods_supported: string[];
+  code_challenge_methods_supported: string[];
+  id_token_signing_alg_values_supported: string[];
+  warnings: string[];
+}
+
+export interface BuiltinRole {
+  name: string;
+  tier: string;
+  description: string;
+  member_count: number;
+}
+
+export interface CustomRole {
+  id: string;
+  organization_id: string;
+  name: string;
+  description: string | null;
+  default_tier: IdentityTier;
+  area_tiers: Record<string, IdentityTier>;
+  member_count: number;
+  created_by: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface RoleList {
+  builtin: BuiltinRole[];
+  custom: CustomRole[];
+}
+
+export interface RoleBody {
+  name: string;
+  description: string | null;
+  default_tier: IdentityTier;
+  area_tiers: Record<string, IdentityTier>;
+}
+
+export interface AreaEntry {
+  area: string;
+  label: string;
+  routes: number;
+  write_routes: number;
+  admin_routes: number;
+  exempt: boolean;
+  exempt_reason: string | null;
+  builtin_tiers: Record<string, string>;
+}
+
+export interface AreaCatalogue {
+  tiers: IdentityTier[];
+  areas: AreaEntry[];
+}
+
+export interface RoleMember {
+  id: string;
+  email: string;
+  full_name: string | null;
+  is_active: boolean;
+  identity_source: string;
+}
+
+export interface RoleMembers {
+  role_id: string;
+  total: number;
+  items: RoleMember[];
+}
+
+export interface SCIMToken {
+  id: string;
+  name: string;
+  token_prefix: string;
+  /** active | expired | revoked */
+  status: string;
+  created_by: string | null;
+  created_at: string | null;
+  last_used_at: string | null;
+  expires_at: string | null;
+  revoked_at: string | null;
+  revoked_by: string | null;
+}
+
+export interface SCIMTokenCreated extends SCIMToken {
+  /** Returned once, by the create call only. */
+  token: string;
+  scim_base_url: string;
+}
+
+export interface SCIMTokenList {
+  scim_base_url: string;
+  items: SCIMToken[];
+}
+
+export interface SCIMGroup {
+  id: string;
+  display_name: string;
+  external_id: string | null;
+  member_count: number;
+  role: string | null;
+  mapping_source: string | null;
+  mapping_error: string | null;
+  created: string | null;
+  last_modified: string | null;
+}
+
+export interface SCIMUserLinkResult {
+  id: string;
+  email: string;
+  identity_source: string;
+  external_id: string | null;
+  is_active: boolean;
+}
+
+export const identityApi = {
+  /** 404 `sso_not_configured` when the organisation has none. */
+  getSso: async (): Promise<SSOConfig> => {
+    const response = await api.get('/settings/sso');
+    return response.data;
+  },
+  putSso: async (body: SSOConfigUpdate): Promise<SSOConfig> => {
+    const response = await api.put('/settings/sso', body);
+    return response.data;
+  },
+  deleteSso: async (): Promise<void> => {
+    await api.delete('/settings/sso');
+  },
+  /** 502 `sso_test_failed` {reason, detail} on failure; never a fake pass. */
+  testSso: async (): Promise<SSOTestResult> => {
+    const response = await api.post('/settings/sso/test');
+    return response.data;
+  },
+
+  listRoles: async (): Promise<RoleList> => {
+    const response = await api.get('/roles');
+    return response.data;
+  },
+  roleAreas: async (): Promise<AreaCatalogue> => {
+    const response = await api.get('/roles/areas');
+    return response.data;
+  },
+  getRole: async (id: string): Promise<CustomRole> => {
+    const response = await api.get(`/roles/${encodeURIComponent(id)}`);
+    return response.data;
+  },
+  createRole: async (body: RoleBody): Promise<CustomRole> => {
+    const response = await api.post('/roles', body);
+    return response.data;
+  },
+  updateRole: async (id: string, body: RoleBody): Promise<CustomRole> => {
+    const response = await api.put(`/roles/${encodeURIComponent(id)}`, body);
+    return response.data;
+  },
+  /** 409 `role_in_use` {members} while anyone holds it. */
+  deleteRole: async (id: string): Promise<void> => {
+    await api.delete(`/roles/${encodeURIComponent(id)}`);
+  },
+  roleMembers: async (id: string): Promise<RoleMembers> => {
+    const response = await api.get(`/roles/${encodeURIComponent(id)}/members`);
+    return response.data;
+  },
+
+  listScimTokens: async (): Promise<SCIMTokenList> => {
+    const response = await api.get('/settings/scim/tokens');
+    return response.data;
+  },
+  createScimToken: async (body: { name: string; expires_in_days?: number | null }): Promise<SCIMTokenCreated> => {
+    const response = await api.post('/settings/scim/tokens', body);
+    return response.data;
+  },
+  revokeScimToken: async (id: string): Promise<void> => {
+    await api.delete(`/settings/scim/tokens/${encodeURIComponent(id)}`);
+  },
+  listScimGroups: async (): Promise<{ items: SCIMGroup[] }> => {
+    const response = await api.get('/settings/scim/groups');
+    return response.data;
+  },
+  /** role: built-in name, custom role id or name; null removes the mapping. */
+  setScimGroupRole: async (groupId: string, role: string | null): Promise<SCIMGroup> => {
+    const response = await api.put(`/settings/scim/groups/${encodeURIComponent(groupId)}`, { role });
+    return response.data;
+  },
+  linkScimUser: async (userId: string, externalId: string | null): Promise<SCIMUserLinkResult> => {
+    const response = await api.post(`/settings/scim/users/${encodeURIComponent(userId)}/link`, {
+      external_id: externalId,
+    });
+    return response.data;
+  },
+  unlinkScimUser: async (userId: string): Promise<SCIMUserLinkResult> => {
+    const response = await api.delete(`/settings/scim/users/${encodeURIComponent(userId)}/link`);
+    return response.data;
+  },
+};

@@ -74,7 +74,17 @@ Decisions and residuals for JP: the API-only list is the contract for integratio
 
 ## Wave 6: JP's extra features
 
-To be filled in from JP's list. Each item gets the same treatment: real backend, real UI, tests, honest states, and a place in the compliance control map.
+Each item gets the same treatment: real backend, real UI, tests, honest states, and a place in the compliance control map. JP's first item (2026-10-15): enterprise identity.
+
+### 6.1 Identity: SSO, SCIM, custom roles
+
+* Schema `12a70c9` (migration 037): one OIDC provider per organisation (secret encrypted), hashed SCIM tokens, custom roles, and on users `custom_role_id`, `external_id`, `identity_source` (local / oidc / scim), `sso_subject`.
+* Custom roles `6a500ba`: a role is a default tier plus per-area overrides (none < read < write < admin; an area is the first path segment under `/api/v1`), enforced through the two existing gates and the current-user dependency for holders only; built-in users take the old paths byte for byte. Role minting and assignment can never exceed the caller's own tiers; superusers cannot hold a role.
+* OIDC single sign-on `a2e199a`: authorization code with PKCE, discovery and JWKS fetched through netguard and cached per configuration, ID tokens validated with PyJWT (asymmetric algorithms only), JIT provisioning for allowed email domains, group-to-role mapping, one-time login code exchanged for the normal token response, MFA challenge unless the provider's MFA is trusted. Trust-determining fields need a full built-in admin; enabling needs a passing live test; superuser accounts are never bound. SAML answers 501 until its package lands (xmlsec in the image).
+* SCIM 2.0 `7bc6b96`: Users and Groups for Okta and Entra shapes, tokens shown once and stored hashed, deactivation revokes sessions, groups stored under the organisation's settings and mapped to roles. A provisioning token never changes a local account's email, lifecycle or role; pre-existing local accounts are linked by an administrator explicitly before the provider manages them.
+* Frontend: Login SSO flow, Settings > Identity (SSO, SCIM, Roles), Users role select (I-D, in progress).
+
+Decisions and residuals for JP: SAML is the next identity package (needs xmlsec in the Docker image); about ten handlers still branch inline on `User.role` and therefore treat custom-role holders as viewers (fail closed; to be moved to the gates); API-key authenticated routes are not tier-checked; group roles from the provider are applied at first login only (SCIM or the admin re-syncs); SCIM-created users cannot sign in without SSO (no usable password); no DNS proof of email-domain ownership (first organisation to claim a domain gets it); a `scim_groups` table and separate given/family name columns are follow-ups.
 
 ## Sizing and order
 

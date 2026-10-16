@@ -5,6 +5,10 @@ export interface User {
   role: string;
   is_active: boolean;
   is_superuser: boolean;
+  /** Custom role held (null: judged by `role`). */
+  custom_role_id?: string | null;
+  /** Who manages the account: local, oidc (SSO) or scim. */
+  identity_source?: string;
   created_at: string;
   updated_at: string;
 }

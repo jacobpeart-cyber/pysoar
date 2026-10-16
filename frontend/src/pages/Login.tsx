@@ -1,9 +1,10 @@
-import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useEffect, useRef, useState } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { Shield, Loader2 } from 'lucide-react';
 import { publicAuthApi } from '../api/publicAuth';
 import { passwordChangeFailure } from '../lib/passwordPolicy';
+import { describeIdentityError, describeSsoLoginError } from '../components/identity/identityErrors';
 
 /** The limited token login issues for a forced change, or null for any other failure. */
 function limitedTokenOf(err: unknown): string | null {
@@ -50,8 +51,79 @@ export default function Login() {
   const [notice, setNotice] = useState('');
   // Rules the server's password policy reported as failed (400 password_policy).
   const [policyRules, setPolicyRules] = useState<string[]>([]);
-  const { login, completeMfaLogin } = useAuth();
+  const { login, completeMfaLogin, completeSsoLogin } = useAuth();
   const navigate = useNavigate();
+  const [params, setParams] = useSearchParams();
+  // "Sign in with SSO": email only, then the browser goes to the IdP.
+  const [ssoMode, setSsoMode] = useState(false);
+  const [ssoBusy, setSsoBusy] = useState(false);
+  const exchangedRef = useRef<string | null>(null);
+
+  // Return from the identity provider: /login?sso=<one-time code> or
+  // /login?sso_error=<reason> (GET /auth/sso/callback). The code is spent once
+  // (60 s, single use) and removed from the address bar either way.
+  useEffect(() => {
+    const code = params.get('sso');
+    const reason = params.get('sso_error');
+    if (!code && !reason) return;
+    setParams({}, { replace: true });
+    if (reason) {
+      setError(describeSsoLoginError(reason));
+      return;
+    }
+    if (!code || exchangedRef.current === code) return;
+    exchangedRef.current = code;
+    setIsLoading(true);
+    setNotice('Completing single sign-on...');
+    completeSsoLogin(code)
+      .then((result) => {
+        setNotice('');
+        if (result.mfaRequired) {
+          setMfaToken(result.mfaToken);
+          setMfaExpiresAt(Date.now() + result.expiresIn * 1000);
+          setMfaCode('');
+          return;
+        }
+        navigate('/');
+      })
+      .catch((err) => {
+        setNotice('');
+        const limited = limitedTokenOf(err);
+        if (limited) {
+          setChangeToken(limited);
+          setChangeExpiresAt(Date.now() + CHANGE_STEP_MS);
+          setCurrentPw('');
+          setNewPw('');
+          setConfirmPw('');
+          return;
+        }
+        setError(describeIdentityError(err));
+      })
+      .finally(() => setIsLoading(false));
+  }, [params, setParams, completeSsoLogin, navigate]);
+
+  const handleSsoSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setNotice('');
+    setSsoBusy(true);
+    try {
+      const found = await publicAuthApi.discoverSso(email.trim());
+      if (!found.available || !found.login_url) {
+        setError(
+          'Single sign-on is not set up for this email domain. Sign in with your password, or ask your administrator.',
+        );
+        return;
+      }
+      // GET /auth/sso/{slug}/start answers 302 to the identity provider.
+      const sep = found.login_url.includes('?') ? '&' : '?';
+      window.location.assign(`${found.login_url}${sep}login_hint=${encodeURIComponent(email.trim())}`);
+    } catch (err) {
+      setError(describeIdentityError(err));
+    } finally {
+      setSsoBusy(false);
+    }
+  };
 
   const runLogin = async (pw: string) => {
     try {
@@ -131,6 +203,11 @@ export default function Login() {
       setNewPw('');
       setConfirmPw('');
       setPassword(pw);
+      if (!email) {
+        // Reached from an SSO sign-in: there is no email to sign in with here.
+        setNotice('Password changed. Sign in again.');
+        return;
+      }
       setNotice('Password changed. Signing you in with the new password.');
       await runLogin(pw);
     } catch (err) {
@@ -268,6 +345,47 @@ export default function Login() {
               Back to password
             </button>
           </form>
+        ) : ssoMode ? (
+          <form onSubmit={handleSsoSubmit} className="bg-gray-800 rounded-xl p-8 shadow-xl">
+            <h2 className="text-xl font-semibold text-white mb-2">Sign in with SSO</h2>
+            <p className="text-sm text-gray-400 mb-6">
+              Enter your work email. If your organisation signs in through an identity provider, you are sent there.
+            </p>
+            {error && (
+              <div className="mb-4 p-3 bg-red-500/10 border border-red-500/20 rounded-lg">
+                <p className="text-sm text-red-400">{error}</p>
+              </div>
+            )}
+            <label htmlFor="sso-email" className="block text-sm font-medium text-gray-300 mb-1">
+              Email address
+            </label>
+            <input
+              id="sso-email"
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              autoComplete="email"
+              autoFocus
+              required
+              className="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              placeholder="you@example.com"
+            />
+            <button
+              type="submit"
+              disabled={ssoBusy || !email.trim()}
+              className="w-full mt-6 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium rounded-lg transition-colors flex items-center justify-center"
+            >
+              {ssoBusy ? <Loader2 className="w-5 h-5 mr-2 animate-spin" /> : null}
+              Continue
+            </button>
+            <button
+              type="button"
+              onClick={() => { setSsoMode(false); setError(''); }}
+              className="w-full mt-3 text-sm text-gray-400 hover:text-gray-200"
+            >
+              Back to password sign-in
+            </button>
+          </form>
         ) : (
         <form onSubmit={handleSubmit} className="bg-gray-800 rounded-xl p-8 shadow-xl">
           <h2 className="text-xl font-semibold text-white mb-6">Sign in to your account</h2>
@@ -334,6 +452,16 @@ export default function Login() {
             Forgot your password? There is no self-service reset and PySOAR does not email reset links.
             Contact your administrator; a reset link issued for your account opens the set-new-password page.
           </p>
+          <div className="mt-6 pt-4 border-t border-gray-700">
+            <button
+              type="button"
+              onClick={() => { setSsoMode(true); setError(''); setNotice(''); }}
+              disabled={isLoading}
+              className="w-full px-4 py-2 border border-gray-600 hover:bg-gray-700 disabled:opacity-50 text-gray-200 font-medium rounded-lg transition-colors"
+            >
+              Sign in with SSO
+            </button>
+          </div>
         </form>
         )}
 

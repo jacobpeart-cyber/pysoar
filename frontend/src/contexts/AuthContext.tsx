@@ -13,6 +13,10 @@ interface User {
   is_active: boolean;
   is_superuser: boolean;
   organization_id: string | null;
+  /** Custom role held (null: judged by `role`). */
+  custom_role_id?: string | null;
+  /** Who manages the account: local, oidc (SSO) or scim. */
+  identity_source?: string;
 }
 
 interface AuthContextType {
@@ -22,6 +26,8 @@ interface AuthContextType {
   isAuthenticated: boolean;
   login: (email: string, password: string) => Promise<LoginResult>;
   completeMfaLogin: (mfaToken: string, code: string) => Promise<void>;
+  /** Trade the one-time `?sso=` code for a session, or the MFA challenge. */
+  completeSsoLogin: (code: string) => Promise<LoginResult>;
   logout: () => Promise<void>;
 }
 
@@ -80,6 +86,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   };
 
+  const completeSsoLogin = async (code: string): Promise<LoginResult> => {
+    const result = await publicAuthApi.exchangeSso(code);
+    if (result.mfa_required) {
+      return { mfaRequired: true, mfaToken: result.mfa_token, expiresIn: result.expires_in };
+    }
+    authApi.storeTokens(result.access_token, result.refresh_token);
+    setToken(result.access_token);
+    try {
+      setUser(await authApi.getProfile());
+    } catch (error) {
+      apiClient.clearToken();
+      setToken(null);
+      throw error;
+    }
+    return { mfaRequired: false };
+  };
+
   const logout = async () => {
     try {
       await authApi.logout();
@@ -99,6 +122,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         isAuthenticated: !!user,
         login,
         completeMfaLogin,
+        completeSsoLogin,
         logout,
       }}
     >

@@ -21,6 +21,8 @@ export interface UserProfile {
   is_active: boolean;
   is_superuser: boolean;
   organization_id: string | null;
+  custom_role_id?: string | null;
+  identity_source?: string;
   created_at: string;
   updated_at: string;
 }
