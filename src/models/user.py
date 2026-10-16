@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.core.encryption import EncryptedType, EncryptedJSON
@@ -28,6 +28,10 @@ class User(BaseModel):
     """User model for authentication"""
 
     __tablename__ = "users"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "sso_subject", name="uq_users_org_sso_subject"),
+        Index("ix_users_org_external_id", "organization_id", "external_id"),
+    )
 
     email: Mapped[str] = mapped_column(
         String(255),
@@ -52,6 +56,18 @@ class User(BaseModel):
         DateTime(timezone=True), nullable=True
     )
     mfa_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # Identity package (migration 037). A user holding a custom role is judged by
+    # that role's per-area tiers instead of the built-in mapping of ``role``;
+    # ``identity_source`` says who manages the account (local password, the
+    # organisation's OIDC provider, or SCIM provisioning); ``external_id`` is the
+    # SCIM externalId and ``sso_subject`` the OIDC ``sub`` bound at first login.
+    custom_role_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("roles.id", ondelete="SET NULL"), nullable=True, index=True,
+    )
+    external_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    identity_source: Mapped[str] = mapped_column(String(20), default="local", server_default="local", nullable=False)
+    sso_subject: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     # Organization
     organization_id: Mapped[Optional[str]] = mapped_column(
@@ -92,3 +108,10 @@ class User(BaseModel):
     @property
     def is_admin(self) -> bool:
         return self.role == UserRole.ADMIN.value or self.is_superuser
+
+
+# users.custom_role_id references the roles table, so the identity models must
+# be in the metadata whenever User is (tests and tools import this module on
+# its own). Imported last to avoid a cycle: src.identity.models only needs
+# src.models.base and src.core.encryption.
+from src.identity import models as _identity_models  # noqa: E402,F401

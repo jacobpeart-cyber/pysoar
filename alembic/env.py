@@ -44,7 +44,7 @@ from src.models.organization import Organization, OrganizationMember, Team, Team
 from src.models.api_key import APIKey
 
 # Module-specific models (best-effort so stale names don't break upgrades)
-_try_import("src.ai.models", ["MLModel", "AIAnalysis", "ThreatPrediction", "AnomalyDetection", "NLQuery"])
+_try_import("src.ai.models", ["MLModel", "AIAnalysis", "ThreatPrediction", "AnomalyDetection"])
 _try_import("src.siem.models", ["SIEMDataSource", "DetectionRule", "LogEntry", "CorrelationEvent"])
 from src.intel.models import (
     ThreatFeed,
@@ -83,6 +83,7 @@ _try_import("src.data_lake.models", ["DataSource", "DataPipeline", "UnifiedDataM
 _try_import("src.collaboration.models", ["WarRoom", "WarRoomMessage", "ActionItem", "SharedArtifact", "IncidentTimeline"])
 _try_import("src.phishing_sim.models", ["PhishingCampaign", "PhishingTemplate", "CampaignEvent", "TargetGroup", "SecurityAwarenessScore"])
 _try_import("src.agents.models", ["EndpointAgent", "AgentCommand", "AgentResult", "AgentHeartbeat"])
+_try_import("src.identity.models", ["SSOConfiguration", "SCIMToken", "Role"])
 
 # Alembic Config object
 config = context.config
