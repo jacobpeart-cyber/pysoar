@@ -140,6 +140,37 @@ def _audit_custom_role(db, caller: User, org_id: str, target_id: str, old: Optio
     ))
 
 
+async def _target_escalation_areas(db, caller: User, target: User, areas) -> list[str]:
+    """Areas where ``target`` holds more than ``caller`` does.
+
+    A caller may not change the credentials, status, role or existence of an
+    account that outranks them anywhere (a custom-role holder with admin over
+    ``users`` must not be able to take over a built-in administrator). Empty
+    for superusers and built-in admins; a target whose custom role cannot be
+    loaded holds nothing.
+    """
+    if getattr(caller, "is_superuser", False):
+        return []
+    if target.custom_role_id:
+        role = await db.get(Role, str(target.custom_role_id))
+        if role is None or str(role.organization_id) != str(target.organization_id or ""):
+            return []
+        return identity_roles.escalation_areas(caller, role.default_tier, dict(role.area_tiers or {}), areas)
+    builtin = identity_roles.BUILTIN_ROLE_TIERS.get(target.role or "", "none")
+    return identity_roles.escalation_areas(caller, builtin, {}, areas)
+
+
+def _target_outranks_caller(areas: list[str]) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={
+            "error": "tier_exceeds_caller",
+            "areas": areas,
+            "detail": "that account holds more than you do in these areas; a full administrator must make this change",
+        },
+    )
+
+
 async def _get_tenant_user(
     user_service: UserService, user_id: str, org_id: str, caller: User
 ) -> User:
@@ -327,6 +358,9 @@ async def update_user(
         org_id = resolve_organization_scope(current_user, organization_id)
         _validate_role(update_data.get("role"))
         target = await _get_tenant_user(user_service, user_id, org_id, current_user)
+        outranks = await _target_escalation_areas(db, current_user, target, identity_roles.known_areas(request.app))
+        if outranks:
+            raise _target_outranks_caller(outranks)
         if custom_role_sent and new_custom_role_id:
             custom_role = await _resolve_custom_role(
                 db, new_custom_role_id, org_id, target, current_user, identity_roles.known_areas(request.app),
@@ -373,6 +407,7 @@ async def update_user(
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_user(
     user_id: str,
+    request: Request,
     org_id: OrganizationId,
     current_user: User = Depends(require_role([UserRole.ADMIN])),
     db: DatabaseSession = None,
@@ -386,7 +421,10 @@ async def delete_user(
         )
 
     user_service = UserService(db)
-    await _get_tenant_user(user_service, user_id, org_id, current_user)
+    target = await _get_tenant_user(user_service, user_id, org_id, current_user)
+    outranks = await _target_escalation_areas(db, current_user, target, identity_roles.known_areas(request.app))
+    if outranks:
+        raise _target_outranks_caller(outranks)
 
     try:
         await user_service.delete(user_id)
