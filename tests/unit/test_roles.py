@@ -376,7 +376,8 @@ async def test_area_catalogue_as_served(client, org_a_admin_headers) -> None:
         assert not by_area[area]["exempt"]
     assert by_area["siem"]["label"] == "SIEM"
     assert by_area["siem"]["admin_routes"] > 0 and by_area["siem"]["write_routes"] > 0
-    assert by_area["roles"]["admin_routes"] == by_area["roles"]["routes"]
+    # Every roles route is admin except the self route GET /roles/me.
+    assert by_area["roles"]["admin_routes"] == by_area["roles"]["routes"] - 1
     assert by_area["auth"]["exempt"] and by_area["auth"]["exempt_reason"]
     assert by_area["alerts"]["builtin_tiers"] == {"viewer": "read", "analyst": "write", "admin": "admin"}
     assert "docs" not in by_area and "" not in by_area

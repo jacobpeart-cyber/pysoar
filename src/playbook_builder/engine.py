@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.logging import get_logger
 from src.core.utils import safe_json_loads
+from src.identity import roles as identity_roles
 from src.playbook_builder.models import (
     EdgeType,
     ErrorHandler,
@@ -915,12 +916,16 @@ async def run_visual_execution(
     actor_is_admin = False
     if execution.triggered_by:
         row = (await db.execute(
-            select(User.id, User.role, User.is_superuser)
+            select(User.id)
             .where(User.id == execution.triggered_by, User.organization_id == execution.organization_id)
         )).first()
         if row is not None:
             actor_user_id = row.id
-            actor_is_admin = bool(row.is_superuser) or row.role == "admin"
+            # Admin over playbook-builder right now (built-in admin, superuser,
+            # or a custom role granting it); an inactive actor is not.
+            actor_is_admin = await identity_roles.user_has_tier(
+                db, row.id, execution.organization_id, "playbook-builder", "admin",
+            )
     engine = PlaybookExecutionEngine(db, actor=actor_user_id, actor_user_id=actor_user_id)
 
     # Re-check privilege at run time against the role recorded at dispatch

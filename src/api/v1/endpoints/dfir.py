@@ -20,6 +20,7 @@ from src.core.csvsafe import csv_safe
 from src.core.logging import get_logger
 from src.core.utils import safe_json_loads
 from src.dfir.storage import EvidencePathRefusedError, relative_location, resolve_tenant_evidence_path
+from src.identity import roles as identity_roles
 from src.models.user import User, UserRole
 
 logger = get_logger(__name__)
@@ -35,7 +36,7 @@ def _session_actor(user: User) -> str:
 
 
 def _require_admin_to_release(user: User, what: str) -> None:
-    if user.is_superuser or user.role == UserRole.ADMIN.value:
+    if identity_roles.has_tier(user, "dfir", "admin"):
         return
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,

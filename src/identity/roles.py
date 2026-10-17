@@ -17,15 +17,26 @@ else its ``default_tier``; anyone else gets the built-in mapping of
 custom role are therefore judged exactly as before: ``src.api.deps`` only runs
 the tier logic for custom-role holders.
 
-Built-in role floor. Several handlers still decide admin-only branches inline
-from ``User.role`` / ``User.is_admin`` (containment steps in playbooks, note
-deletion by non-authors, admin-permission API keys...). So that such a check
-can never hand a custom-role holder more than the role grants, assigning a
-custom role sets the built-in ``role`` to ``viewer`` (``apply_custom_role``):
-inline built-in checks treat the holder as a viewer (fail closed), while every
+Built-in role floor. Assigning a custom role sets the built-in ``role`` to
+``viewer`` (``apply_custom_role``), so any check that still reads ``User.role``
+/ ``User.is_admin`` treats the holder as a viewer (fail closed), while every
 dependency gate (``require_role``, ``AdminUser``, ``get_current_superuser``)
 uses the custom role's tiers. SSO JIT and SCIM provisioning must assign custom
 roles through ``apply_custom_role`` too.
+
+Handler checks. Admin-only branches inside handlers (containment steps in
+playbooks, note / comment / attachment deletion by non-authors, bulk alert
+delete, admin-permission API keys, legal-hold release, team visibility, the
+agent role ladder...) ask ``has_tier(user, "<area>", "<tier>")`` instead of
+``User.role``, so a custom role's tiers decide them exactly like the
+dependency gates; for users without a custom role ``has_tier`` is the built-in
+mapping, so their behaviour is unchanged. Background code (Celery playbook
+runs) has no request cache and uses ``user_has_tier``, which loads the role
+from the database.
+
+The checks that deliberately stay on the built-in role are the *full admin*
+ones (``is_full_admin``: a built-in admin without a custom role, or the
+platform superuser): SSO trust settings, SCIM tokens and links.
 """
 
 from __future__ import annotations
@@ -137,12 +148,22 @@ def area_of_path(path: str) -> Optional[str]:
     return path[len(prefix) + 1:].split("/", 1)[0]
 
 
+#: Fixed self paths inside a gated area, never denied by tier: ``GET
+#: /roles/me`` (what the caller's own role grants) must answer even for a role
+#: with ``none`` over ``roles``.
+SELF_PATHS: frozenset[tuple[str, str]] = frozenset({("roles", "me")})
+
+
 def is_self_route(path: str, user_id: str) -> bool:
-    """``/api/v1/users/<caller's own id>`` (and nothing under it)."""
+    """``/api/v1/users/<caller's own id>`` and ``/api/v1/roles/me`` (and nothing under them)."""
     area = area_of_path(path)
-    if area not in SELF_ROUTE_AREAS:
+    if not area:
         return False
     rest = path[len(settings.api_v1_prefix.rstrip("/")) + 1 + len(area):].strip("/")
+    if (area, rest) in SELF_PATHS:
+        return True
+    if area not in SELF_ROUTE_AREAS:
+        return False
     return rest == str(user_id)
 
 
@@ -188,11 +209,96 @@ def effective_tier(user: Any, area: Optional[str], role: Optional[Role] = None) 
     return BUILTIN_ROLE_TIERS.get(getattr(user, "role", ""), Tier.NONE.value)
 
 
-def has_tier(user: Any, area: Optional[str], required: str) -> bool:
+def has_tier(user: Any, area: Optional[str], required: str, role: Optional[Role] = None) -> bool:
     """Whether ``user`` holds at least ``required`` in ``area``. For users
     without a custom role this is the built-in mapping, so ``has_tier(u,
-    "users", "admin")`` equals ``u.is_admin`` for them."""
-    return tier_at_least(effective_tier(user, area), required)
+    "users", "admin")`` equals ``u.is_admin`` for them. ``role`` as in
+    ``effective_tier`` (request handlers omit it)."""
+    return tier_at_least(effective_tier(user, area, role), required)
+
+
+def has_tier_everywhere(user: Any, required: str, role: Optional[Role] = None) -> bool:
+    """Whether ``user`` holds at least ``required`` in every area (for grants
+    not confined to one area, such as a ``*`` API-key permission). Built-in
+    users: their one tier; a custom role: its default tier and every override;
+    a custom role that cannot be loaded: nothing."""
+    if getattr(user, "is_superuser", False):
+        return True
+    if not getattr(user, "custom_role_id", None):
+        return has_tier(user, None, required)
+    if role is None:
+        role = getattr(user, CUSTOM_ROLE_ATTR, None)
+    if role is None or str(role.id) != str(user.custom_role_id) or (
+        str(role.organization_id) != str(getattr(user, "organization_id", "") or "")
+    ):
+        return False
+    tiers = [role.default_tier, *(role.area_tiers or {}).values()]
+    return all(tier_at_least(t if t in TIER_ORDER else Tier.NONE.value, required) for t in tiers)
+
+
+#: The built-in role whose tier equals a tier (``none`` maps to the viewer
+#: floor; callers that need more than read refuse it anyway).
+_TIER_TO_BUILTIN: dict[str, str] = {
+    Tier.ADMIN.value: "admin", Tier.WRITE.value: "analyst", Tier.READ.value: "viewer", Tier.NONE.value: "viewer",
+}
+
+
+def builtin_equivalent(user: Any, area: Optional[str], role: Optional[Role] = None) -> str:
+    """The built-in role name (``admin`` / ``analyst`` / ``viewer``) matching
+    the tier ``user`` holds in ``area``, for code that keeps a role ladder (the
+    agent context, the role recorded on a playbook run). For users without a
+    custom role it is their own role (superusers: ``admin``; an unknown role
+    value: ``viewer``)."""
+    return _TIER_TO_BUILTIN[effective_tier(user, area, role)]
+
+
+def is_full_admin(user: Any) -> bool:
+    """A built-in admin without a custom role, or the platform superuser."""
+    return bool(getattr(user, "is_superuser", False)) or (
+        getattr(user, "role", None) == "admin" and not getattr(user, "custom_role_id", None)
+    )
+
+
+def tiers_over(user: Any, areas: Iterable[str], role: Optional[Role] = None) -> dict[str, str]:
+    """``{area: effective tier}`` for each of ``areas``."""
+    return {area: effective_tier(user, area, role) for area in areas}
+
+
+def exempt_area_names() -> list[str]:
+    """The exempt areas a client can see (documentation paths left out)."""
+    return sorted(a for a in EXEMPT_AREAS if a not in _HIDDEN_AREAS)
+
+
+async def load_custom_role(db: Any, user: Any) -> Optional[Role]:
+    """Load ``user``'s custom role outside a request (no ``get_current_user``
+    cache): ``None`` when the user has none, or when it is missing or belongs
+    to another organisation (``effective_tier`` then grants ``none``)."""
+    if not getattr(user, "custom_role_id", None):
+        return None
+    role = await db.get(Role, str(user.custom_role_id))
+    if role is None or str(role.organization_id) != str(getattr(user, "organization_id", "") or ""):
+        return None
+    return role
+
+
+async def user_has_tier(db: Any, user_id: Optional[str], org_id: str, area: str, required: str) -> bool:
+    """Background-code form of ``has_tier``: whether the *active* user
+    ``user_id`` of ``org_id`` holds ``required`` in ``area`` right now (role and
+    custom role read from the database). False for an unknown, inactive or
+    other-organisation user."""
+    if not user_id:
+        return False
+    from sqlalchemy import select
+
+    from src.models.user import User
+
+    user = (await db.execute(
+        select(User).where(User.id == user_id, User.organization_id == org_id),
+    )).scalar_one_or_none()
+    if user is None or not user.is_active:
+        return False
+    role = await load_custom_role(db, user) if has_custom_role(user) else None
+    return has_tier(user, area, required, role)
 
 
 def area_denied_detail(area: str) -> dict[str, str]:

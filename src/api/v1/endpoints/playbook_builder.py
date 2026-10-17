@@ -22,6 +22,7 @@ from sqlalchemy.orm import selectinload
 from src.api.deps import AdminUser, CurrentUser, DatabaseSession, OrganizationId, require_role
 from src.core.logging import get_logger
 from src.core.utils import safe_json_loads
+from src.identity import roles as identity_roles
 from src.models.user import UserRole
 from src.playbook_builder.engine import (
     PlaybookDesigner,
@@ -76,8 +77,10 @@ logger = get_logger(__name__)
 
 
 def _effective_role(user) -> str:
-    """Role recorded on the execution: platform superusers count as admin."""
-    return "admin" if user.is_superuser else str(user.role)
+    """Role recorded on the execution: the built-in role matching the caller's
+    tier over ``playbook-builder`` (platform superusers count as admin; for
+    users without a custom role it is their own role)."""
+    return identity_roles.builtin_equivalent(user, "playbook-builder")
 
 
 async def _start_execution(

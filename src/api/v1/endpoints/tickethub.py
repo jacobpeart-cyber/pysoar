@@ -9,6 +9,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from sqlalchemy import delete, desc, func, select
 
 from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
+from src.identity import roles as identity_roles
 from src.models.user import UserRole
 from src.tickethub.models import (
     AutomationRule,
@@ -385,7 +386,7 @@ async def delete_comment(
     comment = result.scalars().first()
     if not comment:
         raise HTTPException(status_code=404, detail="Comment not found")
-    if comment.author_id != str(current_user.id) and not current_user.is_admin:
+    if comment.author_id != str(current_user.id) and not identity_roles.has_tier(current_user, "tickethub", "admin"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"error": "not_comment_author", "detail": "only the author or an admin can delete a comment"},

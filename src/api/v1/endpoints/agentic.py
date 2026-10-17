@@ -86,6 +86,7 @@ from src.audit_evidence.models import AuditTrail
 from src.core.metrics import AGENT_INJECTION_EVENTS_TOTAL
 from src.core.metrics import increment as metric_increment
 from src.core.utils import safe_json_loads
+from src.identity import roles as identity_roles
 from src.llm import factory as llm_factory
 from src.llm.base import (
     LLMNotConfigured,
@@ -150,14 +151,18 @@ def _org_id(current_user: Any) -> str:
     return resolve_organization_scope(current_user, None)
 
 
-def _agent_role(current_user: Any) -> UserRole:
-    """Map the JWT user's role onto the agent role ladder (superuser -> admin)."""
-    if bool(getattr(current_user, "is_superuser", False)):
+def _agent_role(current_user: Any, area: Optional[str] = "agentic") -> UserRole:
+    """Map the caller's tier in ``area`` onto the agent role ladder: admin ->
+    ADMIN, write -> ANALYST, read / none -> VIEWER (superuser -> ADMIN).
+
+    For users without a custom role this is their built-in role, as before; a
+    custom role is judged by its tier in the area (``identity_roles.has_tier``
+    semantics), so every ``ctx.role`` check (privileged approvals, suspect
+    proposals, propose_actions) follows the role's tiers."""
+    tier_role = identity_roles.builtin_equivalent(current_user, area)
+    if tier_role == UserRole.ADMIN.value:
         return UserRole.ADMIN
-    raw = str(getattr(current_user, "role", "") or "").lower()
-    if raw == UserRole.ADMIN.value:
-        return UserRole.ADMIN
-    if raw == UserRole.ANALYST.value:
+    if tier_role == UserRole.ANALYST.value:
         return UserRole.ANALYST
     return UserRole.VIEWER
 
@@ -186,9 +191,12 @@ def _agent_context(
     Routes pass ``org_id`` from ``OrganizationId``; without it the caller's
     own organisation is required (403 ``organization_required``).
     """
+    # The area is the request's (``itdr`` for ITDR respond), else ``agentic``.
+    path = getattr(getattr(request, "url", None), "path", None)
+    area = identity_roles.area_of_path(path) if isinstance(path, str) else None
     return AgentContext(
         org_id=str(org_id) if org_id else _org_id(current_user),
-        role=_agent_role(current_user),
+        role=_agent_role(current_user, area or "agentic"),
         mode=mode,
         actor_user_id=str(getattr(current_user, "id", "") or ""),
         propose_actions=propose_actions,
@@ -219,12 +227,26 @@ def _require_admin(ctx: AgentContext) -> None:
 
 def _agentic_role_gate(*allowed: UserRole):
     """Router-level role dependency (``require_role`` semantics: superusers
-    pass) that keeps this module's ``role_not_permitted`` error contract."""
+    pass; a custom role needs the lowest tier of ``allowed`` in the
+    ``agentic`` area) that keeps this module's ``role_not_permitted`` error
+    contract."""
     allowed_values = frozenset(role.value for role in allowed)
+    required_tier = identity_roles.required_tier_for_roles(allowed_values)
 
     async def _check(current_user: CurrentUser) -> User:
         if bool(getattr(current_user, "is_superuser", False)):
             return current_user
+        if identity_roles.has_custom_role(current_user):
+            if identity_roles.has_tier(current_user, "agentic", required_tier):
+                return current_user
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": "role_not_permitted",
+                    "detail": f"this operation needs {required_tier} access to the Agentic SOC; "
+                    f"your role grants {identity_roles.effective_tier(current_user, 'agentic')}",
+                },
+            )
         if str(getattr(current_user, "role", "") or "").lower() not in allowed_values:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -235,6 +257,7 @@ def _agentic_role_gate(*allowed: UserRole):
             )
         return current_user
 
+    setattr(_check, identity_roles.REQUIRED_TIER_ATTR, required_tier)
     return _check
 
 

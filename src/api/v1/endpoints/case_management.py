@@ -17,6 +17,7 @@ from sqlalchemy.orm import selectinload
 from src.api.deps import DatabaseSession, OrganizationId, require_role
 from src.core.logging import get_logger
 from src.core.utils import safe_json_loads
+from src.identity import roles as identity_roles
 from src.models.case import (
     AttachmentType,
     CaseAttachment,
@@ -392,8 +393,8 @@ async def update_note(
             detail="Note not found",
         )
 
-    # Only author or admin can update
-    if note.author_id != current_user.id and not current_user.is_admin:
+    # Only author or admin (tier admin over incidents) can update
+    if note.author_id != current_user.id and not identity_roles.has_tier(current_user, "incidents", "admin"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Not authorized to update this note",
@@ -452,8 +453,8 @@ async def delete_note(
             detail="Note not found",
         )
 
-    # Only author or admin can delete
-    if note.author_id != current_user.id and not current_user.is_admin:
+    # Only author or admin (tier admin over incidents) can delete
+    if note.author_id != current_user.id and not identity_roles.has_tier(current_user, "incidents", "admin"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Not authorized to delete this note",
@@ -909,8 +910,8 @@ async def delete_attachment(
             detail="Attachment not found",
         )
 
-    # Only uploader or admin can delete
-    if attachment.uploaded_by != current_user.id and not current_user.is_admin:
+    # Only uploader or admin (tier admin over incidents) can delete
+    if attachment.uploaded_by != current_user.id and not identity_roles.has_tier(current_user, "incidents", "admin"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Not authorized to delete this attachment",

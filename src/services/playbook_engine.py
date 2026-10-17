@@ -817,17 +817,12 @@ class PlaybookEngine:
         self.db = db
 
     async def _is_current_admin(self, user_id: Optional[str], org_id: str) -> bool:
-        """True when ``user_id`` is, right now, an admin of ``org_id`` or a platform superuser."""
-        if not user_id:
-            return False
-        from src.models.user import User
+        """True when ``user_id`` is, right now, an active user of ``org_id``
+        with admin over ``playbooks`` (built-in admin, platform superuser, or a
+        custom role granting it)."""
+        from src.identity import roles as identity_roles
 
-        row = (await self.db.execute(
-            select(User.role, User.is_superuser, User.is_active).where(User.id == user_id, User.organization_id == org_id)
-        )).first()
-        if row is None or not row.is_active:
-            return False
-        return bool(row.is_superuser) or row.role == "admin"
+        return await identity_roles.user_has_tier(self.db, user_id, org_id, "playbooks", "admin")
 
     async def _actor(self, execution: PlaybookExecution, org_id: str) -> tuple[str, Optional[str]]:
         from src.models.user import User

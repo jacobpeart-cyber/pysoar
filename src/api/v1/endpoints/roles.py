@@ -6,8 +6,9 @@ judged by it in every area instead of the built-in ``role``. Enforcement is in
 ``src.api.deps`` and ``src.identity.roles`` (see that module's docstring for
 the tier model, exempt areas and the built-in role floor).
 
-Every route is ``admin`` (tier admin in the ``roles`` area) and confined to the
-caller's organisation (``OrganizationId``: an org-less caller, including the
+``GET /roles/me`` is open to any authenticated user (it describes the caller's
+own access and is never denied by tier). Every other route is ``admin`` (tier
+admin in the ``roles`` area) and confined to the caller's organisation (``OrganizationId``: an org-less caller, including the
 platform superuser, gets 403 ``organization_required``). A role of another
 organisation is reported as missing (404 ``role_not_found``). Create, update
 and delete are audited. Role changes take effect on the holders' next request
@@ -21,7 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import DatabaseSession, OrganizationId, require_role
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
 from src.core.logging import get_logger
 from src.identity import roles as identity_roles
 from src.identity.models import BUILTIN_ROLE_TIERS, TIER_ORDER, Role
@@ -31,6 +32,8 @@ from src.schemas.identity import (
     AreaCatalogueResponse,
     AreaEntry,
     BuiltinRoleResponse,
+    MyAccessResponse,
+    MyCustomRole,
     RoleCreate,
     RoleListResponse,
     RoleMember,
@@ -220,6 +223,28 @@ async def list_areas(request: Request, org_id: OrganizationId, current_user: Rol
     return AreaCatalogueResponse(
         tiers=list(TIER_ORDER),
         areas=[AreaEntry(**entry) for entry in identity_roles.area_catalogue(request.app)],
+    )
+
+
+@router.get("/me", response_model=MyAccessResponse)
+async def my_access(request: Request, current_user: CurrentUser) -> MyAccessResponse:
+    """What the caller's own role grants: the built-in role, the custom role
+    (if any), and the effective tier in every area of the catalogue, computed
+    by the same function the API gates use. Any authenticated user; never
+    denied by tier (a self route); the platform superuser without an
+    organisation gets ``admin`` everywhere."""
+    role = getattr(current_user, identity_roles.CUSTOM_ROLE_ATTR, None) if current_user.custom_role_id else None
+    custom: Optional[MyCustomRole] = None
+    if identity_roles.has_custom_role(current_user):
+        custom = MyCustomRole(id=str(current_user.custom_role_id), name=role.name if role is not None else None)
+    areas = [entry["area"] for entry in identity_roles.area_catalogue(request.app)]
+    return MyAccessResponse(
+        role=str(current_user.role),
+        custom_role=custom,
+        is_superuser=bool(current_user.is_superuser),
+        is_full_admin=identity_roles.is_full_admin(current_user),
+        tiers=identity_roles.tiers_over(current_user, areas, role),
+        exempt_areas=identity_roles.exempt_area_names(),
     )
 
 

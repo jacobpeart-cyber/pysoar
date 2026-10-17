@@ -11,10 +11,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession, get_current_admin_user
 from src.core.security import get_password_hash, verify_password
+from src.identity import roles as identity_roles
 from src.models.api_key import APIKey, APIKeyPermission
 from src.models.user import User
 
 router = APIRouter()
+
+#: Permission prefixes that are admin permissions: creating a key that carries
+#: one (``users:read``, ``settings:write``, ``users:*``...) needs tier admin in
+#: that area. ``*`` needs admin in every area.
+_ADMIN_PERMISSION_AREAS: frozenset[str] = frozenset({"users", "settings"})
 
 
 class APIKeyCreate(BaseModel):
@@ -103,10 +109,17 @@ async def create_api_key(
                 detail=f"Invalid permission: {perm}",
             )
 
-    # Non-admins can only create keys with limited permissions
-    if not current_user.is_admin:
-        admin_perms = ["users:read", "users:write", "settings:read", "settings:write", "*"]
-        if any(perm in admin_perms for perm in data.permissions):
+    # Admin permissions need admin in their area (users / settings), and "*"
+    # admin everywhere: the built-in admin, or a custom role whose every tier
+    # is admin. Others can only create keys with limited permissions.
+    for perm in data.permissions:
+        if perm == "*":
+            allowed = identity_roles.has_tier_everywhere(current_user, "admin")
+        elif perm.split(":", 1)[0] in _ADMIN_PERMISSION_AREAS:
+            allowed = identity_roles.has_tier(current_user, perm.split(":", 1)[0], "admin")
+        else:
+            continue
+        if not allowed:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only admins can create keys with admin permissions",

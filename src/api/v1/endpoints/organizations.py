@@ -17,6 +17,7 @@ from src.api.deps import (
     resolve_organization_scope,
 )
 from src.core.logging import get_logger
+from src.identity import roles as identity_roles
 from src.models.organization import (
     Organization,
     OrganizationMember,
@@ -444,7 +445,7 @@ async def list_teams(
     scope_org = resolve_organization_scope(current_user, organization_id)
     query = select(Team).where(Team.organization_id == scope_org)
 
-    if not current_user.is_admin:
+    if not identity_roles.has_tier(current_user, "teams", "admin"):
         # Get teams the user is a member of
         member_subquery = select(TeamMember.team_id).where(
             TeamMember.user_id == current_user.id,
@@ -716,7 +717,7 @@ async def _get_organization(
             detail="Organization not found",
         )
 
-    if require_admin and user.role != UserRole.ADMIN.value:
+    if require_admin and not identity_roles.has_tier(user, "organizations", "admin"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required",
@@ -756,8 +757,8 @@ async def _get_team(
             detail="Team not found",
         )
 
-    # Check access (admin or team member)
-    if not user.is_admin:
+    # Check access (admin over teams, or team member)
+    if not identity_roles.has_tier(user, "teams", "admin"):
         member_result = await db.execute(
             select(TeamMember).where(
                 TeamMember.team_id == team_id,

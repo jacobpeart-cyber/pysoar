@@ -524,5 +524,17 @@ def claim(claims: dict[str, Any], name: Optional[str]) -> Any:
     return current
 
 
+def first_mapped_group(group_role_map: Optional[dict[str, Any]], groups: list[str]) -> Optional[tuple[str, str]]:
+    """``(group, role value)`` for the first entry of ``group_role_map`` (in map
+    order) whose group the user is in, or ``None`` when none of the user's
+    groups is mapped. Used for just-in-time provisioning and the re-sync on
+    every login, so both pick the same role."""
+    member_of = set(groups)
+    for group, value in (group_role_map or {}).items():
+        if group in member_of:
+            return str(group), str(value)
+    return None
+
+
 def email_domain(email: str) -> str:
     return email.rsplit("@", 1)[-1].strip().lower() if "@" in email else ""

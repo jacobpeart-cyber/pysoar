@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AdminUser, CurrentUser, DatabaseSession, OrganizationId, require_role
 from src.core.database import async_session_factory
+from src.identity import roles as identity_roles
 from src.models.alert import Alert
 from src.models.incident import Incident
 from src.models.user import UserRole
@@ -362,7 +363,7 @@ async def execute_playbook(
         s.get("action") for s in steps
         if isinstance(s, dict) and is_privileged_step(str(s.get("action") or ""), s.get("parameters") or {})
     })
-    if containment_steps and not (current_user.is_superuser or current_user.role == UserRole.ADMIN.value):
+    if containment_steps and not identity_roles.has_tier(current_user, "playbooks", "admin"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"error": "containment_requires_admin", "containment_steps": containment_steps},

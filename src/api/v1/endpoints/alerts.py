@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
 from src.core.database import async_session_factory
 from src.core.logging import get_logger
+from src.identity import roles as identity_roles
 from src.models.alert import Alert, AlertSeverity, AlertStatus
 from src.models.audit import AuditLog
 from src.models.user import User, UserRole
@@ -423,7 +424,7 @@ async def bulk_action(
     probe other tenants' alert ids. One AuditLog row records the action and
     every per-id outcome.
     """
-    if action_data.action == "delete" and not current_user.is_admin:
+    if action_data.action == "delete" and not identity_roles.has_tier(current_user, "alerts", "admin"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"error": "admin_required", "detail": "bulk delete requires the admin role"},
