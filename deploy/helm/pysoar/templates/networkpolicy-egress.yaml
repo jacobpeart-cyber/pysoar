@@ -1,0 +1,143 @@
+{{- if .Values.networkPolicy.egress.enabled }}
+{{- $np := .Values.networkPolicy.egress }}
+{{- /*
+Folded in from deploy/kubernetes/base/networkpolicy-llm-egress.yaml.
+The Agentic SOC sends alert, log and IOC excerpts to the configured LLM
+provider; egress from the api, worker and scheduler pods is limited so a
+compromised or prompt-injected agent cannot reach the cloud metadata service
+(169.254.169.254), in-cluster data stores or internal hosts.
+Controls: SC-7, SC-7(5) (deny-by-default egress), SC-7(8), CM-7, AC-4.
+*/}}
+{{- if eq $np.flavor "kubernetes" }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pysoar.fullname" . }}-backend-egress
+  labels:
+    {{- include "pysoar.labels" . | nindent 4 }}
+    pysoar.io/control: SC-7
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/instance
+        operator: In
+        values: [{{ .Release.Name | quote }}]
+      - key: app.kubernetes.io/component
+        operator: In
+        values: ["api", "worker", "worker-investigations", "scheduler", "migrate"]
+  policyTypes:
+    - Egress
+  egress:
+    # Cluster DNS, required to resolve provider hostnames.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml $np.dnsNamespaceLabels | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml $np.dnsPodLabels | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if .Values.devDependencies.enabled }}
+    # In-cluster development Postgres and Redis.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "pysoar.selectorLabels" (dict "ctx" . "component" "postgres") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "pysoar.selectorLabels" (dict "ctx" . "component" "redis") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 6379
+    {{- end }}
+    # HTTPS to public address space only: the except list blocks the cloud
+    # metadata service, link-local, loopback, multicast, CGNAT and every
+    # RFC1918 range, so a provider base URL cannot point at internal targets.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.0.0/16
+              - 127.0.0.0/8
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 224.0.0.0/4
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- with $np.extraEgress }}
+    # Deployer-supplied destinations (external Postgres and Redis, SMTP, ...).
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- else }}
+# Strict variant: egress pinned to the provider hostnames. Requires Cilium
+# with its DNS proxy (L7 proxy enabled).
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: {{ include "pysoar.fullname" . }}-backend-egress-fqdn
+  labels:
+    {{- include "pysoar.labels" . | nindent 4 }}
+    pysoar.io/control: SC-7
+spec:
+  endpointSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/instance
+        operator: In
+        values: [{{ .Release.Name | quote }}]
+      - key: app.kubernetes.io/component
+        operator: In
+        values: ["api", "worker", "worker-investigations", "scheduler", "migrate"]
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            {{- range $k, $v := $np.dnsPodLabels }}
+            k8s:{{ $k }}: {{ $v | quote }}
+            {{- end }}
+            k8s:io.kubernetes.pod.namespace: kube-system
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: ANY
+          rules:
+            dns:
+              - matchPattern: "*"
+    {{- if .Values.devDependencies.enabled }}
+    - toEndpoints:
+        - matchLabels:
+            {{- include "pysoar.selectorLabels" (dict "ctx" . "component" "postgres") | nindent 12 }}
+      toPorts:
+        - ports:
+            - port: "5432"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            {{- include "pysoar.selectorLabels" (dict "ctx" . "component" "redis") | nindent 12 }}
+      toPorts:
+        - ports:
+            - port: "6379"
+              protocol: TCP
+    {{- end }}
+    - toFQDNs:
+        {{- range $np.llmHosts }}
+        - matchName: {{ . | quote }}
+        {{- end }}
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+    {{- with $np.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}
+{{- end }}

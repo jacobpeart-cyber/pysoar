@@ -1,0 +1,114 @@
+# Example production overrides for the PySOAR chart.
+#
+# Every hostname, CIDR and Secret name below is a placeholder to replace with
+# your own (example.com is reserved for documentation). Render with:
+#   helm template pysoar deploy/helm/pysoar -n pysoar \
+#     -f deploy/helm/pysoar/values-example-production.yaml
+#
+# Postgres 15 and Redis 7 are external (managed services); their URLs live in
+# the Secret named below, created as shown in deploy/kubernetes/README.md.
+
+image:
+  backend:
+    # Pin a released version (or a digest) rather than following appVersion.
+    tag: "0.9.0"
+  frontend:
+    tag: "0.9.0"
+
+imagePullSecrets:
+  - name: ghcr-pull
+
+publicUrl: https://soar.example.com
+
+secret:
+  existingSecret: pysoar-env
+
+config:
+  appEnv: production
+  databaseSslMode: require
+  firstAdminEmail: soc-admin@example.com
+  corsOrigins: []
+  siemSyslogEnabled: true
+
+api:
+  # Trust X-Forwarded-For from the ingress controller pods (pod CIDR of the
+  # cluster) so rate limits and audit rows see the client address.
+  forwardedAllowIps: "10.244.0.0/16"
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/instance: pysoar
+          app.kubernetes.io/component: api
+
+worker:
+  replicas: 2
+  queues: celery
+  pdb:
+    enabled: true
+    minAvailable: 1
+
+investigationsWorker:
+  enabled: true
+  replicas: 1
+
+frontend:
+  replicas: 2
+
+ingress:
+  enabled: true
+  className: nginx
+  host: soar.example.com
+  annotations:
+    # ingress-nginx equivalents of nginx/nginx.conf: 50 MB uploads and
+    # long-lived WebSocket reads on /api/v1/ws.
+    nginx.ingress.kubernetes.io/proxy-body-size: 50m
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "86400"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "86400"
+    # cert-manager fills the TLS Secret when an issuer is installed.
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  tls:
+    enabled: true
+    secretName: pysoar-tls
+
+syslog:
+  service:
+    enabled: true
+    type: LoadBalancer
+    loadBalancerSourceRanges:
+      - 10.20.0.0/16
+
+persistence:
+  enabled: true
+  storageClass: efs-sc
+  accessModes:
+    - ReadWriteMany
+  size: 50Gi
+
+networkPolicy:
+  egress:
+    enabled: true
+    flavor: kubernetes
+    extraEgress:
+      # Managed Postgres and Redis in the VPC's private data subnets.
+      - to:
+          - ipBlock:
+              cidr: 10.20.32.0/20
+        ports:
+          - protocol: TCP
+            port: 5432
+          - protocol: TCP
+            port: 6379
+      # SMTP relay.
+      - to:
+          - ipBlock:
+              cidr: 10.20.48.10/32
+        ports:
+          - protocol: TCP
+            port: 587

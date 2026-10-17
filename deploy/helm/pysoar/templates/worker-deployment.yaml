@@ -1,0 +1,109 @@
+{{- define "pysoar.workerDeployment" -}}
+{{- $ctx := .ctx -}}
+{{- $w := .worker -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pysoar.fullname" $ctx }}-{{ .component }}
+  labels:
+    {{- include "pysoar.componentLabels" (dict "ctx" $ctx "component" .component) | nindent 4 }}
+spec:
+  replicas: {{ $w.replicas }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "pysoar.selectorLabels" (dict "ctx" $ctx "component" .component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pysoar.componentLabels" (dict "ctx" $ctx "component" .component) | nindent 8 }}
+      annotations:
+        checksum/config: {{ include "pysoar.configData" $ctx | sha256sum }}
+        {{- with $w.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "pysoar.serviceAccountName" $ctx }}
+      automountServiceAccountToken: false
+      {{- with $ctx.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml $ctx.Values.backendSecurity.podSecurityContext | nindent 8 }}
+      # Celery acks late (task_acks_late): give running tasks time to finish
+      # on a rolling update before SIGKILL.
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: worker
+          image: {{ include "pysoar.image" (dict "ctx" $ctx "image" $ctx.Values.image.backend) }}
+          imagePullPolicy: {{ $ctx.Values.image.backend.pullPolicy }}
+          # Same command as the docker-compose.yml worker service.
+          command:
+            - celery
+            - -A
+            - src.workers.celery_app
+            - worker
+            - --loglevel=info
+            - --concurrency={{ $w.concurrency }}
+            - --max-memory-per-child={{ $w.maxMemoryPerChild | int64 }}
+            - --max-tasks-per-child={{ $w.maxTasksPerChild }}
+            {{- with .queues }}
+            - -Q
+            - {{ . | quote }}
+            {{- end }}
+          envFrom:
+            {{- include "pysoar.backendEnvFrom" $ctx | nindent 12 }}
+          env:
+            # Each Celery task runs its coroutine on a fresh event loop; a
+            # pooled asyncpg connection from an earlier loop breaks the next
+            # task. NullPool, as docker-compose.yml sets (src/core/database.py).
+            - name: PYSOAR_DB_POOL
+              value: "null"
+            {{- with $w.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          securityContext:
+            {{- toYaml $ctx.Values.backendSecurity.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml $w.resources | nindent 12 }}
+          {{- if $ctx.Values.worker.livenessProbe.enabled }}
+          # The compose healthcheck (celery inspect ping), addressed to this pod's
+          # own node name so another live worker cannot answer for it.
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - celery -A src.workers.celery_app inspect ping --timeout 10 -d "celery@${HOSTNAME}" 2>/dev/null | grep -q pong
+            initialDelaySeconds: {{ $ctx.Values.worker.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ $ctx.Values.worker.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ $ctx.Values.worker.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ $ctx.Values.worker.livenessProbe.failureThreshold }}
+          {{- end }}
+          volumeMounts:
+            {{- include "pysoar.backendVolumeMounts" $ctx | nindent 12 }}
+      volumes:
+        {{- include "pysoar.backendVolumes" $ctx | nindent 8 }}
+      {{- with $w.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $w.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $w.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $w.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end -}}
+{{- include "pysoar.workerDeployment" (dict "ctx" . "worker" .Values.worker "component" "worker" "queues" .Values.worker.queues) }}
+{{- if .Values.investigationsWorker.enabled }}
+---
+{{ include "pysoar.workerDeployment" (dict "ctx" . "worker" .Values.investigationsWorker "component" "worker-investigations" "queues" "investigations") }}
+{{- end }}

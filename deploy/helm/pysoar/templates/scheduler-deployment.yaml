@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pysoar.fullname" . }}-scheduler
+  labels:
+    {{- include "pysoar.componentLabels" (dict "ctx" . "component" "scheduler") | nindent 4 }}
+spec:
+  # Celery beat: exactly one, and never two during a rollout.
+  replicas: 1
+  revisionHistoryLimit: 5
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "pysoar.selectorLabels" (dict "ctx" . "component" "scheduler") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pysoar.componentLabels" (dict "ctx" . "component" "scheduler") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include "pysoar.configData" . | sha256sum }}
+        {{- with .Values.scheduler.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "pysoar.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.backendSecurity.podSecurityContext | nindent 8 }}
+      containers:
+        - name: scheduler
+          image: {{ include "pysoar.image" (dict "ctx" . "image" .Values.image.backend) }}
+          imagePullPolicy: {{ .Values.image.backend.pullPolicy }}
+          # docker-compose.yml runs `celery -A src.workers.celery_app beat
+          # --loglevel=info`; beat's schedule state file is moved from the
+          # working directory to /tmp because the root filesystem is read-only.
+          command:
+            - celery
+            - -A
+            - src.workers.celery_app
+            - beat
+            - --loglevel=info
+            - --schedule=/tmp/celerybeat-schedule
+          envFrom:
+            {{- include "pysoar.backendEnvFrom" . | nindent 12 }}
+          env:
+            - name: PYSOAR_DB_POOL
+              value: "null"
+            {{- with .Values.scheduler.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          securityContext:
+            {{- toYaml .Values.backendSecurity.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.scheduler.resources | nindent 12 }}
+          # The compose healthcheck: PID 1 is celery beat.
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "grep -q beat /proc/1/cmdline"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: logs
+              mountPath: /app/logs
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: logs
+          emptyDir: {}
+      {{- with .Values.scheduler.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.scheduler.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.scheduler.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

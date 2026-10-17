@@ -1,0 +1,20 @@
+apiVersion: v2
+name: pysoar
+description: >-
+  PySOAR (FastAPI api, Celery worker and beat scheduler, nginx frontend) for
+  Kubernetes. Render-validated with helm lint, helm template and kubeconform;
+  not yet applied to a cluster (see deploy/kubernetes/README.md).
+type: application
+# Chart version: bump on any change to this chart.
+version: 0.1.0
+# appVersion follows the repository VERSION file; an empty image tag in
+# values resolves to this value (images ghcr.io/<owner>/pysoar-backend and
+# pysoar-frontend tagged <version> by .github/workflows/release.yml).
+appVersion: "0.9.0"
+kubeVersion: ">=1.26.0-0"
+home: https://github.com/jacobpeart-cyber/pysoar
+sources:
+  - https://github.com/jacobpeart-cyber/pysoar
+keywords:
+  - soar
+  - security

@@ -1,0 +1,18 @@
+{{- /* Folded in from deploy/kubernetes/base/pdb.yaml (api), plus frontend and worker. */ -}}
+{{- $components := list (dict "name" "api" "pdb" .Values.api.pdb) (dict "name" "frontend" "pdb" .Values.frontend.pdb) (dict "name" "worker" "pdb" .Values.worker.pdb) -}}
+{{- range $components }}
+{{- if .pdb.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pysoar.fullname" $ }}-{{ .name }}
+  labels:
+    {{- include "pysoar.componentLabels" (dict "ctx" $ "component" .name) | nindent 4 }}
+spec:
+  minAvailable: {{ .pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "pysoar.selectorLabels" (dict "ctx" $ "component" .name) | nindent 6 }}
+{{- end }}
+{{- end }}

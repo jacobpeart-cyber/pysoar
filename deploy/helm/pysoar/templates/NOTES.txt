@@ -1,0 +1,25 @@
+PySOAR {{ .Chart.AppVersion }} (chart {{ .Chart.Version }}) in namespace {{ .Release.Namespace }}.
+
+Images:
+  backend:  {{ include "pysoar.image" (dict "ctx" . "image" .Values.image.backend) }}
+  frontend: {{ include "pysoar.image" (dict "ctx" . "image" .Values.image.frontend) }}
+
+Settings come from ConfigMap {{ include "pysoar.fullname" . }}-config and
+Secret {{ include "pysoar.secretName" . }} (not managed by this chart).
+{{- if .Values.devDependencies.enabled }}
+
+WARNING: devDependencies.enabled is true. The in-cluster Postgres and Redis
+are for development and evaluation only: no backups, no TLS, no HA.
+{{- end }}
+
+Check the release:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "pysoar.apiServiceName" . }} 8000:{{ .Values.api.service.port }}
+  curl -s http://127.0.0.1:8000/api/v1/health
+{{- if .Values.ingress.enabled }}
+
+Ingress host: {{ .Values.ingress.host }}{{ if .Values.ingress.tls.enabled }} (TLS Secret {{ include "pysoar.tlsSecretName" . }}){{ end }}
+{{- end }}
+
+The first boot creates {{ .Values.config.firstAdminEmail }} with FIRST_ADMIN_PASSWORD
+from the Secret; that account must change its password at first login.

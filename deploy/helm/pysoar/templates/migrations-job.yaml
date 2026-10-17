@@ -1,0 +1,66 @@
+{{- if and .Values.migrations.enabled (not .Values.devDependencies.enabled) }}
+{{- include "pysoar.validate" . }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "pysoar.fullname" . }}-migrate
+  labels:
+    {{- include "pysoar.componentLabels" (dict "ctx" . "component" "migrate") | nindent 4 }}
+  annotations:
+    # Runs before any Deployment is created or updated, so new api pods
+    # never start against an older schema (an unmigrated database
+    # crash-loops the api in create_first_admin).
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    # A failed Job is kept for `kubectl logs`; the next run replaces it.
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migrations.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migrations.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "pysoar.componentLabels" (dict "ctx" . "component" "migrate") | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      # The chart's ServiceAccount is not created until after pre-install
+      # hooks, so the Job uses the namespace default account, without a token.
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.backendSecurity.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "pysoar.image" (dict "ctx" . "image" .Values.image.backend) }}
+          imagePullPolicy: {{ .Values.image.backend.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              {{- include "pysoar.migrateScript" . | nindent 14 }}
+          # Same settings as the ConfigMap (which does not exist yet during a
+          # pre-install hook), then the existing Secret.
+          env:
+            {{- $cfg := include "pysoar.configData" . | fromYaml }}
+            {{- range $k := keys $cfg | sortAlpha }}
+            - name: {{ $k }}
+              value: {{ get $cfg $k | toString | quote }}
+            {{- end }}
+            - name: PYSOAR_DB_POOL
+              value: "null"
+          envFrom:
+            - secretRef:
+                name: {{ include "pysoar.secretName" . }}
+          securityContext:
+            {{- toYaml .Values.backendSecurity.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.migrations.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- end }}

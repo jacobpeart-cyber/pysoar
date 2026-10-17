@@ -1,0 +1,124 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pysoar.fullname" . }}-api
+  labels:
+    {{- include "pysoar.componentLabels" (dict "ctx" . "component" "api") | nindent 4 }}
+spec:
+  {{- if not .Values.api.autoscaling.enabled }}
+  replicas: {{ .Values.api.replicas }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "pysoar.selectorLabels" (dict "ctx" . "component" "api") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pysoar.componentLabels" (dict "ctx" . "component" "api") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include "pysoar.configData" . | sha256sum }}
+        {{- with .Values.api.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "pysoar.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.backendSecurity.podSecurityContext | nindent 8 }}
+      {{- if .Values.devDependencies.enabled }}
+      # Development mode only: the in-cluster database is created with the
+      # release, after any pre-install hook would have run, so migrations
+      # run here, before the api container starts.
+      initContainers:
+        - name: migrate
+          image: {{ include "pysoar.image" (dict "ctx" . "image" .Values.image.backend) }}
+          imagePullPolicy: {{ .Values.image.backend.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until python -c "import asyncio; from src.core.database import health_check; import sys; sys.exit(0 if asyncio.run(health_check()) else 1)"; do
+                echo "pysoar-migrate: waiting for the database"; sleep 3;
+              done
+              {{- include "pysoar.migrateScript" . | nindent 14 }}
+          envFrom:
+            {{- include "pysoar.backendEnvFrom" . | nindent 12 }}
+          env:
+            - name: PYSOAR_DB_POOL
+              value: "null"
+          securityContext:
+            {{- toYaml .Values.backendSecurity.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.migrations.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      {{- end }}
+      containers:
+        - name: api
+          image: {{ include "pysoar.image" (dict "ctx" . "image" .Values.image.backend) }}
+          imagePullPolicy: {{ .Values.image.backend.pullPolicy }}
+          # The image's CMD: uvicorn src.main:app --host 0.0.0.0 --port 8000
+          ports:
+            - name: http
+              containerPort: {{ .Values.api.port }}
+              protocol: TCP
+            {{- if .Values.config.siemSyslogEnabled }}
+            - name: syslog-udp
+              containerPort: {{ .Values.config.siemSyslogPort }}
+              protocol: UDP
+            - name: syslog-tcp
+              containerPort: {{ .Values.config.siemSyslogPort }}
+              protocol: TCP
+            {{- end }}
+          envFrom:
+            {{- include "pysoar.backendEnvFrom" . | nindent 12 }}
+          {{- if or .Values.api.forwardedAllowIps .Values.api.extraEnv }}
+          env:
+            {{- with .Values.api.forwardedAllowIps }}
+            - name: FORWARDED_ALLOW_IPS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.api.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.backendSecurity.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+          startupProbe:
+            {{- toYaml .Values.api.startupProbe | nindent 12 }}
+          livenessProbe:
+            {{- toYaml .Values.api.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.api.readinessProbe | nindent 12 }}
+          volumeMounts:
+            {{- include "pysoar.backendVolumeMounts" . | nindent 12 }}
+      volumes:
+        {{- include "pysoar.backendVolumes" . | nindent 8 }}
+      {{- with .Values.api.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.api.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.api.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.api.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

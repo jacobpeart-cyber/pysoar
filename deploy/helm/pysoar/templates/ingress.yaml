@@ -1,0 +1,42 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "pysoar.fullname" . }}
+  labels:
+    {{- include "pysoar.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host | quote }}
+      secretName: {{ include "pysoar.tlsSecretName" . }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          # Prefix matching is per path element: /api matches /api and
+          # /api/v1/..., not the SPA routes /api-keys or /api-security.
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "pysoar.apiServiceName" . }}
+                port:
+                  name: http
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "pysoar.fullname" . }}-frontend
+                port:
+                  name: http
+{{- end }}

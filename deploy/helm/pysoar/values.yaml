@@ -1,0 +1,390 @@
+# Default values for the PySOAR chart.
+#
+# Status: this chart is render-validated (helm lint, helm template,
+# kubeconform; see .github/workflows/helm.yml). It has not yet been applied to
+# a Kubernetes cluster. Read deploy/kubernetes/README.md before installing.
+#
+# Four values have no default and must be set by the deployer (the chart
+# refuses to render without them): secret.existingSecret, publicUrl,
+# config.firstAdminEmail and, when the ingress is enabled, ingress.host.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  backend:
+    # Built and pushed by .github/workflows/release.yml on a v* tag.
+    repository: ghcr.io/jacobpeart-cyber/pysoar-backend
+    # Empty means the chart's appVersion (the repository VERSION file).
+    tag: ""
+    # Optional sha256 digest; when set the image is pulled by digest.
+    digest: ""
+    pullPolicy: IfNotPresent
+  frontend:
+    repository: ghcr.io/jacobpeart-cyber/pysoar-frontend
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+
+# Names of existing kubernetes.io/dockerconfigjson Secrets, e.g.
+# [{name: ghcr-pull}]. Needed while the ghcr.io packages are private.
+imagePullSecrets: []
+
+# External URL users reach PySOAR on (PYSOAR_PUBLIC_URL). Used to build links
+# in notifications and phishing-simulation tracking. Required: the code's
+# fallback is the PySOAR project's own hostname, which is wrong for any other
+# deployment.
+publicUrl: ""
+
+secret:
+  # Name of an existing Secret in the release namespace. The chart never
+  # creates or templates secret values. Every key in it is exposed to the
+  # api, worker, scheduler and migration containers as an environment
+  # variable (envFrom). Required keys: DATABASE_URL, REDIS_URL,
+  # CELERY_BROKER_URL, CELERY_RESULT_BACKEND, SECRET_KEY, JWT_SECRET_KEY,
+  # ENCRYPTION_MASTER_KEY, FIRST_ADMIN_PASSWORD. Optional keys: any secret
+  # setting from src/core/config.py (SMTP_PASSWORD, VIRUSTOTAL_API_KEY,
+  # ANTHROPIC_API_KEY, ...). See deploy/kubernetes/README.md.
+  existingSecret: ""
+
+# Non-secret settings, rendered into a ConfigMap (src/core/config.py names).
+config:
+  # APP_ENV=production arms the production validators in src/main.py and
+  # src/core/config.py (secret strength, ENCRYPTION_MASTER_KEY presence,
+  # DATABASE_SSL_MODE).
+  appEnv: production
+  # Must be require, verify-full or disable when appEnv is production. The
+  # setting is validated but not applied to the database engine: put TLS
+  # parameters in DATABASE_URL itself (asyncpg: ?ssl=require).
+  databaseSslMode: require
+  logLevel: INFO
+  logFormat: json
+  # CORS_ORIGINS. Production strips localhost origins. The frontend is served
+  # from the same origin as the API through the ingress, so an empty list is
+  # correct unless another origin calls the API from a browser.
+  corsOrigins: []
+  # FIRST_ADMIN_EMAIL: the account created on first boot when the users table
+  # is empty (its password is FIRST_ADMIN_PASSWORD in the Secret; the account
+  # must change it at first login). Required.
+  firstAdminEmail: ""
+  # Platform LLM defaults (tenants normally bring their own key).
+  llmProvider: gemini
+  llmModel: ""
+  ollamaBaseUrl: ""
+  openaiBaseUrl: ""
+  # OT_DISCOVERY_ALLOWED_CIDRS; empty disables active OT discovery.
+  otDiscoveryAllowedCidrs: []
+  # SIEM syslog receiver started by the api process (UDP and TCP).
+  siemSyslogEnabled: true
+  siemSyslogPort: 5514
+  # Any other non-secret setting, as NAME: "value" (strings).
+  extra: {}
+
+serviceAccount:
+  create: true
+  # Defaults to the release fullname when empty.
+  name: ""
+  annotations: {}
+
+# Pod and container security contexts. UID/GID 999 is the `pysoar` user the
+# backend Dockerfile creates (useradd -r); 101 is the nginx user of the
+# nginx:alpine base of the frontend image.
+backendSecurity:
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 999
+    runAsGroup: 999
+    fsGroup: 999
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    privileged: false
+    capabilities:
+      drop: ["ALL"]
+
+frontendSecurity:
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 101
+    runAsGroup: 101
+    fsGroup: 101
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    privileged: false
+    capabilities:
+      drop: ["ALL"]
+
+api:
+  # Ignored while autoscaling.enabled is true (the HPA owns the count).
+  replicas: 2
+  port: 8000
+  # FORWARDED_ALLOW_IPS for uvicorn: the proxies whose X-Forwarded-For is
+  # trusted (client IPs for rate limiting and audit). Empty leaves uvicorn's
+  # default (127.0.0.1), so client addresses are the ingress controller's.
+  forwardedAllowIps: ""
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  startupProbe:
+    httpGet:
+      path: /api/v1/health
+      port: http
+    periodSeconds: 5
+    timeoutSeconds: 5
+    failureThreshold: 60
+  livenessProbe:
+    httpGet:
+      path: /api/v1/health
+      port: http
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 3
+  readinessProbe:
+    httpGet:
+      path: /api/v1/health
+      port: http
+    periodSeconds: 10
+    timeoutSeconds: 10
+    failureThreshold: 3
+  service:
+    type: ClusterIP
+    port: 8000
+  autoscaling:
+    # Folded in from deploy/kubernetes/base/hpa.yaml.
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+    behavior:
+      scaleDown:
+        stabilizationWindowSeconds: 300
+        policies:
+          - type: Percent
+            value: 50
+            periodSeconds: 60
+          - type: Pods
+            value: 2
+            periodSeconds: 60
+        selectPolicy: Min
+      scaleUp:
+        stabilizationWindowSeconds: 60
+        policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 30
+          - type: Pods
+            value: 2
+            periodSeconds: 30
+        selectPolicy: Max
+  pdb:
+    # Folded in from deploy/kubernetes/base/pdb.yaml.
+    enabled: true
+    minAvailable: 1
+  extraEnv: []
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+
+worker:
+  replicas: 1
+  # Same flags as docker-compose.yml. --max-memory-per-child is in KB.
+  concurrency: 2
+  maxMemoryPerChild: 300000
+  maxTasksPerChild: 50
+  # Comma-separated Celery queues (-Q). Empty consumes every declared queue
+  # (celery and investigations).
+  queues: ""
+  # The compose worker's hard ceiling (mem_limit 1536m).
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1536Mi
+  livenessProbe:
+    enabled: true
+    periodSeconds: 60
+    timeoutSeconds: 20
+    failureThreshold: 3
+    initialDelaySeconds: 60
+  pdb:
+    enabled: false
+    minAvailable: 1
+  extraEnv: []
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+
+# Optional dedicated worker for the investigations queue (agentic runs), as
+# described in src/workers/celery_app.py. When enabled, set worker.queues to
+# "celery" so the default worker leaves investigations to this one.
+investigationsWorker:
+  enabled: false
+  replicas: 1
+  concurrency: 2
+  maxMemoryPerChild: 400000
+  maxTasksPerChild: 50
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1536Mi
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+scheduler:
+  # Celery beat must run as exactly one replica (two would fire every
+  # periodic task twice); the chart pins replicas to 1 and uses Recreate.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 192Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  extraEnv: []
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+frontend:
+  replicas: 2
+  # nginx listens on an unprivileged port so the container runs as non-root.
+  port: 8080
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  service:
+    type: ClusterIP
+    port: 80
+  pdb:
+    enabled: true
+    minAvailable: 1
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+
+ingress:
+  enabled: true
+  # IngressClass name (e.g. nginx); empty uses the cluster default class.
+  className: ""
+  annotations: {}
+  # Hostname users reach PySOAR on. Required when enabled.
+  host: ""
+  tls:
+    enabled: true
+    # Existing kubernetes.io/tls Secret holding the certificate for host.
+    # Defaults to <fullname>-tls when empty. The chart does not create it;
+    # create it yourself or let cert-manager fill it via an annotation.
+    secretName: ""
+
+# Optional Service exposing the api's SIEM syslog receiver (UDP and TCP).
+syslog:
+  service:
+    enabled: false
+    type: LoadBalancer
+    annotations: {}
+    loadBalancerSourceRanges: []
+
+# Writable application data shared by api and worker pods:
+# /app/uploads, /app/data, /app/backups, /app/archives (one claim, subPaths).
+persistence:
+  enabled: true
+  existingClaim: ""
+  storageClass: ""
+  # ReadWriteMany so several api replicas on different nodes can mount it.
+  # Use ReadWriteOnce only with a single api replica and no worker on
+  # another node.
+  accessModes:
+    - ReadWriteMany
+  size: 20Gi
+
+# Database migrations: a Helm pre-install/pre-upgrade hook Job running the api
+# image. On a database that already carries an alembic_version table it runs
+# `alembic upgrade head`; on an empty database it creates the schema from the
+# models and runs `alembic stamp head` (the migration chain cannot build an
+# empty database, see README); on a database with tables but no
+# alembic_version it fails without changing anything.
+migrations:
+  enabled: true
+  backoffLimit: 2
+  activeDeadlineSeconds: 900
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+networkPolicy:
+  # Egress policy for api, worker and scheduler pods, folded in from
+  # deploy/kubernetes/base/networkpolicy-llm-egress.yaml (SC-7, SC-7(5)).
+  # It is deny-by-default for egress: everything the pods need outside the
+  # cluster and outside public TCP/443 (an external Postgres or Redis in a
+  # private subnet, SMTP, a SIEM) must be listed in extraEgress.
+  egress:
+    enabled: false
+    # kubernetes: vanilla NetworkPolicy (DNS, public TCP/443, extraEgress).
+    # cilium: CiliumNetworkPolicy with egress pinned to llmHosts by FQDN
+    # (requires Cilium with its DNS proxy). Use one, not both.
+    flavor: kubernetes
+    llmHosts:
+      - api.anthropic.com
+      - generativelanguage.googleapis.com
+      - api.openai.com
+    dnsNamespaceLabels:
+      kubernetes.io/metadata.name: kube-system
+    dnsPodLabels:
+      k8s-app: kube-dns
+    # Raw NetworkPolicyEgressRule entries, e.g.
+    #   - to: [{ipBlock: {cidr: 10.20.0.0/24}}]
+    #     ports: [{protocol: TCP, port: 5432}]
+    extraEgress: []
+
+# IN-CLUSTER POSTGRES AND REDIS: DEVELOPMENT AND EVALUATION ONLY. NOT FOR
+# PRODUCTION. Single replica, no backups, no TLS, no high availability.
+# Production uses managed or separately operated Postgres 15 and Redis 7 via
+# the URLs in the Secret. When enabled, the Secret must also hold
+# POSTGRES_PASSWORD and REDIS_PASSWORD, DATABASE_URL must point at
+# <fullname>-postgres and the Redis URLs at <fullname>-redis, and migrations
+# run as an init container of the api pod (a pre-install hook would run
+# before the in-cluster database exists).
+devDependencies:
+  enabled: false
+  postgres:
+    image: postgres:15-alpine
+    database: pysoar
+    user: pysoar
+    storageSize: 10Gi
+    storageClass: ""
+  redis:
+    image: redis:7-alpine
+    storageSize: 2Gi
+    storageClass: ""

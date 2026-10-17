@@ -1,0 +1,222 @@
+{{- if .Values.devDependencies.enabled }}
+{{- $dev := .Values.devDependencies }}
+# ---------------------------------------------------------------------------
+# DEVELOPMENT AND EVALUATION ONLY. NOT FOR PRODUCTION.
+# Single-replica Postgres and Redis with no backups, no TLS and no high
+# availability. Passwords come from POSTGRES_PASSWORD and REDIS_PASSWORD in
+# the existing Secret; the chart does not generate them.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pysoar.fullname" . }}-postgres
+  labels:
+    {{- include "pysoar.componentLabels" (dict "ctx" . "component" "postgres") | nindent 4 }}
+    pysoar.io/not-for-production: "true"
+spec:
+  selector:
+    {{- include "pysoar.selectorLabels" (dict "ctx" . "component" "postgres") | nindent 4 }}
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "pysoar.fullname" . }}-postgres
+  labels:
+    {{- include "pysoar.componentLabels" (dict "ctx" . "component" "postgres") | nindent 4 }}
+    pysoar.io/not-for-production: "true"
+spec:
+  serviceName: {{ include "pysoar.fullname" . }}-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "pysoar.selectorLabels" (dict "ctx" . "component" "postgres") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pysoar.componentLabels" (dict "ctx" . "component" "postgres") | nindent 8 }}
+        pysoar.io/not-for-production: "true"
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        # uid/gid 70 is the postgres user of postgres:*-alpine.
+        runAsNonRoot: true
+        runAsUser: 70
+        runAsGroup: 70
+        fsGroup: 70
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: {{ $dev.postgres.image }}
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          env:
+            - name: POSTGRES_USER
+              value: {{ $dev.postgres.user | quote }}
+            - name: POSTGRES_DB
+              value: {{ $dev.postgres.database | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pysoar.secretName" . }}
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with $dev.postgres.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $dev.postgres.storageSize }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pysoar.fullname" . }}-redis
+  labels:
+    {{- include "pysoar.componentLabels" (dict "ctx" . "component" "redis") | nindent 4 }}
+    pysoar.io/not-for-production: "true"
+spec:
+  selector:
+    {{- include "pysoar.selectorLabels" (dict "ctx" . "component" "redis") | nindent 4 }}
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "pysoar.fullname" . }}-redis
+  labels:
+    {{- include "pysoar.componentLabels" (dict "ctx" . "component" "redis") | nindent 4 }}
+    pysoar.io/not-for-production: "true"
+spec:
+  serviceName: {{ include "pysoar.fullname" . }}-redis
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "pysoar.selectorLabels" (dict "ctx" . "component" "redis") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pysoar.componentLabels" (dict "ctx" . "component" "redis") | nindent 8 }}
+        pysoar.io/not-for-production: "true"
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        # uid/gid 999 is the redis user of redis:*-alpine.
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: {{ $dev.redis.image }}
+          # docker-compose.yml's redis command.
+          command: ["/bin/sh", "-c"]
+          args:
+            - exec redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru --requirepass "$REDIS_PASSWORD"
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pysoar.secretName" . }}
+                  key: REDIS_PASSWORD
+            - name: REDISCLI_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pysoar.secretName" . }}
+                  key: REDIS_PASSWORD
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with $dev.redis.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $dev.redis.storageSize }}
+{{- end }}

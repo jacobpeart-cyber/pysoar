@@ -1,0 +1,111 @@
+name: Helm chart
+
+# Render validation for deploy/helm/pysoar: helm lint, helm template with the
+# default values (plus the four required values) and with the example
+# production values, and kubeconform against the Kubernetes API schemas of the
+# chart's floor (kubeVersion >=1.26) and of the EKS version the Terraform in
+# deploy/terraform/aws defaults to (1.29). Nothing here talks to a cluster.
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "deploy/helm/**"
+      - ".github/workflows/helm.yml"
+      - "VERSION"
+  pull_request:
+    branches: [main]
+    paths:
+      - "deploy/helm/**"
+      - ".github/workflows/helm.yml"
+      - "VERSION"
+
+permissions:
+  contents: read
+
+env:
+  HELM_VERSION: v3.17.3
+  HELM_SHA256: ee88b3c851ae6466a3de507f7be73fe94d54cbf2987cbaa3d1a3832ea331f2cd
+  KUBECONFORM_VERSION: v0.6.7
+  KUBECONFORM_SHA256: 95f14e87aa28c09d5941f11bd024c1d02fdc0303ccaa23f61cef67bc92619d73
+  CHART: deploy/helm/pysoar
+  # The required values, for rendering values.yaml on its own. These are
+  # documentation-reserved names, not a deployment.
+  REQUIRED_SET: >-
+    --set secret.existingSecret=pysoar-env
+    --set publicUrl=https://soar.example.com
+    --set config.firstAdminEmail=soc-admin@example.com
+    --set ingress.host=soar.example.com
+
+jobs:
+  validate:
+    name: Lint, render, kubeconform
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install helm and kubeconform (checksum-verified)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          cd "$RUNNER_TEMP"
+          curl -fsSLo helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm.tgz" | sha256sum -c -
+          tar -xzf helm.tgz linux-amd64/helm
+          mv linux-amd64/helm bin/helm
+          curl -fsSLo kubeconform.tgz "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  kubeconform.tgz" | sha256sum -c -
+          tar -xzf kubeconform.tgz kubeconform
+          mv kubeconform bin/kubeconform
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Tool versions
+        run: |
+          helm version
+          kubeconform -v
+
+      - name: Chart appVersion matches VERSION
+        run: |
+          set -euo pipefail
+          want="$(tr -d '[:space:]' < VERSION)"
+          got="$(sed -n 's/^appVersion: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$CHART/Chart.yaml")"
+          echo "VERSION=${want} appVersion=${got}"
+          test "$want" = "$got"
+
+      - name: helm lint
+        run: |
+          set -euo pipefail
+          helm lint "$CHART" --strict $REQUIRED_SET
+          helm lint "$CHART" --strict -f "$CHART/values-example-production.yaml"
+
+      - name: Missing required values fail the render
+        run: |
+          set -uo pipefail
+          if helm template pysoar "$CHART" > /dev/null 2>&1; then
+            echo "helm template succeeded without secret.existingSecret, publicUrl and config.firstAdminEmail" >&2
+            exit 1
+          fi
+
+      - name: helm template
+        run: |
+          set -euo pipefail
+          mkdir -p rendered
+          helm template pysoar "$CHART" -n pysoar $REQUIRED_SET > rendered/default.yaml
+          helm template pysoar "$CHART" -n pysoar -f "$CHART/values-example-production.yaml" > rendered/production.yaml
+          helm template pysoar "$CHART" -n pysoar $REQUIRED_SET \
+            --set devDependencies.enabled=true --set api.autoscaling.enabled=false \
+            --set api.replicas=1 --set networkPolicy.egress.enabled=true > rendered/dev.yaml
+          helm template pysoar "$CHART" -n pysoar -f "$CHART/values-example-production.yaml" \
+            --set networkPolicy.egress.flavor=cilium --set-json 'networkPolicy.egress.extraEgress=[]' > rendered/cilium.yaml
+          grep -c '^kind:' rendered/*.yaml
+
+      - name: kubeconform
+        run: |
+          set -euo pipefail
+          for v in 1.26.0 1.29.0; do
+            kubeconform -strict -summary -kubernetes-version "$v" \
+              -schema-location default \
+              -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+              rendered/*.yaml
+          done

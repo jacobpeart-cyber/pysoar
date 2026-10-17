@@ -1,0 +1,9 @@
+{{- include "pysoar.validate" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pysoar.fullname" . }}-config
+  labels:
+    {{- include "pysoar.labels" . | nindent 4 }}
+data:
+  {{- include "pysoar.configData" . | nindent 2 }}

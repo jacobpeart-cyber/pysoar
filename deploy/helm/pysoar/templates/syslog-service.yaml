@@ -1,0 +1,33 @@
+{{- if and .Values.syslog.service.enabled .Values.config.siemSyslogEnabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pysoar.fullname" . }}-syslog
+  labels:
+    {{- include "pysoar.componentLabels" (dict "ctx" . "component" "api") | nindent 4 }}
+  {{- with .Values.syslog.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.syslog.service.type }}
+  {{- if and (eq .Values.syslog.service.type "LoadBalancer") .Values.syslog.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml .Values.syslog.service.loadBalancerSourceRanges | nindent 4 }}
+  {{- end }}
+  {{- if ne .Values.syslog.service.type "ClusterIP" }}
+  # Keep the sender's address (the receiver records the source host).
+  externalTrafficPolicy: Local
+  {{- end }}
+  selector:
+    {{- include "pysoar.selectorLabels" (dict "ctx" . "component" "api") | nindent 4 }}
+  ports:
+    - name: syslog-udp
+      port: {{ .Values.config.siemSyslogPort }}
+      targetPort: syslog-udp
+      protocol: UDP
+    - name: syslog-tcp
+      port: {{ .Values.config.siemSyslogPort }}
+      targetPort: syslog-tcp
+      protocol: TCP
+{{- end }}
