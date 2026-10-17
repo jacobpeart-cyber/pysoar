@@ -1,0 +1,167 @@
+# Upgrading PySOAR
+
+Every upgrade has the same shape: back up, move the code and images to the
+new version, apply the database migrations **before** the new code serves
+requests, restart, check the version. Skipping the migrations is the failure
+seen in production on 2026-06-15: new code against an old schema crash-loops
+the api at `create_first_admin` (`UndefinedColumnError`).
+
+Install guides: [compose](../install/compose.md),
+[Kubernetes](../install/kubernetes.md). Backups:
+[backup-restore.md](backup-restore.md).
+
+## docker compose
+
+Run from the compose directory (`/opt/pysoar` on the production host).
+
+### 1. Note what is running
+
+```sh
+git describe --tags --always
+docker compose exec api curl -fsS http://localhost:8000/api/v1/health
+```
+
+Read the release notes of every version between the running one and the
+target (GitHub release page; see [RELEASING.md](../releases/RELEASING.md)).
+
+### 2. Back up and check the backup
+
+```sh
+(umask 077; docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' \
+  | gzip > "backups/pre-upgrade-$(date +%Y%m%d-%H%M%S).sql.gz")
+deploy/restore-db.sh --verify-only backups/pre-upgrade-YYYYMMDD-HHMMSS.sql.gz
+```
+
+The file name pattern `pre-<reason>-YYYYMMDD-HHMMSS.sql.gz` is the one
+`deploy/backup-db.sh` keeps for `KEEP_EVENT_DAYS` (90 days). `--verify-only`
+loads the dump into a scratch database, checks its alembic revision and row
+counts, and drops the scratch copy; the live database is not touched.
+
+### 3. Move the code
+
+To a release tag:
+
+```sh
+git fetch --tags origin
+git checkout vX.Y.Z
+```
+
+To the tip of `main` (how the production host is deployed today):
+
+```sh
+git fetch origin main
+git reset --hard origin/main
+```
+
+`git reset --hard` discards local changes to tracked files in the checkout.
+`.env`, `backups/`, `frontend/dist/` and `nginx/ssl/*.pem` are untracked and
+are not affected.
+
+### 4. Move the images
+
+Released images (set `PYSOAR_IMAGE_TAG=X.Y.Z` in `.env` first):
+
+```sh
+docker compose pull api worker scheduler flower frontend
+```
+
+Or build from the checkout:
+
+```sh
+PYSOAR_COMMIT=$(git rev-parse HEAD) docker compose build
+```
+
+A build is needed whenever `requirements.txt` or a Dockerfile changed; the
+`./src` bind mount carries Python code changes but not new dependencies.
+
+### 5. Stop the application, migrate, start
+
+```sh
+docker compose stop api worker scheduler flower
+docker compose run --rm --no-deps api alembic upgrade head
+docker compose up -d
+docker compose restart frontend nginx
+```
+
+Stopping first keeps the old code from running against the new schema while
+the migration runs. `docker compose up -d` starts the stopped containers with
+a fresh process (so the bind-mounted code is re-read) and recreates any whose
+image or configuration changed. `frontend` and `nginx` are restarted because
+they hold the api container's address.
+
+If `alembic upgrade head` fails, nothing has started on the new code: fix the
+cause and run it again, or roll back (below).
+
+### 6. Refresh the web UI files
+
+`./frontend/dist` on the host is what nginx serves, not the copy inside the
+frontend image. Replace it from the new frontend image and restart both
+containers that mount it **before** deleting the old directory (the running
+containers keep the old directory's inode; deleting it first leaves nginx an
+empty root and it answers 403):
+
+```sh
+rm -rf frontend/dist.new && mkdir frontend/dist.new
+docker create --name pysoar-dist ghcr.io/jacobpeart-cyber/pysoar-frontend:X.Y.Z   # or :local after a build
+docker cp pysoar-dist:/usr/share/nginx/html/. frontend/dist.new/
+docker rm pysoar-dist
+mv frontend/dist frontend/dist.old && mv frontend/dist.new frontend/dist
+docker compose restart frontend nginx
+rm -rf frontend/dist.old
+```
+
+### 7. Check
+
+```sh
+docker compose ps
+docker compose exec api curl -fsS http://localhost:8000/api/v1/health
+docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT version_num FROM alembic_version"'
+```
+
+The health response must say `healthy` with the new `version` and `commit`
+(`commit` is `unknown` for a build without `PYSOAR_COMMIT`), and the alembic
+revision must be the newest file in `alembic/versions/`. Then load the UI
+from outside the host and confirm the page loads.
+
+### Rolling back
+
+The revisions' `downgrade()` functions are not exercised by any test or
+procedure, so this guide does not use `alembic downgrade`. Roll back by
+restoring the pre-upgrade dump with the old code:
+
+```sh
+git checkout vPREVIOUS                      # the tag noted in step 1
+# set PYSOAR_IMAGE_TAG back in .env and pull, or rebuild
+deploy/restore-db.sh backups/pre-upgrade-YYYYMMDD-HHMMSS.sql.gz
+```
+
+then refresh `frontend/dist` from the old image (step 6). Data written
+between the backup and the rollback is lost; the database it replaces is
+kept as `pysoar_pre_restore_<stamp>` (see
+[backup-restore.md](backup-restore.md#restore)).
+
+## Kubernetes
+
+Not yet exercised on a cluster (the chart is render-validated only; see
+[kubernetes.md](../install/kubernetes.md)). What the chart does:
+
+1. Take a snapshot of the managed database (provider tooling; the compose
+   scripts do not apply).
+2. Set `image.backend.tag` and `image.frontend.tag` (or `digest`) to the new
+   version, then:
+
+   ```sh
+   helm upgrade pysoar deploy/helm/pysoar -n pysoar -f my-values.yaml --wait --timeout 15m
+   ```
+
+   The `pysoar-migrate` pre-upgrade hook Job runs `alembic upgrade head` with
+   the new backend image before any Deployment changes. If it fails, the
+   upgrade stops with the old pods still running; read
+   `kubectl -n pysoar logs job/pysoar-migrate`.
+3. Check `curl -s http://127.0.0.1:8000/api/v1/health` through
+   `kubectl -n pysoar port-forward svc/pysoar-api 8000:8000`.
+
+`helm rollback` restores the previous manifests and images but does not run
+the migration hook (it is `pre-install,pre-upgrade` only) and does not undo
+migrations. Rolling back across a schema change means restoring the
+pre-upgrade database snapshot as well.
