@@ -149,6 +149,11 @@ class APIKeyPermission:
     SETTINGS_READ = "settings:read"
     SETTINGS_WRITE = "settings:write"
 
+    # SIEM log ingestion (POST /siem/logs/ingest/bulk with X-API-Key); the
+    # key owner must also hold write on siem at the time of the request.
+    SIEM_WRITE = "siem:write"
+    LOGS_WRITE = "logs:write"
+
     # Audit permissions
     AUDIT_READ = "audit:read"
 
@@ -167,6 +172,7 @@ class APIKeyPermission:
             cls.USERS_READ, cls.USERS_WRITE,
             cls.SETTINGS_READ, cls.SETTINGS_WRITE,
             cls.AUDIT_READ,
+            cls.SIEM_WRITE, cls.LOGS_WRITE,
         ]
 
     @classmethod

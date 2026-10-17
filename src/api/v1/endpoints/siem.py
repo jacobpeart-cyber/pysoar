@@ -221,16 +221,27 @@ async def _resolve_api_key(api_key: str, db: AsyncSession) -> Optional[str]:
             if verify_password(stripped, candidate.key_hash):
                 if candidate.is_expired:
                     return None
-                # Permissions check: allow if the key carries
-                # "siem:write" / "logs:write" / "*" / empty (full).
+                # Permissions check: the key must carry "siem:write",
+                # "logs:write", "siem:*" or "*". An empty or unreadable
+                # permission list grants nothing (it used to mean full access).
                 perms: list[str] = []
                 if candidate.permissions:
                     try:
                         perms = json.loads(candidate.permissions) or []
                     except (json.JSONDecodeError, TypeError):
                         perms = []
-                if perms and not any(
-                    p in ("*", "siem:write", "logs:write", "siem:*") for p in perms
+                if not any(p in ("*", "siem:write", "logs:write", "siem:*") for p in perms):
+                    return None
+                # The key is only as good as its owner: an inactive owner, or one
+                # who no longer holds write on siem (role or custom role read from
+                # the database), cannot ingest through a key minted earlier.
+                from src.identity.roles import user_has_tier
+
+                owner = (await db.execute(select(User).where(User.id == candidate.owner_id))).scalar_one_or_none()
+                if owner is None or not owner.is_active:
+                    return None
+                if owner.organization_id and not await user_has_tier(
+                    db, str(owner.id), str(owner.organization_id), "siem", "write"
                 ):
                     return None
                 # Bump usage_count + last_used_at so the APIKeys page

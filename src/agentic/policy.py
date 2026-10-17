@@ -896,6 +896,13 @@ _MODEL_BY_TARGET_KIND: dict[str, str] = {v: k for k, v in _TARGET_KIND_BY_MODEL.
 
 
 def _user_is_admin(user: Any) -> bool:
+    """Whether the *target* account is protected like an administrator.
+
+    The target's custom role is not loaded here, so any custom-role holder
+    is treated as protected (fail closed: acting on them needs the same
+    approval as acting on a built-in admin)."""
+    if getattr(user, "custom_role_id", None):
+        return True
     role = getattr(user, "role", None)
     role_value = getattr(role, "value", role)
     return str(role_value).lower() == UserRole.ADMIN.value
