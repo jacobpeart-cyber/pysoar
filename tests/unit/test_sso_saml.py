@@ -475,7 +475,7 @@ def _future(minutes: int) -> datetime:
         ({"audience": "https://another-sp.example.com"}, "saml_conditions_failed", "audience"),
         ({"not_on_or_after": _past(10), "confirmation_until": _past(10)}, "saml_conditions_failed", "expired"),
         ({"confirmation_until": _past(10)}, "saml_conditions_failed", "bearer confirmation expired"),
-        ({"not_before": _future(10)}, "saml_conditions_failed", "not valid before"),
+        ({"not_before": _future(24 * 60)}, "saml_conditions_failed", "not valid before"),  # a day out: collection-time values must outlive a long run
         ({"recipient": "https://evil.example.com/acs"}, "saml_conditions_failed", "Recipient"),
         ({"issuer": "https://evil.example.com/metadata"}, "saml_conditions_failed", "Issuer"),
         ({"status": "urn:oasis:names:tc:SAML:2.0:status:Responder"}, "saml_status_failure", "Responder"),
