@@ -144,9 +144,12 @@ jobs:
           fail_ci_if_error: false
 
   build:
-    name: Build Docker Image
+    name: Build Docker Images
     runs-on: ubuntu-latest
     needs: [lint, debt-ratchet, security-scan, test]
+    # Builds the same two images release.yml publishes (backend and frontend),
+    # without pushing, and checks that each one starts. The cache scopes match
+    # release.yml's so a release reuses these layers.
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -154,15 +157,31 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Docker image
+      - name: Build backend image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
+          target: production
           push: false
           tags: pysoar-backend:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          build-args: |
+            PYSOAR_COMMIT=${{ github.sha }}
+          cache-from: type=gha,scope=pysoar-backend
+          cache-to: type=gha,mode=max,scope=pysoar-backend
+          load: true
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: false
+          tags: pysoar-frontend:${{ github.sha }}
+          build-args: |
+            PYSOAR_COMMIT=${{ github.sha }}
+          cache-from: type=gha,scope=pysoar-frontend
+          cache-to: type=gha,mode=max,scope=pysoar-frontend
           load: true
 
       - name: Test Docker image startup (enforcing)
@@ -179,6 +198,37 @@ jobs:
           -e DATABASE_SSL_MODE=disable
           pysoar-backend:${{ github.sha }}
           python -c "from src.main import app; print('App imports successfully')"
+
+      - name: Backend image reports its build identity (enforcing)
+        # VERSION is copied into the image and PYSOAR_COMMIT is baked in from
+        # the build argument; src/core/version.py reads both and GET
+        # /api/v1/health reports them as version and commit.
+        run: >
+          docker run --rm
+          -e DATABASE_URL="sqlite+aiosqlite:///./pysoar.db"
+          -e DATABASE_SSL_MODE=disable
+          pysoar-backend:${{ github.sha }}
+          python -c "from src.core.version import __version__, get_commit;
+          assert __version__ == open('VERSION').read().strip(), __version__;
+          assert get_commit() == '${{ github.sha }}', get_commit();
+          print('version', __version__, 'commit', get_commit())"
+
+      - name: Test frontend image startup (enforcing)
+        # nginx.conf proxies /api to http://api:8000 and nginx refuses to start
+        # when that name does not resolve, so the check maps "api" to loopback
+        # (nothing listens there; only the static bundle is exercised). The
+        # check passes when nginx serves the built index.html.
+        run: |
+          set -euo pipefail
+          docker run -d --name pysoar-frontend-check --add-host api:127.0.0.1 -p 127.0.0.1:8080:80 pysoar-frontend:${{ github.sha }}
+          for i in $(seq 1 15); do
+            if curl -fsS http://127.0.0.1:8080/ -o index.html; then break; fi
+            sleep 1
+          done
+          docker logs pysoar-frontend-check
+          docker rm -f pysoar-frontend-check
+          grep -q '<div id="root">' index.html
+          echo "Frontend image serves index.html"
 
   frontend:
     name: Frontend Build

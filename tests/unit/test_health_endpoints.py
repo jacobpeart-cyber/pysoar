@@ -15,7 +15,7 @@ async def test_public_health_returns_status_only(client):
     resp = await client.get("/api/v1/health")
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert set(body) == {"status"}
+    assert set(body) == {"status", "version", "commit"}
     assert body["status"] in {"healthy", "degraded"}
 
 

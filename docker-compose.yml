@@ -6,9 +6,15 @@ version: '3.8'
 services:
   # Frontend Application
   frontend:
+    # Image name and tag: see docs/releases/RELEASING.md. PYSOAR_IMAGE_TAG
+    # unset means "local": `docker compose build` builds and tags it here.
+    # Set it to a released version (e.g. 0.9.0) to pull that release instead.
+    image: ghcr.io/jacobpeart-cyber/pysoar-frontend:${PYSOAR_IMAGE_TAG:-local}
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        PYSOAR_COMMIT: ${PYSOAR_COMMIT:-unknown}
     container_name: pysoar-frontend
     # No host port: the reverse proxy (nginx service) owns 80 and 443 and
     # reaches this container over the internal network. When this service
@@ -36,10 +42,14 @@ services:
 
   # Main API Application
   api:
+    image: ghcr.io/jacobpeart-cyber/pysoar-backend:${PYSOAR_IMAGE_TAG:-local}
     build:
       context: .
       dockerfile: Dockerfile
       target: production
+      args:
+        # Reported as "commit" by GET /api/v1/health; "unknown" when unset.
+        PYSOAR_COMMIT: ${PYSOAR_COMMIT:-unknown}
     container_name: pysoar-api
     env_file:
       - .env
@@ -83,10 +93,14 @@ services:
 
   # Celery Worker for background tasks
   worker:
+    image: ghcr.io/jacobpeart-cyber/pysoar-backend:${PYSOAR_IMAGE_TAG:-local}
     build:
       context: .
       dockerfile: Dockerfile
       target: production
+      args:
+        # Reported as "commit" by GET /api/v1/health; "unknown" when unset.
+        PYSOAR_COMMIT: ${PYSOAR_COMMIT:-unknown}
     container_name: pysoar-worker
     # --max-memory-per-child=300000 (KB == 300 MB) is deliberately
     # duplicated from `worker_max_memory_per_child` in
@@ -134,10 +148,14 @@ services:
 
   # Celery Beat for scheduled tasks
   scheduler:
+    image: ghcr.io/jacobpeart-cyber/pysoar-backend:${PYSOAR_IMAGE_TAG:-local}
     build:
       context: .
       dockerfile: Dockerfile
       target: production
+      args:
+        # Reported as "commit" by GET /api/v1/health; "unknown" when unset.
+        PYSOAR_COMMIT: ${PYSOAR_COMMIT:-unknown}
     container_name: pysoar-scheduler
     command: celery -A src.workers.celery_app beat --loglevel=info
     env_file:
@@ -163,10 +181,14 @@ services:
 
   # Flower - Celery monitoring
   flower:
+    image: ghcr.io/jacobpeart-cyber/pysoar-backend:${PYSOAR_IMAGE_TAG:-local}
     build:
       context: .
       dockerfile: Dockerfile
       target: production
+      args:
+        # Reported as "commit" by GET /api/v1/health; "unknown" when unset.
+        PYSOAR_COMMIT: ${PYSOAR_COMMIT:-unknown}
     container_name: pysoar-flower
     command: celery -A src.workers.celery_app flower --port=5555
     env_file:

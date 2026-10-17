@@ -10,12 +10,12 @@ from typing import Any, Dict, Optional, Tuple
 from fastapi import APIRouter
 from sqlalchemy import text
 
-from src import __version__
 from src.api.deps import AdminUser, CurrentUser, DatabaseSession, PlatformSuperUser, RedisClient
 from src.core import metrics as agentic_metrics
 from src.core.config import settings
 from src.core.database import async_session_factory
 from src.core.logging import get_logger
+from src.core.version import __version__, get_commit
 from src.schemas.common import HealthResponse
 from src.schemas.settings import LLMHealthResponse
 
@@ -53,12 +53,16 @@ async def _probe_dependencies() -> tuple[bool, bool]:
 @router.get("/health")
 async def health_check():
     """
-    Health check endpoint for load balancers.
-    Returns minimal status only (no internal details).
+    Health check endpoint for load balancers and deploy verification.
+
+    Returns the status plus the build identity (``version`` from the VERSION
+    file, ``commit`` from the image's PYSOAR_COMMIT or ``unknown``), so an
+    operator can confirm which release is serving. No dependency details:
+    those are on the admin-only ``/health/detailed``.
     """
     db_ok, redis_ok = await _probe_dependencies()
     status = "healthy" if (db_ok and redis_ok) else "degraded"
-    return {"status": status}
+    return {"status": status, "version": __version__, "commit": get_commit()}
 
 
 @router.get("/health/detailed", response_model=HealthResponse)
