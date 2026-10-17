@@ -24,3 +24,20 @@ def test_default_or_guessable_first_admin_password_fails_the_production_check(pa
 def test_a_random_first_admin_password_passes() -> None:
     s = Settings(_env_file=None, app_env="production", database_ssl_mode="disable", first_admin_password="Xb7-Rq2-Lm9-Wz4-Tc8", **STRONG)
     assert s.validate_production_secrets() == []
+
+
+@pytest.mark.parametrize("email", ["admin@pysoar.local", "admin@soc.test", "root@localhost", "not-an-address"])
+def test_an_admin_email_the_sign_in_form_refuses_fails_the_production_check(email: str) -> None:
+    s = Settings(_env_file=None, app_env="production", database_ssl_mode="disable",
+                 first_admin_password="Xb7-Rq2-Lm9-Wz4-Tc8", first_admin_email=email, **STRONG)
+    warnings = s.validate_production_secrets()
+    assert any("first_admin_email is not an address the sign-in form accepts" in w for w in warnings), warnings
+
+
+def test_the_default_admin_email_can_sign_in() -> None:
+    from pydantic import EmailStr, TypeAdapter
+
+    s = Settings(_env_file=None, app_env="production", database_ssl_mode="disable",
+                 first_admin_password="Xb7-Rq2-Lm9-Wz4-Tc8", **STRONG)
+    TypeAdapter(EmailStr).validate_python(s.first_admin_email)
+    assert s.validate_production_secrets() == []

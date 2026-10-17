@@ -157,6 +157,15 @@ PRODUCTION_RULES = (
         "ENCRYPTION_MASTER_KEY must be set in production environment",
     ),
     ProductionRule(
+        ("first_admin_email",),
+        "The api refuses to start when the address is one the sign-in form "
+        "refuses (email-validator rejects special-use domains such as .local, "
+        ".test and .invalid), because the administrator it creates could never "
+        "sign in. Read only while the `users` table is empty.",
+        "src/core/config.py",
+        "TypeAdapter(EmailStr).validate_python(self.first_admin_email)",
+    ),
+    ProductionRule(
         ("first_admin_password",),
         "The api refuses to start when its Shannon entropy is below 3.0 bits "
         "per character or it contains a weak word (change, default, password, "

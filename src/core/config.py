@@ -77,7 +77,10 @@ class Settings(BaseSettings):
     password_min_length: int = 12
 
     # First Admin User
-    first_admin_email: str = "admin@pysoar.local"
+    # admin@pysoar.local was refused by the sign-in form (email-validator
+    # rejects the special-use .local), so the default administrator could
+    # never sign in; .example is reserved (RFC 2606) and accepted.
+    first_admin_email: str = "admin@pysoar.example"
     first_admin_password: str = "changeme123"
 
     # CORS
@@ -289,6 +292,21 @@ class Settings(BaseSettings):
         if not self.encryption_master_key:
             warnings.append(
                 "encryption_master_key is not set. Data encryption will not be available.",
+            )
+
+        # The sign-in form validates addresses with email-validator (LoginRequest
+        # uses EmailStr); an administrator created with an address it refuses
+        # (special-use domains such as .local, .test, .invalid) can never sign in.
+        try:
+            from pydantic import EmailStr, TypeAdapter
+
+            TypeAdapter(EmailStr).validate_python(self.first_admin_email)
+        except Exception as exc:  # pydantic ValidationError or import problems
+            reason = getattr(exc, "errors", None)
+            detail = reason()[0]["msg"] if callable(reason) else str(exc)
+            warnings.append(
+                f"first_admin_email is not an address the sign-in form accepts ({detail}). "
+                "Set FIRST_ADMIN_EMAIL to the first administrator's real address; it is only read when the users table is empty.",
             )
 
         # Check first_admin_password entropy (the weak-pattern loop above already

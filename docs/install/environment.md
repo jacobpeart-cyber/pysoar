@@ -35,7 +35,7 @@ Read by every backend process (api, worker, scheduler, flower and the migration 
 | `ACCOUNT_LOCKOUT_MAX_ATTEMPTS` | int | `5` | no |  |
 | `ACCOUNT_LOCKOUT_DURATION_SECONDS` | int | `900` | no |  |
 | `PASSWORD_MIN_LENGTH` | int | `12` | no |  |
-| `FIRST_ADMIN_EMAIL` | str | `admin@pysoar.local` | no |  |
+| `FIRST_ADMIN_EMAIL` | str | `admin@pysoar.example` | no | **Production:** The api refuses to start when the address is one the sign-in form refuses (email-validator rejects special-use domains such as .local, .test and .invalid), because the administrator it creates could never sign in. Read only while the `users` table is empty. (`src/core/config.py`) |
 | `FIRST_ADMIN_PASSWORD` | str | `changeme123` | yes | **Production:** The api refuses to start when its Shannon entropy is below 3.0 bits per character or it contains a weak word (change, default, password, secret, admin, test, example, placeholder), so the default `changeme123` is refused. The account is created only when the `users` table is empty, and must change its password at first login. (`src/core/config.py`) Secret: initial password of the first administrator. |
 | `CORS_ORIGINS` | list[str] (JSON) | `["http://localhost:3000","http://localhost:8000"]` | no | A JSON list, or a comma-separated string. **Production:** Origins containing `localhost` or `127.0.0.1` are dropped. (`src/main.py`) |
 | `OT_DISCOVERY_ALLOWED_CIDRS` | list[str] (JSON) | `[]` | no | A JSON list, or a comma-separated string; empty means `[]`. |
