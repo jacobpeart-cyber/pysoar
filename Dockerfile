@@ -26,10 +26,29 @@ FROM python:3.11-slim AS production
 
 WORKDIR /app
 
-# Install runtime dependencies only
+# Install runtime dependencies only.
+# postgresql-client-15 gives the api pg_dump for POST /api/v1/backup/create.
+# It must not be older than the server (the bundled postgres service is
+# postgres:15), and its major version should match the server's so the dump
+# reloads with psql there (pg_dump 17 writes settings a 15 server rejects).
+# The Debian release under python:3.11-slim ships only its own major version,
+# so it comes from the PostgreSQL project's apt repository; the signing key's
+# fingerprint is checked before the repository is trusted.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     curl \
+    ca-certificates \
+    gpg \
+    && install -d /usr/share/postgresql-common/pgdg \
+    && curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+       https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    && gpg --show-keys --with-colons /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+       | grep -qx "fpr:::::::::B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8:" \
+    && . /etc/os-release \
+    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+       > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update && apt-get install -y --no-install-recommends postgresql-client-15 \
+    && apt-get purge -y --auto-remove gpg \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -43,8 +62,9 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Copy application code
 COPY --chown=pysoar:pysoar . .
 
-# Create necessary directories
-RUN mkdir -p /app/logs /app/uploads /app/tmp && \
+# Create necessary directories (/app/backups: BACKUP_DIR of the backup routes;
+# docker-compose.yml mounts ./backups over it)
+RUN mkdir -p /app/logs /app/uploads /app/tmp /app/backups && \
     chown -R pysoar:pysoar /app
 
 # Switch to non-root user

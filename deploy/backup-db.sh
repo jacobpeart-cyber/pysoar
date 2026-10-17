@@ -11,8 +11,17 @@
 #   daily    keep the newest KEEP_DAILY dumps (default 14)
 #   weekly   keep Sunday dumps for KEEP_WEEKLY weeks (default 8)
 #   monthly  keep 1st-of-month dumps for KEEP_MONTHLY months (default 12)
-#   event    keep pre-* dumps (pre-deploy, pre-migration, ...) for
+#   event    keep pre-* dumps (pre-deploy, pre-migration, ...) and the
+#            pysoar_api_* dumps written by POST /api/v1/backup/create for
 #            KEEP_EVENT_DAYS days (default 90)
+#
+# Sanity checks on the new dump (a failure exits 1 and prunes nothing):
+#   MIN_BYTES             smaller dumps are failures (default 32768; an
+#                         empty schema dumps to about 68 KB)
+#   SHRINK_FLOOR_PERCENT  a dump smaller than this percentage of the newest
+#                         previous daily dump is a failure (default 50); it
+#                         is kept as <name>.sql.gz.suspect for inspection.
+#                         ALLOW_SHRINK=1 accepts it (after a deliberate purge).
 #
 # Usage: backup-db.sh [--dry-run] [--prune-only]
 set -euo pipefail
@@ -23,7 +32,9 @@ KEEP_DAILY="${KEEP_DAILY:-14}"
 KEEP_WEEKLY="${KEEP_WEEKLY:-8}"
 KEEP_MONTHLY="${KEEP_MONTHLY:-12}"
 KEEP_EVENT_DAYS="${KEEP_EVENT_DAYS:-90}"
-MIN_BYTES="${MIN_BYTES:-1048576}"   # a dump smaller than 1 MiB is treated as a failure
+MIN_BYTES="${MIN_BYTES:-32768}"     # a dump smaller than 32 KiB is treated as a failure
+SHRINK_FLOOR_PERCENT="${SHRINK_FLOOR_PERCENT:-50}"
+ALLOW_SHRINK="${ALLOW_SHRINK:-0}"
 
 DRY_RUN=0
 PRUNE_ONLY=0
@@ -61,6 +72,20 @@ if [ "$PRUNE_ONLY" = 0 ]; then
             log "ERROR: dump is only ${size} bytes; keeping the previous backup, removing the partial file"
             rm -f "$tmp"
             exit 1
+        fi
+        # A dump that suddenly shrinks (a wrong database, a truncated table,
+        # a half-finished purge) must not quietly become the newest backup
+        # and start pushing good ones out of retention.
+        # Globs expand in sorted order, so the last match is the newest date.
+        prev=""
+        for f in "$DIR"/pysoar_[0-9]*.sql.gz; do [ -e "$f" ] && prev="$f"; done
+        if [ -n "$prev" ] && [ "$ALLOW_SHRINK" != 1 ]; then
+            prev_size=$(stat -c %s "$prev")
+            if [ $((size * 100)) -lt $((prev_size * SHRINK_FLOOR_PERCENT)) ]; then
+                mv -f "$tmp" "${out}.suspect"
+                log "ERROR: dump is ${size} bytes, under ${SHRINK_FLOOR_PERCENT}% of $(basename "$prev") (${prev_size} bytes); kept as ${out}.suspect, nothing pruned. If the shrink is expected, rerun with ALLOW_SHRINK=1"
+                exit 1
+            fi
         fi
         mv -f "$tmp" "$out"
         log "ok: $(du -h "$out" | cut -f1)"
@@ -101,8 +126,9 @@ for f in "${dailies[@]}"; do
     fi
 done
 
-# Event dumps: pre-<reason>-YYYYMMDD-HHMMSS.sql.gz
-for f in "$DIR"/pre-*.sql.gz; do
+# Event dumps: pre-<reason>-YYYYMMDD-HHMMSS.sql.gz, and the in-app dumps
+# pysoar_api_YYYYMMDD-HHMMSS.sql.gz (POST /api/v1/backup/create).
+for f in "$DIR"/pre-*.sql.gz "$DIR"/pysoar_api_*.sql.gz; do
     [ -e "$f" ] || continue
     name=$(basename "$f")
     if [[ "$name" =~ ([0-9]{8})-[0-9]{6}\.sql\.gz$ ]]; then

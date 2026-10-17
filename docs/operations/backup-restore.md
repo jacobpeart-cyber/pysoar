@@ -42,9 +42,10 @@ deploy/backup-db.sh [--dry-run] [--prune-only]
 ```
 
 Writes `backups/pysoar_YYYYMMDD.sql.gz` (mode 600, directory mode 700),
-checks it with `gzip -t`, refuses a dump smaller than `MIN_BYTES`, then
-prunes. One file per day: a second run on the same day replaces that day's
-file. Install it for root:
+checks it with `gzip -t`, refuses a dump smaller than `MIN_BYTES` or one
+that shrank below `SHRINK_FLOOR_PERCENT` of the newest previous daily dump,
+then prunes. One file per day: a second run on the same day replaces that
+day's file. Install it for root:
 
 ```sh
 0 2 * * * /opt/pysoar/deploy/backup-db.sh >> /var/log/pysoar-backup.log 2>&1
@@ -57,18 +58,26 @@ file. Install it for root:
 | `KEEP_DAILY` | `14` | newest daily dumps kept |
 | `KEEP_WEEKLY` | `8` | weeks of Sunday dumps kept |
 | `KEEP_MONTHLY` | `12` | months of 1st-of-month dumps kept |
-| `KEEP_EVENT_DAYS` | `90` | days `pre-*-YYYYMMDD-HHMMSS.sql.gz` dumps are kept |
-| `MIN_BYTES` | `1048576` | smaller dumps are treated as failures |
+| `KEEP_EVENT_DAYS` | `90` | days `pre-*-YYYYMMDD-HHMMSS.sql.gz` and `pysoar_api_YYYYMMDD-HHMMSS.sql.gz` dumps are kept |
+| `MIN_BYTES` | `32768` | smaller dumps are failures: the partial file is removed, exit 1, nothing pruned |
+| `SHRINK_FLOOR_PERCENT` | `50` | a dump smaller than this percentage of the newest previous `pysoar_YYYYMMDD.sql.gz` is a failure: kept as `pysoar_YYYYMMDD.sql.gz.suspect`, exit 1, nothing pruned |
+| `ALLOW_SHRINK` | `0` | `1` accepts a dump the shrink check would refuse |
 
-A new install's dump is smaller than the 1 MiB default (68 KB for an empty
-schema in the drill below), so set `MIN_BYTES` lower in the crontab line until
-the database has grown, or every run fails.
+An empty schema dumps to about 68 KB, so the `MIN_BYTES` default passes from
+the first night. The shrink check catches a dump of the wrong or a damaged
+database before it becomes the newest backup and starts pushing good ones
+out of retention. When the database really did shrink (a purge, a retention
+sweep), inspect the `.suspect` file and run once with `ALLOW_SHRINK=1`; the
+next night compares against that dump. `.suspect` files do not match the
+retention patterns: delete them by hand.
 
 `--dry-run` prints what pruning would delete without dumping or deleting;
 `--prune-only` skips the dump.
 
-Ad-hoc dumps before risky work (an upgrade, a restore) use the event name
-pattern so retention keeps them:
+Dumps written by `POST /api/v1/backup/create` (below) are named
+`pysoar_api_YYYYMMDD-HHMMSS.sql.gz` and are kept like event dumps. Ad-hoc
+dumps before risky work (an upgrade, a restore) use the event name pattern
+so retention keeps them:
 
 ```sh
 (umask 077; docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' \
@@ -182,18 +191,73 @@ Not covered by the drill: the full `docker-compose.yml` (nginx, frontend,
 flower, the fixed container names), a Linux host, dumps of a populated
 production-size database, and restores across major PostgreSQL versions.
 
+### Drill record: 2026-10-17, `MIN_BYTES` and the shrink check
+
+Same machine. `deploy/backup-db.sh`, unmodified, with `PYSOAR_DIR` pointing
+at a throwaway compose project; every dump was a real `pg_dump`:
+
+1. In the install drill of [compose.md](../install/compose.md#verification-record)
+   (210-table empty schema, one user): default `MIN_BYTES`: exit 0,
+   `pysoar_20261017.sql.gz` 68 KB. `MIN_BYTES=10000000`: exit 1, partial file
+   removed, the earlier dump kept. A `pysoar_api_20260101-000000.sql.gz`
+   (copied from a real in-app dump, renamed older than `KEEP_EVENT_DAYS`) was
+   deleted by `--prune-only`; the current in-app dump was kept.
+2. Shrink check, run twice (in the install drill, and again after the
+   newest-previous-dump lookup was rewritten, in a project with only the
+   `postgres` service): a table of 60,000 random rows was added and the dump
+   (2.4 MB) renamed to yesterday's date, the table dropped, and the script
+   run again: the 44 to 68 KB dump was refused (exit 1, kept as
+   `pysoar_20261017.sql.gz.suspect`, nothing pruned). With `ALLOW_SHRINK=1`
+   it was accepted (exit 0), and a same-day rerun compared against that dump
+   and passed.
+
 ## The application's `/api/v1/backup` routes
 
-The application's own backup routes (`POST /api/v1/backup/create`,
-`POST /api/v1/backup/restore`, platform superusers only) call `pg_dump` and
-`psql` inside the api container. The backend image does not contain them
-(it installs `libpq5` only), so `create` falls back to a metadata-only file
-whose note says so, and `restore` cannot restore a database. Use the scripts
-above.
+Platform superusers only (`is_superuser`; a tenant admin gets 403
+`platform_superuser_required`). No page of the UI calls them
+([api-only-routes.md](../api/api-only-routes.md)). The scripts above remain
+the supported path: they need no running api and they restore.
+
+- `POST /api/v1/backup/create` runs `pg_dump` inside the api container
+  against `DATABASE_URL` (password through `PGPASSWORD`, `DATABASE_SSL_MODE`
+  as `PGSSLMODE`) and writes a gzip plain-SQL dump
+  `pysoar_api_YYYYMMDD-HHMMSS.sql.gz` (UTC) into `BACKUP_DIR` (`/app/backups`),
+  mode 600, renamed into place only when `pg_dump` exited 0. It answers with
+  the file name and size, and records an audit row (`backup_create`). The
+  backend image carries `postgresql-client-15` (15.19 when this was
+  written) from the PostgreSQL project's apt repository, the same major
+  version as the bundled `postgres:15` server; `pg_dump` 17, the version
+  Debian ships, writes `SET transaction_timeout`, a setting PostgreSQL 15
+  does not have. `docker-compose.yml` mounts the host's `./backups` there,
+  the directory `backup-db.sh` uses, so the dump survives a container
+  recreate and `restore-db.sh` can restore it; the directory must belong to
+  uid 999 (the image's `pysoar` user), which `deploy/start-production.sh`
+  sets up when run as root. Without `pg_dump`, or with a database that is not
+  PostgreSQL, it answers 503 and writes nothing; a failed `pg_dump` answers
+  500 with its error and leaves no file.
+- `POST /api/v1/backup/restore` always answers 409
+  `restore_not_supported_in_app` and starts nothing. Replacing the live
+  database from inside the api would mean ending the api's and the workers'
+  own connections and swapping the database under them; `restore-db.sh` does
+  it from the host with the services stopped and the previous database kept.
+- `GET /api/v1/backup/status` (tenant admins may read it) lists the `.sql.gz`
+  and `.sql` files directly in `BACKUP_DIR` with sizes, and whether `pg_dump`
+  is installed. `DELETE /api/v1/backup/backups/{filename}` deletes one file
+  directly in `BACKUP_DIR`; a name with a path separator or a dot segment is
+  refused with 400.
+
+Drilled on 2026-10-17 in the install drill of
+[compose.md](../install/compose.md#verification-record): `create` wrote a
+67 KB dump into the host's `backups/`, `restore-db.sh --verify-only` restored
+it, and `restore` answered 409. The uid-999 ownership on a Linux host was not
+exercised.
 
 ## Kubernetes
 
 `backup-db.sh` and `restore-db.sh` drive docker compose and do not apply.
+The chart mounts no volume at `/app/backups` and runs the api with a
+read-only root filesystem, so `POST /api/v1/backup/create` has nowhere to
+write there (not exercised).
 Use the managed database's snapshots and point-in-time recovery, and back up
 the chart's data claim (`<release>-data`) with your storage provider's
 tooling. The same checks apply after a restore: one row in `alembic_version`

@@ -35,11 +35,11 @@ sudo usermod -aG docker $USER
 sudo systemctl enable docker
 sudo systemctl start docker
 
-# Install Docker Compose standalone (v2)
-echo "[3/6] Installing Docker Compose..."
-sudo curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-$(uname -m)" \
-  -o /usr/local/bin/docker-compose
-sudo chmod +x /usr/local/bin/docker-compose
+# Docker Compose: the docker-compose-plugin package above provides
+# `docker compose`, which every PySOAR script and guide uses. The standalone
+# /usr/local/bin/docker-compose binary is not installed.
+echo "[3/6] Checking the Docker Compose plugin..."
+sudo docker compose version
 
 # Install Git
 echo "[4/6] Installing Git..."
@@ -48,12 +48,13 @@ sudo apt-get install -y -qq git
 # Clone PySOAR
 echo "[5/6] Cloning PySOAR repository..."
 cd /opt
-sudo git clone https://github.com/$(git config --global user.name 2>/dev/null || echo "YOUR_GITHUB_USERNAME")/pysoar.git || {
+sudo git clone https://github.com/jacobpeart-cyber/pysoar.git || {
   echo ""
-  echo "  NOTE: Automatic clone failed (no GitHub URL configured)."
-  echo "  You will need to upload the code manually - see deploy instructions."
+  echo "  NOTE: the clone failed (network, or /opt/pysoar already exists)."
+  echo "  Clone or upload the code to /opt/pysoar by hand."
   echo ""
 }
+sudo chown -R "$USER" /opt/pysoar 2>/dev/null || true
 
 # Configure firewall (Oracle Linux requires both ufw AND iptables rules)
 echo "[6/6] Configuring firewall..."
@@ -74,11 +75,12 @@ echo "=========================================="
 echo "  Setup complete!"
 echo "=========================================="
 echo ""
-echo "Next steps:"
-echo "  1. Upload your PySOAR code to /opt/pysoar"
-echo "     (or fix the GitHub clone above)"
-echo "  2. Run: bash /opt/pysoar/deploy/configure-env.sh"
-echo "  3. Run: bash /opt/pysoar/deploy/start-production.sh"
+echo "Next steps (docs/install/compose.md):"
+echo "  1. Check out a release tag in /opt/pysoar, or stay on main"
+echo "  2. Run: bash /opt/pysoar/deploy/configure-env.sh https://YOUR-HOST-NAME ADMIN-EMAIL"
+echo "  3. Put the TLS certificate in /opt/pysoar/nginx/ssl and the web UI files in"
+echo "     /opt/pysoar/frontend/dist (compose.md, steps 4 and 5)"
+echo "  4. Run: bash /opt/pysoar/deploy/start-production.sh"
 echo ""
 echo "  IMPORTANT: Log out and back in for docker group to take effect."
 echo ""

@@ -144,6 +144,30 @@ kept as `pysoar_pre_restore_<stamp>` (see
 
 Read these together with the release notes. Each one is pinned by a test.
 
+### Upgrading past `67e0c3c`: in-app backups and the backup script
+
+- **Rebuild or pull the backend image.** It now carries `pg_dump`
+  (`postgresql-client-15`, from apt.postgresql.org, so a build needs network
+  access to that host). `POST /api/v1/backup/create` writes a real dump
+  into `/app/backups`, which `docker-compose.yml` now mounts from the host's
+  `./backups`; with an old image it answers 503 and writes nothing (it no
+  longer writes a metadata-only JSON file). Pinned by
+  `tests/unit/test_backup_routes.py`.
+- **`./backups` must belong to uid 999** (the image's `pysoar` user) for that
+  route: `sudo chown 999 /opt/pysoar/backups`. root's nightly
+  `deploy/backup-db.sh` keeps working either way. Until then the route
+  answers 500 and says the directory is not writable.
+- **`POST /api/v1/backup/restore` always answers 409**
+  (`restore_not_supported_in_app`); use `deploy/restore-db.sh`.
+  `GET /api/v1/backup/status` no longer returns `auto_backup_enabled` or
+  `retention_days` (they were constants, not configuration) and now returns
+  `pg_dump_available`. Pinned by `tests/unit/test_backup_routes.py`.
+- **`deploy/backup-db.sh`**: `MIN_BYTES` defaults to 32768 instead of 1 MiB,
+  and a dump under `SHRINK_FLOOR_PERCENT` (50) of the newest previous daily
+  dump now fails the run (kept as `.suspect`, nothing pruned). After a
+  deliberate large purge, run it once with `ALLOW_SHRINK=1`. Drilled (see
+  [backup-restore.md](backup-restore.md)), not covered by an automated test.
+
 ### Upgrading past `8d844c0` (0.9.0)
 
 - **`FIRST_ADMIN_PASSWORD` must be set to a random value in production**, even

@@ -70,6 +70,10 @@ services:
       # and other compliance artifacts. Must survive container rebuilds
       # so re-scan hash-verification works.
       - pysoar-data:/app/data
+      # BACKUP_DIR of POST /api/v1/backup/create: the same host directory
+      # deploy/backup-db.sh writes to. It must belong to the image's pysoar
+      # user (uid 999); deploy/start-production.sh creates it.
+      - ./backups:/app/backups
     depends_on:
       postgres:
         condition: service_healthy

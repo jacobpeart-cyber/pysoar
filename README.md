@@ -170,30 +170,38 @@ Every module fires events into a central `AutomationService` pipeline so action 
 
 ## Quick Start
 
+The install procedure is [docs/install/compose.md](docs/install/compose.md)
+(docker compose) or [docs/install/kubernetes.md](docs/install/kubernetes.md)
+(Helm). The short path for docker compose on a Linux host, from a checkout in
+`/opt/pysoar`:
+
 ```bash
-# Clone and start
-git clone https://github.com/jacobpeart-cyber/pysoar.git
-cd pysoar
-cp .env.example .env
+git clone https://github.com/jacobpeart-cyber/pysoar.git /opt/pysoar
+cd /opt/pysoar
 
-# Build the schema before the api first starts (on an empty database
-# `alembic upgrade head` creates it from the models and stamps head)
-docker compose up -d postgres redis
-docker compose run --rm --no-deps api alembic upgrade head
+# Write .env (mode 600) with fresh random secrets for the bundled postgres and
+# redis services. It prints no secret, only where to read the admin password.
+bash deploy/configure-env.sh https://soar.example.com you@example.org
 
-# Start all services
-docker compose up -d
+# TLS certificate in nginx/ssl/ and the web UI files in frontend/dist/:
+# compose.md, steps 4 and 5.
 
-# After pulling a new version: apply its migrations, then restart
-docker exec pysoar-api alembic upgrade head
-
-# Access the platform
-open http://localhost
+# Build the images (or pull them when PYSOAR_IMAGE_TAG is set in .env), check
+# .env against the production checks, start postgres and redis, run
+# `alembic upgrade head`, start everything, wait for a healthy /api/v1/health.
+bash deploy/start-production.sh
 ```
 
+The same steps by hand, and what each `.env` key means, are in compose.md.
+Do not start from `.env.example`: it is a development file (SQLite, Redis on
+localhost) and does not work inside the compose network. Upgrades, which
+apply the migrations before the new code serves requests:
+[docs/operations/upgrade.md](docs/operations/upgrade.md).
+
 **First login:** the API creates the first administrator on start from
-`FIRST_ADMIN_EMAIL` and `FIRST_ADMIN_PASSWORD` in your `.env`. There are no
-default credentials and no demo data; the repository ships nothing synthetic.
+`FIRST_ADMIN_EMAIL` and `FIRST_ADMIN_PASSWORD` in your `.env`, and the account
+must change its password at first sign-in. There are no default credentials
+and no demo data; the repository ships nothing synthetic.
 
 ---
 
@@ -216,21 +224,20 @@ The agent will exchange its enrollment token for a long-lived agent token, send 
 
 ## Production Deployment
 
+Production is the same docker compose install as the Quick Start
+([docs/install/compose.md](docs/install/compose.md), `docker-compose.yml` at
+the repository root), followed by the nightly backup and the restore drill
+([docs/operations/backup-restore.md](docs/operations/backup-restore.md)).
+Kubernetes: [docs/install/kubernetes.md](docs/install/kubernetes.md) (the chart
+is render-validated, not yet applied to a cluster). Every setting is listed in
+[docs/install/environment.md](docs/install/environment.md).
+
 ```bash
-# Configure production environment
-cp .env.production .env
-# Edit .env with real secrets, database URL, domain
-
-# Deploy with production config
-docker compose -f docker-compose.prod.yml up -d
-
-# Verify health
-curl https://your-domain/api/v1/health
+docker compose exec api curl -fsS http://localhost:8000/api/v1/health
+curl -fsS https://soar.example.com/api/v1/health
 ```
 
 All 47 sidebar pages are backed by real endpoints with tenant-scoped data. No placeholder or theater data. No hardcoded stats. No silent 500s.
-
-See `.env.example` for all configuration options.
 
 ---
 

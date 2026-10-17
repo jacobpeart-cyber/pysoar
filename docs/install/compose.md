@@ -25,8 +25,8 @@ Every variable named below is in the generated
 | `agent` | `python:3.11-alpine` | The simulation endpoint agent. It waits until the api has written a token to `/app/data/agent/`, which the api does only when `SIM_AGENT_SEED_ENABLED` is true or `APP_ENV` is not `production`. With `APP_ENV=production` and the variable unset it keeps waiting and does nothing. |
 
 The api, worker and scheduler bind-mount `./src` (and the api also
-`./alembic`) from the host, and `frontend` and `nginx` bind-mount
-`./frontend/dist`. The code that runs is whatever the host checkout holds, so
+`./alembic`, and `./backups` at `/app/backups` for the in-app backup route)
+from the host, and `frontend` and `nginx` bind-mount `./frontend/dist`. The code that runs is whatever the host checkout holds, so
 the checkout and the image tag must match (see
 [RELEASING.md](../releases/RELEASING.md#docker-compose-and-image-tags)).
 
@@ -38,7 +38,8 @@ it to operators).
 
 - Linux host with Docker Engine and the compose plugin (`docker compose`).
   `deploy/server-setup.sh` installs them on Ubuntu 22.04.
-- Git, `openssl`, `python3` (used below only to generate random values).
+- Git, `openssl` (and `python3` if you write `.env` by hand; both are used
+  only to generate random values).
 - A DNS name for the host, and a certificate for it (step 4).
 
 ## 1. Get the code
@@ -51,6 +52,54 @@ git checkout v0.9.0      # a release tag; or stay on main to build from source
 
 `git tag` lists the releases. If none is listed, no release has been cut yet:
 stay on `main` and build the images yourself (step 3).
+
+## The short path: two scripts
+
+Steps 2, 3, 6 and 7 are scripted. From the checkout, after step 1:
+
+```sh
+bash deploy/configure-env.sh https://soar.example.com you@example.org
+# step 4 (TLS certificate) and step 5 (web UI files), then:
+bash deploy/start-production.sh
+```
+
+`deploy/configure-env.sh <public URL> <admin email>` writes `.env` with exactly
+the keys of step 2: fresh random values from `openssl rand` (drawn again in
+the rare case one contains a word the production check refuses),
+`DATABASE_SSL_MODE=disable` and `DATABASE_URL` with the `pysoar` password
+the bundled postgres service is created with (change it afterwards, below),
+the Redis password in all three Redis URLs, `PYSOAR_PUBLIC_URL` from the
+first argument and `CORS_ORIGINS=[]`. The file is mode 600. It refuses an
+admin address on a special-use domain (`.local`, `.test`, `.invalid`, ...),
+which the sign-in form would reject. It refuses to overwrite an existing
+`.env`; with `--force` it replaces it and keeps the old one as
+`.env.replaced-<stamp>` (mode 600). It does not modify `docker-compose.yml`
+and prints no secret: it prints the path and the command that reads
+`FIRST_ADMIN_PASSWORD` from the file. `PYSOAR_DIR` (default `/opt/pysoar`)
+names the compose directory.
+
+`deploy/start-production.sh [--no-build] [--systemd]` then, in order:
+refuses to continue without `.env`, the compose plugin, the certificate in
+`nginx/ssl/` and `frontend/dist/index.html`; creates `backups/` (mode 700);
+pulls the release images when `PYSOAR_IMAGE_TAG` is set in `.env`, otherwise
+builds them from the checkout (`--no-build` skips both); runs the api's
+production checks and the sign-in form's check of `FIRST_ADMIN_EMAIL` in a
+throwaway api container and stops, with nothing started, if any fails
+(field names and messages are printed, never values); then runs step 6
+(`up -d postgres redis`, `alembic upgrade head`, `up -d`, restart of
+`frontend` and `nginx`) and waits up to `HEALTH_TIMEOUT` seconds (180) for
+`/api/v1/health` to say `healthy`. `--systemd` also installs
+`/etc/systemd/system/pysoar.service`, which runs `docker compose up -d` in
+the compose directory at boot. Running it again on an installed system
+applies only missing migrations; for upgrades use
+[upgrade.md](../operations/upgrade.md), which backs up first.
+
+`backups/` must belong to uid 999, the `pysoar` user of the backend image,
+for `POST /api/v1/backup/create` to write there; run as root, the script
+chowns it, otherwise it prints the `chown` command. root (the nightly
+`deploy/backup-db.sh`) writes it either way.
+
+The steps below are the same procedure by hand.
 
 ## 2. Write `.env`
 
@@ -124,10 +173,7 @@ words such as `change`, `secret` or `password`; `ENCRYPTION_MASTER_KEY` must
 be set to base64 of 32 bytes; `FIRST_ADMIN_PASSWORD` must pass the same
 entropy and weak-word checks, so the code default `changeme123` is refused.
 
-`deploy/configure-env.sh` writes a `.env` too, but it is not part of this
-procedure: it sets `APP_ENV=production` without `DATABASE_SSL_MODE`,
-`ENCRYPTION_MASTER_KEY` or `REDIS_PASSWORD`, so the api it configures does not
-start, and it edits `docker-compose.yml` in place.
+`deploy/configure-env.sh` (above) writes this same file.
 
 ## 3. Get the images
 
@@ -264,3 +310,44 @@ the recreated api reported `healthy` and queried the database. nginx,
 frontend, TLS, Grafana and the public URL were not part of that run, because
 the full file uses fixed container names that were already in use on that
 machine.
+
+Later the same day the two scripts were run, unmodified, from `deploy/` (Git
+Bash, `MSYS_NO_PATHCONV=1`, `COMPOSE_PROJECT_NAME=h1drill`, `PYSOAR_DIR`
+pointing at a throwaway directory) against a compose file with the same
+`postgres`, `redis`, `api`, `worker` and `scheduler` services, a backend image
+built from the working tree at 67e0c3c with this change's Dockerfile
+(`postgresql-client-15`), and `src/` and `alembic/` exported from 67e0c3c plus
+the new `src/api/v1/endpoints/backup.py` bind-mounted over the image's copy:
+
+1. `configure-env.sh https://soar.drill.example.org ops@example.org` wrote
+   `.env` with every key of step 2 and printed no secret. Without arguments,
+   with an existing `.env` and with an `.invalid` address it exited non-zero
+   and wrote nothing. Mode 600, `--force` (old file kept as
+   `.env.replaced-<stamp>`, mode 600) and the refusals of a `ftp://` URL and of
+   a malformed address were checked by running the script in a Linux container
+   (`alpine:3.20` with bash and openssl), since NTFS does not show POSIX modes.
+2. `start-production.sh` with `DATABASE_SSL_MODE=prefer`, with
+   `FIRST_ADMIN_PASSWORD=changeme123` and with an `.invalid` admin address (an
+   earlier run had installed one, which then could not sign in; that is why
+   both scripts now check it): each stopped at the production check, exit 1,
+   with no container started.
+3. `start-production.sh` with the written `.env`: exit 0; `alembic upgrade
+   head` built 210 tables and stamped `038`; the api ran with
+   `APP_ENV=production` and reported `healthy`; the first administrator
+   existed with `is_superuser` and `force_password_change` set. Signing in
+   returned 403 `Password change required` with a limited token, the limited
+   token was refused by `POST /api/v1/backup/create`, and after the change the
+   new password signed in.
+4. As that administrator, `POST /api/v1/backup/create` wrote
+   `pysoar_api_<stamp>.sql.gz` (67 KB, `pg_dump` 15.19) into the host's
+   `backups/`; `deploy/restore-db.sh --verify-only` restored it (revision
+   `038`, 211 tables, `users` 1). `POST /api/v1/backup/restore` answered 409.
+
+Not run: `--systemd` (no systemd on that machine), the image pull path,
+nginx, frontend, flower, TLS, Grafana, and the uid-999 ownership of
+`backups/` on a Linux host (Docker Desktop bind mounts do not enforce it; the
+script printed its `chown` note). The worker and scheduler there used the
+image's default health check, which probes port 8000 and so reports them
+unhealthy; `docker-compose.yml` gives them their own checks. The full
+`docker-compose.yml` was not used because its fixed container names were in
+use on that machine.

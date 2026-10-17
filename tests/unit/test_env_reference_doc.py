@@ -138,6 +138,8 @@ SCRIPT_VARIABLES = {
     "KEEP_MONTHLY": "deploy/backup-db.sh",
     "KEEP_EVENT_DAYS": "deploy/backup-db.sh",
     "MIN_BYTES": "deploy/backup-db.sh",
+    "SHRINK_FLOOR_PERCENT": "deploy/backup-db.sh",
+    "ALLOW_SHRINK": "deploy/backup-db.sh",
     "PYSOAR_OWNER": "deploy/certbot-deploy-hook.sh",
     "RENEWED_LINEAGE": "deploy/certbot-deploy-hook.sh",
     "POSTGRES_USER": "docker-compose.yml",

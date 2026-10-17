@@ -5,18 +5,41 @@ restoring and deleting them is limited to platform superusers
 (``PlatformSuperUser``: ``is_superuser``; the tenant ``admin`` role is not
 enough). Before 2026-10-08 any tenant admin could dump or replace every
 tenant's data.
+
+The supported backup and restore path for a compose install is
+``deploy/backup-db.sh`` and ``deploy/restore-db.sh``
+(docs/operations/backup-restore.md). These routes:
+
+* ``POST /backup/create`` runs ``pg_dump`` (postgresql-client-15 in the
+  backend image) against ``DATABASE_URL`` and writes a gzip plain-SQL dump
+  ``pysoar_api_YYYYMMDD-HHMMSS.sql.gz`` (UTC) into ``BACKUP_DIR``, which
+  docker-compose.yml mounts from the host's ``./backups``. Without
+  ``pg_dump`` it answers 503 and writes nothing.
+* ``POST /backup/restore`` always refuses with 409: replacing the live
+  database from inside the api would mean ending the api's and the
+  workers' own connections and swapping the database under them.
+  ``deploy/restore-db.sh`` does that from the host with the services stopped.
+* ``GET /backup/status`` and ``DELETE /backup/backups/{filename}`` only ever
+  see files directly inside ``BACKUP_DIR``.
 """
 
+import gzip
 import os
+import shutil
 import subprocess
-import uuid
+import tempfile
+import threading
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query, Body
-from src.api.deps import AdminUser, PlatformSuperUser
+from fastapi import APIRouter, HTTPException
+from fastapi.concurrency import run_in_threadpool
+from sqlalchemy.engine import make_url
+
+from src.api.deps import AdminUser, DatabaseSession, PlatformSuperUser
 from src.core.config import settings
 from src.core.logging import get_logger
+from src.models.audit import AuditLog
 
 logger = get_logger(__name__)
 
@@ -24,14 +47,29 @@ router = APIRouter(prefix="/backup", tags=["backup-restore"])
 
 BACKUP_DIR = os.environ.get("BACKUP_DIR", "/app/backups")
 
+# pg_dump of the whole database; a stuck dump is killed after this long.
+PG_DUMP_TIMEOUT_SECONDS = 600
+
+RESTORE_REFUSAL = (
+    "Restoring from inside the running api is not supported: it would have to end "
+    "its own and the workers' database connections and swap the database under "
+    "them. Restore from the host with deploy/restore-db.sh, which checks the dump "
+    "in a scratch database, stops the services and keeps the previous database "
+    "(docs/operations/backup-restore.md)."
+)
+
+
+class BackupUnavailableError(Exception):
+    """pg_dump cannot run here; nothing was written."""
+
 
 def _safe_backup_path(filename: str) -> str:
     """Resolve a backup filename to an absolute path strictly inside
     BACKUP_DIR, rejecting path traversal (e.g. '../../etc/passwd').
 
     Backups are flat files in BACKUP_DIR, so any directory separator or
-    relative component is invalid — this prevents a caller from reading,
-    restoring from, or deleting arbitrary files on the host.
+    relative component is invalid — this prevents a caller from reading or
+    deleting arbitrary files on the host.
     """
     if not filename or "/" in filename or "\\" in filename or filename in (".", ".."):
         raise HTTPException(status_code=400, detail="Invalid backup filename")
@@ -42,212 +80,209 @@ def _safe_backup_path(filename: str) -> str:
     return candidate
 
 
+async def _audit(
+    db, user, action: str, resource_id: Optional[str], description: str, success: bool,
+    error: Optional[str] = None,
+) -> None:
+    """One AuditLog row per backup operation. Best-effort: a failure to
+    record is logged, never turned into a different HTTP answer."""
+    try:
+        db.add(AuditLog(
+            user_id=str(user.id),
+            organization_id=getattr(user, "organization_id", None),
+            action=action,
+            resource_type="database_backup",
+            resource_id=resource_id,
+            description=description,
+            success=success,
+            error_message=error,
+        ))
+        await db.commit()
+    except Exception:
+        logger.error("could not record audit row for %s", action, exc_info=True)
+
+
+def _pg_dump_command(pg_dump: str) -> tuple[list[str], dict[str, str]]:
+    """argv and environment for pg_dump against DATABASE_URL. The password
+    travels in PGPASSWORD, never on the command line."""
+    url = make_url(settings.database_url)
+    if not url.drivername.startswith("postgresql"):
+        raise BackupUnavailableError(
+            f"DATABASE_URL uses {url.drivername}; database dumps need PostgreSQL"
+        )
+    env = os.environ.copy()
+    env["PGPASSWORD"] = url.password or ""
+    # DATABASE_SSL_MODE is applied to the api's own connection
+    # (src/core/database.py); pg_dump gets the same mode.
+    env["PGSSLMODE"] = settings.database_ssl_mode
+    argv = [
+        pg_dump,
+        "--no-password",
+        "-h", url.host or "localhost",
+        "-p", str(url.port or 5432),
+        "-U", url.username or "",
+        "-d", url.database or "",
+    ]
+    return argv, env
+
+
+def _write_dump(argv: list[str], env: dict[str, str], final_path: str) -> int:
+    """Stream pg_dump's plain SQL through gzip into final_path. The file is
+    created owner-only (mode 600) under a temporary name and renamed into
+    place only when pg_dump exited 0. Returns the size in bytes."""
+    part = final_path + ".part"
+    fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with tempfile.TemporaryFile() as err, os.fdopen(fd, "wb") as raw:
+            with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=6) as gz:
+                proc = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=err)
+                timer = threading.Timer(PG_DUMP_TIMEOUT_SECONDS, proc.kill)
+                timer.start()
+                try:
+                    if proc.stdout is None:  # pragma: no cover - stdout=PIPE always sets it
+                        raise RuntimeError("pg_dump produced no output stream")
+                    shutil.copyfileobj(proc.stdout, gz, 1024 * 1024)
+                    returncode = proc.wait()
+                finally:
+                    timer.cancel()
+            if returncode != 0:
+                err.seek(0)
+                stderr = err.read().decode("utf-8", "replace").strip()
+                raise RuntimeError(f"pg_dump exited {returncode}: {stderr[-500:]}")
+        os.replace(part, final_path)
+    except BaseException:
+        try:
+            os.remove(part)
+        except FileNotFoundError:
+            pass
+        raise
+    return os.path.getsize(final_path)
+
+
 @router.get("/status")
-async def get_backup_status(current_user: AdminUser = None):
+async def get_backup_status(current_user: AdminUser):
     """Get backup system status and list available backups.
 
     Read-only, so tenant admins may view it (previously any user could);
     it exposes file names and sizes only, never contents. Every operation
-    that writes, restores or deletes a backup requires a platform superuser.
+    that writes or deletes a backup requires a platform superuser.
     """
     backups = []
 
-    if os.path.exists(BACKUP_DIR):
+    if os.path.isdir(BACKUP_DIR):
         for f in sorted(os.listdir(BACKUP_DIR), reverse=True):
-            if f.endswith(".sql.gz") or f.endswith(".sql"):
-                filepath = os.path.join(BACKUP_DIR, f)
-                stat = os.stat(filepath)
-                backups.append({
-                    "filename": f,
-                    "size_bytes": stat.st_size,
-                    "size_mb": round(stat.st_size / (1024 * 1024), 2),
-                    "created_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
-                })
+            if not (f.endswith(".sql.gz") or f.endswith(".sql")):
+                continue
+            filepath = os.path.join(BACKUP_DIR, f)
+            if not os.path.isfile(filepath):
+                continue
+            stat = os.stat(filepath)
+            backups.append({
+                "filename": f,
+                "size_bytes": stat.st_size,
+                "size_mb": round(stat.st_size / (1024 * 1024), 2),
+                "created_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+            })
 
     return {
         "backup_dir": BACKUP_DIR,
         "backup_count": len(backups),
         "backups": backups[:20],
-        "auto_backup_enabled": True,
-        "retention_days": 7,
+        "pg_dump_available": shutil.which("pg_dump") is not None,
     }
 
 
 @router.post("/create")
-async def create_backup(current_user: PlatformSuperUser):
-    """Trigger an immediate database backup. Platform superuser only: dumps
-    the entire multi-tenant database."""
-    os.makedirs(BACKUP_DIR, exist_ok=True)
+async def create_backup(current_user: PlatformSuperUser, db: DatabaseSession):
+    """Dump the whole database with pg_dump into BACKUP_DIR (gzip plain SQL). Platform superuser only."""
+    pg_dump = shutil.which("pg_dump")
+    try:
+        if pg_dump is None:
+            raise BackupUnavailableError("pg_dump is not installed in this container")
+        argv, env = _pg_dump_command(pg_dump)
+    except BackupUnavailableError as exc:
+        detail = (
+            f"Backup unavailable: {exc}. Nothing was written. Use deploy/backup-db.sh "
+            "(docs/operations/backup-restore.md)."
+        )
+        await _audit(db, current_user, "backup_create", None, "database backup refused", False, str(exc))
+        raise HTTPException(status_code=503, detail=detail) from None
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    filename = f"pysoar_{timestamp}.sql.gz"
+    created = datetime.now(timezone.utc)
+    filename = f"pysoar_api_{created.strftime('%Y%m%d-%H%M%S')}.sql.gz"
     filepath = os.path.join(BACKUP_DIR, filename)
-
-    # Parse database URL for pg_dump
-    db_url = settings.database_url
-    # Remove async driver prefix
-    sync_url = db_url.replace("+asyncpg", "").replace("+aiosqlite", "")
-
     try:
-        # Use pg_dump via subprocess
-        # Extract connection params from URL
-        from urllib.parse import urlparse
-        parsed = urlparse(sync_url)
+        os.makedirs(BACKUP_DIR, mode=0o700, exist_ok=True)
+        if os.path.exists(filepath):
+            raise HTTPException(status_code=409, detail=f"{filename} already exists; retry in a second")
+        size = await run_in_threadpool(_write_dump, argv, env, filepath)
+    except HTTPException:
+        raise
+    except PermissionError as exc:
+        logger.error("backup directory not writable: %s", exc)
+        await _audit(db, current_user, "backup_create", filename, "database backup failed", False, str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Backup failed: {BACKUP_DIR} is not writable by the api's user. On a compose "
+                "install the host's ./backups must belong to that uid (deploy/start-production.sh "
+                "prints it)."
+            ),
+        ) from exc
+    except Exception as exc:
+        logger.error("database backup failed: %s", exc)
+        await _audit(db, current_user, "backup_create", filename, "database backup failed", False, str(exc)[:500])
+        raise HTTPException(status_code=500, detail=f"Backup failed: {exc}") from exc
 
-        env = os.environ.copy()
-        env["PGPASSWORD"] = parsed.password or ""
-
-        cmd = [
-            "pg_dump",
-            "-h", parsed.hostname or "localhost",
-            "-p", str(parsed.port or 5432),
-            "-U", parsed.username or "pysoar",
-            "-d", parsed.path.lstrip("/") or "pysoar",
-            "--format=custom",
-            "--compress=6",
-            f"--file={filepath}",
-        ]
-
-        result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
-
-        if result.returncode != 0:
-            logger.error(f"pg_dump failed: {result.stderr}")
-            # Create a SQL dump as fallback
-            filepath = filepath.replace(".sql.gz", ".sql")
-            cmd[-2] = "--format=plain"
-            cmd[-1] = f"--file={filepath}"
-            result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
-
-            if result.returncode != 0:
-                raise Exception(f"Backup failed: {result.stderr}")
-
-        file_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
-
-        # Send notification — best-effort; the backup itself already succeeded
-        # by this point, so notification failures must NOT fail the request,
-        # but we MUST log them loudly instead of silently swallowing.
-        try:
-            from src.workers.tasks import send_notification_task
-            send_notification_task.delay(
-                channel="email",
-                recipients=[settings.first_admin_email],
-                subject="PySOAR Backup Completed",
-                message=f"Database backup completed successfully.\nFile: {filename}\nSize: {round(file_size / (1024*1024), 2)} MB",
-            )
-        except ImportError:
-            logger.warning(
-                "Backup notification skipped: src.workers.tasks unavailable "
-                "(Celery workers not deployed in this environment)."
-            )
-        except Exception:
-            logger.error(
-                "Backup notification dispatch failed for %s; the backup file "
-                "itself was created successfully.",
-                filename,
-                exc_info=True,
-            )
-
-        return {
-            "status": "success",
-            "filename": os.path.basename(filepath),
-            "size_bytes": file_size,
-            "size_mb": round(file_size / (1024 * 1024), 2),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=500, detail="Backup timed out after 5 minutes")
-    except FileNotFoundError:
-        # pg_dump not available — create a lightweight metadata backup
-        import json
-        metadata = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "database_url": settings.database_url.split("@")[1] if "@" in settings.database_url else "unknown",
-            "note": "pg_dump not available in this container. Use docker exec for full backups.",
-        }
-        meta_path = os.path.join(BACKUP_DIR, f"pysoar_{timestamp}_metadata.json")
-        with open(meta_path, "w") as f:
-            json.dump(metadata, f, indent=2)
-
-        return {
-            "status": "partial",
-            "message": "pg_dump not available. Metadata backup created. Run full backup via: docker exec pysoar-postgres pg_dump -U pysoar pysoar | gzip > backup.sql.gz",
-            "filename": os.path.basename(meta_path),
-        }
-    except Exception as e:
-        logger.error(f"Backup failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Backup failed: {str(e)}")
-
-
-@router.post("/restore")
-async def restore_backup(
-    current_user: PlatformSuperUser,
-    data: dict = Body(...),
-):
-    """Restore database from a backup file. Platform superuser only: this
-    REPLACES the entire database (pg_restore --clean) for ALL tenants."""
-    filename = data.get("filename")
-    if not filename:
-        raise HTTPException(status_code=400, detail="filename is required")
-
-    filepath = _safe_backup_path(filename)
-    if not os.path.exists(filepath):
-        raise HTTPException(status_code=404, detail=f"Backup file not found: {filename}")
-
-    # Safety check
-    confirm = data.get("confirm", False)
-    if not confirm:
-        return {
-            "status": "confirmation_required",
-            "message": f"WARNING: This will replace ALL current data with backup '{filename}'. Set confirm=true to proceed.",
-            "filename": filename,
-            "size_mb": round(os.path.getsize(filepath) / (1024 * 1024), 2),
-        }
-
+    logger.info("database backup written", filename=filename, size_bytes=size)
+    # Notification is best-effort: the dump already succeeded, so a failure to
+    # queue the mail is logged, not returned.
     try:
-        from urllib.parse import urlparse
-        sync_url = settings.database_url.replace("+asyncpg", "")
-        parsed = urlparse(sync_url)
+        from src.workers.tasks import send_notification_task
+        send_notification_task.delay(
+            channel="email",
+            recipients=[settings.first_admin_email],
+            subject="PySOAR Backup Completed",
+            message=f"Database backup completed.\nFile: {filename}\nSize: {round(size / (1024 * 1024), 2)} MB",
+        )
+    except Exception:
+        logger.error("backup notification dispatch failed for %s", filename, exc_info=True)
+    await _audit(
+        db, current_user, "backup_create", filename,
+        f"database backup {filename} written ({size} bytes)", True,
+    )
+    return {
+        "status": "success",
+        "filename": filename,
+        "size_bytes": size,
+        "size_mb": round(size / (1024 * 1024), 2),
+        "created_at": created.isoformat(),
+    }
 
-        env = os.environ.copy()
-        env["PGPASSWORD"] = parsed.password or ""
 
-        cmd = [
-            "pg_restore",
-            "-h", parsed.hostname or "localhost",
-            "-p", str(parsed.port or 5432),
-            "-U", parsed.username or "pysoar",
-            "-d", parsed.path.lstrip("/") or "pysoar",
-            "--clean",
-            "--if-exists",
-            filepath,
-        ]
-
-        result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=600)
-
-        return {
-            "status": "success" if result.returncode == 0 else "completed_with_warnings",
-            "message": "Database restored from backup",
-            "filename": filename,
-            "warnings": result.stderr[:500] if result.stderr else None,
-        }
-
-    except Exception as e:
-        logger.error(f"Restore failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Restore failed: {str(e)}")
+@router.post("/restore", status_code=409)
+async def restore_backup(current_user: PlatformSuperUser, db: DatabaseSession):
+    """Refused (409): restore with deploy/restore-db.sh from the host. Platform superuser only."""
+    await _audit(db, current_user, "backup_restore", None, "in-app database restore refused", False, "not supported in-app")
+    raise HTTPException(
+        status_code=409,
+        detail={"error": "restore_not_supported_in_app", "message": RESTORE_REFUSAL},
+    )
 
 
 @router.delete("/backups/{filename}")
 async def delete_backup(
     filename: str,
     current_user: PlatformSuperUser,
+    db: DatabaseSession,
 ):
     """Delete a backup file. Platform superuser only."""
     filepath = _safe_backup_path(filename)
-    if not os.path.exists(filepath):
+    if not os.path.isfile(filepath):
         raise HTTPException(status_code=404, detail="Backup not found")
 
     os.remove(filepath)
+    await _audit(db, current_user, "backup_delete", filename, f"database backup {filename} deleted", True)
     return {"status": "deleted", "filename": filename}
 
 

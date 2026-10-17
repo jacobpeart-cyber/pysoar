@@ -86,28 +86,29 @@ async def test_status_is_admin_readable_but_not_viewer_readable(client, db_sessi
 
 @pytest.mark.asyncio
 async def test_platform_superuser_keeps_backup_operations(client, db_session, tmp_path, monkeypatch):
+    # The superuser passes the gate; what each route then does is pinned in
+    # tests/unit/test_backup_routes.py. Here: no pg_dump on PATH -> 503 and no
+    # file; restore -> 409 (never in-app); delete works.
     monkeypatch.setattr(backup_endpoints, "BACKUP_DIR", str(tmp_path))
-
-    def _no_pg_dump(*_args: object, **_kwargs: object) -> None:
-        raise FileNotFoundError("pg_dump")
-
-    monkeypatch.setattr(backup_endpoints.subprocess, "run", _no_pg_dump)
+    empty = tmp_path / "empty-path"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
     _, headers = await _org_user(db_session, email="bkp-root@bkp-org.io", role="admin", is_superuser=True)
 
     resp = await client.post("/api/v1/backup/create", headers=headers)
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["status"] == "partial"
+    assert resp.status_code == 503, resp.text
+    assert [p.name for p in tmp_path.iterdir()] == ["empty-path"]
 
     dump = tmp_path / "pysoar_20261002_000000.sql.gz"
     dump.write_bytes(b"synthetic dump bytes")
     resp = await client.post("/api/v1/backup/restore", headers=headers, json={"filename": dump.name})
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["status"] == "confirmation_required"
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["error"] == "restore_not_supported_in_app"
 
     resp = await client.delete(f"/api/v1/backup/backups/{dump.name}", headers=headers)
     assert resp.status_code == 200, resp.text
     assert not dump.exists()
 
     # Path traversal is still refused for superusers.
-    resp = await client.post("/api/v1/backup/restore", headers=headers, json={"filename": "../secret", "confirm": True})
+    resp = await client.delete("/api/v1/backup/backups/..%5Csecret", headers=headers)
     assert resp.status_code == 400
