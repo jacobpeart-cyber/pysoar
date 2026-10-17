@@ -5,7 +5,7 @@ self-signed certificate are generated per provider, Assertions (and, when
 asked, Responses) are signed with signxml exactly as an IdP signs them
 (enveloped, exclusive C14N, RSA-SHA256), the metadata document is real SAML
 metadata, and the AuthnRequest the SP sends is inflated and parsed like an IdP
-would. It is plugged in by replacing ``src.identity.saml._http_request`` (the
+would. It is plugged in by replacing ``src.identity.saml._http_stream`` (the
 single outbound boundary), so netguard is not consulted.
 """
 
@@ -14,6 +14,8 @@ from __future__ import annotations
 import base64
 import uuid
 import zlib
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from unittest.mock import AsyncMock
@@ -181,6 +183,7 @@ class FakeSAMLIdP:
         signing_cert: Optional[x509.Certificate] = None,
         encrypt: bool = False,
         tamper: Optional[str] = None,
+        raw_attributes: Optional[list[tuple[Optional[str], Optional[str], list[str]]]] = None,
     ) -> str:
         """A base64 SAML Response (the HTTP-POST ``SAMLResponse`` field)."""
         now = datetime.now(timezone.utc)
@@ -242,6 +245,15 @@ class FakeSAMLIdP:
                                     NameFormat="urn:oasis:names:tc:SAML:2.0:attrname-format:basic")
             for value in attr_values:
                 etree.SubElement(attr, _q(NS_SAML, "AttributeValue")).text = value
+        # (Name, FriendlyName, values) appended verbatim: duplicates and aliases for the hostile-IdP tests.
+        for raw_name, friendly, raw_values in raw_attributes or []:
+            attr = etree.SubElement(statement, _q(NS_SAML, "Attribute"))
+            if raw_name is not None:
+                attr.set("Name", raw_name)
+            if friendly is not None:
+                attr.set("FriendlyName", friendly)
+            for value in raw_values:
+                etree.SubElement(attr, _q(NS_SAML, "AttributeValue")).text = value
 
         if sign_assertion:
             assertion = signer.sign(assertion, key=self._key_pem(key), cert=cert_pem)
@@ -262,15 +274,27 @@ class FakeSAMLIdP:
 
 
 def install(monkeypatch: Any, *idps: FakeSAMLIdP) -> None:
-    """Route ``src.identity.saml._http_request`` to the fake providers."""
+    """Route ``src.identity.saml._http_stream`` (the streamed GET boundary) to the fake providers."""
 
-    async def fake_http(method: str, url: str) -> httpx.Response:
+    @asynccontextmanager
+    async def fake_stream(url: str) -> AsyncIterator[httpx.Response]:
         for idp in idps:
             if url.startswith(idp.base + "/"):
-                return await idp.handle(method, url)
-        return httpx.Response(404, request=httpx.Request(method, url))
+                yield await idp.handle("GET", url)
+                return
+        yield httpx.Response(404, request=httpx.Request("GET", url))
 
-    monkeypatch.setattr("src.identity.saml._http_request", fake_http)
+    monkeypatch.setattr("src.identity.saml._http_stream", fake_stream)
+
+
+def install_body(monkeypatch: Any, chunks: AsyncIterator[bytes], headers: Optional[dict[str, str]] = None) -> None:
+    """Serve one streamed metadata body (an async chunk iterator) for any URL."""
+
+    @asynccontextmanager
+    async def fake_stream(url: str) -> AsyncIterator[httpx.Response]:
+        yield httpx.Response(200, headers=headers or {}, content=chunks, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr("src.identity.saml._http_stream", fake_stream)
 
 
 def sp_entity_id(slug: str) -> str:

@@ -30,19 +30,23 @@ refused), Single Logout, IdP-initiated (unsolicited) login, the HTTP-POST
 binding for requests, artifact binding, SHA-1 signatures and digests, and
 transient NameIDs.
 
-Every outbound call (IdP metadata) goes through ``_http_request``, which
-resolves and vets the target with ``src.integrations.netguard``. Tests replace
-``_http_request`` with a fake identity provider.
+Every outbound call (IdP metadata) goes through ``_http_stream``, which
+resolves and vets the target with ``src.integrations.netguard``; the body is
+streamed and capped (``read_capped``) within an overall deadline. Tests replace
+``_http_stream`` with a fake identity provider.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
 import re
 import secrets
 import zlib
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -89,6 +93,8 @@ MAX_CLOCK_SKEW_SECONDS = 300
 #: Largest decoded Response / metadata document accepted.
 MAX_RESPONSE_BYTES = 256 * 1024
 MAX_METADATA_BYTES = 1024 * 1024
+#: Overall deadline for downloading IdP metadata (connect + every chunk).
+METADATA_DEADLINE_SECONDS = 20.0
 #: Signing certificates kept per IdP (current + rollover).
 MAX_CERTIFICATES = 4
 HTTP_TIMEOUT_SECONDS = 10.0
@@ -375,9 +381,12 @@ def parse_idp_metadata(data: bytes, expected_entity_id: str) -> IdPMetadata:
     return IdPMetadata(entity_id=expected_entity_id, sso_url=str(sso_url), certificates=certs, name_id_formats=formats)
 
 
-async def _http_request(method: str, url: str) -> httpx.Response:
-    """One request to the IdP through netguard (internal addresses refused,
-    pinned address, no redirects). ``SAMLError("provider_unreachable")`` otherwise."""
+@asynccontextmanager
+async def _http_stream(url: str) -> AsyncIterator[httpx.Response]:
+    """A streamed GET to the IdP through netguard (internal addresses refused,
+    pinned address, no redirects); the body is not read here.
+    ``SAMLError("provider_unreachable")`` when refused or unreachable. Tests
+    replace this boundary with a fake identity provider."""
     try:
         target = await resolve_and_vet(url)
     except OutboundTargetRefused as exc:
@@ -385,20 +394,53 @@ async def _http_request(method: str, url: str) -> httpx.Response:
     pinned = merge_pinned_kwargs(target, {"Accept": "application/samlmetadata+xml, application/xml, text/xml"})
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=False) as client:
-            return await client.request(method, target.pinned_url, headers=pinned["headers"],
-                                        extensions=pinned["extensions"])
+            async with client.stream("GET", target.pinned_url, headers=pinned["headers"],
+                                     extensions=pinned["extensions"]) as response:
+                yield response
     except httpx.HTTPError as exc:
         raise SAMLError("provider_unreachable", f"{type(exc).__name__}: {exc}") from exc
 
 
+async def read_capped(response: httpx.Response, limit: int, what: str) -> bytes:
+    """The body, refused (``metadata_failed``) when a declared Content-Length
+    exceeds ``limit`` (nothing is read) or once more than ``limit`` bytes arrived."""
+    declared = response.headers.get("content-length")
+    if declared is not None:
+        try:
+            size = int(declared)
+        except ValueError as exc:
+            raise SAMLError("metadata_failed", f"{what} has an invalid Content-Length {declared!r}") from exc
+        if size > limit:
+            raise SAMLError("metadata_failed", f"{what} declares {size} bytes; at most {limit} are accepted")
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        body.extend(chunk)
+        if len(body) > limit:
+            raise SAMLError("metadata_failed", f"{what} is larger than {limit} bytes; the download was stopped")
+    return bytes(body)
+
+
+async def _download_metadata(url: str) -> bytes:
+    async with _http_stream(url) as response:
+        if response.status_code != 200:
+            raise SAMLError("metadata_failed", f"GET {url} answered HTTP {response.status_code}")
+        try:
+            return await read_capped(response, MAX_METADATA_BYTES, "IdP metadata")
+        except httpx.HTTPError as exc:
+            raise SAMLError("provider_unreachable", f"{type(exc).__name__}: {exc}") from exc
+
+
 async def fetch_idp_metadata(url: str, expected_entity_id: str) -> IdPMetadata:
-    """Fetch (never cached) and parse the IdP metadata at ``url``."""
+    """Fetch (never cached, streamed, capped at ``MAX_METADATA_BYTES``, within
+    ``METADATA_DEADLINE_SECONDS`` overall) and parse the IdP metadata at ``url``."""
     if not is_https_url(url):
         raise SAMLError("metadata_failed", "the IdP metadata URL must be https")
-    response = await _http_request("GET", url)
-    if response.status_code != 200:
-        raise SAMLError("metadata_failed", f"GET {url} answered HTTP {response.status_code}")
-    return parse_idp_metadata(response.content, expected_entity_id)
+    try:
+        data = await asyncio.wait_for(_download_metadata(url), timeout=METADATA_DEADLINE_SECONDS)
+    except TimeoutError as exc:
+        raise SAMLError("metadata_failed",
+                        f"the IdP metadata download did not finish within {METADATA_DEADLINE_SECONDS:g} s") from exc
+    return parse_idp_metadata(data, expected_entity_id)
 
 
 # ---------------------------------------------------------------------------
@@ -610,13 +652,20 @@ def validate_response(xml: bytes, *, settings: SAMLSettings, idp_entity_id: str,
         if moment >= session_end + skew:
             raise SAMLError("saml_conditions_failed", f"the IdP session ended at {session_end.isoformat()}")
 
+    # Attributes are keyed by Name only: a FriendlyName is a display hint any
+    # attribute may carry, so it never satisfies or shadows a configured Name.
+    # A Name that appears twice is ambiguous (which one is the email, which the
+    # groups?), so such an assertion is unusable rather than first- or last-wins.
     attributes: dict[str, list[str]] = {}
     for statement in signed.findall(_q(NS_SAML, "AttributeStatement")):
         for attribute in statement.findall(_q(NS_SAML, "Attribute")):
-            values = [v for v in (_text(x) for x in attribute.findall(_q(NS_SAML, "AttributeValue"))) if v]
-            for key in (attribute.get("Name"), attribute.get("FriendlyName")):
-                if key and key not in attributes:
-                    attributes[key] = values
+            name = (attribute.get("Name") or "").strip()
+            if not name:
+                continue
+            if name in attributes:
+                raise SAMLError("saml_response_invalid",
+                                f"the assertion carries attribute {name!r} more than once; it is ambiguous and refused")
+            attributes[name] = [v for v in (_text(x) for x in attribute.findall(_q(NS_SAML, "AttributeValue"))) if v]
 
     assertion_id = signed.get("ID") or ""
     return SAMLIdentity(

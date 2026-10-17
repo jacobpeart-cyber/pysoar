@@ -6,6 +6,7 @@ signxml."""
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -30,6 +31,7 @@ from tests.unit.saml_fakes import (
     acs_url,
     configure,
     install,
+    install_body,
     make_certificate,
     query,
     saml_redis,
@@ -693,3 +695,96 @@ async def test_saml_group_mapping_is_a_trust_setting(client: AsyncClient, db_ses
     assert resp.status_code == 403 and resp.json()["detail"]["fields"] == ["group_role_map"]
     resp = await client.put("/api/v1/settings/sso", json=_unchanged(idp, slug, display_name="Renamed"), headers=headers)
     assert resp.status_code == 200, resp.text
+
+
+# ---------------------------------------------------------------------------
+# Attribute aliasing (Name only; a duplicated Name is unusable)
+# ---------------------------------------------------------------------------
+
+
+async def test_duplicate_attribute_name_is_refused(client: AsyncClient, db_session, org_a, idp: FakeSAMLIdP) -> None:
+    org_id = org_a.id
+    await configure(db_session, org_id, org_a.slug, idp)
+    result = await _login(client, idp, org_a.slug, name_id=f"dup@{DOMAIN}",
+                          raw_attributes=[("email", None, [f"boss@{DOMAIN}"])])
+    assert result == {"sso_error": "saml_response_invalid"}
+    rows = await _audit_rows(db_session, "sso_login_failed", org_id)
+    assert rows and "more than once" in rows[-1].error_message
+    assert (await db_session.execute(select(User).where(User.organization_id == org_id,
+                                                        User.email.like(f"%@{DOMAIN}")))).scalars().all() == []
+
+
+async def test_friendly_name_never_satisfies_the_configured_name(client: AsyncClient, db_session, org_a, idp: FakeSAMLIdP) -> None:
+    await configure(db_session, org_a.id, org_a.slug, idp)
+    result = await _login(client, idp, org_a.slug, name_id="p-9", name_id_format=NAMEID_PERSISTENT,
+                          raw_attributes=[("urn:oid:0.9.2342.19200300.100.1.3", "email", [f"f@{DOMAIN}"])])
+    assert result == {"sso_error": "email_missing"}
+
+
+async def test_friendly_name_never_shadows_the_configured_name(client: AsyncClient, db_session, org_a, idp: FakeSAMLIdP) -> None:
+    org_id = org_a.id
+    await configure(db_session, org_id, org_a.slug, idp, group_role_map={"Admins": "admin"})
+    result = await _login(client, idp, org_a.slug, name_id="p-10", name_id_format=NAMEID_PERSISTENT, raw_attributes=[
+        ("urn:alias:mail", "email", [f"boss@{DOMAIN}"]),
+        ("urn:alias:groups", "groups", ["Admins"]),
+        ("email", None, [f"real@{DOMAIN}"]),
+    ])
+    assert "sso" in result
+    users = (await db_session.execute(select(User).where(User.organization_id == org_id, User.sso_subject == "p-10"))).scalars().all()
+    assert [u.email for u in users] == [f"real@{DOMAIN}"] and users[0].role == "viewer"
+
+
+# ---------------------------------------------------------------------------
+# Metadata download limits (streamed, capped, deadline)
+# ---------------------------------------------------------------------------
+
+
+class _Body:
+    """An async chunk stream that counts what was pulled from it."""
+
+    def __init__(self, chunk: bytes, count: int | None = None, delay: float = 0.0) -> None:
+        self.chunk, self.count, self.delay, self.pulled = chunk, count, delay, 0
+
+    def __aiter__(self):
+        return self._gen()
+
+    async def _gen(self):
+        while self.count is None or self.pulled < self.count:
+            if self.delay:
+                await asyncio.sleep(self.delay)
+            self.pulled += 1
+            yield self.chunk
+
+
+async def test_declared_oversized_metadata_is_refused_unread(monkeypatch) -> None:
+    body = _Body(b"x" * 1024, count=10)
+    install_body(monkeypatch, body, headers={"Content-Length": str(saml_sp.MAX_METADATA_BYTES + 1)})
+    with pytest.raises(saml_sp.SAMLError) as exc:
+        await saml_sp.fetch_idp_metadata("https://idp.saml-example.com/metadata", "x")
+    assert exc.value.reason == "metadata_failed" and "declares" in exc.value.detail
+    assert body.pulled == 0
+
+
+async def test_streamed_oversized_metadata_stops_at_the_cap(
+    client: AsyncClient, db_session, org_a, org_a_admin_headers, monkeypatch,
+) -> None:
+    chunk = 64 * 1024
+    body = _Body(b"<" * chunk)  # endless, no Content-Length
+    install_body(monkeypatch, body)
+    idp = FakeSAMLIdP()
+    await configure(db_session, org_a.id, org_a.slug, idp, enabled=False, discovery_url=idp.metadata_url)
+    resp = await client.post("/api/v1/settings/sso/test", headers=org_a_admin_headers)
+    assert resp.status_code == 502, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "metadata_failed" and "download was stopped" in detail["detail"]
+    assert body.pulled == saml_sp.MAX_METADATA_BYTES // chunk + 1
+
+
+async def test_slow_metadata_hits_the_deadline(monkeypatch) -> None:
+    body = _Body(b"<", delay=5.0)
+    install_body(monkeypatch, body)
+    monkeypatch.setattr(saml_sp, "METADATA_DEADLINE_SECONDS", 0.2)
+    with pytest.raises(saml_sp.SAMLError) as exc:
+        await saml_sp.fetch_idp_metadata("https://idp.saml-example.com/metadata", "x")
+    assert exc.value.reason == "metadata_failed" and "did not finish" in exc.value.detail
+    assert body.pulled == 0
