@@ -6,7 +6,7 @@ Roles: `viewer` < `analyst` < `admin` inside an organisation; `platform superuse
 
 Classified in wave 5 (W5-B, 2026-10-15) from the uncalled-route tables in `docs/audit/2026-10-08/` and the code as it stands after waves 1-4. Routes graded FAKE, duplicates and superseded aliases were deleted, not listed. Rows are one per method and path; to add a route, add a row in the right section.
 
-## KEEP-API (501 routes)
+## KEEP-API (504 routes)
 
 Real routes with no UI control, kept for integrations, scripts, endpoint agents, probes and API clients.
 
@@ -78,6 +78,9 @@ Real routes with no UI control, kept for integrations, scripts, endpoint agents,
 | GET | `/api/v1/attack/techniques` | List ATT&CK techniques (tactic / platform filters). | any authenticated user | platform ATT&CK knowledge base |
 | GET | `/api/v1/attack/techniques/{external_id}` | Full context for one technique (tactics, mitigations, groups, software, data sources). | any authenticated user | platform ATT&CK knowledge base |
 | GET | `/api/v1/auth/sso/callback` | OIDC redirect target the identity provider sends the browser to (code + state); answers 302 to `/login?sso=<one-time code>` or `/login?sso_error=<reason>`. | public (single-use state from `/auth/sso/{org_slug}/start`) | the organisation named by the stored state |
+| GET | `/api/v1/auth/sso/{org_slug}/saml/metadata` | SAML SP metadata (XML EntityDescriptor: SP entity id, ACS URL with HTTP-POST, NameID format, unsigned requests, signed assertions wanted); the administrator gives this URL (shown in Settings > Identity) to the IdP. 404 `saml_not_configured` (I-E). | public | the organisation named by the slug (SAML configuration only) |
+| POST | `/api/v1/auth/sso/{org_slug}/saml/acs` | SAML Assertion Consumer Service: the IdP's HTTP-POST of `SAMLResponse` + `RelayState`; signature, status, issuer, conditions, audience, recipient, InResponseTo and replay checked; 303 to `/auth/sso/saml/complete?ticket=` or `/login?sso_error=<reason>` (I-E). | public (IdP-signed response answering a pending AuthnRequest) | the organisation named by the slug; the pending request must belong to it |
+| GET | `/api/v1/auth/sso/saml/complete` | Second leg of the SAML login in the starting browser: single-use ticket (60 s) plus the `pysoar_sso` cookie binding, then the shared SSO user resolution; 302 to `/login?sso=<one-time code>` or `/login?sso_error=<reason>` (I-E). | public (ticket from the ACS + browser cookie) | the organisation named by the ticket |
 | GET | `/api/v1/audit-evidence/audit/export` | Export audit trail | any authenticated user | org-scoped |
 | POST | `/api/v1/audit-evidence/audit/log` | Log an audit event as the calling user. | analyst, admin | org-scoped |
 | GET | `/api/v1/audit-evidence/audit/suspicious-activity` | Detect suspicious activity for actor | any authenticated user | org-scoped |
@@ -547,9 +550,10 @@ Pages call these through a path built at runtime, which the contract diff's call
 | POST | `/api/v1/ot_security/zones/{zone_id}/segmentation_audit` | OTSecurityDashboard action dialog (agent approval queue). | admin | org-scoped |
 | GET | `/api/v1/auth/sso/{org_slug}/start` | Login page "Sign in with SSO": the browser navigates (`window.location.assign`) to `login_url` from `POST /auth/sso/discover` (plus `login_hint`); 302 to the IdP. | public | the organisation named by the slug |
 
-## EXPOSE (0 routes; the 41 handed to W5-A and the 20 identity routes handed to I-D are called by the UI)
+## EXPOSE (1 route; the 41 handed to W5-A and the 20 identity routes handed to I-D are called by the UI)
 
 Real routes the UI should call. They stay in the contract diff's "never called" list until a page calls them; then delete the row.
 
 | Method | Route | Note | Roles | Tenancy |
 |---|---|---|---|---|
+| GET | `/api/v1/roles/me` | The caller's own access: built-in `role`, `custom_role` `{id, name}` or null, `is_superuser`, `is_full_admin`, `tiers` (`{area: tier}` over the area catalogue, computed by the same function the gates use) and `exempt_areas`; never denied by tier (I-F). For the frontend's permission gating (later package). | any authenticated user (platform superuser included) | the caller's own account |

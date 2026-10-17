@@ -19,8 +19,11 @@ class SSOConfigUpdate(BaseModel):
     """``PUT /settings/sso`` body (full replace; ``client_secret`` omitted or
     null keeps the stored secret, an empty string clears it).
 
-    ``issuer`` and ``client_id`` are required for ``oidc``; they are optional in
-    the schema only so a ``saml`` request reaches the handler's 501."""
+    ``issuer`` and ``client_id`` are required for ``oidc``. For ``saml``:
+    ``issuer`` = the IdP entity id (required), ``client_id`` = our SP entity id
+    (optional; defaults to the SP metadata URL), ``discovery_url`` = the IdP
+    metadata URL (optional), ``client_secret`` and ``scopes`` are unused, the
+    claim fields name SAML attributes, and ``saml`` carries the rest."""
 
     protocol: str = Field(default="oidc", max_length=10)
     display_name: Optional[str] = Field(default=None, max_length=100)
@@ -40,6 +43,8 @@ class SSOConfigUpdate(BaseModel):
     require_email_verified: bool = True
     trust_idp_mfa: bool = True
     enabled: bool = False
+    #: SAML only; ignored for ``oidc``.
+    saml: Optional["SAMLSettingsUpdate"] = None
 
 
 class SSOConfigResponse(BaseModel):
@@ -76,6 +81,8 @@ class SSOConfigResponse(BaseModel):
     updated_by: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    #: SAML only (null for ``oidc``): what to register at the IdP and the IdP settings.
+    saml: Optional["SAMLConfigResponse"] = None
 
 
 class SSOTestResponse(BaseModel):
@@ -113,6 +120,79 @@ class SSOExchangeRequest(BaseModel):
     code: str = Field(min_length=16, max_length=128)
 
 
+# ---------------------------------------------------------------------------
+# SAML 2.0 (src/identity/saml.py)
+# ---------------------------------------------------------------------------
+
+
+class SAMLSettingsUpdate(BaseModel):
+    """The SAML part of ``PUT /settings/sso``. ``idp_certificates`` omitted or
+    null keeps the stored certificates; a list replaces them (PEM, or the bare
+    base64 DER metadata carries)."""
+
+    idp_sso_url: Optional[str] = Field(default=None, max_length=2000)
+    idp_certificates: Optional[list[str]] = Field(default=None, max_length=4)
+    name_id_format: str = Field(default="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress", max_length=200)
+    #: Always true: an unsigned assertion is never accepted (false answers 422).
+    want_assertions_signed: bool = True
+    want_response_signed: bool = False
+    clock_skew_seconds: int = 60
+
+
+class SAMLCertificateSummary(BaseModel):
+    subject: str
+    issuer: str
+    not_before: str
+    not_after: str
+    sha256_fingerprint: str
+    expired: bool
+
+
+class SAMLConfigResponse(BaseModel):
+    """SAML settings of the configuration. ``sp_entity_id``, ``acs_url`` and
+    ``sp_metadata_url`` are what the administrator registers at the IdP."""
+
+    sp_entity_id: str
+    acs_url: str
+    sp_metadata_url: str
+    metadata_url: Optional[str] = None
+    idp_entity_id: str
+    idp_sso_url: Optional[str] = None
+    idp_certificates: list[SAMLCertificateSummary] = Field(default_factory=list)
+    name_id_format: str
+    name_id_formats_supported: list[str] = Field(default_factory=list)
+    want_assertions_signed: bool = True
+    want_response_signed: bool
+    clock_skew_seconds: int
+
+
+class SAMLTestResponse(BaseModel):
+    """``POST /settings/sso/test`` success for a SAML configuration.
+    ``source``: ``metadata`` (fetched from the IdP metadata URL, which updated
+    the stored SSO URL and certificates) or ``configuration`` (no metadata URL:
+    the stored certificates and SSO URL were checked locally; the IdP was not
+    contacted)."""
+
+    status: str = "ok"
+    protocol: str = "saml"
+    tested_at: datetime
+    source: str
+    idp_entity_id: str
+    idp_sso_url: str
+    certificate_count: int
+    certificates: list[SAMLCertificateSummary] = Field(default_factory=list)
+    name_id_formats: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+def _saml_audit(raw: Any) -> Optional[dict[str, Any]]:
+    if not raw:
+        return None
+    from src.identity.saml import SAMLSettings
+
+    return SAMLSettings.from_config(raw).audit_dict()
+
+
 def sso_config_to_dict(value: Any) -> dict[str, Any]:
     """Audit-safe snapshot of an SSO configuration (no secret)."""
     return {
@@ -133,6 +213,7 @@ def sso_config_to_dict(value: Any) -> dict[str, Any]:
         "require_email_verified": value.require_email_verified,
         "trust_idp_mfa": value.trust_idp_mfa,
         "enabled": value.enabled,
+        "saml_settings": _saml_audit(getattr(value, "saml_settings", None)),
     }
 
 
@@ -308,3 +389,31 @@ class SCIMUserLinkResponse(BaseModel):
     identity_source: str
     external_id: Optional[str] = None
     is_active: bool
+
+
+# ============================================================================
+# The caller's own access — GET /roles/me (src/api/v1/endpoints/roles.py)
+# ============================================================================
+
+
+class MyCustomRole(BaseModel):
+    """The custom role the caller holds; ``name`` is null when the role can no
+    longer be loaded (it then grants nothing)."""
+
+    id: str
+    name: Optional[str] = None
+
+
+class MyAccessResponse(BaseModel):
+    """``GET /roles/me``: what the caller's role grants, so the UI can gate
+    exactly as the API does. ``tiers`` covers every area of ``GET
+    /roles/areas``; ``exempt_areas`` are never denied by tier (role gates
+    inside them still apply). ``is_full_admin``: a built-in admin without a
+    custom role, or the platform superuser (SSO trust settings, SCIM tokens)."""
+
+    role: str
+    custom_role: Optional[MyCustomRole] = None
+    is_superuser: bool
+    is_full_admin: bool
+    tiers: dict[str, TierName]
+    exempt_areas: list[str]

@@ -20,6 +20,7 @@ interface IdentityErrorBody {
   domain?: string;
   value?: string;
   members?: number;
+  index?: number;
 }
 
 function bodyOf(err: unknown): { status: number | null; body: IdentityErrorBody | null } {
@@ -52,6 +53,10 @@ export const SSO_TEST_REASONS: Record<string, string> = {
   provider_unreachable: 'the provider could not be reached (DNS, TLS or network, or the address is refused by the outbound guard because it is private or internal)',
   discovery_failed: 'the discovery document was missing, malformed, or its issuer does not match the configured issuer',
   jwks_failed: 'the signing keys (JWKS) could not be fetched or contained no keys',
+  // SAML
+  metadata_failed: 'the IdP metadata could not be fetched or used (wrong entity ID, no HTTP-Redirect SSO URL, no signing certificate, or the IdP demands signed requests)',
+  configuration_incomplete: 'the SAML settings are incomplete (enter the IdP SSO URL and signing certificate, or an IdP metadata URL)',
+  certificate_invalid: 'the IdP signing certificate is unusable (expired or unreadable)',
 };
 
 export function describeIdentityError(err: unknown): string {
@@ -63,13 +68,28 @@ export function describeIdentityError(err: unknown): string {
     switch (k) {
       // SSO configuration
       case 'not_implemented':
-        return body.reason === 'saml_requires_xmlsec'
-          ? 'SAML 2.0 is not implemented: verifying signed assertions needs xmlsec in the API image, which ships with a later identity package. Use OpenID Connect; Okta, Entra ID, Google, Auth0, Keycloak and Ping all support it.'
-          : `Not implemented (${body.reason ?? 'no reason given'}).`;
+        return `Not implemented (${body.reason ?? 'no reason given'}).`;
       case 'unsupported_protocol':
-        return 'Only OpenID Connect (oidc) is supported.';
+        return 'The protocol must be OpenID Connect (oidc) or SAML 2.0 (saml).';
       case 'missing_field':
-        return `Required for OpenID Connect: ${list(body.fields)}.`;
+        return `Required: ${list(body.fields)}.`;
+      // SAML configuration
+      case 'saml_assertion_signature_required':
+        return 'Signed assertions are always required; an unsigned assertion is never accepted.';
+      case 'invalid_name_id_format':
+        return 'The NameID format must be emailAddress, persistent or unspecified (a transient NameID cannot identify an account).';
+      case 'invalid_clock_skew':
+        return 'The allowed clock skew must be between 0 and 300 seconds.';
+      case 'invalid_idp_sso_url':
+        return 'The IdP single sign-on URL must be an https URL.';
+      case 'invalid_metadata_url':
+        return 'The IdP metadata URL must be an https URL.';
+      case 'invalid_sp_entity_id':
+        return 'The SP entity ID must be at most 255 characters.';
+      case 'invalid_certificate':
+        return `IdP certificate ${typeof body.index === 'number' ? body.index + 1 : ''} is not an X.509 certificate (paste the PEM block, or the base64 from the metadata).`;
+      case 'saml_not_configured':
+        return 'This organisation has no SAML configuration.';
       case 'invalid_issuer':
         return 'The issuer must be an https URL (OpenID Connect requires TLS).';
       case 'invalid_discovery_url':
@@ -181,6 +201,14 @@ export const SSO_LOGIN_ERRORS: Record<string, string> = {
   user_inactive: 'Your PySOAR account is deactivated.',
   superuser_not_allowed: 'The platform operator account cannot sign in through single sign-on.',
   sso_failed: 'Single sign-on failed.',
+  // SAML (POST /auth/sso/{org}/saml/acs, GET /auth/sso/saml/complete)
+  saml_response_invalid: 'The SAML response from your identity provider was malformed or refused (DTDs, entities and extra assertions are not accepted).',
+  saml_signature_invalid: "The SAML assertion's signature did not verify against the certificate configured for your identity provider.",
+  saml_conditions_failed: 'The SAML assertion was not valid for PySOAR (issuer, audience, recipient or validity time). Check the clocks and the SP entity ID registered at the IdP.',
+  saml_unsolicited: 'The SAML response did not answer a sign-in started here (IdP-initiated sign-in is not supported, or the request expired). Start the SSO sign-in from PySOAR.',
+  saml_replay: 'This SAML assertion was already used. Start the SSO sign-in again.',
+  saml_encrypted_unsupported: 'Your identity provider encrypted the assertion; PySOAR does not support encrypted assertions. Ask your administrator to turn assertion encryption off for PySOAR.',
+  saml_status_failure: 'Your identity provider reported that the sign-in failed.',
 };
 
 export function describeSsoLoginError(reason: string): string {

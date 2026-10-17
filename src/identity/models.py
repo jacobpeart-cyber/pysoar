@@ -52,9 +52,8 @@ class IdentitySource(str, Enum):
 
 
 class SSOProtocol(str, Enum):
-    """Supported single sign-on protocols. ``saml`` is declared so configuration
-    can name it, but it answers 501 until the SAML package (xmlsec in the image)
-    lands."""
+    """Supported single sign-on protocols: OpenID Connect (``src.identity.oidc``)
+    and SAML 2.0 as a service provider (``src.identity.saml``)."""
 
     OIDC = "oidc"
     SAML = "saml"
@@ -94,6 +93,11 @@ class SSOConfiguration(BaseModel):
     last_test_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     last_test_detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     updated_by: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    #: SAML only (migration 038): ``{"idp_sso_url", "idp_certificates": [PEM, ...],
+    #: "name_id_format", "want_response_signed", "clock_skew_seconds"}``. For SAML,
+    #: ``issuer`` is the IdP entity id, ``discovery_url`` the IdP metadata URL and
+    #: ``client_id`` our SP entity id; OIDC rows leave this NULL.
+    saml_settings: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
     def __repr__(self) -> str:
         return f"<SSOConfiguration org={self.organization_id} {self.protocol} enabled={self.enabled}>"

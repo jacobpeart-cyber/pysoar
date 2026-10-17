@@ -132,11 +132,12 @@ async def test_changing_the_issuer_clears_the_test_result(
     assert resp.status_code == 409 and resp.json()["detail"]["error"] == "sso_test_required"
 
 
-async def test_saml_is_501_not_implemented(client: AsyncClient, org_a_admin_headers, store) -> None:
+async def test_saml_needs_the_idp_entity_id(client: AsyncClient, org_a_admin_headers, store) -> None:
+    """SAML is implemented (tests/unit/test_sso_saml.py); a bare body is a validation error, not a 501."""
     resp = await client.put("/api/v1/settings/sso", json={"protocol": "saml"}, headers=org_a_admin_headers)
-    assert resp.status_code == 501
+    assert resp.status_code == 422
     detail = resp.json()["detail"]
-    assert detail["error"] == "not_implemented" and detail["reason"] == "saml_requires_xmlsec"
+    assert detail["error"] == "missing_field" and detail["fields"] == ["issuer"]
 
 
 @pytest.mark.parametrize(
@@ -729,3 +730,31 @@ async def test_exchange_needs_the_starting_browser_and_clears_the_cookie(
     assert resp.status_code == 200 and "access_token" in resp.json()
     cleared = resp.headers["set-cookie"].lower()
     assert cleared.startswith("pysoar_sso=") and "max-age=0" in cleared and "path=/api/v1/auth/sso" in cleared
+
+
+@pytest.mark.usefixtures("store")
+async def test_group_mapping_is_a_trust_setting_once_groups_are_configured(
+    client: AsyncClient, db_session, org_a, idp: FakeIdP,
+) -> None:
+    """Every login re-syncs roles from group_role_map when a groups claim is set,
+    so a custom-role admin could re-role existing accounts (admins included)."""
+    config = await configure(db_session, org_a.id, idp)
+    headers = await _custom_role_admin(db_session, org_a.id)
+    # No groups claim: mappings within the caller's tiers are allowed.
+    resp = await client.put("/api/v1/settings/sso", json=_unchanged_body(idp, group_role_map={"soc": "analyst"}),
+                            headers=headers)
+    assert resp.status_code == 200, resp.text
+
+    config.groups_claim = "groups"
+    await db_session.commit()
+    for overrides, field in (
+        ({"groups_claim": "groups", "group_role_map": {"soc": "viewer"}}, "group_role_map"),
+        ({"groups_claim": "groups", "group_role_map": {"soc": "analyst"}, "default_role": "analyst"}, "default_role"),
+    ):
+        resp = await client.put("/api/v1/settings/sso", json=_unchanged_body(idp, **overrides), headers=headers)
+        assert resp.status_code == 403, resp.text
+        assert resp.json()["detail"]["error"] == "full_admin_required" and resp.json()["detail"]["fields"] == [field]
+    # Unchanged mapping: still fine (e.g. renaming the button).
+    resp = await client.put("/api/v1/settings/sso", json=_unchanged_body(
+        idp, groups_claim="groups", group_role_map={"soc": "analyst"}, display_name="Corp"), headers=headers)
+    assert resp.status_code == 200, resp.text
