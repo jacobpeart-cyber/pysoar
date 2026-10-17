@@ -1,5 +1,13 @@
 import { api } from './client';
 import type { Row } from '../lib/apiRow';
+import type {
+  Connector,
+  InstalledAction,
+  InstalledIntegration,
+  IntegrationExecution,
+  IntegrationTestResult,
+  Paginated,
+} from '../components/integrations/types';
 import {
   PaginatedResponse,
   Alert,
@@ -701,16 +709,99 @@ export const darkwebApi = {
 
 // Integrations
 export const integrationsApi = {
-  getConnectors: async (): Promise<any[]> => {
-    const response = await api.get('/integrations/connectors');
+  // size=100: the backend defaults to 20, fewer than the catalogue holds.
+  getConnectors: async (): Promise<Connector[]> => {
+    const response = await api.get('/integrations/connectors', { params: { size: 100 } });
     const d = response.data;
     return Array.isArray(d) ? d : (d?.items ?? []);
   },
 
-  getInstalled: async (): Promise<any[]> => {
-    const response = await api.get('/integrations/installed');
+  getInstalled: async (): Promise<InstalledIntegration[]> => {
+    const response = await api.get('/integrations/installed', { params: { size: 100 } });
     const d = response.data;
     return Array.isArray(d) ? d : (d?.items ?? []);
+  },
+
+  /** Newest first, this organisation only. */
+  getExecutions: async (params?: { page?: number; size?: number }): Promise<Paginated<IntegrationExecution>> => {
+    const response = await api.get('/integrations/executions', { params: { size: 100, ...params } });
+    const d = response.data;
+    return { items: d?.items ?? [], total: d?.total ?? 0, page: d?.page, size: d?.size, pages: d?.pages };
+  },
+
+  /** 201; 422 missing_fields / invalid_fields naming fields; 501 not_implemented for a planned connector. */
+  install: async (body: {
+    connector_id: string;
+    display_name: string;
+    config: Record<string, unknown>;
+    credentials: Record<string, unknown>;
+  }): Promise<InstalledIntegration> => {
+    const response = await api.post('/integrations/install', body);
+    return response.data;
+  },
+
+  /** Config and credentials are merged over the stored values; omitted keys stay unchanged. */
+  update: async (
+    integrationId: string,
+    body: { display_name?: string; config?: Record<string, unknown>; credentials?: Record<string, unknown> },
+  ): Promise<InstalledIntegration> => {
+    const response = await api.patch(`/integrations/installed/${integrationId}`, body);
+    return response.data;
+  },
+
+  /** The connector's real read-only call; persists health_status. 501 for planned and log-ingest connectors. */
+  test: async (integrationId: string): Promise<IntegrationTestResult> => {
+    const response = await api.post(`/integrations/installed/${integrationId}/test`);
+    return response.data;
+  },
+
+  enable: async (integrationId: string): Promise<unknown> => {
+    const response = await api.post(`/integrations/installed/${integrationId}/enable`, {});
+    return response.data;
+  },
+
+  disable: async (integrationId: string): Promise<unknown> => {
+    const response = await api.post(`/integrations/installed/${integrationId}/disable`, {});
+    return response.data;
+  },
+
+  uninstall: async (integrationId: string): Promise<void> => {
+    await api.delete(`/integrations/installed/${integrationId}`);
+  },
+
+  getActions: async (integrationId: string): Promise<InstalledAction[]> => {
+    const response = await api.get(`/integrations/installed/${integrationId}/actions`, { params: { size: 100 } });
+    return response.data?.items ?? [];
+  },
+
+  /** 202 with the execution row; 422 invalid_parameters; 501 not_implemented; 403 approval_required. */
+  executeAction: async (
+    integrationId: string,
+    actionId: string,
+    inputData: Record<string, unknown>,
+  ): Promise<IntegrationExecution> => {
+    const response = await api.post(`/integrations/installed/${integrationId}/actions/${actionId}/execute`, {
+      input_data: inputData,
+    });
+    return response.data;
+  },
+
+  createWebhook: async (
+    integrationId: string,
+    body: { endpoint_path: string; http_method: string; event_types: string[] },
+  ): Promise<unknown> => {
+    const response = await api.post(`/integrations/installed/${integrationId}/webhooks`, body);
+    return response.data;
+  },
+
+  /** Answers 501 by design: there is no synthetic-event pipeline. */
+  testWebhook: async (integrationId: string, webhookId: string): Promise<unknown> => {
+    const response = await api.post(`/integrations/installed/${integrationId}/webhooks/${webhookId}/test`);
+    return response.data;
+  },
+
+  deleteWebhook: async (integrationId: string, webhookId: string): Promise<void> => {
+    await api.delete(`/integrations/installed/${integrationId}/webhooks/${webhookId}`);
   },
 };
 

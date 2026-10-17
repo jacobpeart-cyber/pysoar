@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useCallback, useState } from 'react';
 import {
   Plug,
   Download,
@@ -9,27 +9,27 @@ import {
   Eye,
   Trash2,
   Search,
-  Star,
+  Play,
+  Power,
+  Loader2,
 } from 'lucide-react';
 import clsx from 'clsx';
-import { api } from '../lib/api';
 import LoadErrorBanner from '../components/LoadErrorBanner';
-import { describeLoadError } from '../lib/loadError';
+import ActionErrorBanner from '../components/ActionErrorBanner';
 import DetailDrawer, { DetailSection } from '../components/DetailDrawer';
-import type { Row } from '../lib/apiRow';
-
-const getHealthColor = (health: string | null) => {
-  switch (health) {
-    case 'healthy':
-      return 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-100';
-    case 'degraded':
-      return 'bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-100';
-    case 'unhealthy':
-      return 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-100';
-    default:
-      return 'bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-100';
-  }
-};
+import { integrationsApi } from '../api/endpoints';
+import { useRoleGate, ADMIN_ONLY_REASON, ANALYST_ONLY_REASON } from '../lib/roles';
+import { ExecutionStatusBadge, HealthBadge, ImplementationBadge, SideEffectBadge } from '../components/integrations/Badges';
+import ConnectorFormModal from '../components/integrations/ConnectorFormModal';
+import ActionRunnerDrawer from '../components/integrations/ActionRunnerDrawer';
+import type {
+  Connector,
+  ConnectorField,
+  InstalledIntegration,
+  IntegrationExecution,
+  IntegrationTestResult,
+} from '../components/integrations/types';
+import { errorDetailText, formatJson, formatTime, httpStatusOf } from '../components/integrations/types';
 
 const getStatusColor = (status: string) => {
   switch (status) {
@@ -46,12 +46,71 @@ const getStatusColor = (status: string) => {
   }
 };
 
+const BTN =
+  'px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2';
+
+/** The inline outcome of a Test press on one installed row. */
+type TestOutcome =
+  | { kind: 'result'; result: IntegrationTestResult }
+  | { kind: 'not_testable'; detail: string }
+  | { kind: 'error'; error: unknown };
+
+interface WebhookRow {
+  id: string;
+  installation_id?: string;
+  name?: string;
+  url?: string;
+  status?: string;
+  event?: string;
+  lastTriggered?: string;
+  successCount?: number;
+}
+
+function FieldsTable({ fields, title }: { fields: ConnectorField[]; title: string }) {
+  if (!fields.length) return <p className="text-sm text-gray-500 dark:text-gray-400">No {title.toLowerCase()} fields.</p>;
+  return (
+    <table className="w-full text-sm">
+      <thead>
+        <tr className="text-left text-xs text-gray-500 dark:text-gray-400">
+          <th className="py-1 pr-2">Field</th>
+          <th className="py-1 pr-2">Type</th>
+          <th className="py-1">Description</th>
+        </tr>
+      </thead>
+      <tbody>
+        {fields.map((f) => (
+          <tr key={f.name} className="border-t border-gray-100 dark:border-gray-800 align-top">
+            <td className="py-1 pr-2">
+              <span className="font-mono">{f.name}</span>
+              {f.required ? <span className="text-red-500 ml-1" title="required">*</span> : <span className="text-xs text-gray-500 ml-1">(optional)</span>}
+              {f.secret && <span className="block text-xs text-amber-700 dark:text-amber-300">secret</span>}
+            </td>
+            <td className="py-1 pr-2">{f.type}</td>
+            <td className="py-1">
+              {f.description || f.display_name}
+              {f.default !== undefined && f.default !== null && (
+                <span className="block text-xs text-gray-500 dark:text-gray-400">Default: {String(f.default)}</span>
+              )}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
 export default function IntegrationMarketplace() {
+  const gate = useRoleGate();
+  // A custom-role holder's tiers are known only to the server: offer the
+  // control and let the server answer (same rule as Settings / Identity).
+  const canAdmin = gate.isAdmin || gate.hasCustomRole;
+  const canOperate = gate.isAnalyst || gate.hasCustomRole;
+
   const [activeTab, setActiveTab] = useState('marketplace');
-  const [connectors, setConnectors] = useState<any[]>([]);
-  const [installed, setInstalled] = useState<any[]>([]);
-  const [executions, setExecutions] = useState<any[]>([]);
-  const [webhooks, setWebhooks] = useState<any[]>([]);
+  const [connectors, setConnectors] = useState<Connector[]>([]);
+  const [installed, setInstalled] = useState<InstalledIntegration[]>([]);
+  const [executions, setExecutions] = useState<IntegrationExecution[]>([]);
+  const [webhooks, setWebhooks] = useState<WebhookRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [connectorsError, setConnectorsError] = useState<unknown>(null);
   const [installedError, setInstalledError] = useState<unknown>(null);
@@ -60,64 +119,95 @@ export default function IntegrationMarketplace() {
   const [searchQuery, setSearchQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [showNewWebhookModal, setShowNewWebhookModal] = useState(false);
-  const [selectedConnector, setSelectedConnector] = useState<any>(null);
-  const [detailExec, setDetailExec] = useState<any | null>(null);
+  const [webhookFormError, setWebhookFormError] = useState<unknown>(null);
+  const [webhookFormMessage, setWebhookFormMessage] = useState<string | null>(null);
+  const [webhookActionError, setWebhookActionError] = useState<{ what: string; error: unknown } | null>(null);
+  const [detailConnector, setDetailConnector] = useState<Connector | null>(null);
+  const [formTarget, setFormTarget] = useState<{ connector: Connector; installation: InstalledIntegration | null } | null>(null);
+  const [runnerFor, setRunnerFor] = useState<InstalledIntegration | null>(null);
+  const [detailExec, setDetailExec] = useState<IntegrationExecution | null>(null);
+  const [testOutcomes, setTestOutcomes] = useState<Record<string, TestOutcome>>({});
+  const [busy, setBusy] = useState<Record<string, string>>({});
+  const [rowErrors, setRowErrors] = useState<Record<string, { what: string; error: unknown }>>({});
+  const [confirmDelete, setConfirmDelete] = useState<InstalledIntegration | null>(null);
+  const [highlightId, setHighlightId] = useState<string | null>(null);
 
-  const loadData = async () => {
+  const loadInstalled = useCallback(async () => {
+    try {
+      setInstalled(await integrationsApi.getInstalled());
+      setInstalledError(null);
+    } catch (e) {
+      setInstalled([]);
+      setInstalledError(e ?? new Error('request failed'));
+    }
+  }, []);
+
+  const loadExecutions = useCallback(async () => {
+    try {
+      const res = await integrationsApi.getExecutions();
+      setExecutions(res.items);
+      setExecutionsTotal(res.total);
+      setExecutionsError(null);
+    } catch (e) {
+      setExecutions([]);
+      setExecutionsTotal(null);
+      setExecutionsError(e ?? new Error('request failed'));
+    }
+  }, []);
+
+  const loadData = useCallback(async () => {
     setLoading(true);
     try {
-      // size=100: the backend defaults to 20, which hid most of the
-      // registry's connectors. Both lists return {items, total, ...}.
-      const [connectorsRes, installedRes, executionsRes] = await Promise.allSettled([
-        api.get('/integrations/connectors', { params: { size: 100 } }),
-        api.get('/integrations/installed', { params: { size: 100 } }),
-        // Newest first, this organisation only.
-        api.get('/integrations/executions', { params: { size: 100 } }),
-      ]);
-      setConnectors(connectorsRes.status === 'fulfilled' ? (connectorsRes.value.data?.items ?? []) : []);
-      setConnectorsError(connectorsRes.status === 'rejected' ? (connectorsRes.reason ?? new Error('request failed')) : null);
-      setInstalled(installedRes.status === 'fulfilled' ? (installedRes.value.data?.items ?? []) : []);
-      setInstalledError(installedRes.status === 'rejected' ? (installedRes.reason ?? new Error('request failed')) : null);
-      setExecutions(executionsRes.status === 'fulfilled' ? (executionsRes.value.data?.items ?? []) : []);
-      setExecutionsTotal(executionsRes.status === 'fulfilled' ? (executionsRes.value.data?.total ?? null) : null);
-      setExecutionsError(executionsRes.status === 'rejected' ? (executionsRes.reason ?? new Error('request failed')) : null);
+      const loadConnectors = async () => {
+        try {
+          setConnectors(await integrationsApi.getConnectors());
+          setConnectorsError(null);
+        } catch (e) {
+          setConnectors([]);
+          setConnectorsError(e ?? new Error('request failed'));
+        }
+      };
+      await Promise.all([loadConnectors(), loadInstalled(), loadExecutions()]);
       // Webhooks are not loaded by this page yet.
       setWebhooks([]);
     } finally {
       setLoading(false);
     }
-  };
+  }, [loadInstalled, loadExecutions]);
 
   React.useEffect(() => {
     loadData();
-  }, []);
+  }, [loadData]);
 
-  // ConnectorResponse has no installed/health fields: installation state
-  // and health come from the org's installed_integrations rows.
-  const installedByConnector = new Map<string, any>(installed.map((i: any) => [i.connector_id, i]));
-  const availableConnectors: number | null = connectorsError || installedError
-    ? null
-    : connectors.filter(c => !installedByConnector.has(c.id)).length;
+  // Installation state and health come from the org's installed rows.
+  const installedByConnector = new Map<string, InstalledIntegration>(installed.map((i) => [i.connector_id, i]));
+  const connectorById = new Map<string, Connector>(connectors.map((c) => [c.id, c]));
+  const installableNotInstalled: number | null =
+    connectorsError || installedError ? null : connectors.filter((c) => c.installable && !installedByConnector.has(c.id)).length;
   const installedCount: number | null = installedError ? null : installed.length;
-  const activeIntegrations: number | null = installedError
-    ? null
-    : installed.filter((i: any) => i.health_status === 'healthy').length;
-  const healthScore: number | null = installedCount && activeIntegrations !== null
-    ? Math.round((activeIntegrations / installedCount) * 100)
-    : null;
-  const shown = (n: number | null, suffix = '') => (n === null ? 'not available' : `${n}${suffix}`);
+  const healthCounts = installed.reduce<Record<string, number>>((acc, i) => {
+    const k = i.health_status || 'unknown';
+    acc[k] = (acc[k] ?? 0) + 1;
+    return acc;
+  }, {});
+  const healthyCount: number | null = installedError ? null : healthCounts.healthy ?? 0;
+  const shown = (n: number | null) => (n === null ? 'not available' : `${n}`);
+
   // Execution rows carry the installed integration id; name it from the
   // installed list and the connector registry.
   const integrationLabel = (installedId: string | null | undefined): string => {
-    const inst = installed.find((i: Row) => i.id === installedId);
+    const inst = installed.find((i) => i.id === installedId);
     if (!inst) return installedId ? `integration ${String(installedId).slice(0, 8)}` : 'unknown integration';
-    const conn = connectors.find((c: Row) => c.id === inst.connector_id);
-    return inst.name || conn?.display_name || conn?.name || inst.connector_id || String(installedId).slice(0, 8);
+    const conn = connectorById.get(inst.connector_id);
+    return inst.display_name || conn?.display_name || conn?.name || inst.connector_id || String(installedId).slice(0, 8);
   };
+  const execInstallId = (e: IntegrationExecution) => e.installed_id ?? e.installation_id ?? null;
 
-  const categories = ['all', ...new Set(connectors.map(c => c.category))];
-  const filteredConnectors = connectors.filter(c => {
-    const matchesSearch = (c.display_name || c.name || '').toLowerCase().includes(searchQuery.toLowerCase());
+  const categories = ['all', ...new Set(connectors.map((c) => c.category).filter(Boolean))];
+  const filteredConnectors = connectors.filter((c) => {
+    const q = searchQuery.toLowerCase();
+    const matchesSearch =
+      (c.display_name || c.name || '').toLowerCase().includes(q) || (c.vendor || '').toLowerCase().includes(q);
     const matchesCategory = categoryFilter === 'all' || c.category === categoryFilter;
     return matchesSearch && matchesCategory;
   });
@@ -129,6 +219,113 @@ export default function IntegrationMarketplace() {
     { id: 'webhooks', label: 'Webhooks', icon: Settings },
   ];
 
+  const openInstalledEntry = (inst: InstalledIntegration) => {
+    setDetailConnector(null);
+    setActiveTab('installed');
+    setHighlightId(inst.id);
+    window.setTimeout(() => document.getElementById(`installed-${inst.id}`)?.scrollIntoView({ block: 'center' }), 0);
+  };
+
+  const withRow = async (inst: InstalledIntegration, what: string, fn: () => Promise<void>) => {
+    setBusy((b) => ({ ...b, [inst.id]: what }));
+    setRowErrors((r) => {
+      const next = { ...r };
+      delete next[inst.id];
+      return next;
+    });
+    try {
+      await fn();
+    } catch (error) {
+      setRowErrors((r) => ({ ...r, [inst.id]: { what, error } }));
+    } finally {
+      setBusy((b) => {
+        const next = { ...b };
+        delete next[inst.id];
+        return next;
+      });
+    }
+  };
+
+  const runTest = (inst: InstalledIntegration) =>
+    withRow(inst, 'test the connection', async () => {
+      try {
+        const result = await integrationsApi.test(inst.id);
+        setTestOutcomes((t) => ({ ...t, [inst.id]: { kind: 'result', result } }));
+      } catch (error) {
+        if (httpStatusOf(error) === 501) {
+          setTestOutcomes((t) => ({
+            ...t,
+            [inst.id]: { kind: 'not_testable', detail: errorDetailText(error) || 'no connection test for this connector' },
+          }));
+        } else {
+          setTestOutcomes((t) => ({ ...t, [inst.id]: { kind: 'error', error } }));
+        }
+      }
+      // The test persists health_status / last_health_check / error_message.
+      await loadInstalled();
+    });
+
+  const toggleEnabled = (inst: InstalledIntegration) =>
+    withRow(inst, inst.status === 'active' ? 'disable the integration' : 'enable the integration', async () => {
+      if (inst.status === 'active') await integrationsApi.disable(inst.id);
+      else await integrationsApi.enable(inst.id);
+      await loadInstalled();
+    });
+
+  const doDelete = (inst: InstalledIntegration) =>
+    withRow(inst, 'delete the integration', async () => {
+      await integrationsApi.uninstall(inst.id);
+      setConfirmDelete(null);
+      await loadInstalled();
+    });
+
+  const openConfigure = (inst: InstalledIntegration) => {
+    const connector = connectorById.get(inst.connector_id);
+    if (!connector) {
+      setRowErrors((r) => ({
+        ...r,
+        [inst.id]: { what: 'configure', error: new Error(`connector ${inst.connector_id} is not in the catalogue`) },
+      }));
+      return;
+    }
+    setFormTarget({ connector, installation: inst });
+  };
+
+  const testOutcomeView = (inst: InstalledIntegration) => {
+    const o = testOutcomes[inst.id];
+    if (!o) return null;
+    if (o.kind === 'not_testable') {
+      return <p className="text-sm text-gray-600 dark:text-gray-300">Not testable: {o.detail}</p>;
+    }
+    if (o.kind === 'error') return <ActionErrorBanner what="test the connection" error={o.error} />;
+    const r = o.result;
+    const ok = r.status === 'healthy' || r.status === 'success';
+    const checked = typeof r.details?.checked === 'string' ? r.details.checked : null;
+    const http = r.details?.http_status;
+    return (
+      <div
+        className={clsx(
+          'text-sm rounded p-3 border',
+          ok
+            ? 'bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800 text-green-800 dark:text-green-200'
+            : 'bg-red-50 dark:bg-red-900/20 border-red-200 dark:border-red-800 text-red-800 dark:text-red-200',
+        )}
+      >
+        <p>
+          Test result: <span className="font-semibold">{r.status}</span>
+          {r.message ? ` · ${r.message}` : ''}
+        </p>
+        <p className="text-xs mt-1 opacity-80">
+          {checked ? `Checked: ${checked} · ` : ''}
+          {http !== undefined && http !== null ? `HTTP ${String(http)} · ` : ''}
+          {formatTime(r.timestamp) ?? 'no timestamp'}
+        </p>
+      </div>
+    );
+  };
+
+  const detailInstallation = detailConnector ? installedByConnector.get(detailConnector.id) ?? null : null;
+
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100">
       {/* Header */}
@@ -139,35 +336,50 @@ export default function IntegrationMarketplace() {
             <h1 className="text-3xl font-bold">Integration Marketplace</h1>
           </div>
           <button
-            onClick={() => setShowNewWebhookModal(true)}
-            className="flex items-center gap-2 bg-cyan-600 hover:bg-cyan-700 text-white px-4 py-2 rounded-lg transition"
+            onClick={() => {
+              setWebhookFormError(null);
+              setWebhookFormMessage(null);
+              setShowNewWebhookModal(true);
+            }}
+            disabled={!canAdmin}
+            title={canAdmin ? undefined : ADMIN_ONLY_REASON}
+            className="flex items-center gap-2 bg-cyan-600 hover:bg-cyan-700 text-white px-4 py-2 rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <Plus className="w-4 h-4" />
             New Webhook
           </button>
         </div>
 
-        {/* Summary Cards */}
+        {/* Summary Cards: counts only, from the catalogue and this org's installed rows. */}
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
           <div className="bg-gradient-to-br from-blue-50 to-blue-100 dark:from-blue-900 dark:to-blue-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-blue-600 dark:text-blue-300">Available Connectors</p>
-            <p className="text-3xl font-bold text-blue-900 dark:text-blue-100 mt-2">{shown(availableConnectors)}</p>
-            <p className="text-xs text-blue-600 dark:text-blue-300 mt-1">ready to install</p>
+            <p className="text-3xl font-bold text-blue-900 dark:text-blue-100 mt-2">{shown(installableNotInstalled)}</p>
+            <p className="text-xs text-blue-600 dark:text-blue-300 mt-1">installable, not yet installed</p>
           </div>
           <div className="bg-gradient-to-br from-green-50 to-green-100 dark:from-green-900 dark:to-green-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-green-600 dark:text-green-300">Installed</p>
             <p className="text-3xl font-bold text-green-900 dark:text-green-100 mt-2">{shown(installedCount)}</p>
-            <p className="text-xs text-green-600 dark:text-green-300 mt-1">active integrations</p>
+            <p className="text-xs text-green-600 dark:text-green-300 mt-1">in this organisation</p>
           </div>
           <div className="bg-gradient-to-br from-purple-50 to-purple-100 dark:from-purple-900 dark:to-purple-800 p-4 rounded-lg">
-            <p className="text-sm font-medium text-purple-600 dark:text-purple-300">Active</p>
-            <p className="text-3xl font-bold text-purple-900 dark:text-purple-100 mt-2">{shown(activeIntegrations)}</p>
-            <p className="text-xs text-purple-600 dark:text-purple-300 mt-1">healthy status</p>
+            <p className="text-sm font-medium text-purple-600 dark:text-purple-300">Healthy</p>
+            <p className="text-3xl font-bold text-purple-900 dark:text-purple-100 mt-2">{shown(healthyCount)}</p>
+            <p className="text-xs text-purple-600 dark:text-purple-300 mt-1">last connection test passed</p>
           </div>
           <div className="bg-gradient-to-br from-orange-50 to-orange-100 dark:from-orange-900 dark:to-orange-800 p-4 rounded-lg">
-            <p className="text-sm font-medium text-orange-600 dark:text-orange-300">Health Score</p>
-            <p className="text-3xl font-bold text-orange-900 dark:text-orange-100 mt-2">{shown(healthScore, '%')}</p>
-            <p className="text-xs text-orange-600 dark:text-orange-300 mt-1">system health</p>
+            <p className="text-sm font-medium text-orange-600 dark:text-orange-300">Health</p>
+            {installedError ? (
+              <p className="text-3xl font-bold text-orange-900 dark:text-orange-100 mt-2">not available</p>
+            ) : installed.length === 0 ? (
+              <p className="text-3xl font-bold text-orange-900 dark:text-orange-100 mt-2">none installed</p>
+            ) : (
+              <p className="text-sm font-semibold text-orange-900 dark:text-orange-100 mt-2 leading-6">
+                {healthCounts.healthy ?? 0} healthy · {healthCounts.unhealthy ?? 0} unhealthy · {healthCounts.unknown ?? 0} unknown
+                {healthCounts.unavailable ? ` · ${healthCounts.unavailable} unavailable` : ''}
+              </p>
+            )}
+            <p className="text-xs text-orange-600 dark:text-orange-300 mt-1">recorded by the last test of each install</p>
           </div>
         </div>
       </div>
@@ -238,70 +450,79 @@ export default function IntegrationMarketplace() {
                   </div>
                 </div>
 
+                {!connectorsError && connectors.length === 0 && (
+                  <p className="text-sm text-gray-500 dark:text-gray-400">The connector catalogue returned no entries.</p>
+                )}
+                {connectors.length > 0 && filteredConnectors.length === 0 && (
+                  <p className="text-sm text-gray-500 dark:text-gray-400">No connector matches the search and category filter.</p>
+                )}
+
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                   {filteredConnectors.map((connector) => {
                     const installation = installedByConnector.get(connector.id);
                     return (
-                    <div key={connector.id} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition flex flex-col">
-                      <div className="flex items-start justify-between mb-3">
-                        <span className="text-xs text-gray-600 dark:text-gray-400">{connector.vendor || ''}</span>
-                        {connector.rating !== null && connector.rating !== undefined ? (
-                          <div className="flex items-center gap-1">
-                            <Star className="w-4 h-4 text-yellow-500 fill-yellow-500" />
-                            <span className="text-sm font-semibold">{connector.rating}</span>
-                          </div>
-                        ) : (
-                          <span className="text-xs text-gray-400">not rated</span>
-                        )}
-                      </div>
-                      <h3 className="font-semibold text-lg mb-1">{connector.display_name || connector.name}</h3>
-                      <div className="flex gap-2 mb-2 flex-wrap">
-                        <span className="text-xs px-2 py-1 bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-100 rounded w-fit">
-                          {connector.category}
-                        </span>
-                        {/* External-SIEM badge — distinguishes optional
-                            interop connectors from PySOAR's native SIEM
-                            so operators aren't misled into thinking they
-                            need to install Splunk to have a SIEM. */}
-                        {connector.integration_role === 'external_siem' && (
-                          <span
-                            title="Optional interop — PySOAR already ships its own native SIEM. Install this only if you have an existing Splunk/Elastic/QRadar/etc. deployment you want to pull events from."
-                            className="text-xs px-2 py-1 bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-200 rounded w-fit border border-amber-300 dark:border-amber-800"
-                          >
-                            Optional · External SIEM
-                          </span>
-                        )}
-                      </div>
-                      <p className="text-sm text-gray-600 dark:text-gray-400 mb-4 flex-grow">{connector.description}</p>
-                      {installation ? (
-                        <div className="space-y-2">
-                          <div className="flex items-center gap-2 text-xs">
-                            <div className={`w-2 h-2 rounded-full ${installation.health_status === 'healthy' ? 'bg-green-600' : 'bg-yellow-600'}`} />
-                            <span className="capitalize">{installation.health_status || 'unknown'}</span>
-                          </div>
-                          <button onClick={() => setSelectedConnector(connector)} className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
-                            Manage
-                          </button>
+                      <div
+                        key={connector.id}
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => setDetailConnector(connector)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' && e.target === e.currentTarget) setDetailConnector(connector);
+                        }}
+                        className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition flex flex-col cursor-pointer"
+                      >
+                        <div className="flex items-start justify-between mb-3 gap-2">
+                          <span className="text-xs text-gray-600 dark:text-gray-400">{connector.vendor || ''}</span>
+                          <ImplementationBadge status={connector.implementation_status} />
                         </div>
-                      ) : (
-                        <button onClick={async () => {
-                          try {
-                            // display_name is required by IntegrationInstallRequest.
-                            await api.post('/integrations/install', {
-                              connector_id: connector.id,
-                              display_name: connector.display_name || connector.name,
-                              config: {},
-                            });
-                            loadData();
-                          } catch (e) {
-                            alert(`Install failed: ${describeLoadError(e)}`);
-                          }
-                        }} className="w-full px-3 py-2 text-sm bg-cyan-600 hover:bg-cyan-700 text-white rounded transition flex items-center justify-center gap-2">
-                          <Download className="w-4 h-4" />
-                          Install
-                        </button>
-                      )}
-                    </div>
+                        <h3 className="font-semibold text-lg mb-1">{connector.display_name || connector.name}</h3>
+                        <div className="flex gap-2 mb-2 flex-wrap">
+                          <span className="text-xs px-2 py-1 bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-100 rounded w-fit">
+                            {connector.category}
+                          </span>
+                          {/* External-SIEM badge: distinguishes optional interop
+                              connectors from PySOAR's native SIEM. */}
+                          {connector.integration_role === 'external_siem' && (
+                            <span
+                              title="Optional interop. PySOAR already ships its own native SIEM. Install this only if you have an existing deployment you want to pull events from."
+                              className="text-xs px-2 py-1 bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-200 rounded w-fit border border-amber-300 dark:border-amber-800"
+                            >
+                              Optional · External SIEM
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">{connector.description}</p>
+                        <p className="text-xs text-gray-500 dark:text-gray-400 italic mb-4 flex-grow">{connector.verification}</p>
+                        {installation ? (
+                          <div className="space-y-2">
+                            <HealthBadge health={installation.health_status} />
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openInstalledEntry(installation);
+                              }}
+                              className={clsx(BTN, 'w-full')}
+                            >
+                              Open installed entry
+                            </button>
+                          </div>
+                        ) : connector.installable ? (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setFormTarget({ connector, installation: null });
+                            }}
+                            disabled={!canAdmin}
+                            title={canAdmin ? undefined : ADMIN_ONLY_REASON}
+                            className="w-full px-3 py-2 text-sm bg-cyan-600 hover:bg-cyan-700 text-white rounded transition flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                          >
+                            <Download className="w-4 h-4" />
+                            Install
+                          </button>
+                        ) : (
+                          <p className="text-sm text-gray-500 dark:text-gray-400">Planned: not installable in this release</p>
+                        )}
+                      </div>
                     );
                   })}
                 </div>
@@ -312,57 +533,101 @@ export default function IntegrationMarketplace() {
             {activeTab === 'installed' && (
               <div className="space-y-6">
                 <LoadErrorBanner what="installed integrations" error={installedError} />
+                {!installedError && installed.length === 0 && (
+                  <p className="text-sm text-gray-500 dark:text-gray-400">No integrations installed. Install one from the Marketplace.</p>
+                )}
                 <div className="grid grid-cols-1 gap-4">
-                  {installed.map((integration) => (
-                    <div key={integration.id} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition">
-                      <div className="flex justify-between items-start mb-4">
-                        <div className="flex-1">
-                          <h3 className="font-semibold text-lg">{integration.display_name}</h3>
-                          <p className="text-sm text-gray-600 dark:text-gray-400 font-mono">{integration.connector_id}</p>
+                  {installed.map((integration) => {
+                    const rowBusy = busy[integration.id];
+                    const rowError = rowErrors[integration.id];
+                    const connector = connectorById.get(integration.connector_id);
+                    return (
+                      <div
+                        key={integration.id}
+                        id={`installed-${integration.id}`}
+                        className={clsx(
+                          'bg-white dark:bg-gray-800 border rounded-lg p-4 hover:shadow-lg transition space-y-4',
+                          highlightId === integration.id ? 'border-cyan-500 ring-2 ring-cyan-500/40' : 'border-gray-200 dark:border-gray-700',
+                        )}
+                      >
+                        <div className="flex justify-between items-start gap-4">
+                          <div className="flex-1">
+                            <h3 className="font-semibold text-lg">{integration.display_name}</h3>
+                            <p className="text-sm text-gray-600 dark:text-gray-400 font-mono">
+                              {integration.connector_id}
+                              {connector ? ` · ${connector.display_name}` : ''}
+                            </p>
+                          </div>
+                          <HealthBadge health={integration.health_status} />
                         </div>
-                        <span className={`px-3 py-1 rounded-full text-xs font-medium ${getHealthColor(integration.health_status || null)}`}>
-                          {integration.health_status || 'unknown'}
-                        </span>
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                          <div>
+                            <p className="text-gray-600 dark:text-gray-400">Last Health Check</p>
+                            <p className="font-medium">{formatTime(integration.last_health_check) ?? 'Never tested'}</p>
+                          </div>
+                          <div>
+                            <p className="text-gray-600 dark:text-gray-400">Status</p>
+                            <p className="font-medium capitalize">{integration.status || 'not available'}</p>
+                          </div>
+                          <div>
+                            <p className="text-gray-600 dark:text-gray-400">Last Successful Action</p>
+                            <p className="font-medium">{formatTime(integration.last_successful_action) ?? 'Never'}</p>
+                          </div>
+                          <div>
+                            <p className="text-gray-600 dark:text-gray-400">Last Error</p>
+                            <p className="font-medium break-words">{integration.error_message || 'None'}</p>
+                          </div>
+                        </div>
+                        {testOutcomeView(integration)}
+                        {rowError && <ActionErrorBanner what={rowError.what} error={rowError.error} />}
+                        <div className="flex gap-2 flex-wrap">
+                          <button
+                            onClick={() => runTest(integration)}
+                            disabled={!canOperate || !!rowBusy}
+                            title={canOperate ? "Runs the connector's read-only test call" : ANALYST_ONLY_REASON}
+                            className={clsx(BTN, 'flex-1')}
+                          >
+                            {rowBusy === 'test the connection' && <Loader2 className="w-4 h-4 animate-spin" />}
+                            Test
+                          </button>
+                          <button
+                            onClick={() => openConfigure(integration)}
+                            disabled={!canAdmin || !!rowBusy}
+                            title={canAdmin ? undefined : ADMIN_ONLY_REASON}
+                            className={clsx(BTN, 'flex-1')}
+                          >
+                            <Settings className="w-4 h-4" />
+                            Configure
+                          </button>
+                          <button
+                            onClick={() => setRunnerFor(integration)}
+                            className={clsx(BTN, 'flex-1')}
+                            title="Declared actions of this integration"
+                          >
+                            <Play className="w-4 h-4" />
+                            Actions
+                          </button>
+                          <button
+                            onClick={() => toggleEnabled(integration)}
+                            disabled={!canAdmin || !!rowBusy}
+                            title={canAdmin ? undefined : ADMIN_ONLY_REASON}
+                            className={clsx(BTN, 'flex-1')}
+                          >
+                            <Power className="w-4 h-4" />
+                            {integration.status === 'active' ? 'Disable' : 'Enable'}
+                          </button>
+                          <button
+                            onClick={() => setConfirmDelete(integration)}
+                            disabled={!canAdmin || !!rowBusy}
+                            title={canAdmin ? 'Delete this integration' : ADMIN_ONLY_REASON}
+                            className={clsx(BTN, 'text-red-600 dark:text-red-400')}
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
                       </div>
-                      <div className="grid grid-cols-4 gap-4 text-sm mb-4">
-                        <div>
-                          <p className="text-gray-600 dark:text-gray-400">Last Health Check</p>
-                          <p className="font-medium">{integration.last_health_check ? new Date(integration.last_health_check).toLocaleString() : 'Never'}</p>
-                        </div>
-                        <div>
-                          <p className="text-gray-600 dark:text-gray-400">Status</p>
-                          <p className="font-medium capitalize">{integration.status || 'not available'}</p>
-                        </div>
-                        <div>
-                          <p className="text-gray-600 dark:text-gray-400">Last Successful Action</p>
-                          <p className="font-medium">{integration.last_successful_action ? new Date(integration.last_successful_action).toLocaleString() : 'Never'}</p>
-                        </div>
-                        <div>
-                          <p className="text-gray-600 dark:text-gray-400">Last Error</p>
-                          <p className="font-medium break-words">{integration.error_message || 'None'}</p>
-                        </div>
-                      </div>
-                      <div className="flex gap-2">
-                        <button onClick={() => setSelectedConnector(integration)} className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
-                          Configure
-                        </button>
-                        <button onClick={async () => {
-                          try {
-                            const res = await api.post(`/integrations/installed/${integration.id}/test`);
-                            alert(`Test result: ${res.data?.status ?? 'unknown'}${res.data?.message ? ` — ${res.data.message}` : ''}`);
-                            loadData();
-                          } catch (e) {
-                            alert(`Test failed: ${describeLoadError(e)}`);
-                          }
-                        }} className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
-                          Test
-                        </button>
-                        <button onClick={() => setSelectedConnector(integration)} className="px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
-                          <Settings className="w-4 h-4" />
-                        </button>
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -396,12 +661,10 @@ export default function IntegrationMarketplace() {
                     <tbody>
                       {executions.map((exec) => (
                         <tr key={exec.id} className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 transition">
-                          <td className="px-6 py-4 text-sm font-medium">{integrationLabel(exec.installed_id)}</td>
-                          <td className="px-6 py-4 text-sm">{exec.started_at || exec.created_at ? new Date(exec.started_at || exec.created_at).toLocaleString() : 'not started'}</td>
+                          <td className="px-6 py-4 text-sm font-medium">{integrationLabel(execInstallId(exec))}</td>
+                          <td className="px-6 py-4 text-sm">{formatTime(exec.started_at || exec.created_at) ?? 'not started'}</td>
                           <td className="px-6 py-4">
-                            <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(exec.status)}`}>
-                              {exec.status}
-                            </span>
+                            <ExecutionStatusBadge status={exec.status} />
                           </td>
                           <td className="px-6 py-4 text-sm">{exec.triggered_by || 'not recorded'}</td>
                           <td className="px-6 py-4 text-sm">{typeof exec.duration_ms === 'number' ? `${exec.duration_ms} ms` : 'not recorded'}</td>
@@ -426,6 +689,12 @@ export default function IntegrationMarketplace() {
             {/* Webhooks Tab */}
             {activeTab === 'webhooks' && (
               <div className="space-y-6">
+                {webhookActionError && <ActionErrorBanner what={webhookActionError.what} error={webhookActionError.error} />}
+                {webhooks.length === 0 && (
+                  <p className="text-sm text-gray-500 dark:text-gray-400">
+                    This page does not list registered webhooks yet. New Webhook registers one on an installed integration.
+                  </p>
+                )}
                 <div className="grid grid-cols-1 gap-4">
                   {webhooks.map((webhook) => (
                     <div key={webhook.id} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition">
@@ -434,7 +703,7 @@ export default function IntegrationMarketplace() {
                           <h3 className="font-semibold">{webhook.name}</h3>
                           <p className="text-xs font-mono text-gray-600 dark:text-gray-400 mt-1 truncate">{webhook.url}</p>
                         </div>
-                        <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(webhook.status)}`}>
+                        <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(webhook.status || '')}`}>
                           {webhook.status}
                         </span>
                       </div>
@@ -445,7 +714,7 @@ export default function IntegrationMarketplace() {
                         </div>
                         <div>
                           <p className="text-gray-600 dark:text-gray-400">Last Triggered</p>
-                          <p className="font-medium">{webhook.lastTriggered ? new Date(webhook.lastTriggered || "").toLocaleDateString() : 'Never'}</p>
+                          <p className="font-medium">{webhook.lastTriggered ? new Date(webhook.lastTriggered).toLocaleDateString() : 'Never'}</p>
                         </div>
                         <div>
                           <p className="text-gray-600 dark:text-gray-400">Success Count</p>
@@ -459,44 +728,45 @@ export default function IntegrationMarketplace() {
                       <div className="flex gap-2">
                         <button
                           onClick={async () => {
-                            const integrationId = (webhook as any).installation_id;
+                            setWebhookActionError(null);
+                            const integrationId = webhook.installation_id;
                             if (!integrationId) {
-                              alert('This webhook has no installation id, so it cannot be tested.');
+                              setWebhookActionError({ what: 'test the webhook', error: new Error('this webhook has no installation id') });
                               return;
                             }
                             try {
-                              const res = await api.post(
-                                `/integrations/installed/${integrationId}/webhooks/${webhook.id}/test`
-                              );
-                              setDetailExec(res.data);
+                              await integrationsApi.testWebhook(integrationId, webhook.id);
                               loadData();
                             } catch (err) {
-                              alert(`Webhook test failed: ${describeLoadError(err)}`);
+                              // 501 by design: there is no inbound pipeline a test event could pass through.
+                              setWebhookActionError({ what: 'test the webhook', error: err });
                             }
                           }}
-                          className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-                          title="Fire a synthetic test event through the webhook pipeline"
+                          disabled={!canOperate}
+                          title={canOperate ? 'Webhook test (answers 501: there is no inbound pipeline to test)' : ANALYST_ONLY_REASON}
+                          className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition disabled:opacity-50"
                         >
                           Test
                         </button>
                         <button
                           onClick={async () => {
                             if (!window.confirm(`Delete webhook ${webhook.name}?`)) return;
-                            const integrationId = (webhook as any).installation_id;
+                            setWebhookActionError(null);
+                            const integrationId = webhook.installation_id;
                             if (!integrationId) {
-                              alert('This webhook has no installation id, so it cannot be deleted.');
+                              setWebhookActionError({ what: 'delete the webhook', error: new Error('this webhook has no installation id') });
                               return;
                             }
                             try {
-                              await api.delete(
-                                `/integrations/installed/${integrationId}/webhooks/${webhook.id}`
-                              );
+                              await integrationsApi.deleteWebhook(integrationId, webhook.id);
                               loadData();
                             } catch (err) {
-                              alert(`Webhook delete failed: ${describeLoadError(err)}`);
+                              setWebhookActionError({ what: 'delete the webhook', error: err });
                             }
                           }}
-                          className="px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                          disabled={!canAdmin}
+                          title={canAdmin ? undefined : ADMIN_ONLY_REASON}
+                          className="px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition disabled:opacity-50"
                         >
                           <Trash2 className="w-4 h-4" />
                         </button>
@@ -512,19 +782,25 @@ export default function IntegrationMarketplace() {
 
       {/* New Webhook Modal */}
       {showNewWebhookModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
           <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto">
             <h2 className="text-xl font-bold mb-4">Create Webhook</h2>
             <form className="space-y-4" onSubmit={async (e) => {
               e.preventDefault();
+              setWebhookFormError(null);
+              setWebhookFormMessage(null);
               const fd = new FormData(e.currentTarget);
-              const integrationId = fd.get('integration_id');
-              if (!integrationId) { alert('Select an installed integration first.'); return; }
+              const integrationId = String(fd.get('integration_id') || '');
+              if (!integrationId) { setWebhookFormMessage('Select an installed integration first.'); return; }
               try {
-                await api.post(`/integrations/installed/${integrationId}/webhooks`, { endpoint_path: fd.get('url'), http_method: 'POST', event_types: [fd.get('event')] });
+                await integrationsApi.createWebhook(integrationId, {
+                  endpoint_path: String(fd.get('url') || ''),
+                  http_method: 'POST',
+                  event_types: [String(fd.get('event') || '')],
+                });
                 setShowNewWebhookModal(false);
                 loadData();
-              } catch (err) { alert(`Create webhook failed: ${describeLoadError(err)}`); }
+              } catch (err) { setWebhookFormError(err); }
             }}>
               <div>
                 <label className="block text-sm font-medium mb-1">Integration</label>
@@ -534,6 +810,9 @@ export default function IntegrationMarketplace() {
                     <option key={inst.id} value={inst.id}>{inst.display_name || inst.connector_id}</option>
                   ))}
                 </select>
+                {installed.length === 0 && (
+                  <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">No integrations installed. Install one from the Marketplace first.</p>
+                )}
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Endpoint Path</label>
@@ -548,6 +827,8 @@ export default function IntegrationMarketplace() {
                   <option>ticket.created</option>
                 </select>
               </div>
+              {webhookFormMessage && <p role="alert" className="text-sm text-red-600 dark:text-red-400">{webhookFormMessage}</p>}
+              <ActionErrorBanner what="create the webhook" error={webhookFormError} />
               <div className="flex gap-2 mt-6">
                 <button type="button" onClick={() => setShowNewWebhookModal(false)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
                 <button type="submit" className="flex-1 px-4 py-2 bg-cyan-600 hover:bg-cyan-700 text-white rounded-lg transition">Create</button>
@@ -557,11 +838,176 @@ export default function IntegrationMarketplace() {
         </div>
       )}
 
+      {/* Install / configure form */}
+      <ConnectorFormModal
+        open={!!formTarget}
+        connector={formTarget?.connector ?? null}
+        installation={formTarget?.installation ?? null}
+        onClose={() => setFormTarget(null)}
+        onInstall={async (body) => {
+          const inst = await integrationsApi.install(body);
+          await loadInstalled();
+          setTestOutcomes((t) => {
+            const next = { ...t };
+            delete next[inst.id];
+            return next;
+          });
+        }}
+        onUpdate={async (id, body) => {
+          await integrationsApi.update(id, body);
+          setTestOutcomes((t) => {
+            const next = { ...t };
+            delete next[id];
+            return next;
+          });
+          await loadInstalled();
+        }}
+      />
+
+      {/* Connector detail drawer */}
+      <DetailDrawer
+        open={!!detailConnector}
+        onClose={() => setDetailConnector(null)}
+        title={detailConnector ? detailConnector.display_name || detailConnector.name : 'Connector'}
+        subtitle={detailConnector ? `${detailConnector.vendor || 'vendor not named'} · ${detailConnector.category}` : undefined}
+        sections={
+          detailConnector
+            ? ([
+                {
+                  title: 'Connector',
+                  fields: [
+                    { label: 'Description', value: detailConnector.description, full: true },
+                    { label: 'Vendor', value: detailConnector.vendor },
+                    { label: 'Identifier', value: detailConnector.id, mono: true },
+                    { label: 'Status', value: <ImplementationBadge status={detailConnector.implementation_status} /> },
+                    { label: 'Installed here', value: detailInstallation ? <HealthBadge health={detailInstallation.health_status} /> : 'no' },
+                    { label: 'Verification', value: detailConnector.verification, full: true },
+                    { label: 'Read-only test call', value: detailConnector.test_call || 'none', mono: true, full: true },
+                  ],
+                },
+                {
+                  title: 'Fields',
+                  fields: [
+                    { label: 'Configuration', value: <FieldsTable fields={detailConnector.config_fields} title="Configuration" />, full: true },
+                    { label: 'Credentials (stored encrypted, never returned)', value: <FieldsTable fields={detailConnector.credential_fields} title="Credential" />, full: true },
+                  ],
+                },
+                {
+                  title: 'Actions',
+                  fields: [
+                    {
+                      label: detailConnector.actions.length ? `${detailConnector.actions.length} declared` : 'Declared actions',
+                      full: true,
+                      value: detailConnector.actions.length ? (
+                        <table className="w-full text-sm">
+                          <thead>
+                            <tr className="text-left text-xs text-gray-500 dark:text-gray-400">
+                              <th className="py-1 pr-2">Action</th>
+                              <th className="py-1 pr-2">Description</th>
+                              <th className="py-1">Kind</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {detailConnector.actions.map((a) => (
+                              <tr key={a.name} className="border-t border-gray-100 dark:border-gray-800 align-top">
+                                <td className="py-1 pr-2 font-mono">{a.name}</td>
+                                <td className="py-1 pr-2">{a.description}</td>
+                                <td className="py-1 space-y-1">
+                                  {a.side_effect ? <SideEffectBadge /> : <span className="text-xs text-gray-500 dark:text-gray-400 block">read-only</span>}
+                                  {a.idempotent && <span className="text-xs text-gray-500 dark:text-gray-400 block">idempotent</span>}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      ) : (
+                        'This connector declares no actions.'
+                      ),
+                    },
+                  ],
+                },
+              ] as DetailSection[])
+            : undefined
+        }
+        actions={
+          detailConnector ? (
+            detailInstallation ? (
+              <button onClick={() => openInstalledEntry(detailInstallation)} className={BTN}>
+                Open installed entry
+              </button>
+            ) : detailConnector.installable ? (
+              <button
+                onClick={() => {
+                  const c = detailConnector;
+                  setDetailConnector(null);
+                  setFormTarget({ connector: c, installation: null });
+                }}
+                disabled={!canAdmin}
+                title={canAdmin ? undefined : ADMIN_ONLY_REASON}
+                className="px-4 py-2 text-sm bg-cyan-600 hover:bg-cyan-700 text-white rounded flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Download className="w-4 h-4" />
+                Install
+              </button>
+            ) : (
+              <span className="text-sm text-gray-500 dark:text-gray-400">Planned: not installable in this release</span>
+            )
+          ) : undefined
+        }
+      />
+
+      {/* Action runner */}
+      <ActionRunnerDrawer
+        installation={runnerFor}
+        isAdmin={canAdmin}
+        isAnalyst={canOperate}
+        onClose={() => setRunnerFor(null)}
+        loadActions={integrationsApi.getActions}
+        execute={integrationsApi.executeAction}
+        onExecuted={() => {
+          loadExecutions();
+          loadInstalled();
+        }}
+        onShowExecutions={() => {
+          setRunnerFor(null);
+          setActiveTab('executions');
+        }}
+      />
+
+      {/* Delete confirmation */}
+      {confirmDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" aria-modal="true" role="dialog">
+          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={() => !busy[confirmDelete.id] && setConfirmDelete(null)} />
+          <div className="relative w-full max-w-md bg-white dark:bg-gray-900 rounded-lg shadow-2xl border border-gray-200 dark:border-gray-700 p-6 space-y-4">
+            <h2 className="text-lg font-semibold">Delete {confirmDelete.display_name}?</h2>
+            <p className="text-sm text-gray-600 dark:text-gray-400">
+              The installed integration and its stored credentials are removed from this organisation. Playbook steps that use it will stop working.
+            </p>
+            {rowErrors[confirmDelete.id] && (
+              <ActionErrorBanner what={rowErrors[confirmDelete.id].what} error={rowErrors[confirmDelete.id].error} />
+            )}
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setConfirmDelete(null)} disabled={!!busy[confirmDelete.id]} className={BTN}>
+                Cancel
+              </button>
+              <button
+                onClick={() => doDelete(confirmDelete)}
+                disabled={!!busy[confirmDelete.id]}
+                className="px-4 py-2 text-sm bg-red-600 hover:bg-red-700 text-white rounded flex items-center gap-2 disabled:opacity-50"
+              >
+                {busy[confirmDelete.id] && <Loader2 className="w-4 h-4 animate-spin" />}
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Execution detail drawer */}
       <DetailDrawer
         open={!!detailExec}
         onClose={() => setDetailExec(null)}
-        title={`Execution · ${detailExec ? integrationLabel(detailExec.installed_id) : 'Integration'}`}
+        title={`Execution · ${detailExec ? integrationLabel(execInstallId(detailExec)) : 'Integration'}`}
         subtitle={detailExec ? `${detailExec.status || 'unknown'} · ${detailExec.triggered_by || 'trigger not recorded'}` : undefined}
         sections={
           detailExec
@@ -570,23 +1016,34 @@ export default function IntegrationMarketplace() {
                   title: 'Execution',
                   fields: [
                     { label: 'Execution ID', value: detailExec.id, mono: true, full: true },
-                    { label: 'Integration', value: integrationLabel(detailExec.installed_id) },
+                    { label: 'Integration', value: integrationLabel(execInstallId(detailExec)) },
                     { label: 'Action ID', value: detailExec.action_id, mono: true },
                     { label: 'Status', value: detailExec.status },
                     { label: 'Triggered by', value: detailExec.triggered_by },
                     { label: 'Playbook run', value: detailExec.playbook_run_id, mono: true },
                     { label: 'Duration', value: detailExec.duration_ms != null ? `${detailExec.duration_ms} ms` : null },
                     { label: 'Retries', value: detailExec.retry_count },
-                    { label: 'Started', value: detailExec.started_at ? new Date(detailExec.started_at).toLocaleString() : null },
-                    { label: 'Completed', value: detailExec.completed_at ? new Date(detailExec.completed_at).toLocaleString() : null },
+                    // Returned by the execute call; the stored row has no column for them.
+                    { label: 'Error code', value: detailExec.error_code ?? 'not stored on the execution row', mono: true },
+                    { label: 'HTTP status', value: detailExec.http_status ?? 'not stored on the execution row' },
+                    { label: 'Started', value: formatTime(detailExec.started_at) },
+                    { label: 'Completed', value: formatTime(detailExec.completed_at) },
                   ],
                 },
                 {
                   title: 'Input and result',
                   fields: [
                     { label: 'Error', value: detailExec.error_message, full: true, mono: true },
-                    { label: 'Input', value: detailExec.input_data, full: true, mono: true },
-                    { label: 'Output', value: detailExec.output_data, full: true, mono: true },
+                    {
+                      label: 'Input',
+                      value: formatJson(detailExec.input_data) ? <pre className="text-xs whitespace-pre-wrap">{formatJson(detailExec.input_data)}</pre> : null,
+                      full: true,
+                    },
+                    {
+                      label: 'Output',
+                      value: formatJson(detailExec.output_data) ? <pre className="text-xs whitespace-pre-wrap">{formatJson(detailExec.output_data)}</pre> : null,
+                      full: true,
+                    },
                   ],
                 },
               ] as DetailSection[])

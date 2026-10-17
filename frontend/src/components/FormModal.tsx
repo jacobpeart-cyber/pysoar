@@ -88,7 +88,12 @@ export default function FormModal({
       await onSubmit(values);
       onClose();
     } catch (err: any) {
-      setError(err?.response?.data?.detail || err?.message || 'Submit failed');
+      const detail = err?.response?.data?.detail;
+      // A dict detail ({error, detail, fields}) must not reach React as a child.
+      const text = typeof detail === 'string' ? detail
+        : detail && typeof detail === 'object' ? (detail.detail || detail.error || JSON.stringify(detail))
+        : null;
+      setError(text || err?.message || 'Submit failed');
     } finally {
       setSubmitting(false);
     }

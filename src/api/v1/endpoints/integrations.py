@@ -239,11 +239,14 @@ def _installed_response(i: InstalledIntegration) -> InstalledIntegrationResponse
     health = i.health_status
     if implementation_status(connector_name) == PLANNED:
         health = HealthStatus.UNAVAILABLE.value
+    # config_encrypted holds the NON-secret config (install writes it as plain
+    # JSON); credentials live in auth_credentials_encrypted and are never returned.
+    stored_config = safe_json_loads(i.config_encrypted, {}) if i.config_encrypted else {}
     return InstalledIntegrationResponse(
         id=i.id,
         connector_id=i.connector_id,
         display_name=i.display_name,
-        config={},
+        config=stored_config if isinstance(stored_config, dict) else {},
         status=i.status,
         health_status=health,
         last_health_check=i.last_health_check,

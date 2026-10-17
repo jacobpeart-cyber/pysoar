@@ -6,7 +6,7 @@ Roles: `viewer` < `analyst` < `admin` inside an organisation; `platform superuse
 
 Classified in wave 5 (W5-B, 2026-10-15) from the uncalled-route tables in `docs/audit/2026-10-08/` and the code as it stands after waves 1-4. Routes graded FAKE, duplicates and superseded aliases were deleted, not listed. Rows are one per method and path; to add a route, add a row in the right section.
 
-## KEEP-API (504 routes)
+## KEEP-API (516 routes)
 
 Real routes with no UI control, kept for integrations, scripts, endpoint agents, probes and API clients.
 
@@ -250,12 +250,7 @@ Real routes with no UI control, kept for integrations, scripts, endpoint agents,
 | GET | `/api/v1/integrations/dashboard/health` | Get integration health overview dashboard. | any authenticated user | org-scoped |
 | GET | `/api/v1/integrations/dashboard/stats` | Get execution statistics dashboard. | any authenticated user | org-scoped |
 | GET | `/api/v1/integrations/dashboard/summary` | Get complete dashboard summary with real top_connectors + high_error_rate. | any authenticated user | org-scoped |
-| DELETE | `/api/v1/integrations/installed/{integration_id}` | Uninstall integration (planned connectors included); audited. | admin | org-scoped |
 | GET | `/api/v1/integrations/installed/{integration_id}` | Get details of installed integration | any authenticated user | org-scoped |
-| PATCH | `/api/v1/integrations/installed/{integration_id}` | Update an installed integration: config and credentials are merged over the stored values; 422 `missing_fields` / `invalid_fields` naming fields only; audited. | admin | org-scoped |
-| GET | `/api/v1/integrations/installed/{integration_id}/actions` | The actions the connector class declares, with their real `input_schema` and `requires_approval` (= changes vendor state); empty for a planned connector. | any authenticated user | org-scoped |
-| POST | `/api/v1/integrations/installed/{integration_id}/actions/{action_id}/execute` | Execute a declared action: 422 `invalid_parameters` against its `params_schema`, 501 for a planned connector, a vendor error is a `failed` execution with `http_status`; one execution row, audited. | analyst, admin | org-scoped |
-| POST | `/api/v1/integrations/installed/{integration_id}/disable` | Disable integration | admin | org-scoped |
 | GET | `/api/v1/integrations/installed/{integration_id}/executions` | Get execution history for integration | any authenticated user | org-scoped |
 | GET | `/api/v1/integrations/installed/{integration_id}/webhooks` | List webhooks for integration | any authenticated user | org-scoped |
 | GET | `/api/v1/integrations/webhooks` | Flat list of webhooks across all integrations. | any authenticated user | org-scoped (in handler) |
