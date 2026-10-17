@@ -391,7 +391,11 @@ async def _http_stream(url: str) -> AsyncIterator[httpx.Response]:
         target = await resolve_and_vet(url)
     except OutboundTargetRefused as exc:
         raise SAMLError("provider_unreachable", f"outbound target refused: {exc}") from exc
-    pinned = merge_pinned_kwargs(target, {"Accept": "application/samlmetadata+xml, application/xml, text/xml"})
+    # identity only: a transparently decompressed body would defeat the size cap.
+    pinned = merge_pinned_kwargs(target, {
+        "Accept": "application/samlmetadata+xml, application/xml, text/xml",
+        "Accept-Encoding": "identity",
+    })
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=False) as client:
             async with client.stream("GET", target.pinned_url, headers=pinned["headers"],
@@ -404,6 +408,9 @@ async def _http_stream(url: str) -> AsyncIterator[httpx.Response]:
 async def read_capped(response: httpx.Response, limit: int, what: str) -> bytes:
     """The body, refused (``metadata_failed``) when a declared Content-Length
     exceeds ``limit`` (nothing is read) or once more than ``limit`` bytes arrived."""
+    encoding = (response.headers.get("content-encoding") or "identity").strip().lower()
+    if encoding not in ("", "identity"):
+        raise SAMLError("metadata_failed", f"{what} is {encoding}-encoded; only an identity-encoded body is accepted")
     declared = response.headers.get("content-length")
     if declared is not None:
         try:
@@ -413,6 +420,8 @@ async def read_capped(response: httpx.Response, limit: int, what: str) -> bytes:
         if size > limit:
             raise SAMLError("metadata_failed", f"{what} declares {size} bytes; at most {limit} are accepted")
     body = bytearray()
+    # Only identity encoding reaches this point, so no decoding happens here
+    # and the cap applies to the bytes that arrive.
     async for chunk in response.aiter_bytes():
         body.extend(chunk)
         if len(body) > limit:

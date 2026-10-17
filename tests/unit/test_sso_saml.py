@@ -765,6 +765,17 @@ async def test_declared_oversized_metadata_is_refused_unread(monkeypatch) -> Non
     assert body.pulled == 0
 
 
+async def test_compressed_metadata_is_refused_unread(monkeypatch) -> None:
+    """A transparently decompressed body would defeat the size cap: only an
+    identity-encoded response is accepted, and nothing of it is read otherwise."""
+    body = _Body(b"x" * 1024, count=10)
+    install_body(monkeypatch, body, headers={"Content-Encoding": "gzip", "Content-Length": "64"})
+    with pytest.raises(saml_sp.SAMLError) as exc:
+        await saml_sp.fetch_idp_metadata("https://idp.saml-example.com/metadata", "x")
+    assert exc.value.reason == "metadata_failed" and "gzip-encoded" in exc.value.detail
+    assert body.pulled == 0
+
+
 async def test_streamed_oversized_metadata_stops_at_the_cap(
     client: AsyncClient, db_session, org_a, org_a_admin_headers, monkeypatch,
 ) -> None:
