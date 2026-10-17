@@ -397,7 +397,7 @@ async def test_happy_path_jit_create_then_exchange_once(client: AsyncClient, db_
     user = (await db_session.execute(select(User).where(User.email == f"jane@{DOMAIN}"))).scalar_one()
     user_id = user.id
     assert user.organization_id == org_id and user.sso_subject == f"Jane@{DOMAIN}" and user.full_name == "Jane Doe"
-    assert user.role == "viewer" and user.identity_source == "oidc"
+    assert user.role == "viewer" and user.identity_source == "saml"
     assert await _audit_rows(db_session, "sso_user_provisioned", org_id)
     assert await _audit_rows(db_session, "sso_saml_assertion", org_id)
 

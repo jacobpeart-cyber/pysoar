@@ -980,7 +980,9 @@ async def _user_for_claims(
             is_active=True,
             is_superuser=False,
             organization_id=org_id,
-            identity_source=IdentitySource.OIDC.value,
+            identity_source=(
+                IdentitySource.SAML.value if config.protocol == SSOProtocol.SAML.value else IdentitySource.OIDC.value
+            ),
             sso_subject=subject,
             force_password_change=False,
         )

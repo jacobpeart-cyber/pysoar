@@ -297,7 +297,7 @@ async def _write_user(
 
 
 #: Identity sources whose sign-in email and lifecycle the identity provider owns.
-_IDP_MANAGED_SOURCES = frozenset({IdentitySource.SCIM.value, IdentitySource.OIDC.value})
+_IDP_MANAGED_SOURCES = frozenset({IdentitySource.SCIM.value, IdentitySource.OIDC.value, IdentitySource.SAML.value})
 
 
 def _idp_managed(user: User) -> bool:

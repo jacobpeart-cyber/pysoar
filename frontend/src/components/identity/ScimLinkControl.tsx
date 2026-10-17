@@ -39,7 +39,7 @@ export default function ScimLinkControl({
   if (user.is_superuser) {
     return <span className="text-xs text-gray-500">The platform superuser is never managed through SCIM.</span>;
   }
-  if (source === 'oidc') {
+  if (source === 'oidc' || source === 'saml') {
     return <span className="text-xs text-gray-500">Provisioned by SSO sign-in; SCIM linking applies to local accounts.</span>;
   }
   const lockReason = !gate.isFullAdmin ? FULL_ADMIN_ONLY_REASON : null;

@@ -757,7 +757,7 @@ async def recompute_role(
     take roles from SCIM groups: a local account (an administrator's included)
     can be listed as a member but its role is managed in PySOAR, so a
     provisioning token cannot demote or promote it."""
-    if user.is_superuser or (user.identity_source or "local") not in ("scim", "oidc"):
+    if user.is_superuser or (user.identity_source or "local") not in ("scim", "oidc", "saml"):
         return None
     best: Optional[tuple[int, str, tuple[str, Optional[Role]]]] = None
     for group in store.groups_of(str(user.id)):

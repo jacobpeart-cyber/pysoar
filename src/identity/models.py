@@ -48,6 +48,7 @@ class IdentitySource(str, Enum):
 
     LOCAL = "local"
     OIDC = "oidc"
+    SAML = "saml"
     SCIM = "scim"
 
 

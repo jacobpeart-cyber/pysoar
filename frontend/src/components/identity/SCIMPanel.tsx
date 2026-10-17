@@ -199,7 +199,7 @@ export default function SCIMPanel() {
                 <div key={u.id} className="py-2 flex flex-wrap items-center gap-3 justify-between">
                   <div className="text-sm text-gray-800 dark:text-gray-200">
                     {u.email}{' '}
-                    <Chip tone={u.identity_source === 'scim' ? 'blue' : u.identity_source === 'oidc' ? 'amber' : 'gray'}>
+                    <Chip tone={u.identity_source === 'scim' ? 'blue' : (u.identity_source === 'oidc' || u.identity_source === 'saml') ? 'amber' : 'gray'}>
                       {u.identity_source ?? 'local'}
                     </Chip>
                     {!u.is_active && <> <Chip tone="red">inactive</Chip></>}

@@ -583,7 +583,7 @@ function UserDetailsModal({
               : 'Managed by the identity provider. PySOAR has no password for this account and refuses a password reset (sso_managed); reset it at the provider.'}
           </div>
 
-          {canManage && !user.is_superuser && source !== 'oidc' && (
+          {canManage && !user.is_superuser && source !== 'oidc' && source !== 'saml' && (
             <div className="space-y-1">
               <label className="block text-sm font-medium text-gray-500">SCIM management</label>
               <p className="text-xs text-gray-500">
