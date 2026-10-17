@@ -77,7 +77,7 @@ production without a strong `SECRET_KEY` / `JWT_SECRET_KEY` and a set
 
 | Key | Content |
 |---|---|
-| `DATABASE_URL` | `postgresql+asyncpg://USER:PASSWORD@HOST:5432/DB`. TLS goes in the URL (`?ssl=require`): `DATABASE_SSL_MODE` is validated but not applied to the engine. |
+| `DATABASE_URL` | `postgresql+asyncpg://USER:PASSWORD@HOST:5432/DB`. TLS comes from `config.databaseSslMode` (`DATABASE_SSL_MODE`, passed to asyncpg as `ssl`); a `?ssl=` or `?sslmode=` parameter in the URL overrides it. |
 | `REDIS_URL` | Redis database 0 |
 | `CELERY_BROKER_URL` | Redis database 1 |
 | `CELERY_RESULT_BACKEND` | Redis database 2 |

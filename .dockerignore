@@ -41,3 +41,20 @@ backups/
 # Docs / tests are not needed in the runtime image
 docs/
 tests/
+
+# Secrets and host-local state. The root Dockerfile does `COPY . .`, so without
+# these an image built on a host (docker compose build) carried that host's
+# live .env and private keys. .env.example is documentation and stays.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.pem.*
+*.p12
+*.pfx
+*.jks
+nginx/ssl/
+docker-compose.override.yml
+*.log
+.playwright-mcp/

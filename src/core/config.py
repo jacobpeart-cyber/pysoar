@@ -269,7 +269,11 @@ class Settings(BaseSettings):
             )
 
         # Check for weak patterns in secrets
-        for secret_name, secret_value in [("secret_key", self.secret_key), ("jwt_secret_key", self.jwt_secret_key)]:
+        for secret_name, secret_value in [
+            ("secret_key", self.secret_key),
+            ("jwt_secret_key", self.jwt_secret_key),
+            ("first_admin_password", self.first_admin_password),
+        ]:
             secret_lower = secret_value.lower()
             for pattern in weak_patterns:
                 if pattern in secret_lower:
@@ -284,7 +288,8 @@ class Settings(BaseSettings):
                 "encryption_master_key is not set. Data encryption will not be available.",
             )
 
-        # Check first_admin_password entropy
+        # Check first_admin_password entropy (the weak-pattern loop above already
+        # rejects the code default "changeme123" and words such as "admin")
         first_admin_entropy = _estimate_entropy(self.first_admin_password)
         if first_admin_entropy < 3.0:
             warnings.append(

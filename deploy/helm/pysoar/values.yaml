@@ -53,9 +53,9 @@ config:
   # src/core/config.py (secret strength, ENCRYPTION_MASTER_KEY presence,
   # DATABASE_SSL_MODE).
   appEnv: production
-  # Must be require, verify-full or disable when appEnv is production. The
-  # setting is validated but not applied to the database engine: put TLS
-  # parameters in DATABASE_URL itself (asyncpg: ?ssl=require).
+  # Must be require, verify-full or disable when appEnv is production.
+  # src/core/database.py passes it to asyncpg as its ssl argument unless
+  # DATABASE_URL already carries ssl= or sslmode=, which then wins.
   databaseSslMode: require
   logLevel: INFO
   logFormat: json
