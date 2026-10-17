@@ -140,6 +140,35 @@ between the backup and the rollback is lost; the database it replaces is
 kept as `pysoar_pre_restore_<stamp>` (see
 [backup-restore.md](backup-restore.md#restore)).
 
+## Behaviour changes to check before upgrading
+
+Read these together with the release notes. Each one is pinned by a test.
+
+### Upgrading past `8d844c0` (0.9.0)
+
+- **`FIRST_ADMIN_PASSWORD` must be set to a random value in production**, even
+  when the first administrator already exists. The production check now refuses
+  the code default `changeme123` and any value containing `change`, `default`,
+  `password`, `secret`, `admin`, `test`, `example` or `placeholder`
+  (`validate_production_secrets()` in `src/core/config.py`); before, only the
+  entropy was checked and an unset variable passed. An install that never set
+  it will not start after the upgrade: add a random value to `.env`
+  (`python3 -c 'import secrets; print(secrets.token_urlsafe(24))'`). The value
+  is only read while the `users` table is empty.
+- **`DATABASE_SSL_MODE` now reaches the database connection** (`00a0d45`). It
+  was validated and ignored before, so an install that set `require` or
+  `verify-full` against a server without TLS (the bundled `postgres` service
+  has none) was connecting in clear and will now fail to connect. Set it to
+  `disable` for the bundled service, or enable TLS on the server; a `ssl=` or
+  `sslmode=` parameter in `DATABASE_URL` overrides the setting.
+- **The simulation agent is no longer seeded in production** (`bb7b805`)
+  unless `SIM_AGENT_SEED_ENABLED=true`. An agent enrolled by an earlier version
+  keeps its token and keeps working; nothing is removed. New production
+  installs get no simulation agent unless the variable is set.
+- Host-built images no longer contain the host's `.env` or key files
+  (`.dockerignore`); no action, but rebuild the images so the old copies are
+  replaced.
+
 ## Kubernetes
 
 Not yet exercised on a cluster (the chart is render-validated only; see

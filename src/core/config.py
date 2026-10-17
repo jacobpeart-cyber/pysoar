@@ -277,9 +277,12 @@ class Settings(BaseSettings):
             secret_lower = secret_value.lower()
             for pattern in weak_patterns:
                 if pattern in secret_lower:
-                    warnings.append(
-                        f"{secret_name} contains weak pattern '{pattern}'. Use a cryptographically random secret.",
+                    hint = (
+                        "Set FIRST_ADMIN_PASSWORD to a random value; it is only read when the users table is empty."
+                        if secret_name == "first_admin_password"
+                        else "Use a cryptographically random secret."
                     )
+                    warnings.append(f"{secret_name} contains weak pattern '{pattern}'. {hint}")
                     break
 
         # Check encryption_master_key is set
