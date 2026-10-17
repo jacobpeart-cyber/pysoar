@@ -633,20 +633,22 @@ async def test_every_outbound_config_value_is_guarded_not_only_base_url(
 
 
 async def test_connection_probe_refuses_internal_targets_before_connecting(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The probe itself applies the outbound guard, so a health check can never
-    reach loopback, link-local or metadata addresses even for stored rows."""
+    """A stored row of a connector without an implementation is never probed:
+    the health task records it ``unavailable`` and does not even build an HTTP
+    client, so a crafted base_url pointing at loopback, link-local or metadata
+    addresses cannot be reached through it. The outbound guard on implemented
+    connectors is covered by tests/unit/test_connector_test_connection.py."""
     import httpx
 
     from src.integrations.engine import ConnectorRegistry, IntegrationManager
 
     class _NeverConnect:
         def __init__(self, *args, **kwargs):
-            raise AssertionError("httpx must not be used for a refused target")
+            raise AssertionError("httpx must not be used for an unimplemented connector")
 
     monkeypatch.setattr(httpx, "AsyncClient", _NeverConnect)
     manager = IntegrationManager(ConnectorRegistry())
     health, message = await manager._probe_connector("webhook", {"webhook_url": "http://127.0.0.1:9/x"}, {})
-    assert health == "unhealthy"
-    assert message.startswith("outbound target refused")
-    health2, message2 = await manager._probe_connector("splunk", {"base_url": "http://169.254.169.254"}, {})
-    assert health2 == "unhealthy" and message2.startswith("outbound target refused")
+    assert health == "unavailable" and "no connector implementation" in message
+    health2, message2 = await manager._probe_connector("cisco_asa", {"base_url": "http://169.254.169.254"}, {})
+    assert health2 == "unavailable" and "no connector implementation" in message2
