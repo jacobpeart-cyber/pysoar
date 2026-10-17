@@ -128,6 +128,11 @@ def test_agent_role_follows_the_request_area() -> None:
     assert _agent_role(holder) is UserRole.ANALYST
     itdr_request = SimpleNamespace(url=SimpleNamespace(path="/api/v1/itdr/threats/t1/respond"), client=None)
     ctx = _agent_context(holder, Mode.INTERACTIVE, request=itdr_request, org_id="org-1")
+    # Admin in the request's area alone is capped at ANALYST (bcaaed1): agent
+    # tools act in other areas, so the ADMIN rung needs admin everywhere.
+    assert ctx.role is UserRole.ANALYST
+    everywhere = _user(custom=_role("admin", {}))
+    ctx = _agent_context(everywhere, Mode.INTERACTIVE, request=itdr_request, org_id="org-1")
     assert ctx.role is UserRole.ADMIN
     ctx = _agent_context(holder, Mode.INTERACTIVE, org_id="org-1")
     assert ctx.role is UserRole.ANALYST
