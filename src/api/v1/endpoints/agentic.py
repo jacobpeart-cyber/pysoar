@@ -161,7 +161,16 @@ def _agent_role(current_user: Any, area: Optional[str] = "agentic") -> UserRole:
     proposals, propose_actions) follows the role's tiers."""
     tier_role = identity_roles.builtin_equivalent(current_user, area)
     if tier_role == UserRole.ADMIN.value:
-        return UserRole.ADMIN
+        # Agent tools act in other areas (users, playbooks, integrations, ...),
+        # so the ADMIN rung needs admin everywhere: built-in admins and
+        # superusers have it; a custom-role holder with admin only in this
+        # area is capped at ANALYST, so privileged tools still need an
+        # administrator's approval.
+        if not identity_roles.has_custom_role(current_user) or identity_roles.has_tier_everywhere(
+            current_user, "admin"
+        ):
+            return UserRole.ADMIN
+        return UserRole.ANALYST
     if tier_role == UserRole.ANALYST.value:
         return UserRole.ANALYST
     return UserRole.VIEWER
