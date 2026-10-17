@@ -19,10 +19,10 @@
 # Environment:
 #   PYSOAR_DIR    compose directory (/opt/pysoar)
 #
-# Requires openssl. docker-compose.yml is not modified. The database password
-# stays the one docker-compose.yml creates the role with (pysoar); change it
-# after the first start as in docs/install/compose.md, "Changing the database
-# password".
+# Requires openssl. docker-compose.yml is not modified. POSTGRES_PASSWORD is
+# random and docker-compose.yml creates the role with it on the FIRST start;
+# an already initialised database keeps its password (ALTER USER as in
+# docs/install/compose.md, "Changing the database password", then --force).
 set -euo pipefail
 
 REPO="${PYSOAR_DIR:-/opt/pysoar}"
@@ -85,6 +85,7 @@ token() {
 }
 
 REDIS_PASSWORD="$(token 24)"
+DB_PASSWORD="$(token 24)"
 SECRET_KEY="$(token 64)"
 JWT_SECRET_KEY="$(token 64)"
 while [ "$JWT_SECRET_KEY" = "$SECRET_KEY" ]; do JWT_SECRET_KEY="$(token 64)"; done
@@ -105,10 +106,12 @@ cat > "$TMP" <<EOF
 APP_ENV=production
 DEBUG=false
 
-# The bundled postgres service (role, password and database pysoar, created by
-# docker-compose.yml on first start; change the password as in compose.md,
-# "Changing the database password"). No TLS on the compose network.
-DATABASE_URL=postgresql+asyncpg://pysoar:pysoar@postgres:5432/pysoar
+# The bundled postgres service: docker-compose.yml creates role and database
+# pysoar with POSTGRES_PASSWORD when the data volume is first initialised
+# (an existing database keeps its password: compose.md, "Changing the
+# database password"). No TLS on the compose network.
+POSTGRES_PASSWORD=$DB_PASSWORD
+DATABASE_URL=postgresql+asyncpg://pysoar:$DB_PASSWORD@postgres:5432/pysoar
 DATABASE_SSL_MODE=disable
 
 # docker-compose.yml starts redis with --requirepass \${REDIS_PASSWORD}.

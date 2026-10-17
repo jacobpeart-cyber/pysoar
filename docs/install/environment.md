@@ -22,7 +22,7 @@ Read by every backend process (api, worker, scheduler, flower and the migration 
 | `HOST` | str | `127.0.0.1` | no |  |
 | `PORT` | int | `8000` | no |  |
 | `WORKERS` | int | `1` | no |  |
-| `DATABASE_URL` | str | `sqlite+aiosqlite:///./pysoar.db` | yes | Secret: contains the database password. |
+| `DATABASE_URL` | str | `sqlite+aiosqlite:///./pysoar.db` | yes | **Production:** For a PostgreSQL URL the api refuses to start when the password is empty, the bundled default `pysoar`, shorter than 12 characters or contains a weak word; `deploy/configure-env.sh` generates a random `POSTGRES_PASSWORD` and writes it into both. (`src/core/config.py`) Secret: contains the database password. |
 | `DATABASE_SSL_MODE` | str | `prefer` | no | When `APP_ENV=production`, must be `require`, `verify-full` or `disable`, or the settings fail to load (every process that imports them exits). On PostgreSQL the value is passed to asyncpg as its `ssl` argument, unless `DATABASE_URL` already carries `ssl=` or `sslmode=`, which then wins. (`src/core/database.py`) |
 | `REDIS_URL` | str | `redis://localhost:6379/0` | yes | Secret: contains the Redis password when Redis requires one. |
 | `CELERY_BROKER_URL` | str | `redis://localhost:6379/1` | yes | Secret: contains the Redis password when Redis requires one. |
@@ -128,6 +128,7 @@ docker compose substitutes these into `docker-compose.yml` itself, from the shel
 | Variable | Behaviour when unset | Secret | Used by services |
 |---|---|---|---|
 | `GRAFANA_ADMIN_PASSWORD` | required (compose refuses to start) | yes | `grafana` |
+| `POSTGRES_PASSWORD` | default `pysoar` | yes | `postgres` |
 | `PYSOAR_COMMIT` | default `unknown` | no | `api`, `flower`, `frontend`, `scheduler`, `worker` |
 | `PYSOAR_IMAGE_TAG` | default `local` | no | `api`, `flower`, `frontend`, `scheduler`, `worker` |
 | `REDIS_PASSWORD` | no default (empty when unset) | yes | `redis` |

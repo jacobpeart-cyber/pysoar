@@ -317,6 +317,26 @@ class Settings(BaseSettings):
                 f"first_admin_password entropy is {first_admin_entropy:.2f} bits (< 3.0). Set a stronger initial admin password.",
             )
 
+        # The bundled postgres role is created with POSTGRES_PASSWORD (default
+        # "pysoar" in docker-compose.yml); a production DATABASE_URL must not
+        # carry that default, an empty password or a guessable one.
+        try:
+            from sqlalchemy.engine import make_url
+
+            url = make_url(self.database_url)
+        except Exception:
+            url = None
+        if url is not None and str(url.drivername).startswith("postgresql"):
+            db_password = str(url.password or "")
+            lowered = db_password.lower()
+            weak = any(pattern in lowered for pattern in weak_patterns)
+            if not db_password or db_password == "pysoar" or len(db_password) < 12 or weak:
+                warnings.append(
+                    "database_url password is empty, the bundled default 'pysoar', shorter than 12 characters "
+                    "or contains a weak pattern. Set POSTGRES_PASSWORD and the DATABASE_URL password to a random "
+                    "value (ALTER USER on an existing database).",
+                )
+
         return warnings
 
 

@@ -144,6 +144,25 @@ kept as `pysoar_pre_restore_<stamp>` (see
 
 Read these together with the release notes. Each one is pinned by a test.
 
+### Upgrading past `cc1d6d8`: database password rule, side-effect actions need an administrator
+
+- **A production `DATABASE_URL` must carry a random password**: the api
+  refuses to start when it is empty, the bundled default `pysoar`, shorter
+  than 12 characters or contains a weak word (`validate_production_secrets()`
+  in `src/core/config.py`). The bundled `postgres` service was created with
+  the literal `pysoar` before this release. Change it first
+  (compose.md, "Changing the database password"), then upgrade.
+  `docker-compose.yml` now reads `POSTGRES_PASSWORD` from `.env` for the first
+  initialisation of a new data volume; an existing volume is unaffected.
+- **Side-effect connector actions need an administrator** through
+  `POST /api/v1/integrations/installed/{id}/actions/{action_id}/execute`
+  (403 `approval_required` otherwise). Analysts keep read-only actions.
+  Playbooks are unaffected.
+- **Sentinel incident and playbook ids are scoped**: `update_incident` takes
+  an incident id (or its ARM path inside the configured workspace) and
+  `run_playbook` a Logic App name (or its ARM path in the configured
+  subscription); any other ARM resource is refused.
+
 ### Upgrading past `67e0c3c`: in-app backups and the backup script
 
 - **Rebuild or pull the backend image.** It now carries `pg_dump`

@@ -41,3 +41,22 @@ def test_the_default_admin_email_can_sign_in() -> None:
                  first_admin_password="Xb7-Rq2-Lm9-Wz4-Tc8", **STRONG)
     TypeAdapter(EmailStr).validate_python(s.first_admin_email)
     assert s.validate_production_secrets() == []
+
+
+PG = "postgresql+asyncpg://pysoar:{pw}@postgres:5432/pysoar"
+
+
+@pytest.mark.parametrize("password", ["pysoar", "", "short", "Admin-Rotated-2026-Xy", "Vq3xN8kLp2Rz7Wtest"])
+def test_a_weak_or_default_database_password_fails_the_production_check(password: str) -> None:
+    s = Settings(_env_file=None, app_env="production", database_ssl_mode="disable",
+                 first_admin_password="Xb7-Rq2-Lm9-Wz4-Tc8", database_url=PG.format(pw=password), **STRONG)
+    assert any("database_url password" in w for w in s.validate_production_secrets())
+
+
+def test_a_random_database_password_passes_and_sqlite_is_not_checked() -> None:
+    strong = Settings(_env_file=None, app_env="production", database_ssl_mode="disable",
+                      first_admin_password="Xb7-Rq2-Lm9-Wz4-Tc8", database_url=PG.format(pw="Vq3xN8kLp2Rz7WmTb5Yc"), **STRONG)
+    assert strong.validate_production_secrets() == []
+    sqlite = Settings(_env_file=None, app_env="production", database_ssl_mode="disable",
+                      first_admin_password="Xb7-Rq2-Lm9-Wz4-Tc8", database_url="sqlite+aiosqlite:///./x.db", **STRONG)
+    assert sqlite.validate_production_secrets() == []

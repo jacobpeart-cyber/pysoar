@@ -55,9 +55,15 @@ def azure_resource_path(value: str) -> str:
     accepted; no ``..``, ``//``, ``@``, ``?``, ``#`` or whitespace.
     """
     text = str(value or "").strip()
-    if not _AZURE_RESOURCE_PATH_RE.fullmatch(text) or "/../" in text or text.endswith("/.."):
+    if (
+        not _AZURE_RESOURCE_PATH_RE.fullmatch(text)
+        or any(segment in (".", "..") for segment in text.split("/"))
+    ):
         raise ValueError("invalid Azure resource path")
     return text
+
+
+_PLAIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class MicrosoftSentinelConnector(BaseConnector):
@@ -159,6 +165,47 @@ class MicrosoftSentinelConnector(BaseConnector):
     def _sentinel_path(self, collection: str) -> str:
         return f"{self._workspace_path()}/providers/Microsoft.SecurityInsights/{collection}"
 
+    def _scoped_incident_path(self, incident_id: str) -> str:
+        """``incident_id`` as a bare id or its ARM path, resolved under THIS
+        workspace's incidents collection. Any other ARM resource is refused so
+        the connector's token is never pointed at a resource the operator did
+        not configure (``ValueError``)."""
+        text = str(incident_id or "").strip()
+        prefix = self._sentinel_path("incidents") + "/"
+        if "/" not in text and _PLAIN_ID_RE.fullmatch(text):
+            return prefix + text
+        path = azure_resource_path(text)
+        rest = path[len(prefix):]
+        if not path.lower().startswith(prefix.lower()) or not rest or "/" in rest:
+            raise ValueError("incident_id is outside the configured workspace's incidents")
+        return prefix + rest
+
+    def _scoped_workflow_path(self, playbook_id: str) -> str:
+        """``playbook_id`` as a Logic App name (in the workspace's resource
+        group) or its ARM path: a ``Microsoft.Logic/workflows`` resource in the
+        configured subscription, any resource group. Anything else is refused
+        (``ValueError``)."""
+        text = str(playbook_id or "").strip()
+        subscription = self._cred("subscription_id")
+        if "/" not in text and _PLAIN_ID_RE.fullmatch(text):
+            return (
+                f"/subscriptions/{subscription}/resourceGroups/{self._cred('resource_group')}"
+                f"/providers/Microsoft.Logic/workflows/{text}"
+            )
+        path = azure_resource_path(text)
+        match = re.fullmatch(
+            rf"/subscriptions/{re.escape(subscription)}/resourceGroups/([A-Za-z0-9._()-]+)"
+            r"/providers/Microsoft\.Logic/workflows/([A-Za-z0-9_.-]+)",
+            path,
+            re.IGNORECASE,
+        )
+        if match is None:
+            raise ValueError("playbook_id must be a Microsoft.Logic/workflows resource in the configured subscription")
+        return (
+            f"/subscriptions/{subscription}/resourceGroups/{match.group(1)}"
+            f"/providers/Microsoft.Logic/workflows/{match.group(2)}"
+        )
+
     async def _get_oauth_token(self) -> str:
         """Client-credentials token - POST login.microsoftonline.com/<tenant>/oauth2/v2.0/token (form body)"""
         if self._token and time.time() < self._token_expiry:
@@ -242,9 +289,12 @@ class MicrosoftSentinelConnector(BaseConnector):
     async def update_incident(self, incident_id: str, data: Dict) -> Dict[str, Any]:
         """Update incident - GET then PUT the incident resource with its etag"""
         try:
-            resource_path = azure_resource_path(incident_id)
+            resource_path = self._scoped_incident_path(incident_id)
         except ValueError:
-            return {"error": "invalid incident_id: expected an ARM resource path", "incident_id": incident_id}
+            return {
+                "error": "invalid incident_id: expected an incident id or its ARM path in the configured workspace",
+                "incident_id": incident_id,
+            }
         current = await self._arm("GET", resource_path, SENTINEL_API_VERSION)
         props = dict(current.get("properties") or {})
         for key in ("title", "description", "severity", "status", "classification",
@@ -302,9 +352,12 @@ class MicrosoftSentinelConnector(BaseConnector):
     async def run_playbook(self, playbook_id: str, trigger_name: str = "manual", payload: Optional[Dict] = None) -> Dict[str, Any]:
         """Run playbook - POST {workflow}/triggers/{trigger}/listCallbackUrl, then POST the callback URL"""
         try:
-            resource_path = azure_resource_path(playbook_id)
+            resource_path = self._scoped_workflow_path(playbook_id)
         except ValueError:
-            return {"error": "invalid playbook_id: expected an ARM resource path", "playbook_id": playbook_id}
+            return {
+                "error": "invalid playbook_id: expected a Logic App name or its ARM path in the configured subscription",
+                "playbook_id": playbook_id,
+            }
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", trigger_name or ""):
             return {"error": "invalid trigger_name", "playbook_id": playbook_id}
         result = await self._arm(

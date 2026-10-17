@@ -118,12 +118,16 @@ value separately; the comments say how.
 APP_ENV=production
 DEBUG=false
 
-# The bundled postgres service. Its user, password and database are created as
-# pysoar / pysoar / pysoar by docker-compose.yml on first start (see
-# "Changing the database password" below). It has no TLS and is reachable only
-# on the compose network, so DATABASE_SSL_MODE is disable; in production the
-# setting must be require, verify-full or disable or no backend process starts.
-DATABASE_URL=postgresql+asyncpg://pysoar:pysoar@postgres:5432/pysoar
+# The bundled postgres service. docker-compose.yml creates role and database
+# pysoar with POSTGRES_PASSWORD when the data volume is first initialised
+# (see "Changing the database password" below for an existing database).
+# In production the password must be random: not pysoar, not shorter than
+# 12 characters, no weak word.  python3 -c 'import secrets; print(secrets.token_urlsafe(24))'
+# The service has no TLS and is reachable only on the compose network, so
+# DATABASE_SSL_MODE is disable; in production the setting must be require,
+# verify-full or disable or no backend process starts.
+POSTGRES_PASSWORD=
+DATABASE_URL=postgresql+asyncpg://pysoar:POSTGRES_PASSWORD_HERE@postgres:5432/pysoar
 DATABASE_SSL_MODE=disable
 
 # Redis: docker-compose.yml starts redis with --requirepass ${REDIS_PASSWORD}.
@@ -282,9 +286,11 @@ Install the nightly backup before anything else depends on the system; see
 
 ## Changing the database password
 
-The `postgres` service is created with password `pysoar` (set in
-`docker-compose.yml`, used only when the data volume is first initialised).
-It is not published on a host port, but change it anyway:
+The `postgres` role is created with `POSTGRES_PASSWORD` from `.env` (default
+`pysoar` when unset, for installs that predate the variable), and only when
+the data volume is first initialised: changing `.env` later does not change
+an existing role. The service is not published on a host port. To change
+the password of an existing database:
 
 ```sh
 docker compose exec postgres psql -U pysoar -d pysoar -c "ALTER USER pysoar WITH PASSWORD 'NEW_PASSWORD'"

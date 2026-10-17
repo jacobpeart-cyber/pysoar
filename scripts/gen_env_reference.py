@@ -87,7 +87,7 @@ SECRET_NAME_RE = re.compile(r"key|password|secret|token|_url$|_user$")
 SECRET_DIRECT = {"OTX_API_KEY", "ABUSECH_AUTH_KEY", "NVD_API_KEY"}
 
 # Compose-only interpolation variables that are secrets (section 3).
-SECRET_COMPOSE = {"REDIS_PASSWORD", "GRAFANA_ADMIN_PASSWORD"}
+SECRET_COMPOSE = {"REDIS_PASSWORD", "GRAFANA_ADMIN_PASSWORD", "POSTGRES_PASSWORD"}
 
 # Every @field_validator on Settings, described. Generation fails when a
 # validator is added without a description here.
@@ -155,6 +155,15 @@ PRODUCTION_RULES = (
         "base64 encoding of exactly 32 bytes (`openssl rand -base64 32`).",
         "src/main.py",
         "ENCRYPTION_MASTER_KEY must be set in production environment",
+    ),
+    ProductionRule(
+        ("database_url",),
+        "For a PostgreSQL URL the api refuses to start when the password is "
+        "empty, the bundled default `pysoar`, shorter than 12 characters or "
+        "contains a weak word; `deploy/configure-env.sh` generates a random "
+        "`POSTGRES_PASSWORD` and writes it into both.",
+        "src/core/config.py",
+        'db_password == "pysoar"',
     ),
     ProductionRule(
         ("first_admin_email",),

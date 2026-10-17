@@ -215,7 +215,10 @@ services:
     container_name: pysoar-postgres
     environment:
       - POSTGRES_USER=pysoar
-      - POSTGRES_PASSWORD=pysoar
+      # Used only when the data volume is first initialised. configure-env.sh
+      # writes a random POSTGRES_PASSWORD; the default keeps installs that
+      # predate it starting (their role already has its own password).
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-pysoar}
       - POSTGRES_DB=pysoar
     volumes:
       - pysoar-postgres:/var/lib/postgresql/data

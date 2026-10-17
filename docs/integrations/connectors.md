@@ -20,7 +20,7 @@ A vendor error is a `failed` execution with the vendor's HTTP status (`http_stat
 
 ## Catalogue
 
-`*` marks an action that changes the vendor's state (`side_effect`; its action row has `requires_approval: true`).
+`*` marks an action that changes the vendor's state (`side_effect`; its action row has `requires_approval: true`). Through `POST /installed/{id}/actions/{action_id}/execute` such an action needs an administrator (403 `approval_required` otherwise); analysts can run the read-only ones. Playbooks run actions under their own authority.
 
 | Connector | Status | Verification | Read-only test call | Credentials | Config | Actions (side effect marked *) |
 |---|---|---|---|---|---|---|

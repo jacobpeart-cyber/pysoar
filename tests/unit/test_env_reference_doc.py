@@ -149,6 +149,7 @@ SCRIPT_VARIABLES = {
 NOT_ENVIRONMENT = {
     "NEW_PASSWORD": "placeholder in a command",
     "REDIS_PASSWORD_HERE": "placeholder in the .env template",
+    "POSTGRES_PASSWORD_HERE": "placeholder in the .env template",
     "ON_ERROR_STOP": "psql variable",
     "MSYS_NO_PATHCONV": "Git Bash setting used in the drill record",
     "COMPOSE_PROJECT_NAME": "docker compose setting used in the drill record",

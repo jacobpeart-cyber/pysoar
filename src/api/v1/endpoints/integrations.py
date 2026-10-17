@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
+from src.identity.roles import is_full_admin, user_has_tier
 # Credential envelope helpers live in src.core.secrets (design v2 section 10);
 # re-exported here because settings.py, main.py and siem/cloud_poller.py
 # import them from this module.
@@ -782,6 +783,32 @@ async def execute_action(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"error": "invalid_parameters", "problems": problems},
+        )
+
+    # An action that changes the vendor's state (contain a host, disable a
+    # user, post to a channel) is run by an administrator only: the analyst
+    # role can run read-only actions. Playbooks carry their own authority.
+    if spec.side_effect and not (
+        is_full_admin(current_user)
+        or await user_has_tier(db, getattr(current_user, "id", None), org_id, "integrations", "admin")
+    ):
+        _audit(
+            db, user=current_user, org_id=org_id, action="integration_action_execute", resource_id=integration.id,
+            description=f"{connector_name}.{action.action_name}: refused, approval_required",
+            details={"connector": connector_name, "action": action.action_name, "side_effect": True},
+            success=False,
+            error="approval_required",
+        )
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "approval_required",
+                "detail": (
+                    f"{action.action_name} changes {_display_name(connector_name)} state; "
+                    "an administrator must run it (analysts can run read-only actions)"
+                ),
+            },
         )
 
     execution_result = await executor.execute_action(

@@ -131,9 +131,45 @@ async def test_slack_ok_false_is_failed_not_success(client, db_session, org_a_ad
     fake_vendor(monkeypatch, lambda request: httpx.Response(200, json={"ok": False, "error": "channel_not_found"}))
     resp = await client.post(
         f"{BASE}/installed/{slack}/actions/{action_id}/execute",
-        json={"input_data": {"channel": "C0NOPE", "text": "hello"}}, headers=org_a_headers,
+        json={"input_data": {"channel": "C0NOPE", "text": "hello"}}, headers=org_a_admin_headers,  # side effect: admin
     )
     assert resp.json()["status"] == "failed" and "channel_not_found" in resp.json()["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_side_effect_actions_need_an_administrator(client, db_session, org_a_admin_headers, org_a_headers, monkeypatch) -> None:
+    """An analyst can run read-only actions; one that changes the vendor's
+    state is refused with 403 approval_required, nothing is sent, and the
+    refusal is audited. An administrator runs it."""
+    from src.models.audit import AuditLog
+
+    slack = await _install(client, org_a_admin_headers, "slack")
+    actions = await _actions(client, org_a_headers, slack)
+    seen = fake_vendor(monkeypatch, lambda request: httpx.Response(200, json={"ok": True, "channels": [], "ts": "1.2"}))
+
+    refused = await client.post(
+        f"{BASE}/installed/{slack}/actions/{actions['send_message']['id']}/execute",
+        json={"input_data": {"channel": "C0GOOD", "text": "hello"}}, headers=org_a_headers,
+    )
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["detail"]["error"] == "approval_required"
+    assert seen == [] and await _executions(db_session, slack) == []
+    rows = (await db_session.execute(
+        select(AuditLog).where(AuditLog.action == "integration_action_execute", AuditLog.resource_id == slack)
+    )).scalars().all()
+    assert rows and any("approval_required" in (r.description or "") for r in rows)
+
+    read_only = await client.post(
+        f"{BASE}/installed/{slack}/actions/{actions['list_channels']['id']}/execute",
+        json={"input_data": {}}, headers=org_a_headers,
+    )
+    assert read_only.status_code == 202, read_only.text
+
+    allowed = await client.post(
+        f"{BASE}/installed/{slack}/actions/{actions['send_message']['id']}/execute",
+        json={"input_data": {"channel": "C0GOOD", "text": "hello"}}, headers=org_a_admin_headers,
+    )
+    assert allowed.status_code == 202, allowed.text
 
 
 @pytest.mark.asyncio
