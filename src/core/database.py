@@ -2,12 +2,29 @@
 
 import os
 from typing import AsyncGenerator
+from urllib.parse import urlparse
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from src.core.config import settings
+
+
+def _asyncpg_connect_args(application_name: str) -> dict:
+    """asyncpg connect arguments. ``DATABASE_SSL_MODE`` (prefer / require /
+    verify-ca / verify-full / disable) is passed as asyncpg's ``ssl`` mode so
+    the setting the operator validated is the one the connection uses; a URL
+    that already carries ``ssl=`` or ``sslmode=`` keeps its own value."""
+    args: dict = {
+        "server_settings": {"application_name": application_name, "jit": "off"},
+        "timeout": 30,
+    }
+    query = urlparse(settings.database_url).query
+    keys = {part.split("=", 1)[0].lower() for part in query.split("&") if part}
+    if "ssl" not in keys and "sslmode" not in keys:
+        args["ssl"] = settings.database_ssl_mode
+    return args
 
 
 def _create_engine():
@@ -54,13 +71,7 @@ def _create_engine():
             echo=settings.debug and not settings.is_production,
             future=True,
             poolclass=NullPool,
-            connect_args={
-                "server_settings": {
-                    "application_name": "pysoar-worker",
-                    "jit": "off",
-                },
-                "timeout": 30,
-            },
+            connect_args=_asyncpg_connect_args("pysoar-worker"),
         )
     else:
         # asyncpg manages its own internal pool; do not pass a poolclass
@@ -73,13 +84,7 @@ def _create_engine():
             pool_timeout=30,
             pool_recycle=3600,
             pool_pre_ping=True,
-            connect_args={
-                "server_settings": {
-                    "application_name": "pysoar",
-                    "jit": "off",
-                },
-                "timeout": 30,
-            },
+            connect_args=_asyncpg_connect_args("pysoar"),
         )
 
 
