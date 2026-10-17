@@ -202,6 +202,12 @@ class Settings(BaseSettings):
     # Call log bodies are never stored unless explicitly enabled; raw rows are
     # rolled up nightly and deleted after the retention window.
     llm_log_bodies: bool = False
+    #: Seed a co-deployed simulation EndpointAgent for every organisation at
+    #: boot (Purple Team / live response target on the platform host). Unset:
+    #: on outside production, off in production, where every tenant would
+    #: otherwise get an agent with bas / live_response / stig_scan on the
+    #: shared host. Set SIM_AGENT_SEED_ENABLED=true to opt in explicitly.
+    sim_agent_seed_enabled: Optional[bool] = None
     llm_log_retention_days: int = 365  # platform default; orgs override 30..1095
     # Per-model price table, USD per 1M tokens, e.g.
     # {"claude-opus-5": {"input": 5, "output": 25, "cache_read": 0.5, "cache_write": 6.25}}
@@ -232,6 +238,13 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"
+
+    @property
+    def seed_sim_agent(self) -> bool:
+        """Whether boot seeds the simulation agent (see ``sim_agent_seed_enabled``)."""
+        if self.sim_agent_seed_enabled is not None:
+            return bool(self.sim_agent_seed_enabled)
+        return not self.is_production
 
     def validate_production_secrets(self) -> list[str]:
         """

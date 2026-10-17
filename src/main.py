@@ -15,6 +15,10 @@ from src import __version__
 from src.api.v1.router import api_router
 from src.core.config import settings
 from src.core.database import close_db, init_db
+
+
+class _SkipSeeding(Exception):
+    """Raised inside the boot seeding block to skip a disabled seeder."""
 from src.core.exceptions import PySOARException
 from src.core.logging import get_logger, setup_logging
 from src.core.middleware import RequestLoggingMiddleware as AuditLoggingMiddleware
@@ -258,6 +262,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     # it and start polling immediately after API boot.
     try:
         from src.agents.sim_seeder import seed_sim_agents
+
+        if not settings.seed_sim_agent:
+            # Production default: no auto-enrolled agent with bas / live_response /
+            # stig_scan on the shared host; operators enrol real agents, or opt in
+            # with SIM_AGENT_SEED_ENABLED=true.
+            logger.info("Simulation agent seeding skipped", app_env=settings.app_env, setting="SIM_AGENT_SEED_ENABLED")
+            raise _SkipSeeding
         sim_result = await seed_sim_agents()
         if sim_result.get("created") or sim_result.get("tokens_written"):
             logger.info(
@@ -265,6 +276,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                 created=sim_result.get("created", 0),
                 tokens_written=sim_result.get("tokens_written", 0),
             )
+    except _SkipSeeding:
+        pass
     except Exception as e:  # noqa: BLE001
         logger.warning("Simulation agent seeding failed", error=str(e))
 
