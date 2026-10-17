@@ -7,7 +7,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from uuid import uuid4
 
-from src.core.encryption import get_encryption_service
 from src.core.logging import get_logger
 from src.core.utils import safe_json_loads
 from src.integrations.connectors import (
@@ -22,26 +21,27 @@ from src.integrations.connectors import (
     SlackConnector,
     VirusTotalConnector,
 )
+from src.integrations.connectors.base import (
+    BaseConnector,
+    ConnectionTestResult,
+    ConnectorActionFailed,
+    sanitize_message,
+)
 from src.integrations.netguard import (
     OutboundTargetRefused,
     VettedTarget,
-    merge_pinned_kwargs,
     pinned_request_kwargs,
     resolve_and_vet,
 )
 from src.integrations.models import (
-    ActionType,
     AuthType,
     ExecutionStatus,
     ExecutionTrigger,
     HealthStatus,
     IntegrationAction,
     IntegrationCategory,
-    IntegrationConnector,
     IntegrationExecution,
     InstalledIntegration,
-    IntegrationStatus,
-    WebhookEndpoint,
 )
 
 logger = get_logger(__name__)
@@ -60,18 +60,140 @@ CONNECTOR_CLASS_MAP = {
 }
 
 
-def _classify_response(resp: Any) -> tuple[str, Optional[str]]:
-    """Translate an httpx ``Response`` into ``(health_status, error)``.
+IMPLEMENTED = "implemented"
+LOG_INGEST = "log_ingest"
+PLANNED = "planned"
+PLANNED_VERIFICATION = "not implemented in this release"
+LOG_INGEST_VERIFICATION = (
+    "log poller implemented with the vendor SDK from public documentation (src/siem/cloud_poller.py); "
+    "not verified against a live tenant"
+)
 
-    2xx -> HEALTHY. 401/403 -> UNHEALTHY (auth problem). Any other 4xx
-    or 5xx -> UNHEALTHY with the status code in the error message.
+# Connectors with no executable connector class whose events the SIEM cloud
+# poller (src/siem/cloud_poller.py) ingests through the vendor SDK on a
+# schedule. They can be installed (the poller needs the stored credentials)
+# but expose no actions and no connection test.
+LOG_INGEST_CONNECTORS = frozenset({"aws_cloudtrail", "azure_activity_log", "gcp_cloud_logging"})
+
+
+def implementation_status(connector_name: Optional[str]) -> str:
+    """``implemented`` (a class in CONNECTOR_CLASS_MAP), ``log_ingest`` or ``planned``.
+
+    Derived at request time from the code, so no column has to be kept in sync.
     """
-    code = getattr(resp, "status_code", 0)
-    if 200 <= code < 300:
-        return HealthStatus.HEALTHY.value, None
-    if code in (401, 403):
-        return HealthStatus.UNHEALTHY.value, f"Authentication rejected (HTTP {code})"
-    return HealthStatus.UNHEALTHY.value, f"Probe returned HTTP {code}"
+    name = (connector_name or "").lower()
+    if name in CONNECTOR_CLASS_MAP:
+        return IMPLEMENTED
+    if name in LOG_INGEST_CONNECTORS:
+        return LOG_INGEST
+    return PLANNED
+
+
+def connector_class(connector_name: Optional[str]) -> Optional[type[BaseConnector]]:
+    return CONNECTOR_CLASS_MAP.get((connector_name or "").lower())
+
+
+def _field_dict(f: Any) -> dict[str, Any]:
+    return f.model_dump() if hasattr(f, "model_dump") else dict(f)
+
+
+def missing_install_fields(connector_name: str, config: dict[str, Any], credentials: dict[str, Any]) -> list[str]:
+    """Required config / credential field names absent from an install or update payload."""
+    cls = connector_class(connector_name)
+    if cls is not None:
+        return cls.missing_fields(config, credentials)
+    meta = BUILTIN_CONNECTORS.get((connector_name or "").lower()) or {}
+    return [k for k in meta.get("required_credentials") or [] if credentials.get(k) in (None, "")]
+
+
+def invalid_install_fields(connector_name: str, config: dict[str, Any], credentials: dict[str, Any]) -> list[str]:
+    cls = connector_class(connector_name)
+    return cls.invalid_fields(config, credentials) if cls is not None else []
+
+
+def build_connector(connector_name: str, config: dict[str, Any], credentials: dict[str, Any]) -> BaseConnector:
+    """Instantiate the connector class; raises ConnectorActionFailed when it cannot act."""
+    cls = connector_class(connector_name)
+    if cls is None:
+        display = (BUILTIN_CONNECTORS.get((connector_name or "").lower()) or {}).get("display_name") or connector_name
+        raise ConnectorActionFailed(
+            f"{display} has no connector implementation in this release", code="not_implemented",
+        )
+    try:
+        return cls(config=config or {}, credentials=credentials or {})
+    except ValueError as exc:
+        raise ConnectorActionFailed(f"integration configuration is invalid: {exc}", code="invalid_configuration") from None
+
+
+async def probe_connector(
+    connector_name: str, config: dict[str, Any], credentials: dict[str, Any],
+) -> ConnectionTestResult:
+    """Run the connector's own ``test_connection`` (no network call when it cannot be tested)."""
+    status = implementation_status(connector_name)
+    if status == PLANNED:
+        return ConnectionTestResult(
+            HealthStatus.UNAVAILABLE.value,
+            f"{connector_name} has no connector implementation in this release",
+            "none",
+        )
+    if status == LOG_INGEST:
+        return ConnectionTestResult(
+            HealthStatus.UNKNOWN.value,
+            "no connection test for this log source; the SIEM cloud poller records health on every poll",
+            "none",
+        )
+    try:
+        connector = build_connector(connector_name, config, credentials)
+    except ConnectorActionFailed as exc:
+        return ConnectionTestResult(HealthStatus.UNHEALTHY.value, exc.message, "none")
+    try:
+        return await connector.test_connection()
+    except Exception as exc:  # noqa: BLE001 (a probe must report, never raise)
+        logger.warning("connector test_connection raised", connector=connector_name, error_type=type(exc).__name__)
+        return ConnectionTestResult(
+            HealthStatus.UNHEALTHY.value, connector.sanitize(f"test raised {type(exc).__name__}: {exc}"), connector.TEST_CALL,
+        )
+
+
+async def sync_connector_actions(db: Any, connector_id: str, connector_name: str) -> int:
+    """Upsert one ``IntegrationAction`` row per declared action of the connector class.
+
+    Rows are keyed by (connector_id, action_name) and carry the real
+    ``input_schema`` (the action's ``params_schema``), ``description``,
+    ``is_idempotent`` and ``requires_approval`` (= the action changes vendor
+    state). Returns the number of rows created. Rows for names the class no
+    longer declares are left in place (executions reference them) but are not
+    listed or executable.
+    """
+    from sqlalchemy import select as _select
+
+    cls = connector_class(connector_name)
+    if cls is None:
+        return 0
+    existing = {
+        a.action_name: a
+        for a in (
+            await db.execute(_select(IntegrationAction).where(IntegrationAction.connector_id == connector_id))
+        ).scalars().all()
+    }
+    created = 0
+    for name, spec in cls.ACTIONS.items():
+        row = existing.get(name)
+        if row is None:
+            row = IntegrationAction(connector_id=connector_id, action_name=name, retry_policy="{}", timeout_seconds=300)
+            db.add(row)
+            created += 1
+        row.display_name = spec.display_name or name
+        row.description = spec.description
+        row.action_type = spec.action_type
+        row.input_schema = json.dumps(spec.params_schema)
+        row.output_schema = json.dumps({"description": spec.output})
+        row.requires_approval = spec.side_effect
+        row.is_idempotent = spec.idempotent
+        if not row.retry_policy:
+            row.retry_policy = "{}"
+    await db.flush()
+    return created
 
 
 # Built-in connector definitions
@@ -86,78 +208,71 @@ BUILTIN_CONNECTORS = {
     "splunk": {
         "name": "splunk",
         "display_name": "Splunk Enterprise",
-        "description": "OPTIONAL INTEROP — pull events from an existing Splunk deployment. Not required; PySOAR has its own native SIEM.",
+        "description": "OPTIONAL INTEROP (planned, not in this release): pull events from an existing Splunk deployment. Not required; PySOAR has its own native SIEM.",
         "vendor": "Splunk",
         "category": IntegrationCategory.SIEM,
         "integration_role": "external_siem",
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["query", "search", "create_alert"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "qradar": {
         "name": "qradar",
         "display_name": "IBM QRadar",
-        "description": "OPTIONAL INTEROP — pull offenses from an existing QRadar deployment. Not required; PySOAR has its own native SIEM.",
+        "description": "OPTIONAL INTEROP (planned, not in this release): pull offenses from an existing QRadar deployment. Not required; PySOAR has its own native SIEM.",
         "vendor": "IBM",
         "category": IntegrationCategory.SIEM,
         "integration_role": "external_siem",
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["query", "create_offense", "close_offense"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "elastic": {
         "name": "elastic",
         "display_name": "Elastic Security",
-        "description": "OPTIONAL INTEROP — pull events from an existing Elastic / OpenSearch cluster. Not required; PySOAR has its own native SIEM.",
+        "description": "OPTIONAL INTEROP (planned, not in this release): pull events from an existing Elastic / OpenSearch cluster. Not required; PySOAR has its own native SIEM.",
         "vendor": "Elastic",
         "category": IntegrationCategory.SIEM,
         "integration_role": "external_siem",
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["query", "search", "create_detection"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "wazuh": {
         "name": "wazuh",
         "display_name": "Wazuh",
-        "description": "OPTIONAL INTEROP — pull events from an existing Wazuh deployment. Not required; PySOAR has its own native SIEM.",
+        "description": "OPTIONAL INTEROP (planned, not in this release): pull events from an existing Wazuh deployment. Not required; PySOAR has its own native SIEM.",
         "vendor": "Wazuh",
         "category": IntegrationCategory.SIEM,
         "integration_role": "external_siem",
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["query", "create_group", "run_agent_command"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "sumo_logic": {
         "name": "sumo_logic",
         "display_name": "Sumo Logic",
-        "description": "OPTIONAL INTEROP — pull events from Sumo Logic. Not required; PySOAR has its own native SIEM.",
+        "description": "OPTIONAL INTEROP (planned, not in this release): pull events from Sumo Logic. Not required; PySOAR has its own native SIEM.",
         "vendor": "Sumo Logic",
         "category": IntegrationCategory.SIEM,
         "integration_role": "external_siem",
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["query", "create_alert", "search"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "chronicle": {
         "name": "chronicle",
         "display_name": "Google Chronicle",
-        "description": "OPTIONAL INTEROP — pull events from Google Chronicle. Not required; PySOAR has its own native SIEM.",
+        "description": "OPTIONAL INTEROP (planned, not in this release): pull events from Google Chronicle. Not required; PySOAR has its own native SIEM.",
         "vendor": "Google",
         "category": IntegrationCategory.SIEM,
         "integration_role": "external_siem",
         "auth_type": AuthType.OAUTH2,
-        "supported_actions": ["query", "enrich", "search"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "graylog": {
         "name": "graylog",
         "display_name": "Graylog",
-        "description": "OPTIONAL INTEROP — pull events from Graylog. Not required; PySOAR has its own native SIEM.",
+        "description": "OPTIONAL INTEROP (planned, not in this release): pull events from Graylog. Not required; PySOAR has its own native SIEM.",
         "vendor": "Graylog",
         "category": IntegrationCategory.SIEM,
         "integration_role": "external_siem",
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["query", "search", "create_alert"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     # EDR
@@ -168,7 +283,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "CrowdStrike",
         "category": IntegrationCategory.EDR,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["query", "contain", "remediate"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "sentinelone": {
@@ -178,7 +292,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "SentinelOne",
         "category": IntegrationCategory.EDR,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["query", "contain", "isolate"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "carbon_black": {
@@ -188,7 +301,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "VMware",
         "category": IntegrationCategory.EDR,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["query", "contain", "quarantine"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "microsoft_defender": {
@@ -198,7 +310,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Microsoft",
         "category": IntegrationCategory.EDR,
         "auth_type": AuthType.OAUTH2,
-        "supported_actions": ["query", "contain", "isolate"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "cortex_xdr": {
@@ -208,7 +319,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Palo Alto Networks",
         "category": IntegrationCategory.EDR,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["query", "contain", "isolate"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     # Firewall
@@ -219,7 +329,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Palo Alto Networks",
         "category": IntegrationCategory.FIREWALL,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["create", "delete", "query"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "fortinet": {
@@ -229,7 +338,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Fortinet",
         "category": IntegrationCategory.FIREWALL,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["create", "delete", "query"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "cisco_asa": {
@@ -239,7 +347,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Cisco",
         "category": IntegrationCategory.FIREWALL,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["create", "delete", "query"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     # Cloud Providers
@@ -250,17 +357,15 @@ BUILTIN_CONNECTORS = {
         "vendor": "Amazon",
         "category": IntegrationCategory.CLOUD_PROVIDER,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["query", "create", "update"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
-    "azure_sentinel": {
-        "name": "azure_sentinel",
-        "display_name": "Azure Sentinel",
-        "description": "Cloud-native SIEM in Azure",
+    "microsoft_sentinel": {
+        "name": "microsoft_sentinel",
+        "display_name": "Microsoft Sentinel",
+        "description": "Cloud-native SIEM in Azure (formerly Azure Sentinel): KQL queries, incidents, analytics rules, bookmarks, Logic Apps playbooks",
         "vendor": "Microsoft",
-        "category": IntegrationCategory.CLOUD_PROVIDER,
+        "category": IntegrationCategory.SIEM,
         "auth_type": AuthType.OAUTH2,
-        "supported_actions": ["query", "create", "update"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "gcp_security_command_center": {
@@ -270,7 +375,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Google",
         "category": IntegrationCategory.CLOUD_PROVIDER,
         "auth_type": AuthType.OAUTH2,
-        "supported_actions": ["query", "create", "update"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     # Cloud Log Sources — pulled every 5 min by Celery beat
@@ -284,7 +388,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Amazon",
         "category": IntegrationCategory.CLOUD_PROVIDER,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["poll_logs"],
         "supported_triggers": ["scheduled", "manual"],
         "required_credentials": ["aws_access_key_id", "aws_secret_access_key"],
         "optional_config": ["region"],
@@ -296,7 +399,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Microsoft",
         "category": IntegrationCategory.CLOUD_PROVIDER,
         "auth_type": AuthType.OAUTH2,
-        "supported_actions": ["poll_logs"],
         "supported_triggers": ["scheduled", "manual"],
         "required_credentials": ["tenant_id", "client_id", "client_secret", "subscription_id"],
     },
@@ -307,7 +409,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Google",
         "category": IntegrationCategory.CLOUD_PROVIDER,
         "auth_type": AuthType.OAUTH2,
-        "supported_actions": ["poll_logs"],
         "supported_triggers": ["scheduled", "manual"],
         "required_credentials": ["service_account_json"],
         "optional_config": ["project_id", "log_filter"],
@@ -320,7 +421,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Okta",
         "category": IntegrationCategory.IDENTITY_PROVIDER,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["query", "disable_user", "reset_password"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "azure_ad": {
@@ -330,7 +430,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Microsoft",
         "category": IntegrationCategory.IDENTITY_PROVIDER,
         "auth_type": AuthType.OAUTH2,
-        "supported_actions": ["query", "disable_user", "reset_password"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "cyberark": {
@@ -340,7 +439,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "CyberArk",
         "category": IntegrationCategory.PAM,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["query", "create", "revoke"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     # Ticketing
@@ -351,7 +449,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "ServiceNow",
         "category": IntegrationCategory.TICKETING,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["create", "update", "query"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "jira": {
@@ -361,7 +458,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Atlassian",
         "category": IntegrationCategory.TICKETING,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["create", "update", "query"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "pagerduty": {
@@ -371,7 +467,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "PagerDuty",
         "category": IntegrationCategory.TICKETING,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["create", "update", "acknowledge"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     # Communication
@@ -382,7 +477,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Slack",
         "category": IntegrationCategory.COMMUNICATION,
         "auth_type": AuthType.OAUTH2,
-        "supported_actions": ["notify", "create_channel", "send_message"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "microsoft_teams": {
@@ -392,7 +486,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Microsoft",
         "category": IntegrationCategory.COMMUNICATION,
         "auth_type": AuthType.OAUTH2,
-        "supported_actions": ["notify", "send_message"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "smtp_email": {
@@ -402,7 +495,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Generic",
         "category": IntegrationCategory.COMMUNICATION,
         "auth_type": AuthType.BASIC,
-        "supported_actions": ["notify"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     # Threat Intelligence
@@ -413,7 +505,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "VirusTotal",
         "category": IntegrationCategory.THREAT_INTEL,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["enrich", "query"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "shodan": {
@@ -423,7 +514,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Shodan",
         "category": IntegrationCategory.THREAT_INTEL,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["enrich", "query"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "alienvault_otx": {
@@ -433,7 +523,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "AlienVault",
         "category": IntegrationCategory.THREAT_INTEL,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["enrich", "query"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "greynoise": {
@@ -443,7 +532,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "GreyNoise",
         "category": IntegrationCategory.THREAT_INTEL,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["enrich", "query"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "abuseipdb": {
@@ -453,7 +541,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "AbuseIPDB",
         "category": IntegrationCategory.THREAT_INTEL,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["enrich", "query"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "recorded_future": {
@@ -463,7 +550,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Recorded Future",
         "category": IntegrationCategory.THREAT_INTEL,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["enrich", "query"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     # Vulnerability Scanners
@@ -474,7 +560,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Tenable",
         "category": IntegrationCategory.VULNERABILITY_SCANNER,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["scan", "query"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "qualys": {
@@ -484,7 +569,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Qualys",
         "category": IntegrationCategory.VULNERABILITY_SCANNER,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["scan", "query"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "openvas": {
@@ -494,7 +578,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "OpenVAS",
         "category": IntegrationCategory.VULNERABILITY_SCANNER,
         "auth_type": AuthType.BASIC,
-        "supported_actions": ["scan", "query"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "trivy": {
@@ -504,7 +587,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Aqua Security",
         "category": IntegrationCategory.CONTAINER_SECURITY,
         "auth_type": AuthType.BASIC,
-        "supported_actions": ["scan", "export"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     # Container Security
@@ -515,7 +597,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Aqua Security",
         "category": IntegrationCategory.CONTAINER_SECURITY,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["scan", "contain", "remediate"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "falco": {
@@ -525,7 +606,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "Falco Project",
         "category": IntegrationCategory.CONTAINER_SECURITY,
         "auth_type": AuthType.BASIC,
-        "supported_actions": ["query", "notify"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     # CI/CD
@@ -536,7 +616,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "GitHub",
         "category": IntegrationCategory.CI_CD,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["trigger", "query"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "gitlab_ci": {
@@ -546,7 +625,6 @@ BUILTIN_CONNECTORS = {
         "vendor": "GitLab",
         "category": IntegrationCategory.CI_CD,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["trigger", "query"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "jenkins": {
@@ -556,14 +634,20 @@ BUILTIN_CONNECTORS = {
         "vendor": "Jenkins",
         "category": IntegrationCategory.CI_CD,
         "auth_type": AuthType.API_KEY,
-        "supported_actions": ["trigger", "query"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
 }
 
 
 class ConnectorRegistry:
-    """Registry of available integration connectors"""
+    """Registry of available integration connectors.
+
+    The catalogue is the union of ``BUILTIN_CONNECTORS`` (names, vendors,
+    categories: the roadmap the market sees) and the connector classes: for a
+    connector in ``CONNECTOR_CLASS_MAP`` the actions, fields, config schema,
+    verification statement and test call all come from the class; every other
+    entry is ``planned`` (not installable, no actions) or ``log_ingest``.
+    """
 
     def __init__(self):
         """Initialize connector registry"""
@@ -573,35 +657,81 @@ class ConnectorRegistry:
     def _load_builtin_connectors(self):
         """Load built-in connector definitions"""
         for name, config in BUILTIN_CONNECTORS.items():
-            self.connectors[name] = {
-                "name": config["name"],
-                "display_name": config["display_name"],
-                "description": config.get("description", ""),
-                "vendor": config.get("vendor", ""),
-                "category": config["category"],
-                "auth_type": config["auth_type"],
-                "version": "1.0.0",
-                "is_builtin": True,
-                # Optional flag — "external_siem" surfaces in the
-                # marketplace UI so operators know these are interop
-                # connectors, not a requirement to replace PySOAR's
-                # native SIEM.
-                "integration_role": config.get("integration_role"),
-                "required_credentials": config.get("required_credentials"),
-                "optional_config": config.get("optional_config"),
-                "supported_actions": config["supported_actions"],
-                "supported_triggers": config["supported_triggers"],
-                "config_schema": json.dumps({"type": "object", "properties": {}}),
-            }
+            self.connectors[name] = self._describe(name, config)
 
-    def register_connector(
-        self,
-        name: str,
-        config: dict[str, Any],
-    ) -> None:
-        """Register a connector"""
-        self.connectors[name] = config
-        logger.info(f"Registered connector: {name}")
+    @staticmethod
+    def _describe(name: str, config: dict[str, Any]) -> dict[str, Any]:
+        status = implementation_status(name)
+        cls = connector_class(name)
+        meta: dict[str, Any] = {
+            "name": config["name"],
+            "display_name": config["display_name"],
+            "description": config.get("description", ""),
+            "vendor": config.get("vendor", ""),
+            "category": config["category"],
+            "auth_type": config["auth_type"],
+            "version": "1.0.0",
+            "is_builtin": True,
+            # Optional flag — "external_siem" surfaces in the
+            # marketplace UI so operators know these are interop
+            # connectors, not a requirement to replace PySOAR's
+            # native SIEM.
+            "integration_role": config.get("integration_role"),
+            "supported_triggers": config["supported_triggers"],
+            "implementation_status": status,
+            "installable": status in (IMPLEMENTED, LOG_INGEST),
+        }
+        if cls is not None:
+            config_fields = [_field_dict(f) for f in cls.CONFIG_FIELDS]
+            credential_fields = [_field_dict(f) for f in cls.CREDENTIAL_FIELDS]
+            meta.update({
+                "verification": cls.VERIFICATION,
+                "test_call": cls.TEST_CALL,
+                "actions": cls.catalogue_actions(),
+                "supported_actions": list(cls.ACTIONS),
+                "config_fields": config_fields,
+                "credential_fields": credential_fields,
+                "required_credentials": [f["name"] for f in credential_fields if f["required"]],
+                "optional_config": [f["name"] for f in config_fields + credential_fields if not f["required"]],
+                "config_schema": json.dumps(cls.config_schema()),
+            })
+        elif status == LOG_INGEST:
+            required = list(config.get("required_credentials") or [])
+            optional = list(config.get("optional_config") or [])
+            credential_fields = [
+                {"name": k, "type": "password", "display_name": k, "description": None,
+                 "required": True, "default": None, "secret": True}
+                for k in required
+            ]
+            config_fields = [
+                {"name": k, "type": "string", "display_name": k, "description": None,
+                 "required": False, "default": None, "secret": False}
+                for k in optional
+            ]
+            meta.update({
+                "verification": LOG_INGEST_VERIFICATION,
+                "test_call": None,
+                "actions": [],
+                "supported_actions": [],
+                "config_fields": config_fields,
+                "credential_fields": credential_fields,
+                "required_credentials": required,
+                "optional_config": optional,
+                "config_schema": json.dumps({"type": "object", "properties": {}}),
+            })
+        else:
+            meta.update({
+                "verification": PLANNED_VERIFICATION,
+                "test_call": None,
+                "actions": [],
+                "supported_actions": [],
+                "config_fields": [],
+                "credential_fields": [],
+                "required_credentials": None,
+                "optional_config": None,
+                "config_schema": json.dumps({"type": "object", "properties": {}}),
+            })
+        return meta
 
     def list_connectors(
         self,
@@ -644,10 +774,14 @@ class ConnectorRegistry:
 
         The ``installed_integrations.connector_id`` FK references
         ``integration_connectors.id``, so an install request that uses a
-        registry name (e.g. "splunk") only works if a row with that
-        id literally exists. Idempotent — safe to run every startup.
+        registry name (e.g. "slack") only works if a row with that
+        id literally exists. Also mirrors each implemented connector's
+        declared actions into ``integration_actions`` (for the catalogue row
+        and any other row that carries the connector's name), so
+        ``GET /installed/{id}/actions`` lists them before anything runs.
+        Idempotent — safe to run every startup.
 
-        Returns the number of rows inserted (not updates).
+        Returns the number of connector rows inserted (not updates).
         """
         from src.core.database import async_session_factory
         from src.integrations.models import IntegrationConnector
@@ -697,18 +831,31 @@ class ConnectorRegistry:
                     row.vendor = cfg.get("vendor") or row.vendor
                     row.category = cat_str
                     row.auth_type = auth_str
+                    row.supported_actions = json.dumps(cfg.get("supported_actions") or [])
+                    row.config_schema = cfg.get("config_schema") or row.config_schema
+            await db.flush()
+            rows = (
+                await db.execute(
+                    _select(IntegrationConnector.id, IntegrationConnector.name).where(
+                        IntegrationConnector.name.in_(list(CONNECTOR_CLASS_MAP)),
+                    )
+                )
+            ).all()
+            for connector_id, connector_name in rows:
+                await sync_connector_actions(db, connector_id, connector_name)
             await db.commit()
         return created
 
     def validate_connector_schema(self, name: str, config: dict[str, Any]) -> bool:
-        """Validate configuration against connector schema"""
+        """True when ``config`` carries every required config field of the connector."""
         connector = self.get_connector_details(name)
         if not connector:
             logger.warning(f"Connector not found: {name}")
             return False
-
-        # Basic validation - in production, use jsonschema
-        return True
+        cls = connector_class(name)
+        if cls is None:
+            return bool(connector.get("installable", False))
+        return not [f.name for f in cls.CONFIG_FIELDS if f.required and config.get(f.name) in (None, "")]
 
     def check_compatibility(self, connector_name: str, action_name: str) -> bool:
         """Check if action is supported by connector"""
@@ -720,139 +867,83 @@ class ConnectorRegistry:
 
 
 class IntegrationManager:
-    """Manage installed integrations lifecycle"""
+    """Health checks for installed integrations.
+
+    Installation and configuration live in the API endpoint
+    (src/api/v1/endpoints/integrations.py), which writes the
+    InstalledIntegration row with encrypted credentials. The no-op
+    configure / enable / disable / update_credentials / uninstall methods
+    that used to live here (one of them bcrypt-hashed credentials, making
+    them unusable) had no callers and were deleted.
+    """
 
     def __init__(self, registry: ConnectorRegistry):
         """Initialize integration manager"""
         self.registry = registry
 
-    # NOTE: connector installation/persistence lives in the API endpoint
-    # (src/api/v1/endpoints/integrations.py), which writes the
-    # InstalledIntegration row. A previous install_connector method here
-    # returned success without persisting anything and had no callers —
-    # deleted 2026-06-11 so nobody wires it up by accident.
-
-    async def configure_integration(
-        self,
-        installation_id: str,
-        config: dict[str, Any],
-        credentials: Optional[dict[str, Any]] = None,
-    ) -> dict[str, Any]:
-        """Update configuration of installed integration by persisting to DB"""
-        from src.core.database import async_session_factory
-        from sqlalchemy import select, update
-
-        async with async_session_factory() as db:
-            query = select(InstalledIntegration).where(InstalledIntegration.id == installation_id)
-            result = await db.execute(query)
-            integration = result.scalar_one_or_none()
-
-            if not integration:
-                return {"status": "error", "installation_id": installation_id, "error": "not_found"}
-
-            integration.config_encrypted = json.dumps(config)
-            if credentials:
-                from src.core.security import get_password_hash
-                integration.auth_credentials_encrypted = get_password_hash(json.dumps(credentials))
-
-            integration.status = IntegrationStatus.ACTIVE.value
-            await db.commit()
-
-        logger.info(f"Configured integration {installation_id}")
-
-        return {
-            "status": "success",
-            "installation_id": installation_id,
-        }
-
     async def test_connection(
         self,
         installation_id: str,
     ) -> dict[str, Any]:
-        """Test health of an installed integration by actually contacting the
-        third-party endpoint and inspecting the response.
+        """Run the connector's ``test_connection`` for one installed integration.
 
-        Resolves the ``connector`` row (so we know the connector type),
-        decodes the stored config + credentials JSON, and dispatches to a
-        per-connector probe. Each probe issues a *real* HTTP request with
-        a 5-second timeout and reports HEALTHY / DEGRADED / UNHEALTHY
-        / UNKNOWN based on the answer. The DB row's ``health_status``
-        and ``last_health_check`` are updated to match.
-
-        Unknown connector types are honestly reported as ``unknown`` —
-        we never claim ``healthy`` without a successful probe.
+        Decrypts the stored credentials, runs the class's authenticated
+        read-only call through the pinned client and persists
+        ``health_status``, ``last_health_check`` and a sanitised
+        ``error_message`` (<= 200 chars, no secrets). A planned connector is
+        recorded ``unavailable`` without any network call; a log-ingest
+        source keeps the health its poller recorded.
         """
-        from src.core.database import async_session_factory
         from sqlalchemy import select
+        from sqlalchemy.orm import selectinload
 
-        health_status = HealthStatus.UNKNOWN.value
-        error_message: Optional[str] = None
+        from src.core.database import async_session_factory
+        from src.core.secrets import _decrypt_secret_json
 
         async with async_session_factory() as db:
-            query = select(InstalledIntegration).where(
-                InstalledIntegration.id == installation_id
-            )
-            integration = (await db.execute(query)).scalar_one_or_none()
-
+            integration = (
+                await db.execute(
+                    select(InstalledIntegration)
+                    .options(selectinload(InstalledIntegration.connector))
+                    .where(InstalledIntegration.id == installation_id)
+                )
+            ).scalar_one_or_none()
             if not integration:
-                logger.info(f"Health check for {installation_id}: not_found")
                 return {
                     "installation_id": installation_id,
                     "status": HealthStatus.UNHEALTHY.value,
                     "error_message": "Integration not found in database",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
-
-            # Resolve the connector so we know which third-party API to
-            # probe. Without it we can only honestly report unknown.
-            connector = (await db.execute(
-                select(IntegrationConnector).where(
-                    IntegrationConnector.id == integration.connector_id
-                )
-            )).scalar_one_or_none()
-
-            connector_type = (connector.name if connector else "").lower()
-
-            try:
-                config = json.loads(integration.config_encrypted or "{}")
-            except (json.JSONDecodeError, TypeError):
-                config = {}
-                error_message = "Stored config is not valid JSON"
-                health_status = HealthStatus.DEGRADED.value
-
-            try:
-                # Note: in real deployments this is decrypted; we round-
-                # trip through json so the probe gets a dict either way.
-                credentials = json.loads(integration.auth_credentials_encrypted or "{}")
-            except (json.JSONDecodeError, TypeError):
-                credentials = {}
-
-            if health_status != HealthStatus.DEGRADED.value:
-                try:
-                    health_status, error_message = await self._probe_connector(
-                        connector_type, config, credentials
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    # Surface the failure verbatim — callers need the truth.
-                    health_status = HealthStatus.UNHEALTHY.value
-                    error_message = f"Probe raised: {exc}"
-
-            integration.health_status = health_status
-            integration.last_health_check = datetime.now(timezone.utc).isoformat()
-            if health_status == HealthStatus.UNHEALTHY.value and error_message:
-                integration.error_message = error_message
+            connector_name = installed_connector_name(integration)
+            if implementation_status(connector_name) == LOG_INGEST:
+                return {
+                    "installation_id": installation_id,
+                    "connector_type": connector_name,
+                    "status": integration.health_status or HealthStatus.UNKNOWN.value,
+                    "error_message": integration.error_message,
+                    "skipped": "log source health is recorded by the SIEM cloud poller",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            config = safe_json_loads(integration.config_encrypted, {}) or {}
+            credentials = _decrypt_secret_json(integration.auth_credentials_encrypted) or {}
+            result = await probe_connector(connector_name, config if isinstance(config, dict) else {}, credentials)
+            record_health(integration, result)
             await db.commit()
 
         logger.info(
-            f"Health check for {installation_id} ({connector_type or 'unknown'}): "
-            f"{health_status} {('- ' + error_message) if error_message else ''}"
+            "integration health check",
+            installation_id=installation_id,
+            connector=connector_name,
+            status=result.status,
         )
-
         return {
             "installation_id": installation_id,
-            "connector_type": connector_type or None,
-            "status": health_status,
-            "error_message": error_message,
+            "connector_type": connector_name or None,
+            "status": result.status,
+            "error_message": None if result.healthy else result.detail,
+            "checked": result.checked,
+            "http_status": result.http_status,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -862,203 +953,13 @@ class IntegrationManager:
         config: dict[str, Any],
         credentials: dict[str, Any],
     ) -> tuple[str, Optional[str]]:
-        """Issue a real network probe against the third-party API.
+        """``(health_status, error_message)`` from the connector's own test_connection.
 
-        Returns ``(health_status, error_message)``. ``error_message`` is
-        None on success. Unknown connector types deliberately return
-        ``unknown`` rather than ``healthy`` — silently passing on
-        connectors we don't know how to verify is exactly the kind of
-        green-checkmark theater this code is replacing.
+        Kept for the remediation module's Test Connection route. A planned
+        connector answers ``unavailable`` with no network call.
         """
-        import httpx
-
-        base_url = (config.get("base_url") or config.get("url") or "").rstrip("/")
-        # The probe opens connections from the API host: every URL it could
-        # hit is resolved once, refused if any answer is private / loopback /
-        # link-local / metadata, and then contacted at that vetted IP (Host
-        # and TLS SNI keep the hostname), so neither a stored URL nor a DNS
-        # answer that changes after the check can reach internal services.
-        vetted: list[VettedTarget] = []
-        for candidate in (base_url, str(config.get("webhook_url") or "").strip()):
-            if not candidate:
-                continue
-            try:
-                vetted.append(await resolve_and_vet(candidate))
-            except OutboundTargetRefused as exc:
-                return HealthStatus.UNHEALTHY.value, f"outbound target refused: {exc}"
-        timeout = httpx.Timeout(5.0, connect=5.0)
-
-        async def _pinned(url: str) -> tuple[str, VettedTarget]:
-            # Reuse a target vetted above when the URL is on its origin, so the
-            # configured host is resolved exactly once; vendor URLs fixed in
-            # code are vetted the same way.
-            for target in vetted:
-                try:
-                    return target.pin(url), target
-                except OutboundTargetRefused:
-                    continue
-            target = await resolve_and_vet(url)
-            return target.pinned_url, target
-
-        async def _send(method: str, url: str, headers: Optional[dict[str, str]] = None, **kwargs: Any) -> Any:
-            pinned_url, target = await _pinned(url)
-            pin_kwargs = merge_pinned_kwargs(target, headers)
-            return await client.request(
-                method, pinned_url,
-                headers=pin_kwargs["headers"], extensions=pin_kwargs["extensions"],
-                **kwargs,
-            )
-
-        # Bearer/API-key/HTTP-basic helpers
-        api_key = credentials.get("api_key") or credentials.get("token")
-        bearer = credentials.get("bearer_token") or credentials.get("access_token")
-        username = credentials.get("username")
-        password = credentials.get("password")
-
-        def _bearer_headers() -> dict[str, str]:
-            return {"Authorization": f"Bearer {bearer or api_key}"} if (bearer or api_key) else {}
-
-        async with httpx.AsyncClient(
-            timeout=timeout, verify=config.get("verify_tls", True), follow_redirects=False,
-        ) as client:
-            try:
-                if connector_type == "splunk":
-                    if not base_url:
-                        return HealthStatus.UNHEALTHY.value, "Splunk base_url not configured"
-                    auth = None
-                    headers = _bearer_headers()
-                    if not headers and username and password:
-                        auth = (username, password)
-                    resp = await _send(
-                        "GET", f"{base_url}/services/server/info?output_mode=json",
-                        headers=headers, auth=auth,
-                    )
-                    return _classify_response(resp)
-
-                if connector_type in ("elastic", "opensearch"):
-                    if not base_url:
-                        return HealthStatus.UNHEALTHY.value, f"{connector_type} base_url not configured"
-                    auth = (username, password) if username and password else None
-                    headers = _bearer_headers() if not auth else {}
-                    resp = await _send("GET", f"{base_url}/", headers=headers, auth=auth)
-                    return _classify_response(resp)
-
-                if connector_type == "qradar":
-                    if not base_url:
-                        return HealthStatus.UNHEALTHY.value, "QRadar base_url not configured"
-                    headers = {"SEC": api_key} if api_key else {}
-                    resp = await _send("GET", f"{base_url}/api/system/about", headers=headers)
-                    return _classify_response(resp)
-
-                if connector_type == "slack":
-                    if not (bearer or api_key):
-                        return HealthStatus.UNHEALTHY.value, "Slack token not configured"
-                    resp = await _send(
-                        "POST", "https://slack.com/api/auth.test",
-                        headers={"Authorization": f"Bearer {bearer or api_key}"},
-                    )
-                    if resp.status_code != 200:
-                        return HealthStatus.UNHEALTHY.value, f"Slack HTTP {resp.status_code}"
-                    body = resp.json() if resp.content else {}
-                    if body.get("ok") is True:
-                        return HealthStatus.HEALTHY.value, None
-                    return HealthStatus.UNHEALTHY.value, f"Slack auth.test: {body.get('error', 'unknown')}"
-
-                if connector_type == "virustotal":
-                    if not api_key:
-                        return HealthStatus.UNHEALTHY.value, "VirusTotal x-apikey not configured"
-                    resp = await _send(
-                        "GET", "https://www.virustotal.com/api/v3/users/current",
-                        headers={"x-apikey": api_key},
-                    )
-                    return _classify_response(resp)
-
-                if connector_type == "misp":
-                    if not base_url or not api_key:
-                        return HealthStatus.UNHEALTHY.value, "MISP base_url or api_key missing"
-                    resp = await _send(
-                        "GET", f"{base_url}/users/view/me",
-                        headers={"Authorization": api_key, "Accept": "application/json"},
-                    )
-                    return _classify_response(resp)
-
-                if connector_type == "cortex":
-                    if not base_url or not (bearer or api_key):
-                        return HealthStatus.UNHEALTHY.value, "Cortex base_url or token missing"
-                    resp = await _send(
-                        "GET", f"{base_url}/api/analyzer",
-                        headers={"Authorization": f"Bearer {bearer or api_key}"},
-                    )
-                    return _classify_response(resp)
-
-                if connector_type in ("webhook", "generic_webhook", "http_webhook"):
-                    url = config.get("webhook_url") or base_url
-                    if not url:
-                        return HealthStatus.UNHEALTHY.value, "Webhook URL not configured"
-                    resp = await _send("HEAD", url)
-                    # Webhooks frequently return 405 to HEAD — that's
-                    # still a sign the endpoint is reachable.
-                    if resp.status_code in (200, 201, 202, 204, 405):
-                        return HealthStatus.HEALTHY.value, None
-                    return HealthStatus.UNHEALTHY.value, f"Webhook HEAD HTTP {resp.status_code}"
-
-            except OutboundTargetRefused as exc:
-                return HealthStatus.UNHEALTHY.value, f"outbound target refused: {exc}"
-            except httpx.TimeoutException:
-                return HealthStatus.UNHEALTHY.value, "Probe timed out after 5s"
-            except httpx.HTTPError as exc:
-                return HealthStatus.UNHEALTHY.value, f"Probe HTTP error: {exc}"
-
-        # Connector type not in the verifiable set — don't lie about it.
-        return (
-            HealthStatus.UNKNOWN.value,
-            f"No active health probe implemented for connector type '{connector_type or 'unspecified'}'",
-        )
-
-    async def enable_integration(
-        self,
-        installation_id: str,
-    ) -> dict[str, Any]:
-        """Enable integration"""
-        logger.info(f"Enabled integration {installation_id}")
-        return {
-            "installation_id": installation_id,
-            "status": "active",
-        }
-
-    async def disable_integration(
-        self,
-        installation_id: str,
-    ) -> dict[str, Any]:
-        """Disable integration"""
-        logger.info(f"Disabled integration {installation_id}")
-        return {
-            "installation_id": installation_id,
-            "status": "inactive",
-        }
-
-    async def update_credentials(
-        self,
-        installation_id: str,
-        credentials: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Update credentials for integration"""
-        logger.info(f"Updated credentials for integration {installation_id}")
-        return {
-            "installation_id": installation_id,
-            "status": "success",
-        }
-
-    async def uninstall_integration(
-        self,
-        installation_id: str,
-    ) -> dict[str, Any]:
-        """Uninstall integration"""
-        logger.info(f"Uninstalled integration {installation_id}")
-        return {
-            "installation_id": installation_id,
-            "status": "uninstalled",
-        }
+        result = await probe_connector((connector_type or "").lower(), config or {}, credentials or {})
+        return result.status, (None if result.healthy else result.detail)
 
     async def get_integration_status(
         self,
@@ -1091,6 +992,20 @@ class IntegrationManager:
             }
 
 
+def installed_connector_name(integration: Any) -> str:
+    """The catalogue name of an installed integration's connector."""
+    connector = getattr(integration, "connector", None)
+    name = getattr(connector, "name", None) if connector is not None else None
+    return (name or integration.connector_id or "").lower()
+
+
+def record_health(integration: Any, result: ConnectionTestResult) -> None:
+    """Persist a test result on the row: status, timestamp, sanitised error (<= 200 chars)."""
+    integration.health_status = result.status
+    integration.last_health_check = datetime.now(timezone.utc).isoformat()
+    integration.error_message = None if result.healthy else sanitize_message(result.detail)
+
+
 class PinnedTarget(str):
     """The vetted URL returned by ``ActionExecutor._resolve_generic_target``.
 
@@ -1113,7 +1028,16 @@ class PinnedTarget(str):
 
 
 class ActionExecutor:
-    """Execute integration actions with rate limiting and retry logic"""
+    """Execute declared connector actions and record every execution.
+
+    Only connectors with a class in ``CONNECTOR_CLASS_MAP`` can execute, and
+    only the names in the class's ``ACTIONS``. A planned connector, an
+    unknown action, invalid parameters or a vendor error all come back as
+    ``status: failed`` with a sanitised ``error_message`` (and the vendor's
+    ``http_status`` when there was one), never as success. The old generic
+    HTTP fallback (a caller-supplied URL against the stored base URL) had no
+    caller in src/ that depended on it and was removed.
+    """
 
     def __init__(self, max_retries: int = 3):
         """Initialize action executor"""
@@ -1128,67 +1052,68 @@ class ActionExecutor:
         triggered_by: str = ExecutionTrigger.MANUAL.value,
         playbook_run_id: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Execute an integration action"""
-        execution_id = str(uuid4())
+        """Execute an integration action.
+
+        Returns ``execution_id``, ``status`` (success / failed),
+        ``output_data``, ``error_message``, ``error_code``, ``http_status``
+        and ``duration_ms``. ``execution_id`` is the id of the persisted
+        ``IntegrationExecution`` row (None when the action is not declared by
+        the connector, since an execution row needs a real action row).
+        """
         start_time = time.time()
         output_data: dict[str, Any] = {}
         error_message: Optional[str] = None
-        status = ExecutionStatus.PENDING.value
+        error_code: Optional[str] = None
+        http_status: Optional[int] = None
+        status = ExecutionStatus.FAILED.value
 
         try:
-            logger.info(
-                f"Executing action {action_name} on {installation_id} "
-                f"(execution={execution_id})",
-            )
-
-            # Validate input
             self._validate_input(input_data)
-
-            # Execute using connector wrapper or generic HTTP fallback
-            output_data = await self._call_connector_action(
-                installation_id,
-                action_name,
-                input_data,
-            )
-
+            output_data = await self._call_connector_action(installation_id, action_name, input_data)
             status = ExecutionStatus.SUCCESS.value
-            return {
-                "execution_id": execution_id,
-                "status": status,
-                "output_data": output_data,
-                "duration_ms": int((time.time() - start_time) * 1000),
-                "retry_count": 0,
-            }
-
-        except Exception as e:
-            error_message = str(e)
-            status = ExecutionStatus.FAILED.value
-            logger.error(f"Action execution failed: {error_message}")
-            return {
-                "execution_id": execution_id,
-                "status": status,
-                "error_message": error_message,
-                "duration_ms": int((time.time() - start_time) * 1000),
-            }
-
-        finally:
-            await self._persist_execution(
+        except ConnectorActionFailed as exc:
+            error_message, error_code, http_status = exc.message, exc.code, exc.http_status
+        except Exception as exc:  # noqa: BLE001 (every failure is reported as a failed execution)
+            error_message = sanitize_message(f"{type(exc).__name__}: {exc}")
+            error_code = "error"
+        duration_ms = int((time.time() - start_time) * 1000)
+        if status != ExecutionStatus.SUCCESS.value:
+            logger.warning(
+                "integration action failed",
                 installation_id=installation_id,
-                action_name=action_name,
-                input_data=input_data,
-                output_data=output_data,
-                execution_id=execution_id,
-                status=status,
-                error_message=error_message,
-                duration_ms=int((time.time() - start_time) * 1000),
-                triggered_by=triggered_by,
-                playbook_run_id=playbook_run_id,
+                action=action_name,
+                code=error_code,
+                http_status=http_status,
             )
+
+        execution_id = await self._persist_execution(
+            installation_id=installation_id,
+            action_name=action_name,
+            input_data=input_data,
+            output_data=output_data if status == ExecutionStatus.SUCCESS.value else {"error": error_message, "http_status": http_status},
+            execution_id=str(uuid4()),
+            status=status,
+            error_message=error_message,
+            duration_ms=duration_ms,
+            triggered_by=triggered_by,
+            playbook_run_id=playbook_run_id,
+        )
+        result: dict[str, Any] = {
+            "execution_id": execution_id,
+            "status": status,
+            "duration_ms": duration_ms,
+            "retry_count": 0,
+        }
+        if status == ExecutionStatus.SUCCESS.value:
+            result["output_data"] = output_data
+        else:
+            result.update({"error_message": error_message, "error_code": error_code, "http_status": http_status})
+        return result
 
     def _validate_input(self, input_data: dict[str, Any]) -> None:
         """Validate action input"""
         if not isinstance(input_data, dict):
-            raise ValueError("Input data must be a dictionary")
+            raise ConnectorActionFailed("input_data must be a JSON object", code="invalid_parameters")
 
     async def _call_connector_action(
         self,
@@ -1196,7 +1121,10 @@ class ActionExecutor:
         action_name: str,
         input_data: dict[str, Any],
     ) -> dict[str, Any]:
-        """Call connector action using a configured connector wrapper."""
+        """Run ``action_name`` on the installed integration's connector class.
+
+        Returns the action output; raises ConnectorActionFailed otherwise.
+        """
         from sqlalchemy import select
         from sqlalchemy.orm import selectinload
         from src.core.database import async_session_factory
@@ -1209,19 +1137,12 @@ class ActionExecutor:
             integration = result.scalar_one_or_none()
 
         if not integration:
-            raise ValueError(f"Installed integration not found: {installation_id}")
+            raise ConnectorActionFailed(f"installed integration not found: {installation_id}", code="not_found")
 
         config = safe_json_loads(integration.config_encrypted, {}) or {}
         credentials = self._decrypt_secret_json(integration.auth_credentials_encrypted)
-        connector_name = (integration.connector.name if integration.connector else integration.connector_id or "").lower()
-        connector_cls = self._get_connector_class(connector_name)
-
-        if connector_cls:
-            connector = connector_cls(config=config, credentials=credentials)
-            return await connector.execute_action(action_name, input_data)
-
-        # Fallback to generic HTTP based connector execution when no wrapper exists.
-        return await self._call_generic_http_action(installation_id, action_name, input_data, config)
+        connector = build_connector(installed_connector_name(integration), config, credentials)
+        return await connector.run_action(action_name, input_data)
 
     @staticmethod
     def _effective_port(scheme: str, port: Optional[int]) -> Optional[int]:
@@ -1230,8 +1151,10 @@ class ActionExecutor:
         return {"http": 80, "https": 443}.get(scheme)
 
     async def _resolve_generic_target(self, requested_url: str, config: dict[str, Any]) -> PinnedTarget:
-        """Pin a generic HTTP action to the integration's configured base URL.
+        """Pin a request to an integration's configured base URL.
 
+        Used by modules that call a tenant-configured HTTP API directly
+        (ITDR directory, container scanning, remediation's stored-URL guard).
         The caller may give a path (joined to the base URL) or an absolute
         URL with the same scheme, host and port as the stored config. The
         final host is resolved once and must not resolve to a private,
@@ -1271,64 +1194,6 @@ class ActionExecutor:
             raise OutboundTargetRefused(f"url refused: {exc}") from exc
         return PinnedTarget(vetted)
 
-    async def _call_generic_http_action(
-        self,
-        installation_id: str,
-        action_name: str,
-        input_data: dict[str, Any],
-        config: Optional[dict[str, Any]] = None,
-    ) -> dict[str, Any]:
-        """Call connector action via HTTP using httpx.
-
-        The request is confined to the installed integration's configured
-        base URL (see _resolve_generic_target) so this is not an open proxy.
-        """
-        import httpx
-
-        # Build request from input data
-        url = input_data.get("url", "")
-        method = str(input_data.get("method", "POST")).upper()
-        headers = input_data.get("headers", {})
-        if not isinstance(headers, dict):
-            headers = {}
-        body = input_data.get("body", {})
-        timeout = input_data.get("timeout", 30)
-        params = input_data.get("params", {})
-
-        if not url or not isinstance(url, str):
-            raise ValueError("Input data must include a 'url' field")
-
-        pinned = await self._resolve_generic_target(url, config or {})
-
-        # Add installation context header
-        headers.setdefault("X-Installation-Id", installation_id)
-        headers.setdefault("X-Action-Name", action_name)
-        # Connect to the vetted IP; Host and TLS SNI carry the hostname.
-        pin_kwargs = merge_pinned_kwargs(pinned.target, headers)
-
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-            response = await client.request(
-                method=method,
-                url=str(pinned),
-                headers=pin_kwargs["headers"],
-                extensions=pin_kwargs["extensions"],
-                json=body if method in ("POST", "PUT", "PATCH") else None,
-                params=params if method == "GET" else None,
-            )
-
-            # Parse response
-            try:
-                response_data = response.json()
-            except Exception:
-                response_data = {"raw_text": response.text}
-
-            return {
-                "result": "success" if response.is_success else "error",
-                "status_code": response.status_code,
-                "data": response_data,
-                "headers": dict(response.headers),
-            }
-
     async def _persist_execution(
         self,
         installation_id: str,
@@ -1341,43 +1206,61 @@ class ActionExecutor:
         duration_ms: int,
         triggered_by: str,
         playbook_run_id: Optional[str],
-    ) -> None:
-        """Persist integration action execution history to the database."""
+    ) -> Optional[str]:
+        """Persist one execution row; returns its id.
+
+        The action row comes from the connector class's declared ``ACTIONS``
+        (created from the spec when the registry sync has not run yet). An
+        action name the connector does not declare is never invented: the
+        failed attempt is logged and not persisted (an execution row needs a
+        real action row). Returns None when nothing was persisted.
+        """
         from sqlalchemy import select
+        from sqlalchemy.orm import selectinload
         from src.core.database import async_session_factory
 
         try:
             async with async_session_factory() as db:
-                query = select(InstalledIntegration).where(InstalledIntegration.id == installation_id)
-                result = await db.execute(query)
-                integration = result.scalar_one_or_none()
-                if not integration:
-                    return
-
-                action_query = select(IntegrationAction).where(
-                    IntegrationAction.connector_id == integration.connector_id,
-                    IntegrationAction.action_name == action_name,
-                )
-                action_result = await db.execute(action_query)
-                action = action_result.scalar_one_or_none()
-                if not action:
-                    action = IntegrationAction(
-                        connector_id=integration.connector_id,
-                        action_name=action_name,
-                        display_name=action_name,
-                        description=f"Auto-created action for {action_name}",
-                        action_type=ActionType.CREATE.value,
-                        input_schema="{}",
-                        output_schema="{}",
-                        requires_approval=False,
-                        timeout_seconds=300,
-                        retry_policy="{}",
-                        is_idempotent=False,
+                integration = (
+                    await db.execute(
+                        select(InstalledIntegration)
+                        .options(selectinload(InstalledIntegration.connector))
+                        .where(InstalledIntegration.id == installation_id)
                     )
-                    db.add(action)
-                    await db.flush()
+                ).scalar_one_or_none()
+                if not integration:
+                    return None
+                connector_name = installed_connector_name(integration)
+                cls = connector_class(connector_name)
+                if cls is None or action_name not in cls.ACTIONS:
+                    logger.warning(
+                        "integration execution not persisted: action not declared by the connector",
+                        installation_id=installation_id,
+                        action=action_name,
+                    )
+                    return None
 
+                async def _action_row() -> Optional[IntegrationAction]:
+                    return (
+                        await db.execute(
+                            select(IntegrationAction).where(
+                                IntegrationAction.connector_id == integration.connector_id,
+                                IntegrationAction.action_name == action_name,
+                            )
+                        )
+                    ).scalars().first()
+
+                action = await _action_row()
+                if action is None:
+                    await sync_connector_actions(db, integration.connector_id, connector_name)
+                    action = await _action_row()
+                if action is None:
+                    return None
+
+                now = datetime.now(timezone.utc)
+                started = now - timedelta(milliseconds=duration_ms)
                 execution = IntegrationExecution(
+                    id=execution_id,
                     organization_id=integration.organization_id,
                     installed_id=integration.id,
                     action_id=action.id,
@@ -1386,29 +1269,34 @@ class ActionExecutor:
                     input_data=json.dumps(input_data, default=str),
                     output_data=json.dumps(output_data, default=str) if output_data is not None else None,
                     status=status,
-                    started_at=datetime.now(timezone.utc).isoformat(),
-                    completed_at=datetime.now(timezone.utc).isoformat(),
+                    started_at=started.isoformat(),
+                    completed_at=now.isoformat(),
                     duration_ms=duration_ms,
                     error_message=error_message,
                     retry_count=0,
                 )
                 db.add(execution)
+                if status == ExecutionStatus.SUCCESS.value:
+                    integration.last_successful_action = now.isoformat()
                 await db.commit()
-        except Exception as exc:
-            logger.error(f"Failed to persist integration execution: {exc}")
+                return execution_id
+        except Exception as exc:  # noqa: BLE001 (history persistence must not mask the action result)
+            logger.error("failed to persist integration execution", error_type=type(exc).__name__)
+            return None
 
     def _decrypt_secret_json(self, value: Optional[str]) -> dict[str, Any]:
-        """Decrypt a stored credentials blob from the database."""
-        if not value:
-            return {}
-        if isinstance(value, str) and value.startswith("__plaintext__:"):
-            return safe_json_loads(value[len("__plaintext__:"):], {}) or {}
+        """Decrypt a stored credentials blob from the database.
 
-        try:
-            decrypted = get_encryption_service().decrypt_field(value)
-            return safe_json_loads(decrypted, {}) or {}
-        except Exception:
-            return safe_json_loads(value, {}) or {}
+        Delegates to ``src.core.secrets._decrypt_secret_json``, which opens the
+        ``enc:v1:`` envelope the install route writes (and the pre-envelope
+        legacy shapes). The previous local reader did not understand the
+        envelope, so every credential written by ``POST /install`` read back
+        as ``{}`` here. A blob that cannot be opened reads as ``{}``, which the
+        connector reports as missing required fields (never a silent success).
+        """
+        from src.core.secrets import _decrypt_secret_json
+
+        return _decrypt_secret_json(value)
 
     def _get_connector_class(self, connector_name: str):
         """Resolve a connector wrapper class by connector name."""

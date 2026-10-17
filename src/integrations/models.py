@@ -102,6 +102,8 @@ class HealthStatus(str, Enum):
     DEGRADED = "degraded"
     UNHEALTHY = "unhealthy"
     UNKNOWN = "unknown"
+    # The connector has no implementation in this release: nothing to test.
+    UNAVAILABLE = "unavailable"
 
 
 class IntegrationConnector(BaseModel):

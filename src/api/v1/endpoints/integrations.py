@@ -1,4 +1,12 @@
-"""Integration marketplace and connector management endpoints"""
+"""Integration marketplace and connector management endpoints.
+
+The connector catalogue is derived from the connector classes
+(src/integrations/connectors/): a connector with a class is ``implemented``
+and declares its actions, config / credential fields and read-only test
+call; the other catalogue entries are ``planned`` (install, test and execute
+answer 501 ``not_implemented``) or ``log_ingest`` (installable SIEM log
+sources with no actions).
+"""
 
 import json
 import math
@@ -17,9 +25,27 @@ from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_r
 from src.core.secrets import _decrypt_secret_json, _encrypt_secret_json  # noqa: F401
 from src.core.security import get_password_hash
 from src.core.utils import safe_json_loads
-from src.integrations.engine import ConnectorRegistry, IntegrationManager, ActionExecutor
+from src.integrations.connectors.base import sanitize_message, validate_params
+from src.integrations.engine import (
+    IMPLEMENTED,
+    LOG_INGEST,
+    PLANNED,
+    ActionExecutor,
+    ConnectorRegistry,
+    IntegrationManager,
+    connector_class,
+    implementation_status,
+    installed_connector_name,
+    invalid_install_fields,
+    missing_install_fields,
+    probe_connector,
+    record_health,
+    sync_connector_actions,
+)
+from src.models.audit import AuditLog
 from src.models.user import UserRole
 from src.integrations.models import (
+    HealthStatus,
     IntegrationAction,
     IntegrationConnector,
     IntegrationExecution,
@@ -67,6 +93,166 @@ _ANALYST = Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))
 registry = ConnectorRegistry()
 manager = IntegrationManager(registry)
 executor = ActionExecutor()
+
+
+def _not_implemented(display_name: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "detail": f"{display_name} has no connector implementation in this release",
+        },
+    )
+
+
+def _display_name(connector_name: str) -> str:
+    meta = registry.get_connector_details(connector_name) or {}
+    return meta.get("display_name") or connector_name
+
+
+def _audit(
+    db: AsyncSession,
+    *,
+    user: Any,
+    org_id: str,
+    action: str,
+    resource_id: Optional[str],
+    description: str,
+    details: Optional[dict[str, Any]] = None,
+    success: bool = True,
+    error: Optional[str] = None,
+) -> None:
+    """Stage an AuditLog row (committed with the handler's transaction).
+
+    ``details`` never carries credential values: callers pass field names.
+    """
+    db.add(AuditLog(
+        user_id=getattr(user, "id", None),
+        organization_id=org_id,
+        action=action,
+        resource_type="integration",
+        resource_id=resource_id,
+        description=description[:4000],
+        new_value=json.dumps(details or {}, default=str)[:20000],
+        success=success,
+        error_message=error,
+    ))
+
+
+def _field_problem(error: str, fields: list[str], message: str) -> HTTPException:
+    """422 naming the fields, never their values."""
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail={"error": error, "fields": sorted(set(fields)), "detail": message},
+    )
+
+
+def _validate_install_payload(connector_name: str, config: dict[str, Any], credentials: dict[str, Any]) -> None:
+    missing = missing_install_fields(connector_name, config, credentials)
+    if missing:
+        raise _field_problem("missing_fields", missing, "required config / credential fields are missing")
+    invalid = invalid_install_fields(connector_name, config, credentials)
+    if invalid:
+        raise _field_problem("invalid_fields", invalid, "config / credential fields have an invalid format")
+
+
+async def _ensure_connector_row(db: AsyncSession, connector_name: str, meta: dict[str, Any]) -> None:
+    """The installed_integrations FK needs the catalogue row; create it from the registry if absent."""
+    existing = (
+        await db.execute(select(IntegrationConnector.id).where(IntegrationConnector.id == connector_name))
+    ).scalar_one_or_none()
+    if existing is not None:
+        return
+    category = meta.get("category")
+    auth_type = meta.get("auth_type")
+    db.add(IntegrationConnector(
+        id=connector_name,
+        name=connector_name,
+        display_name=meta.get("display_name") or connector_name,
+        description=meta.get("description") or None,
+        vendor=meta.get("vendor") or None,
+        category=getattr(category, "value", category) or "threat_intel",
+        version=meta.get("version", "1.0.0"),
+        supported_actions=json.dumps(meta.get("supported_actions") or []),
+        supported_triggers=json.dumps(meta.get("supported_triggers") or []),
+        auth_type=getattr(auth_type, "value", auth_type) or "api_key",
+        config_schema=meta.get("config_schema") or "{}",
+        is_builtin=True,
+        is_community=False,
+    ))
+    await db.flush()
+
+
+async def _org_install_counts(db: AsyncSession, org_id: Optional[str]) -> dict[str, int]:
+    """Installs per connector name for the caller's organisation (no organisation: none)."""
+    rows = (
+        await db.execute(
+            select(IntegrationConnector.name, func.count(InstalledIntegration.id))
+            .join(IntegrationConnector, IntegrationConnector.id == InstalledIntegration.connector_id)
+            .where(InstalledIntegration.organization_id == org_id)
+            .group_by(IntegrationConnector.name)
+        )
+    ).all()
+    return {str(name).lower(): int(count) for name, count in rows}
+
+
+def _connector_response(meta: dict[str, Any], install_count: int) -> ConnectorResponse:
+    category = meta.get("category", "")
+    auth_type = meta.get("auth_type", "")
+    return ConnectorResponse(
+        id=meta.get("name", ""),
+        name=meta.get("name", ""),
+        display_name=meta.get("display_name", ""),
+        description=meta.get("description"),
+        vendor=meta.get("vendor"),
+        category=getattr(category, "value", category),
+        version=meta.get("version", "1.0.0"),
+        auth_type=getattr(auth_type, "value", auth_type),
+        supported_actions=meta.get("supported_actions", []),
+        supported_triggers=meta.get("supported_triggers", []),
+        icon_url=None,
+        documentation_url=None,
+        config_schema=safe_json_loads(meta.get("config_schema"), {}) if isinstance(meta.get("config_schema"), str) else (meta.get("config_schema") or {}),
+        is_builtin=meta.get("is_builtin", False),
+        # Not marketplace statistics (see ConnectorResponse).
+        is_community=False,
+        rating=None,
+        install_count=install_count,
+        last_updated=None,
+        integration_role=meta.get("integration_role"),
+        implementation_status=meta.get("implementation_status", PLANNED),
+        installable=bool(meta.get("installable")),
+        verification=meta.get("verification", ""),
+        test_call=meta.get("test_call"),
+        config_fields=meta.get("config_fields") or [],
+        credential_fields=meta.get("credential_fields") or [],
+        actions=meta.get("actions") or [],
+        created_at=None,
+        updated_at=None,
+    )
+
+
+def _installed_response(i: InstalledIntegration) -> InstalledIntegrationResponse:
+    """Installed-integration view; a planned connector's row reads ``unavailable``."""
+    connector_name = installed_connector_name(i)
+    health = i.health_status
+    if implementation_status(connector_name) == PLANNED:
+        health = HealthStatus.UNAVAILABLE.value
+    return InstalledIntegrationResponse(
+        id=i.id,
+        connector_id=i.connector_id,
+        display_name=i.display_name,
+        config={},
+        status=i.status,
+        health_status=health,
+        last_health_check=i.last_health_check,
+        last_successful_action=i.last_successful_action,
+        error_message=i.error_message,
+        rate_limit_remaining=i.rate_limit_remaining,
+        rate_limit_reset=i.rate_limit_reset,
+        created_at=i.created_at,
+        updated_at=i.updated_at,
+    )
 
 
 # Helper functions
@@ -130,14 +316,16 @@ async def list_connectors(
     size: int = Query(20, ge=1, le=100),
     category: Optional[str] = None,
     search: Optional[str] = None,
+    implementation: Optional[str] = Query(None, pattern="^(implemented|planned|log_ingest)$"),
 ):
-    """List available connectors in marketplace"""
-    # Get connectors from registry
+    """List the connector catalogue (implemented, log-ingest and planned entries)."""
     connectors = registry.list_connectors(
         category=category,
         search=search,
         limit=size * 10,
     )
+    if implementation:
+        connectors = [c for c in connectors if c.get("implementation_status") == implementation]
 
     # Apply pagination
     total = len(connectors)
@@ -145,34 +333,8 @@ async def list_connectors(
     end = start + size
     page_connectors = connectors[start:end]
 
-    # Convert to response schema
-    items = []
-    for connector_meta in page_connectors:
-        items.append(
-            ConnectorResponse(
-                id=connector_meta.get("name", ""),
-                name=connector_meta.get("name", ""),
-                display_name=connector_meta.get("display_name", ""),
-                description=connector_meta.get("description"),
-                vendor=connector_meta.get("vendor"),
-                category=connector_meta.get("category", ""),
-                version=connector_meta.get("version", "1.0.0"),
-                auth_type=connector_meta.get("auth_type", ""),
-                supported_actions=connector_meta.get("supported_actions", []),
-                supported_triggers=connector_meta.get("supported_triggers", []),
-                icon_url=None,
-                documentation_url=None,
-                config_schema=connector_meta.get("config_schema", {}) if isinstance(connector_meta.get("config_schema"), dict) else safe_json_loads(connector_meta.get("config_schema", "{}"), {}) if isinstance(connector_meta.get("config_schema"), str) else {},
-                is_builtin=connector_meta.get("is_builtin", False),
-                is_community=connector_meta.get("is_community", False),
-                rating=connector_meta.get("rating"),
-                install_count=connector_meta.get("install_count", 0),
-                last_updated=connector_meta.get("last_updated"),
-                integration_role=connector_meta.get("integration_role"),
-                created_at=None,
-                updated_at=None,
-            ),
-        )
+    counts = await _org_install_counts(db, current_user.organization_id)
+    items = [_connector_response(meta, counts.get(meta.get("name", ""), 0)) for meta in page_connectors]
 
     pages = math.ceil(total / size) if total > 0 else 1
 
@@ -188,6 +350,7 @@ async def list_connectors(
 @router.get("/connectors/{connector_name}")
 async def get_connector_details(
     current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     connector_name: str = Path(...),
 ):
     """Get detailed information about a specific connector"""
@@ -197,30 +360,8 @@ async def get_connector_details(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Connector not found",
         )
-
-    return ConnectorResponse(
-        id=connector_meta.get("name", ""),
-        name=connector_meta.get("name", ""),
-        display_name=connector_meta.get("display_name", ""),
-        description=connector_meta.get("description"),
-        vendor=connector_meta.get("vendor"),
-        category=connector_meta.get("category", ""),
-        version=connector_meta.get("version", "1.0.0"),
-        auth_type=connector_meta.get("auth_type", ""),
-        supported_actions=connector_meta.get("supported_actions", []),
-        supported_triggers=connector_meta.get("supported_triggers", []),
-        icon_url=None,
-        documentation_url=None,
-        config_schema=safe_json_loads(connector_meta.get("config_schema"), {}),
-        is_builtin=connector_meta.get("is_builtin", False),
-        is_community=connector_meta.get("is_community", False),
-        rating=connector_meta.get("rating"),
-        install_count=connector_meta.get("install_count", 0),
-        last_updated=connector_meta.get("last_updated"),
-        integration_role=connector_meta.get("integration_role"),
-        created_at=None,
-        updated_at=None,
-    )
+    counts = await _org_install_counts(db, current_user.organization_id)
+    return _connector_response(connector_meta, counts.get(connector_name, 0))
 
 
 # Installed integrations endpoints
@@ -234,22 +375,35 @@ async def install_connector(
     request: IntegrationInstallRequest,
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
-    """Install a connector"""
-    # Validate connector exists
-    connector_meta = registry.get_connector_details(request.connector_id)
+    """Install a connector.
+
+    501 ``not_implemented`` for a planned connector; 422 ``missing_fields`` /
+    ``invalid_fields`` naming the config or credential fields (never their
+    values). Credentials are stored AES-256-GCM encrypted and never returned.
+    The connector's declared actions are mirrored into ``integration_actions``.
+    """
+    connector_name = (request.connector_id or "").lower()
+    connector_meta = registry.get_connector_details(connector_name)
     if not connector_meta:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Connector not found: {request.connector_id}",
         )
+    if not connector_meta.get("installable"):
+        raise _not_implemented(connector_meta.get("display_name") or connector_name)
+
+    config = dict(request.config or {})
+    credentials = dict(request.credentials or {})
+    _validate_install_payload(connector_name, config, credentials)
 
     # Check if already installed
     result = await db.execute(
         select(InstalledIntegration).where(
             and_(
                 InstalledIntegration.organization_id == org_id,
-                InstalledIntegration.connector_id == request.connector_id,
+                InstalledIntegration.connector_id == connector_name,
             ),
         ),
     )
@@ -259,36 +413,26 @@ async def install_connector(
             detail="Connector already installed",
         )
 
-    # Create installation record. Config is non-secret but we still
-    # serialize through the encrypt helper for consistency; credentials
-    # are AES-256-GCM encrypted at rest.
+    await _ensure_connector_row(db, connector_name, connector_meta)
     installation = InstalledIntegration(
         organization_id=org_id,
-        connector_id=request.connector_id,
+        connector_id=connector_name,
         display_name=request.display_name,
-        config_encrypted=json.dumps(request.config),  # non-secret
-        auth_credentials_encrypted=_encrypt_secret_json(request.credentials),
+        config_encrypted=json.dumps(config),  # non-secret
+        auth_credentials_encrypted=_encrypt_secret_json(credentials),
     )
-
     db.add(installation)
-    await db.commit()
-    await db.refresh(installation)
-
-    return InstalledIntegrationResponse(
-        id=installation.id,
-        connector_id=installation.connector_id,
-        display_name=installation.display_name,
-        config={},
-        status=installation.status,
-        health_status=installation.health_status,
-        last_health_check=installation.last_health_check,
-        last_successful_action=installation.last_successful_action,
-        error_message=installation.error_message,
-        rate_limit_remaining=installation.rate_limit_remaining,
-        rate_limit_reset=installation.rate_limit_reset,
-        created_at=installation.created_at,
-        updated_at=installation.updated_at,
+    await db.flush()
+    await sync_connector_actions(db, connector_name, connector_name)
+    _audit(
+        db, user=current_user, org_id=org_id, action="integration_install", resource_id=installation.id,
+        description=f"installed {connector_name}",
+        details={"connector": connector_name, "config_fields": sorted(config), "credential_fields": sorted(credentials)},
     )
+    await db.commit()
+
+    integration = await get_installed_integration_or_404(db, installation.id, org_id)
+    return _installed_response(integration)
 
 
 @router.get("/installed", response_model=InstalledIntegrationListResponse)
@@ -332,24 +476,7 @@ async def list_installed_integrations(
     result = await db.execute(query)
     integrations = list(result.scalars().all())
 
-    items = [
-        InstalledIntegrationResponse(
-            id=i.id,
-            connector_id=i.connector_id,
-            display_name=i.display_name,
-            config={},
-            status=i.status,
-            health_status=i.health_status,
-            last_health_check=i.last_health_check,
-            last_successful_action=i.last_successful_action,
-            error_message=i.error_message,
-            rate_limit_remaining=i.rate_limit_remaining,
-            rate_limit_reset=i.rate_limit_reset,
-            created_at=i.created_at,
-            updated_at=i.updated_at,
-        )
-        for i in integrations
-    ]
+    items = [_installed_response(i) for i in integrations]
 
     pages = math.ceil(total / size) if total > 0 else 1
 
@@ -370,22 +497,7 @@ async def get_installed_integration(
 ):
     """Get details of installed integration"""
     integration = await get_installed_integration_or_404(db, integration_id, org_id)
-
-    return InstalledIntegrationResponse(
-        id=integration.id,
-        connector_id=integration.connector_id,
-        display_name=integration.display_name,
-        config={},
-        status=integration.status,
-        health_status=integration.health_status,
-        last_health_check=integration.last_health_check,
-        last_successful_action=integration.last_successful_action,
-        error_message=integration.error_message,
-        rate_limit_remaining=integration.rate_limit_remaining,
-        rate_limit_reset=integration.rate_limit_reset,
-        created_at=integration.created_at,
-        updated_at=integration.updated_at,
-    )
+    return _installed_response(integration)
 
 
 @router.patch("/installed/{integration_id}", response_model=InstalledIntegrationResponse, dependencies=[_ADMIN])
@@ -393,103 +505,97 @@ async def update_installed_integration(
     request: InstalledIntegrationUpdate,
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     integration_id: str = Path(...),
 ):
-    """Update installed integration configuration"""
-    integration = await get_installed_integration_or_404(db, integration_id, org_id)
+    """Update installed integration configuration.
 
-    # Update fields — credentials always encrypted at rest.
+    ``config`` and ``credentials`` are merged over the stored values (so a
+    secret can be rotated without resending the others, which are never
+    returned) and the result must still carry every required field: 422
+    ``missing_fields`` / ``invalid_fields`` otherwise, naming fields only.
+    """
+    integration = await get_installed_integration_or_404(db, integration_id, org_id)
+    connector_name = installed_connector_name(integration)
+
+    changed: list[str] = []
     if request.display_name:
         integration.display_name = request.display_name
-    if request.config:
-        integration.config_encrypted = json.dumps(request.config)
-    if request.credentials:
-        integration.auth_credentials_encrypted = _encrypt_secret_json(request.credentials)
+        changed.append("display_name")
+    if request.config is not None or request.credentials is not None:
+        stored_config = safe_json_loads(integration.config_encrypted, {}) or {}
+        stored_credentials = _decrypt_secret_json(integration.auth_credentials_encrypted) or {}
+        config = {**(stored_config if isinstance(stored_config, dict) else {}), **(request.config or {})}
+        credentials = {**stored_credentials, **(request.credentials or {})}
+        if implementation_status(connector_name) != PLANNED:
+            _validate_install_payload(connector_name, config, credentials)
+        integration.config_encrypted = json.dumps(config)
+        integration.auth_credentials_encrypted = _encrypt_secret_json(credentials)
+        changed += [f"config.{k}" for k in sorted(request.config or {})]
+        changed += [f"credentials.{k}" for k in sorted(request.credentials or {})]
+        if request.credentials:
+            # New credentials invalidate the last verdict until the next test.
+            integration.health_status = HealthStatus.UNKNOWN.value
 
-    await db.commit()
-    await db.refresh(integration)
-
-    return InstalledIntegrationResponse(
-        id=integration.id,
-        connector_id=integration.connector_id,
-        display_name=integration.display_name,
-        config={},
-        status=integration.status,
-        health_status=integration.health_status,
-        last_health_check=integration.last_health_check,
-        last_successful_action=integration.last_successful_action,
-        error_message=integration.error_message,
-        rate_limit_remaining=integration.rate_limit_remaining,
-        rate_limit_reset=integration.rate_limit_reset,
-        created_at=integration.created_at,
-        updated_at=integration.updated_at,
+    _audit(
+        db, user=current_user, org_id=org_id, action="integration_update", resource_id=integration.id,
+        description=f"updated {connector_name}", details={"connector": connector_name, "changed": changed},
     )
+    await db.commit()
+    integration = await get_installed_integration_or_404(db, integration_id, org_id)
+    return _installed_response(integration)
 
 
 @router.post("/installed/{integration_id}/test", response_model=IntegrationTestResponse, dependencies=[_ANALYST])
 async def test_integration(
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     integration_id: str = Path(...),
 ):
-    """Test connection to installed integration"""
+    """Test the connection with the connector's own authenticated read-only call.
+
+    The call (``details.checked``) goes through the pinned transport with TLS
+    verification on; a target that resolves to an internal address is refused
+    and recorded ``unhealthy``. ``health_status``, ``last_health_check`` and a
+    sanitised ``error_message`` are persisted. 501 for a planned connector
+    and for a log-ingest source (its poller records health).
+    """
     integration = await get_installed_integration_or_404(db, integration_id, org_id)
+    connector_name = installed_connector_name(integration)
+    impl = implementation_status(connector_name)
+    if impl == PLANNED:
+        raise _not_implemented(_display_name(connector_name))
+    if impl == LOG_INGEST:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail={
+                "error": "not_implemented",
+                "detail": f"{_display_name(connector_name)} has no connection test; the SIEM cloud poller records health_status on every poll",
+            },
+        )
 
-    # Real connection test: resolve the connector's test URL and probe it.
-    # If the connector has no built-in test URL we check the stored
-    # health_status and last_health_check freshness.
-    import httpx
-
-    # InstalledIntegration has no `connector_name` column — previously
-    # this raised AttributeError and the Test button always crashed
-    # with a 500. Resolve via the connector relationship or fall back
-    # to connector_id.
-    connector = (
-        getattr(integration.connector, "name", None)
-        if getattr(integration, "connector", None) is not None
-        else None
-    ) or integration.connector_id
-    config = safe_json_loads(integration.config_encrypted, {}) if integration.config_encrypted else {}
-
-    test_url = config.get("base_url") or config.get("host") or config.get("url")
-    health_path = config.get("health_path", "/health")
-
-    test_status = "unknown"
-    error_msg = None
-
-    if test_url:
-        full_url = f"{test_url.rstrip('/')}{health_path}"
-        try:
-            # TLS verification stays on unless the integration config supplies
-            # its own CA bundle or opts out explicitly (SC-8).
-            verify: bool | str = config.get("ca_bundle") or bool(config.get("verify_tls", True))
-            async with httpx.AsyncClient(timeout=10.0, verify=verify) as client:
-                resp = await client.get(full_url)
-                if resp.status_code < 400:
-                    test_status = "healthy"
-                else:
-                    test_status = "unhealthy"
-                    error_msg = f"HTTP {resp.status_code}"
-        except httpx.TimeoutException:
-            test_status = "unhealthy"
-            error_msg = "Connection timed out"
-        except Exception as exc:
-            test_status = "unhealthy"
-            error_msg = str(exc)[:200]
-    else:
-        test_status = integration.health_status or "unknown"
-
-    # Persist the result
-    integration.health_status = test_status
-    integration.last_health_check = datetime.now(timezone.utc)
-    if error_msg:
-        integration.error_message = error_msg
+    config = safe_json_loads(integration.config_encrypted, {}) or {}
+    credentials = _decrypt_secret_json(integration.auth_credentials_encrypted) or {}
+    result = await probe_connector(connector_name, config if isinstance(config, dict) else {}, credentials)
+    record_health(integration, result)
+    _audit(
+        db, user=current_user, org_id=org_id, action="integration_test", resource_id=integration.id,
+        description=f"connection test of {connector_name}: {result.status}",
+        details={"connector": connector_name, "checked": result.checked, "http_status": result.http_status},
+        success=result.healthy, error=None if result.healthy else integration.error_message,
+    )
     await db.commit()
 
     return IntegrationTestResponse(
-        status=test_status,
-        message=error_msg,
-        details={"connector": connector, "tested_url": test_url},
+        status=result.status,
+        message=result.detail,
+        details={
+            "connector": connector_name,
+            "checked": result.checked,
+            "http_status": result.http_status,
+            "implementation_status": IMPLEMENTED,
+        },
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
 
@@ -546,11 +652,16 @@ async def disable_integration(
 async def uninstall_integration(
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     integration_id: str = Path(...),
 ):
-    """Uninstall integration"""
+    """Uninstall integration (works for planned connectors too)."""
     integration = await get_installed_integration_or_404(db, integration_id, org_id)
-
+    connector_name = installed_connector_name(integration)
+    _audit(
+        db, user=current_user, org_id=org_id, action="integration_uninstall", resource_id=integration.id,
+        description=f"uninstalled {connector_name}", details={"connector": connector_name},
+    )
     await db.delete(integration)
     await db.commit()
 
@@ -564,12 +675,28 @@ async def list_integration_actions(
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
 ):
-    """List available actions for integration"""
+    """List the actions the integration's connector class declares (none for a planned connector)."""
     integration = await get_installed_integration_or_404(db, integration_id, org_id)
+    cls = connector_class(installed_connector_name(integration))
+    declared = list(cls.ACTIONS) if cls is not None else []
 
-    # Get actions for this connector
+    if declared:
+        present = (
+            await db.execute(
+                select(func.count(IntegrationAction.id)).where(
+                    IntegrationAction.connector_id == integration.connector_id,
+                    IntegrationAction.action_name.in_(declared),
+                )
+            )
+        ).scalar() or 0
+        if present < len(declared):
+            # Installs that predate the action mirror get their rows now.
+            await sync_connector_actions(db, integration.connector_id, installed_connector_name(integration))
+            await db.commit()
+
     query = select(IntegrationAction).where(
         IntegrationAction.connector_id == integration.connector_id,
+        IntegrationAction.action_name.in_(declared),
     )
 
     # Get total count
@@ -580,7 +707,7 @@ async def list_integration_actions(
     total = count_result.scalar() or 0
 
     # Apply pagination
-    query = query.order_by(IntegrationAction.created_at.desc())
+    query = query.order_by(IntegrationAction.action_name)
     query = query.offset((page - 1) * size).limit(size)
 
     result = await db.execute(query)
@@ -626,50 +753,80 @@ async def execute_action(
     request: ActionExecutionRequest,
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     integration_id: str = Path(...),
     action_id: str = Path(...),
 ):
     """Execute an integration action (analyst role or above).
 
-    Actions run outbound calls with the integration's stored credentials;
-    viewers are refused.
+    501 for a planned or log-ingest connector; 404 for an action the
+    connector does not declare; 422 ``invalid_parameters`` when
+    ``input_data`` does not match the action's ``params_schema``. A vendor
+    error is a ``failed`` execution carrying the HTTP status and a sanitised
+    message. One execution row is written per call.
     """
     integration = await get_installed_integration_or_404(db, integration_id, org_id)
+    connector_name = installed_connector_name(integration)
+    cls = connector_class(connector_name)
+    if cls is None:
+        raise _not_implemented(_display_name(connector_name))
 
     # Get action — scoped to the installed integration's connector so an
     # action belonging to a different connector can't be executed here.
     action = await get_action_or_404(db, action_id, integration.connector_id)
+    spec = cls.ACTIONS.get(action.action_name)
+    if spec is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Action not found")
+    problems = validate_params(spec.params_schema, request.input_data)
+    if problems:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "invalid_parameters", "problems": problems},
+        )
 
-    # Execute action
     execution_result = await executor.execute_action(
-        installation_id=integration_id,
+        installation_id=integration.id,
         action_name=action.action_name,
         input_data=request.input_data,
-        playbook_run_id=request.playbook_run_id,
-    )
-
-    # Create execution record
-    execution = IntegrationExecution(
-        organization_id=org_id,
-        installed_id=integration_id,
-        action_id=action_id,
         triggered_by="manual",
-        input_data=json.dumps(request.input_data),
-        output_data=json.dumps(execution_result.get("output_data", {})),
-        status=execution_result.get("status", "failed"),
-        duration_ms=execution_result.get("duration_ms"),
-        error_message=execution_result.get("error_message"),
         playbook_run_id=request.playbook_run_id,
     )
-
-    db.add(execution)
+    succeeded = execution_result.get("status") == "success"
+    _audit(
+        db, user=current_user, org_id=org_id, action="integration_action_execute", resource_id=integration.id,
+        description=f"{connector_name}.{action.action_name}: {execution_result.get('status')}",
+        details={
+            "connector": connector_name,
+            "action": action.action_name,
+            "side_effect": spec.side_effect,
+            "execution_id": execution_result.get("execution_id"),
+            "http_status": execution_result.get("http_status"),
+        },
+        success=succeeded,
+        error=execution_result.get("error_message"),
+    )
     await db.commit()
-    await db.refresh(execution)
+
+    execution = None
+    if execution_result.get("execution_id"):
+        execution = (
+            await db.execute(
+                select(IntegrationExecution).where(
+                    IntegrationExecution.id == execution_result["execution_id"],
+                    IntegrationExecution.organization_id == org_id,
+                )
+            )
+        ).scalar_one_or_none()
+    if execution is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "execution_not_recorded", "detail": sanitize_message(execution_result.get("error_message"))},
+        )
 
     return IntegrationExecutionResponse(
         id=execution.id,
         installation_id=integration_id,
-        action_id=action_id,
+        action_id=execution.action_id,
         triggered_by=execution.triggered_by,
         status=execution.status,
         input_data=safe_json_loads(execution.input_data, {}),
@@ -678,6 +835,8 @@ async def execute_action(
         completed_at=execution.completed_at,
         duration_ms=execution.duration_ms,
         error_message=execution.error_message,
+        error_code=execution_result.get("error_code"),
+        http_status=execution_result.get("http_status"),
         retry_count=execution.retry_count,
         created_at=execution.created_at,
         updated_at=execution.updated_at,

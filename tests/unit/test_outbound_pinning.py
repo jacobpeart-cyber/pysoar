@@ -144,29 +144,36 @@ async def test_non_http_scheme_and_blocked_names_are_refused(monkeypatch: pytest
 
 
 # --------------------------------------------------------------------------
-# Generic HTTP action
+# Base-URL pinning (ITDR directory, container scanning)
 # --------------------------------------------------------------------------
 
 
+async def _pinned_get(base_url: str, path: str, method: str = "GET", **kwargs: Any) -> httpx.Response:
+    """The pattern every base-URL caller uses (ITDR directory, container scanning):
+    pin through ``_resolve_generic_target`` and send with its Host / SNI kwargs."""
+    pinned = await ActionExecutor()._resolve_generic_target(path, {"base_url": base_url})
+    async with httpx.AsyncClient(follow_redirects=False) as client:
+        return await client.request(
+            method, str(pinned),
+            headers=pinned.request_kwargs["headers"], extensions=pinned.request_kwargs["extensions"], **kwargs,
+        )
+
+
 @pytest.mark.asyncio
-async def test_generic_action_connects_to_vetted_ip_with_hostname_in_host_and_sni(monkeypatch, capture_client):
+async def test_generic_target_connects_to_vetted_ip_with_hostname_in_host_and_sni(monkeypatch, capture_client):
     seen, _ = capture_client
     resolver = _Resolver([PUBLIC_IP])
     monkeypatch.setattr(netguard, "_getaddrinfo", resolver)
 
-    result = await ActionExecutor()._call_generic_http_action(
-        "inst-1", "lookup", {"url": "/v1/items", "method": "GET"},
-        {"base_url": "https://siem.customer.example/api"},
-    )
+    resp = await _pinned_get("https://siem.customer.example/api", "/v1/items")
 
-    assert result["status_code"] == 200
+    assert resp.status_code == 200
     assert len(seen) == 1
     req = seen[0]
     assert req.url.host == PUBLIC_IP
     assert req.url.path == "/api/v1/items"
     assert req.headers["host"] == "siem.customer.example"
     assert req.extensions["sni_hostname"] == "siem.customer.example"
-    assert req.headers["x-installation-id"] == "inst-1"
 
 
 @pytest.mark.asyncio
@@ -184,10 +191,7 @@ async def test_rebinding_after_check_still_connects_only_to_first_vetted_ip(monk
 
     monkeypatch.setattr(socket, "getaddrinfo", _stdlib_rebound)
 
-    await ActionExecutor()._call_generic_http_action(
-        "inst-1", "post", {"url": "/hook", "method": "POST", "body": {"a": 1}},
-        {"base_url": "https://rebind.attacker.example"},
-    )
+    await _pinned_get("https://rebind.attacker.example", "/hook", "POST", json={"a": 1})
 
     assert len(resolver.calls) == 1
     assert [r.url.host for r in seen] == [PUBLIC_IP]
@@ -200,11 +204,9 @@ async def test_redirect_to_internal_address_is_not_followed(monkeypatch, capture
     monkeypatch.setattr(netguard, "_getaddrinfo", _Resolver([PUBLIC_IP]))
     responses.append(httpx.Response(302, headers={"Location": "http://169.254.169.254/latest/meta-data/"}))
 
-    result = await ActionExecutor()._call_generic_http_action(
-        "inst-1", "get", {"url": "/start", "method": "GET"}, {"base_url": "https://vendor.example"},
-    )
+    resp = await _pinned_get("https://vendor.example", "/start")
 
-    assert result["status_code"] == 302
+    assert resp.status_code == 302
     assert len(seen) == 1
     assert seen[0].url.host == PUBLIC_IP
 
@@ -224,44 +226,53 @@ async def test_resolve_generic_target_returns_pinned_url_and_kwargs(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_probe_refuses_internal_webhook_urls_before_any_client(monkeypatch):
+async def test_probe_of_planned_connector_makes_no_network_call(monkeypatch):
+    """Splunk / generic webhooks have no connector class: the probe answers
+    ``unavailable`` and never builds a client or resolves a name."""
     class _NeverConnect:
         def __init__(self, *args, **kwargs):
-            raise AssertionError("no client may be built for a refused target")
+            raise AssertionError("no client may be built for a planned connector")
+
+    async def _no_dns(host, port):
+        raise AssertionError("no DNS lookup for a planned connector")
 
     monkeypatch.setattr(httpx, "AsyncClient", _NeverConnect)
-    monkeypatch.setattr(netguard, "_getaddrinfo", _Resolver(["169.254.169.254"]))
+    monkeypatch.setattr(netguard, "_getaddrinfo", _no_dns)
     manager = IntegrationManager(ConnectorRegistry())
 
-    health, message = await manager._probe_connector("webhook", {"webhook_url": "https://hooks.attacker.example/x"}, {})
-    assert health == "unhealthy" and message.startswith("outbound target refused")
-    health, message = await manager._probe_connector("webhook", {"webhook_url": "http://[::1]:9/x"}, {})
-    assert health == "unhealthy" and message.startswith("outbound target refused")
+    for name, config in (("splunk", {"base_url": "https://splunk.customer.example:8089"}),
+                         ("webhook", {"webhook_url": "https://hooks.attacker.example/x"})):
+        health, message = await manager._probe_connector(name, config, {"token": "t"})
+        assert health == "unavailable" and "no connector implementation" in message
 
 
 @pytest.mark.asyncio
-async def test_probe_pins_base_url_and_webhook(monkeypatch, capture_client):
-    seen, _ = capture_client
+async def test_probe_of_implemented_connector_is_pinned(monkeypatch):
+    """The probe is the class's own read-only call (Slack auth.test), sent to
+    the vetted IP with the vendor hostname in Host and SNI."""
     resolver = _Resolver([PUBLIC_IP])
     monkeypatch.setattr(netguard, "_getaddrinfo", resolver)
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"ok": True, "team": "t"})
+
+    # Replace only the innermost network transport: PinnedTransport stays in front.
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda *_a, **_kw: httpx.MockTransport(handler))
     manager = IntegrationManager(ConnectorRegistry())
 
-    health, _ = await manager._probe_connector("splunk", {"base_url": "https://splunk.customer.example:8089"}, {"token": "t"})
-    assert health == "healthy"
-    assert seen[-1].url.host == PUBLIC_IP and seen[-1].url.port == 8089
-    assert seen[-1].headers["host"] == "splunk.customer.example:8089"
-    assert seen[-1].extensions["sni_hostname"] == "splunk.customer.example"
-
-    health, _ = await manager._probe_connector("webhook", {"webhook_url": "https://hooks.customer.example/in"}, {})
-    assert health == "healthy"
-    assert seen[-1].method == "HEAD" and seen[-1].url.host == PUBLIC_IP
-    assert seen[-1].headers["host"] == "hooks.customer.example"
-    # One lookup per configured URL, none repeated by the request itself.
-    assert resolver.calls == [("splunk.customer.example", 8089), ("hooks.customer.example", 443)]
+    health, message = await manager._probe_connector("slack", {}, {"bot_token": "xoxb-test-token"})
+    assert health == "healthy" and message is None
+    assert [r.url.path for r in seen] == ["/api/auth.test"]
+    assert seen[0].url.host == PUBLIC_IP
+    assert seen[0].headers["host"] == "slack.com"
+    assert seen[0].extensions["sni_hostname"] == "slack.com"
+    assert resolver.calls == [("slack.com", 443)]
 
 
 # --------------------------------------------------------------------------
-# Connector wrappers (CrowdStrike and every BaseConnector subclass)
+# Connector wrappers
 # --------------------------------------------------------------------------
 
 

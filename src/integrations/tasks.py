@@ -59,9 +59,13 @@ async def _health_check_all_integrations_async(
 ) -> dict[str, Any]:
     """Probe every installed integration and persist its health status.
 
-    Delegates each check to ``IntegrationManager.test_connection``,
-    which issues a real HTTP probe against the third-party API and
-    updates ``health_status`` / ``last_health_check`` on the row.
+    Delegates each check to ``IntegrationManager.test_connection``, which
+    runs the connector class's own authenticated read-only call
+    (``BaseConnector.test_connection``) through the pinned transport and
+    updates ``health_status`` / ``last_health_check`` / ``error_message`` on
+    the row. A planned connector (no class in this release) is recorded
+    ``unavailable`` without any network call; a log-ingest source keeps the
+    health its SIEM poller recorded and is counted under that status.
     """
     from src.core.database import async_session_factory
     from src.integrations.engine import ConnectorRegistry, IntegrationManager
@@ -74,8 +78,9 @@ async def _health_check_all_integrations_async(
         "degraded": 0,
         "unhealthy": 0,
         "unknown": 0,
+        "unavailable": 0,
     }
-    status_keys = ("healthy", "degraded", "unhealthy", "unknown")
+    status_keys = ("healthy", "degraded", "unhealthy", "unknown", "unavailable")
 
     # Ids are paged one window at a time (each window's session closed
     # before its probes run, as before) instead of listing every id up front.

@@ -82,12 +82,14 @@ async def test_generic_target_refuses_private_base_and_missing_config():
 
 
 @pytest.mark.asyncio
-async def test_generic_http_action_refuses_before_any_request():
+async def test_generic_http_action_fallback_is_gone_and_target_still_refused():
+    """The caller-supplied-URL fallback was removed (connectors without a
+    class cannot execute); the base-URL pin that ITDR and container scanning
+    use still refuses an off-origin internal target before any request."""
     ex = ActionExecutor()
+    assert not hasattr(ex, "_call_generic_http_action")
     with pytest.raises(OutboundTargetRefused):
-        await ex._call_generic_http_action(
-            "inst-1", "do", {"url": "http://127.0.0.1:6379/", "method": "GET"}, {"base_url": PUBLIC_BASE}
-        )
+        await ex._resolve_generic_target("http://127.0.0.1:6379/", {"base_url": PUBLIC_BASE})
 
 
 @pytest.mark.asyncio

@@ -1,11 +1,38 @@
-"""AWS Security Hub connector for security findings and compliance"""
+"""AWS Security Hub / GuardDuty / CloudTrail connector (boto3).
 
-from typing import Any, Dict, Optional, List
+Calls go through boto3 (SigV4 signing, AWS-owned regional endpoints), run in
+a worker thread so the event loop is not blocked. Endpoints are derived by
+botocore from the region, which is validated against the AWS region format so
+a crafted value cannot steer the endpoint host. Each call is documented in the
+boto3 reference (SecurityHub.Client, GuardDuty.Client, CloudTrail.Client).
+"""
 
-from src.integrations.connectors.base import BaseConnector
+import asyncio
+import re
+from typing import Any, Dict, List, Optional
+
+from src.core.exceptions import IntegrationError
 from src.core.logging import get_logger
+from src.integrations.connectors.base import (
+    ActionSpec,
+    BaseConnector,
+    ConnectionTestResult,
+    ConnectorHTTPError,
+    field_spec,
+    object_schema,
+)
 
 logger = get_logger(__name__)
+
+_REGION_RE = re.compile(r"^[a-z]{2}(-gov|-iso[a-z]?)?-[a-z]+-\d{1,2}$")
+_WORKFLOW_STATUSES = ["NEW", "NOTIFIED", "RESOLVED", "SUPPRESSED"]
+
+
+def aws_region(value: Any) -> str:
+    text = str(value or "us-east-1").strip().lower()
+    if not _REGION_RE.fullmatch(text):
+        raise ValueError("region is not an AWS region name (e.g. us-east-1)")
+    return text
 
 
 class AWSSecurityHubConnector(BaseConnector):
@@ -14,329 +41,229 @@ class AWSSecurityHubConnector(BaseConnector):
     name = "aws_security_hub"
     base_url = "https://securityhub.amazonaws.com"
 
+    CREDENTIAL_FIELDS = [
+        field_spec("access_key_id", "Access key id", "IAM access key id", secret=True),
+        field_spec("secret_access_key", "Secret access key", "IAM secret access key", secret=True),
+        field_spec("region", "Region", "AWS region of the Security Hub administrator account", required=False, default="us-east-1"),
+    ]
+    TEST_CALL = "securityhub:DescribeHub"
+    ACTIONS = {
+        "get_findings": ActionSpec(
+            "Security Hub findings (GetFindings, up to 100; default filter RecordState=ACTIVE).",
+            object_schema({"filters": {"type": "object", "description": "AwsSecurityFindingFilters"}}),
+            "finding count and findings (id, product ARN, title, severity, types, resource type, dates)",
+            idempotent=True, side_effect=False, action_type="query", display_name="Get findings",
+        ),
+        "batch_import_findings": ActionSpec(
+            "Import findings in ASFF (BatchImportFindings).",
+            object_schema({"findings": {"type": "array", "items": {"type": "object"}, "minItems": 1}}, ["findings"]),
+            "success and failure counts",
+            idempotent=True, side_effect=True, action_type="create", display_name="Import findings",
+        ),
+        "update_findings": ActionSpec(
+            "Set the workflow status (and an optional note) of findings (BatchUpdateFindings).",
+            object_schema({
+                "findings": {
+                    "type": "array", "items": {"type": "object"}, "minItems": 1,
+                    "description": "[{id, product_arn}] finding identifiers",
+                },
+                "status": {"type": "string", "enum": _WORKFLOW_STATUSES},
+                "note": {"type": "string"},
+            }, ["findings"]),
+            "processed and unprocessed counts",
+            idempotent=True, side_effect=True, action_type="update", display_name="Update findings",
+        ),
+        "get_insight_results": ActionSpec(
+            "Results of a Security Hub insight (GetInsightResults).",
+            object_schema({"insight_arn": {"type": "string", "minLength": 1}}, ["insight_arn"]),
+            "grouped attribute values and counts",
+            idempotent=True, side_effect=False, action_type="query", display_name="Insight results",
+        ),
+        "list_enabled_standards": ActionSpec(
+            "Enabled security standards (GetEnabledStandards).",
+            object_schema({}),
+            "standards (ARN, name, status)",
+            idempotent=True, side_effect=False, action_type="query", display_name="Enabled standards",
+        ),
+        "get_guardduty_findings": ActionSpec(
+            "GuardDuty findings with severity >= 4 (ListFindings + GetFindings, up to 50).",
+            object_schema({"detector_id": {"type": "string"}}),
+            "detector id and findings (id, type, severity, resource type, dates)",
+            idempotent=True, side_effect=False, action_type="query", display_name="GuardDuty findings",
+        ),
+        "get_cloudtrail_events": ActionSpec(
+            "Recent CloudTrail management events, optionally by event name (LookupEvents, up to 50).",
+            object_schema({"lookup_query": {"type": "string", "description": "EventName to filter on"}}),
+            "events (id, name, time, user, resource type)",
+            idempotent=True, side_effect=False, action_type="query", display_name="CloudTrail events",
+        ),
+    }
+
     def __init__(self, config: Dict[str, Any], credentials: Dict[str, Any]):
         """Initialize with AWS credentials"""
         super().__init__(config, credentials)
-        self._client = None
-        self._guardduty_client = None
-        self._cloudtrail_client = None
+        self.region = aws_region(self.credentials.get("region"))
+        self._boto: Dict[str, Any] = {}
 
-    async def _get_boto_client(self, service: str = "securityhub"):
-        """Get or create boto3 client"""
-        if service == "securityhub" and self._client:
-            return self._client
-        if service == "guardduty" and self._guardduty_client:
-            return self._guardduty_client
-        if service == "cloudtrail" and self._cloudtrail_client:
-            return self._cloudtrail_client
-
+    @classmethod
+    def invalid_fields(cls, config: Optional[Dict[str, Any]], credentials: Optional[Dict[str, Any]]) -> List[str]:
         try:
+            aws_region((credentials or {}).get("region"))
+        except ValueError:
+            return ["region"]
+        return []
+
+    def _client_for(self, service: str) -> Any:
+        if service not in self._boto:
             import boto3
-        except ImportError:
-            logger.error("boto3 not installed. Install with: pip install boto3")
-            return None
+
+            self._boto[service] = boto3.client(
+                service,
+                aws_access_key_id=self.credentials.get("access_key_id"),
+                aws_secret_access_key=self.credentials.get("secret_access_key"),
+                region_name=self.region,
+            )
+        return self._boto[service]
+
+    async def _aws(self, service: str, operation: str, **kwargs: Any) -> Dict[str, Any]:
+        """Run one boto3 operation in a thread; AWS errors become ConnectorHTTPError."""
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        def _call() -> Dict[str, Any]:
+            return getattr(self._client_for(service), operation)(**kwargs)
 
         try:
-            access_key = self.credentials.get("access_key_id")
-            secret_key = self.credentials.get("secret_access_key")
-            region = self.credentials.get("region", "us-east-1")
+            return await asyncio.to_thread(_call)
+        except ClientError as exc:
+            err = exc.response.get("Error", {}) if hasattr(exc, "response") else {}
+            status_code = int((exc.response.get("ResponseMetadata") or {}).get("HTTPStatusCode") or 400)
+            message = f"{err.get('Code', 'ClientError')}: {err.get('Message', '')}".strip(": ")
+            raise ConnectorHTTPError(self.name, status_code, self.sanitize(message)) from None
+        except BotoCoreError as exc:
+            raise IntegrationError(self.name, self.sanitize(type(exc).__name__)) from None
 
-            if service == "securityhub":
-                self._client = boto3.client(
-                    "securityhub",
-                    aws_access_key_id=access_key,
-                    aws_secret_access_key=secret_key,
-                    region_name=region,
-                )
-                return self._client
-            elif service == "guardduty":
-                self._guardduty_client = boto3.client(
-                    "guardduty",
-                    aws_access_key_id=access_key,
-                    aws_secret_access_key=secret_key,
-                    region_name=region,
-                )
-                return self._guardduty_client
-            elif service == "cloudtrail":
-                self._cloudtrail_client = boto3.client(
-                    "cloudtrail",
-                    aws_access_key_id=access_key,
-                    aws_secret_access_key=secret_key,
-                    region_name=region,
-                )
-                return self._cloudtrail_client
-
-        except Exception as e:
-            logger.error(f"Failed to create boto3 client: {e}")
-            return None
-
-    async def execute_action(self, action_name: str, params: Dict) -> Dict[str, Any]:
-        """Execute AWS Security Hub action"""
-        actions = {
-            "get_findings": self.get_findings,
-            "batch_import_findings": self.batch_import_findings,
-            "update_findings": self.update_findings,
-            "get_insight_results": self.get_insight_results,
-            "list_enabled_standards": self.list_enabled_standards,
-            "get_guardduty_findings": self.get_guardduty_findings,
-            "get_cloudtrail_events": self.get_cloudtrail_events,
-        }
-
-        if action := actions.get(action_name):
-            return await action(**params)
-        raise ValueError(f"Unknown action: {action_name}")
+    async def test_connection(self) -> ConnectionTestResult:
+        return await self._probe(self.TEST_CALL, lambda: self._aws("securityhub", "describe_hub"))
 
     async def get_findings(self, filters: Optional[Dict] = None) -> Dict[str, Any]:
-        """Get findings - securityhub.get_findings()"""
-        if not self.is_configured:
-            return {"error": "AWS credentials not configured"}
-
-        try:
-            client = await self._get_boto_client("securityhub")
-            if not client:
-                return {"error": "Failed to create securityhub client"}
-
-            params = {}
-            if filters:
-                params["Filters"] = filters
-            else:
-                params["Filters"] = {
-                    "RecordState": [{"Value": "ACTIVE", "Comparison": "EQUALS"}]
-                }
-
-            response = client.get_findings(
-                MaxResults=100,
-                **params
-            )
-
-            findings = []
-            for finding in response.get("Findings", []):
-                findings.append({
-                    "id": finding.get("Id"),
-                    "title": finding.get("Title"),
-                    "severity": finding.get("Severity", {}).get("Label"),
-                    "type": finding.get("Types", []),
-                    "resource_type": finding.get("Resources", [{}])[0].get("Type"),
-                    "created": finding.get("FirstObservedAt"),
-                    "updated": finding.get("LastObservedAt"),
-                })
-
-            return {
-                "provider": self.name,
-                "finding_count": len(findings),
-                "findings": findings,
-            }
-        except Exception as e:
-            logger.error(f"AWS Security Hub get_findings error: {e}")
-            return {"error": str(e)}
+        """GetFindings"""
+        response = await self._aws(
+            "securityhub", "get_findings",
+            Filters=filters or {"RecordState": [{"Value": "ACTIVE", "Comparison": "EQUALS"}]},
+            MaxResults=100,
+        )
+        findings = []
+        for finding in response.get("Findings", []):
+            resources = finding.get("Resources") or [{}]
+            findings.append({
+                "id": finding.get("Id"),
+                "product_arn": finding.get("ProductArn"),
+                "title": finding.get("Title"),
+                "severity": (finding.get("Severity") or {}).get("Label"),
+                "type": finding.get("Types", []),
+                "resource_type": resources[0].get("Type"),
+                "workflow_status": (finding.get("Workflow") or {}).get("Status"),
+                "created": finding.get("FirstObservedAt") or finding.get("CreatedAt"),
+                "updated": finding.get("LastObservedAt") or finding.get("UpdatedAt"),
+            })
+        return {"provider": self.name, "finding_count": len(findings), "findings": findings}
 
     async def batch_import_findings(self, findings: List[Dict]) -> Dict[str, Any]:
-        """Import findings - securityhub.batch_import_findings()"""
-        if not self.is_configured:
-            return {"error": "AWS credentials not configured"}
-
-        try:
-            client = await self._get_boto_client("securityhub")
-            if not client:
-                return {"error": "Failed to create securityhub client"}
-
-            response = client.batch_import_findings(Findings=findings)
-
-            return {
-                "provider": self.name,
-                "success_count": response.get("SuccessCount", 0),
-                "failure_count": response.get("FailureCount", 0),
-                "failures": response.get("FailedFindings", []),
-            }
-        except Exception as e:
-            logger.error(f"AWS Security Hub batch_import_findings error: {e}")
-            return {"error": str(e)}
+        """BatchImportFindings"""
+        response = await self._aws("securityhub", "batch_import_findings", Findings=findings)
+        return {
+            "provider": self.name,
+            "success_count": response.get("SuccessCount", 0),
+            "failure_count": response.get("FailureCount", 0),
+            "failures": response.get("FailedFindings", []),
+        }
 
     async def update_findings(
-        self,
-        finding_ids: List[str],
-        note: Optional[str] = None,
-        status: str = "RESOLVED"
+        self, findings: List[Dict], status: str = "RESOLVED", note: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Update findings - securityhub.batch_update_findings()"""
-        if not self.is_configured:
-            return {"error": "AWS credentials not configured"}
-
-        try:
-            client = await self._get_boto_client("securityhub")
-            if not client:
-                return {"error": "Failed to create securityhub client"}
-
-            finding_updates = []
-            for finding_id in finding_ids:
-                update = {
-                    "FindingIdentifiers": {
-                        "Id": finding_id,
-                    },
-                    "RecordState": "ARCHIVED" if status == "RESOLVED" else "ACTIVE",
-                }
-                if note:
-                    update["Note"] = {
-                        "Text": note,
-                        "UpdatedBy": "PySOAR",
-                    }
-                finding_updates.append(update)
-
-            response = client.batch_update_findings(FindingUpdates=finding_updates)
-
-            return {
-                "provider": self.name,
-                "processed_count": response.get("ProcessedFindings", 0),
-                "unprocessed_count": len(response.get("UnprocessedFindings", [])),
-            }
-        except Exception as e:
-            logger.error(f"AWS Security Hub update_findings error: {e}")
-            return {"error": str(e)}
+        """BatchUpdateFindings: FindingIdentifiers need Id and ProductArn; Workflow.Status sets the state."""
+        identifiers = []
+        for f in findings:
+            fid, arn = f.get("id"), f.get("product_arn")
+            if not fid or not arn:
+                raise ValueError("each finding needs id and product_arn")
+            identifiers.append({"Id": fid, "ProductArn": arn})
+        kwargs: Dict[str, Any] = {"FindingIdentifiers": identifiers, "Workflow": {"Status": status}}
+        if note:
+            kwargs["Note"] = {"Text": note, "UpdatedBy": "PySOAR"}
+        response = await self._aws("securityhub", "batch_update_findings", **kwargs)
+        return {
+            "provider": self.name,
+            "processed_count": len(response.get("ProcessedFindings", [])),
+            "unprocessed_count": len(response.get("UnprocessedFindings", [])),
+            "unprocessed": response.get("UnprocessedFindings", []),
+        }
 
     async def get_insight_results(self, insight_arn: str) -> Dict[str, Any]:
-        """Get insight results - securityhub.get_insight_results()"""
-        if not self.is_configured:
-            return {"error": "AWS credentials not configured"}
-
-        try:
-            client = await self._get_boto_client("securityhub")
-            if not client:
-                return {"error": "Failed to create securityhub client"}
-
-            response = client.get_insight_results(InsightArn=insight_arn)
-
-            results = []
-            for result in response.get("InsightResults", {}).get("ResultAttributes", []):
-                results.append({
-                    "attribute": result.get("AttributeKey"),
-                    "value": result.get("AttributeValue"),
-                    "count": result.get("Count"),
-                })
-
-            return {
-                "provider": self.name,
-                "insight_arn": insight_arn,
-                "result_count": len(results),
-                "results": results,
-            }
-        except Exception as e:
-            logger.error(f"AWS Security Hub get_insight_results error: {e}")
-            return {"error": str(e)}
+        """GetInsightResults"""
+        response = await self._aws("securityhub", "get_insight_results", InsightArn=insight_arn)
+        results = [
+            {"attribute": r.get("GroupByAttributeValue"), "count": r.get("Count")}
+            for r in (response.get("InsightResults") or {}).get("ResultValues", [])
+        ]
+        return {"provider": self.name, "insight_arn": insight_arn, "result_count": len(results), "results": results}
 
     async def list_enabled_standards(self) -> Dict[str, Any]:
-        """List enabled standards - securityhub.get_enabled_standards()"""
-        if not self.is_configured:
-            return {"error": "AWS credentials not configured"}
-
-        try:
-            client = await self._get_boto_client("securityhub")
-            if not client:
-                return {"error": "Failed to create securityhub client"}
-
-            response = client.get_enabled_standards()
-
-            standards = []
-            for standard in response.get("StandardsSubscriptions", []):
-                standards.append({
-                    "arn": standard.get("StandardsArn"),
-                    "name": standard.get("StandardsArn", "").split("/")[-1],
-                    "status": standard.get("StandardsStatus"),
-                })
-
-            return {
-                "provider": self.name,
-                "standard_count": len(standards),
-                "standards": standards,
+        """GetEnabledStandards"""
+        response = await self._aws("securityhub", "get_enabled_standards")
+        standards = [
+            {
+                "arn": s.get("StandardsArn"),
+                "name": (s.get("StandardsArn") or "").split("/")[-3] if (s.get("StandardsArn") or "").count("/") >= 3 else (s.get("StandardsArn") or "").split("/")[-1],
+                "status": s.get("StandardsStatus"),
             }
-        except Exception as e:
-            logger.error(f"AWS Security Hub list_enabled_standards error: {e}")
-            return {"error": str(e)}
+            for s in response.get("StandardsSubscriptions", [])
+        ]
+        return {"provider": self.name, "standard_count": len(standards), "standards": standards}
 
     async def get_guardduty_findings(self, detector_id: str = "") -> Dict[str, Any]:
-        """Get GuardDuty findings - guardduty.list_findings() + get_findings()"""
-        if not self.is_configured:
-            return {"error": "AWS credentials not configured"}
-
-        try:
-            client = await self._get_boto_client("guardduty")
-            if not client:
-                return {"error": "Failed to create guardduty client"}
-
-            if not detector_id:
-                detectors = client.list_detectors()
-                detector_id = detectors.get("DetectorIds", [""])[0]
-                if not detector_id:
-                    return {"error": "No GuardDuty detector found"}
-
-            list_response = client.list_findings(
-                DetectorId=detector_id,
-                FindingCriteria={
-                    "Criterion": {
-                        "severity": {"Gte": 4},
-                    }
-                },
-                MaxResults=50,
-            )
-
-            finding_ids = list_response.get("FindingIds", [])
-            findings = []
-
-            if finding_ids:
-                get_response = client.get_findings(
-                    DetectorId=detector_id,
-                    FindingIds=finding_ids,
-                )
-
-                for finding in get_response.get("Findings", []):
-                    findings.append({
-                        "id": finding.get("Id"),
-                        "type": finding.get("Type"),
-                        "severity": finding.get("Severity"),
-                        "created": finding.get("CreatedAt"),
-                        "updated": finding.get("UpdatedAt"),
-                        "resource_type": finding.get("Resource", {}).get("ResourceType"),
-                    })
-
-            return {
-                "provider": self.name,
-                "detector_id": detector_id,
-                "finding_count": len(findings),
-                "findings": findings,
-            }
-        except Exception as e:
-            logger.error(f"AWS GuardDuty get_guardduty_findings error: {e}")
-            return {"error": str(e)}
+        """GuardDuty ListDetectors / ListFindings / GetFindings"""
+        if not detector_id:
+            detectors = (await self._aws("guardduty", "list_detectors")).get("DetectorIds") or []
+            if not detectors:
+                return {"error": "no GuardDuty detector in this region", "http_status": 404}
+            detector_id = detectors[0]
+        listed = await self._aws(
+            "guardduty", "list_findings",
+            DetectorId=detector_id,
+            FindingCriteria={"Criterion": {"severity": {"GreaterThanOrEqual": 4}}},
+            MaxResults=50,
+        )
+        finding_ids = listed.get("FindingIds") or []
+        findings = []
+        if finding_ids:
+            got = await self._aws("guardduty", "get_findings", DetectorId=detector_id, FindingIds=finding_ids)
+            for f in got.get("Findings", []):
+                findings.append({
+                    "id": f.get("Id"),
+                    "type": f.get("Type"),
+                    "severity": f.get("Severity"),
+                    "created": f.get("CreatedAt"),
+                    "updated": f.get("UpdatedAt"),
+                    "resource_type": (f.get("Resource") or {}).get("ResourceType"),
+                })
+        return {"provider": self.name, "detector_id": detector_id, "finding_count": len(findings), "findings": findings}
 
     async def get_cloudtrail_events(self, lookup_query: str = "") -> Dict[str, Any]:
-        """Get CloudTrail events - cloudtrail.lookup_events()"""
-        if not self.is_configured:
-            return {"error": "AWS credentials not configured"}
-
-        try:
-            client = await self._get_boto_client("cloudtrail")
-            if not client:
-                return {"error": "Failed to create cloudtrail client"}
-
-            response = client.lookup_events(
-                MaxResults=50,
-                **{"EventName": lookup_query} if lookup_query else {}
-            )
-
-            events = []
-            for event in response.get("Events", []):
-                events.append({
-                    "event_id": event.get("EventId"),
-                    "event_name": event.get("EventName"),
-                    "event_time": event.get("EventTime"),
-                    "username": event.get("Username"),
-                    "resource_type": event.get("Resources", [{}])[0].get("ResourceType"),
-                })
-
-            return {
-                "provider": self.name,
-                "event_count": len(events),
-                "events": events,
-            }
-        except Exception as e:
-            logger.error(f"AWS CloudTrail get_cloudtrail_events error: {e}")
-            return {"error": str(e)}
+        """CloudTrail LookupEvents (filtering goes through LookupAttributes)"""
+        kwargs: Dict[str, Any] = {"MaxResults": 50}
+        if lookup_query:
+            kwargs["LookupAttributes"] = [{"AttributeKey": "EventName", "AttributeValue": lookup_query}]
+        response = await self._aws("cloudtrail", "lookup_events", **kwargs)
+        events = []
+        for event in response.get("Events", []):
+            resources = event.get("Resources") or [{}]
+            when = event.get("EventTime")
+            events.append({
+                "event_id": event.get("EventId"),
+                "event_name": event.get("EventName"),
+                "event_time": when.isoformat() if hasattr(when, "isoformat") else when,
+                "username": event.get("Username"),
+                "resource_type": resources[0].get("ResourceType"),
+            })
+        return {"provider": self.name, "event_count": len(events), "events": events}

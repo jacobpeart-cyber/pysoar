@@ -94,10 +94,10 @@ Real routes with no UI control, kept for integrations, scripts, endpoint agents,
 | GET | `/api/v1/audit-evidence/rules` | List automated evidence collection rules | any authenticated user | org-scoped |
 | POST | `/api/v1/audit-evidence/rules/create` | Create automated evidence collection rule (configuration: admin only). | admin | org-scoped |
 | DELETE | `/api/v1/backup/backups/{filename}` | Delete a backup file. | platform superuser | platform-wide |
-| POST | `/api/v1/backup/create` | Trigger an immediate database backup. | platform superuser | platform-wide |
+| POST | `/api/v1/backup/create` | Dump the whole database with `pg_dump` into `BACKUP_DIR` as `pysoar_api_YYYYMMDD-HHMMSS.sql.gz`; 503 and no file when `pg_dump` is missing (docs/operations/backup-restore.md). | platform superuser | platform-wide |
 | GET | `/api/v1/backup/notifications/test` | Send a test email notification to verify SMTP configuration. | platform superuser | platform-wide |
-| POST | `/api/v1/backup/restore` | Restore database from a backup file. | platform superuser | platform-wide |
-| GET | `/api/v1/backup/status` | Get backup system status and list available backups. | admin | platform backup state |
+| POST | `/api/v1/backup/restore` | Always refuses with 409 `restore_not_supported_in_app`: restore from the host with `deploy/restore-db.sh` (docs/operations/backup-restore.md). | platform superuser | platform-wide |
+| GET | `/api/v1/backup/status` | List the dump files in `BACKUP_DIR` (names and sizes) and whether `pg_dump` is installed. | admin | platform backup state |
 | GET | `/api/v1/collaboration/artifacts/{artifact_id}` | Artifact metadata (no file bytes are stored). | any authenticated user | org-scoped |
 | PATCH | `/api/v1/collaboration/messages/{message_id}` | Edit message (only its sender may edit it) | analyst, admin | org-scoped |
 | POST | `/api/v1/collaboration/messages/{message_id}/pin` | Pin message in room | analyst, admin | org-scoped |
@@ -246,15 +246,15 @@ Real routes with no UI control, kept for integrations, scripts, endpoint agents,
 | GET | `/api/v1/hunting/templates/{template_id}` | Get a template by ID | any authenticated user | platform template catalogue |
 | PATCH | `/api/v1/incidents/{incident_id}/notes/{note_id}` | Update a note | analyst, admin | org-scoped |
 | POST | `/api/v1/incidents/{incident_id}/timeline` | Create a custom timeline event | analyst, admin | org-scoped |
-| GET | `/api/v1/integrations/connectors/{connector_name}` | Get detailed information about a specific connector | any authenticated user | platform connector catalogue |
+| GET | `/api/v1/integrations/connectors/{connector_name}` | One catalogue entry: `implementation_status` (implemented / log_ingest / planned), `installable`, `verification`, `test_call`, declared config / credential fields and actions; `install_count` is the caller's organisation's installs (docs/integrations/connectors.md). | any authenticated user | platform connector catalogue |
 | GET | `/api/v1/integrations/dashboard/health` | Get integration health overview dashboard. | any authenticated user | org-scoped |
 | GET | `/api/v1/integrations/dashboard/stats` | Get execution statistics dashboard. | any authenticated user | org-scoped |
 | GET | `/api/v1/integrations/dashboard/summary` | Get complete dashboard summary with real top_connectors + high_error_rate. | any authenticated user | org-scoped |
-| DELETE | `/api/v1/integrations/installed/{integration_id}` | Uninstall integration | admin | org-scoped |
+| DELETE | `/api/v1/integrations/installed/{integration_id}` | Uninstall integration (planned connectors included); audited. | admin | org-scoped |
 | GET | `/api/v1/integrations/installed/{integration_id}` | Get details of installed integration | any authenticated user | org-scoped |
-| PATCH | `/api/v1/integrations/installed/{integration_id}` | Update installed integration configuration | admin | org-scoped |
-| GET | `/api/v1/integrations/installed/{integration_id}/actions` | List available actions for integration | any authenticated user | org-scoped |
-| POST | `/api/v1/integrations/installed/{integration_id}/actions/{action_id}/execute` | Execute an integration action (analyst role or above). | analyst, admin | org-scoped |
+| PATCH | `/api/v1/integrations/installed/{integration_id}` | Update an installed integration: config and credentials are merged over the stored values; 422 `missing_fields` / `invalid_fields` naming fields only; audited. | admin | org-scoped |
+| GET | `/api/v1/integrations/installed/{integration_id}/actions` | The actions the connector class declares, with their real `input_schema` and `requires_approval` (= changes vendor state); empty for a planned connector. | any authenticated user | org-scoped |
+| POST | `/api/v1/integrations/installed/{integration_id}/actions/{action_id}/execute` | Execute a declared action: 422 `invalid_parameters` against its `params_schema`, 501 for a planned connector, a vendor error is a `failed` execution with `http_status`; one execution row, audited. | analyst, admin | org-scoped |
 | POST | `/api/v1/integrations/installed/{integration_id}/disable` | Disable integration | admin | org-scoped |
 | GET | `/api/v1/integrations/installed/{integration_id}/executions` | Get execution history for integration | any authenticated user | org-scoped |
 | GET | `/api/v1/integrations/installed/{integration_id}/webhooks` | List webhooks for integration | any authenticated user | org-scoped |

@@ -7,6 +7,10 @@ are admin-only, running actions and connection tests are analyst+, viewers
 are read-only and an org-less platform superuser gets
 ``organization_required``. The webhook "test" route, which only inflated the
 inbound counters, is an honest 501.
+
+The fixtures install VirusTotal (an implemented connector, so install needs
+its declared ``api_key`` credential); a planned connector such as Splunk is
+refused with 501 (tests/unit/test_connector_catalog_truth.py).
 """
 
 from __future__ import annotations
@@ -22,7 +26,8 @@ from src.integrations.models import IntegrationConnector, WebhookEndpoint
 from tests.helpers.tenancy import assert_tenant_isolated, bearer, make_user
 
 BASE = "/api/v1/integrations"
-CONNECTOR = "splunk"
+CONNECTOR = "virustotal"
+CREDENTIALS = {"api_key": "vt-test-key-0001"}
 
 
 async def _seed_connector(db: AsyncSession) -> None:
@@ -35,8 +40,8 @@ async def _seed_connector(db: AsyncSession) -> None:
             IntegrationConnector(
                 id=CONNECTOR,
                 name=CONNECTOR,
-                display_name="Splunk",
-                category="siem",
+                display_name="VirusTotal",
+                category="threat_intel",
                 supported_actions=json.dumps([]),
                 supported_triggers=json.dumps([]),
                 auth_type="api_key",
@@ -50,7 +55,7 @@ async def _install(client: AsyncClient, db: AsyncSession, headers: dict[str, str
     await _seed_connector(db)
     resp = await client.post(
         f"{BASE}/install",
-        json={"connector_id": CONNECTOR, "display_name": "Splunk A", "config": {}, "credentials": {}},
+        json={"connector_id": CONNECTOR, "display_name": "VirusTotal A", "config": {}, "credentials": CREDENTIALS},
         headers=headers,
     )
     assert resp.status_code == 201, resp.text
@@ -121,7 +126,7 @@ async def test_installed_integrations_are_tenant_isolated(
     # Org B installing the same connector gets its own row (no 409 across tenants).
     other = await client.post(
         f"{BASE}/install",
-        json={"connector_id": CONNECTOR, "display_name": "Splunk B"},
+        json={"connector_id": CONNECTOR, "display_name": "VirusTotal B", "credentials": CREDENTIALS},
         headers=org_b_admin_headers,
     )
     assert other.status_code == 201, other.text
@@ -129,7 +134,7 @@ async def test_installed_integrations_are_tenant_isolated(
 
     # Org A still sees its untouched install and webhook.
     own = await client.get(inst, headers=org_a_admin_headers)
-    assert own.status_code == 200 and own.json()["display_name"] == "Splunk A"
+    assert own.status_code == 200 and own.json()["display_name"] == "VirusTotal A"
     hooks = await client.get(f"{inst}/webhooks", headers=org_a_admin_headers)
     assert webhook_id in {w["id"] for w in hooks.json()["items"]}
 
@@ -168,7 +173,16 @@ async def test_analyst_refused_on_admin_routes(
     db_session: AsyncSession,
     org_a_admin_headers: dict[str, str],
     org_a_headers: dict[str, str],
+    monkeypatch,
 ) -> None:
+    from src.integrations import netguard
+
+    async def _internal_only(host: str, port: int):
+        # The connection test must never leave the test process: every name
+        # resolves to loopback, which the pinned transport refuses.
+        return [(2, 1, 6, "", ("127.0.0.1", port))]
+
+    monkeypatch.setattr(netguard, "_getaddrinfo", _internal_only)
     integration_id = await _install(client, db_session, org_a_admin_headers)
     webhook_id = await _webhook(client, integration_id, org_a_admin_headers)
     inst = f"{BASE}/installed/{integration_id}"
@@ -190,6 +204,7 @@ async def test_analyst_refused_on_admin_routes(
     assert resp.status_code == 404, resp.text
     resp = await client.post(f"{inst}/test", headers=org_a_headers)
     assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "unhealthy"
 
 
 async def test_admin_configuration_routes_work(

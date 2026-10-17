@@ -22,8 +22,33 @@ class ConnectorBase(BaseModel):
     supported_triggers: list[str] = []
 
 
+class ConnectorActionSummary(BaseModel):
+    """One executable action as the connector class declares it."""
+
+    name: str
+    display_name: str = ""
+    description: str = ""
+    params_schema: dict[str, Any] = {}
+    output: str = ""
+    idempotent: bool = False
+    side_effect: bool = False
+    action_type: str = "query"
+
+
 class ConnectorResponse(ConnectorBase, DBModel):
-    """Connector response schema"""
+    """Connector response schema.
+
+    ``implementation_status`` is ``implemented`` (a connector class ships in
+    this release), ``log_ingest`` (installable log source polled by the SIEM,
+    no actions) or ``planned`` (catalogue entry only: not installable, no
+    actions). ``verification`` says how the connector was checked; none has
+    been exercised against a live vendor tenant in this repository.
+
+    ``install_count`` is the calling organisation's installs of this connector
+    (0 or 1). ``rating``, ``is_community`` and ``last_updated`` are not
+    marketplace statistics: there is no marketplace service, so they are
+    always None / False / None.
+    """
 
     id: str = ""
     icon_url: Optional[str] = None
@@ -38,6 +63,13 @@ class ConnectorResponse(ConnectorBase, DBModel):
     # (e.g. "external_siem" — PySOAR already ships its own SIEM) so
     # the marketplace UI can render a clarifying badge.
     integration_role: Optional[str] = None
+    implementation_status: str = "planned"
+    installable: bool = False
+    verification: str = ""
+    test_call: Optional[str] = None
+    config_fields: list["IntegrationConfigField"] = []
+    credential_fields: list["IntegrationConfigField"] = []
+    actions: list[ConnectorActionSummary] = []
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -65,6 +97,13 @@ class IntegrationConfigField(BaseModel):
     description: Optional[str] = None
     required: bool = False
     default: Optional[Any] = None
+    # A secret field is write-only: stored AES-encrypted, never returned.
+    secret: bool = False
+
+
+# ConnectorResponse names IntegrationConfigField before it is defined.
+ConnectorResponse.model_rebuild()
+ConnectorListResponse.model_rebuild()
 
 
 class IntegrationInstallRequest(BaseModel):
@@ -234,6 +273,10 @@ class IntegrationExecutionResponse(DBModel):
     completed_at: Optional[str] = None
     duration_ms: Optional[int] = None
     error_message: Optional[str] = None
+    # Set on a failed execution: why (unknown_action, invalid_parameters,
+    # not_implemented, not_configured, failed) and the vendor HTTP status.
+    error_code: Optional[str] = None
+    http_status: Optional[int] = None
     retry_count: int = 0
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
