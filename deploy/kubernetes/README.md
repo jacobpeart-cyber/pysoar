@@ -160,12 +160,16 @@ start against an older schema (an unmigrated database crash-loops the api at
 `create_first_admin`). It inspects the database first:
 
 * `alembic_version` table present: `alembic upgrade head`.
-* No tables at all (first install): creates the schema the way the api does
-  at boot (`init_db()`, `Base.metadata.create_all`, after importing
-  `src.main`), then `alembic stamp head`. This path exists because
-  `alembic upgrade head` cannot build an empty database: run from scratch on
-  2026-10-17 it stops at migration 007 (`column "ioc_type" does not exist`).
-  Until the chain is fixed, a fresh install is a create_all plus stamp.
+* No tables at all (first install): also `alembic upgrade head`. On a
+  database with no tables (or only an empty `alembic_version`),
+  `alembic/env.py` creates the schema from the models it imports (the same
+  tables, columns, indexes and foreign keys as the api's boot-time
+  `init_db()` create_all) and stamps head, in one transaction on PostgreSQL;
+  the revision chain is not replayed, because revisions 001-006 created
+  placeholder tables the later revisions never matched (it stopped at 007,
+  `column "ioc_type" does not exist`). It refuses if any model module failed
+  to import. `alembic upgrade <rev>` other than head, and `alembic stamp`,
+  do not take this path.
 * Tables but no `alembic_version`: the Job fails and changes nothing. Stamp
   the revision that matches the schema by hand (`alembic stamp <rev>`) and
   upgrade again.
@@ -245,10 +249,19 @@ Against a throwaway `postgres:15-alpine` and `redis:7-alpine`, with a backend
 image built from the working tree and the local frontend image:
 
 * The rendered migration script, run as UID 999 with a read-only root
-  filesystem and all capabilities dropped: empty database bootstrapped (211
-  tables, stamped `038`); a second run upgrades as a no-op; a database one
-  revision behind upgrades `037 -> 038`; tables without `alembic_version`
-  exit 1.
+  filesystem and all capabilities dropped (the earlier version of the script,
+  which bootstrapped an empty database with `init_db()` plus
+  `alembic stamp head`): empty database bootstrapped (211 tables, stamped
+  `038`); a second run upgrades as a no-op; a database one revision behind
+  upgrades `037 -> 038`; tables without `alembic_version` exit 1.
+* The current script (empty databases go through `alembic upgrade head`),
+  extracted from `helm template` with the production values and run with the
+  working tree's Python against throwaway `postgres:15` databases, not in the
+  container: empty database built (210 tables plus `alembic_version`,
+  stamped `038`) with the same tables, columns, types, nullability, indexes
+  and foreign keys as a second database built by the api's `init_db()`; a
+  second run is a no-op; a database with one stray table and no
+  `alembic_version` exits 1 and is left unchanged.
 * The api under the same settings with the chart's mounts: started,
   `GET /api/v1/health` returned `healthy`; the syslog receiver bound 5514 as
   non-root. With root-owned data volumes the simulation-agent token write to

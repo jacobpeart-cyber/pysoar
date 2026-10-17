@@ -176,10 +176,15 @@ git clone https://github.com/jacobpeart-cyber/pysoar.git
 cd pysoar
 cp .env.example .env
 
+# Build the schema before the api first starts (on an empty database
+# `alembic upgrade head` creates it from the models and stamps head)
+docker compose up -d postgres redis
+docker compose run --rm --no-deps api alembic upgrade head
+
 # Start all services
 docker compose up -d
 
-# Apply database migrations
+# After pulling a new version: apply its migrations, then restart
 docker exec pysoar-api alembic upgrade head
 
 # Access the platform

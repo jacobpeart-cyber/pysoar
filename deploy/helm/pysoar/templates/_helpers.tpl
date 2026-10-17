@@ -199,14 +199,10 @@ PY
 state="$(cat /tmp/pysoar-db-state)"
 echo "pysoar-migrate: database state: ${state}"
 case "${state}" in
-  managed)
+  managed|empty)
+    # On an empty database alembic/env.py builds the schema from the models
+    # and stamps head; otherwise this applies the pending revisions.
     alembic upgrade head
-    ;;
-  empty)
-    # The same create_all the api runs at boot, after importing src.main so
-    # every model the application registers is in the metadata.
-    python -c "import asyncio, src.main; from src.core.database import init_db; asyncio.run(init_db())"
-    alembic stamp head
     ;;
   *)
     echo "pysoar-migrate: tables exist but there is no alembic_version table; refusing to guess. Stamp the matching revision by hand (alembic stamp <rev>) and re-run." >&2

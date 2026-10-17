@@ -153,17 +153,21 @@ def downgrade() -> None:
     existing = _columns(bind, USERS)
     if existing is not None:
         names = _names(bind, USERS)
+        # The FK is named by upgrade() below, but a users table built by the
+        # models' create_all (init_db, or alembic's empty-database bootstrap in
+        # env.py) carries the dialect's default name; drop whichever exists.
+        role_fks = [
+            fk["name"] for fk in sa.inspect(bind).get_foreign_keys(USERS)
+            if fk.get("constrained_columns") == ["custom_role_id"] and fk.get("name")
+        ]
         for index in (USER_ROLE_INDEX, USER_EXTERNAL_INDEX):
             if index in names:
                 op.drop_index(index, table_name=USERS)
         with op.batch_alter_table(USERS) as batch:
             if USER_SSO_UNIQUE in names:
                 batch.drop_constraint(USER_SSO_UNIQUE, type_="unique")
-            if "custom_role_id" in existing:
-                try:
-                    batch.drop_constraint("fk_users_custom_role_id_roles", type_="foreignkey")
-                except Exception:  # noqa: BLE001 - SQLite batch mode names it differently
-                    pass
+            for fk_name in role_fks:
+                batch.drop_constraint(fk_name, type_="foreignkey")
             for name, _type, _kw in USER_COLUMNS:
                 if name in existing:
                     batch.drop_column(name)

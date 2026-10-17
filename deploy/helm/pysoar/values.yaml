@@ -326,10 +326,9 @@ persistence:
   size: 20Gi
 
 # Database migrations: a Helm pre-install/pre-upgrade hook Job running the api
-# image. On a database that already carries an alembic_version table it runs
-# `alembic upgrade head`; on an empty database it creates the schema from the
-# models and runs `alembic stamp head` (the migration chain cannot build an
-# empty database, see README); on a database with tables but no
+# image. On an empty database or one that carries an alembic_version table it
+# runs `alembic upgrade head` (which builds an empty database from the models
+# and stamps head, see README); on a database with tables but no
 # alembic_version it fails without changing anything.
 migrations:
   enabled: true

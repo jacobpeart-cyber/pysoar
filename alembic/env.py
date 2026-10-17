@@ -3,7 +3,9 @@
 import asyncio
 from logging.config import fileConfig
 
+import sqlalchemy as sa
 from alembic import context
+from alembic.runtime.migration import MigrationContext, RevisionStep
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
@@ -22,6 +24,12 @@ from src.models import Base
 import logging as _logging
 _log = _logging.getLogger("alembic.env")
 
+# Model modules that failed to import. An empty database is only bootstrapped
+# from the models (see _bootstrap_empty_database) when this stays empty, so a
+# broken import can never produce a schema that silently lacks its tables.
+_import_failures: list[str] = []
+
+
 def _try_import(name: str, names: list[str]) -> None:
     try:
         mod = __import__(name, fromlist=names)
@@ -29,6 +37,7 @@ def _try_import(name: str, names: list[str]) -> None:
             if not hasattr(mod, n):
                 _log.warning("alembic env: %s has no attribute %s", name, n)
     except Exception as e:  # noqa: BLE001
+        _import_failures.append(f"{name} ({e})")
         _log.warning("alembic env: skipping %s (%s)", name, e)
 
 # Core models
@@ -84,6 +93,10 @@ _try_import("src.collaboration.models", ["WarRoom", "WarRoomMessage", "ActionIte
 _try_import("src.phishing_sim.models", ["PhishingCampaign", "PhishingTemplate", "CampaignEvent", "TargetGroup", "SecurityAwarenessScore"])
 _try_import("src.agents.models", ["EndpointAgent", "AgentCommand", "AgentResult", "AgentHeartbeat"])
 _try_import("src.identity.models", ["SSOConfiguration", "SCIMToken", "Role"])
+# Tables the app registers that revisions 019 / 020 create; listed so an empty
+# database bootstrapped from the models gets them too.
+_try_import("src.attack.models", [])
+_try_import("src.llm.models", [])
 
 # Alembic Config object
 config = context.config
@@ -113,9 +126,81 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+def _database_is_empty(connection: Connection) -> bool:
+    """True when the database has no tables, or only an empty ``alembic_version``."""
+    tables = set(sa.inspect(connection).get_table_names())
+    if tables - {"alembic_version"}:
+        return False
+    if "alembic_version" in tables:
+        return not connection.execute(sa.text("SELECT COUNT(*) FROM alembic_version")).scalar()
+    return True
+
+
+def _upgrades_to_every_head(migration_context: MigrationContext) -> bool:
+    """True when the command being run is an upgrade from nothing to every head.
+
+    The work function alembic's command handed to the context is asked for its
+    plan from an empty version table: ``alembic upgrade head`` yields upgrade
+    ``RevisionStep``s covering every head, while ``stamp`` yields ``StampStep``s
+    and ``downgrade`` / ``current`` / ``check`` yield nothing.
+    """
+    fn = getattr(migration_context, "_migrations_fn", None)
+    if fn is None:
+        return False
+    steps = list(fn((), migration_context))
+    if not steps or not all(isinstance(s, RevisionStep) and s.is_upgrade for s in steps):
+        return False
+    planned = {s.revision.revision for s in steps}
+    return set(context.script.get_heads()) <= planned
+
+
+def _bootstrap_empty_database(connection: Connection) -> None:
+    """Create an empty database's schema from the models and stamp it at head.
+
+    Revisions 001-006 created placeholder tables whose columns never matched
+    the ORM (e.g. ``iocs.type`` where 007 reads ``iocs.ioc_type``,
+    ``threat_indicators.indicator_value`` where 008 reads ``value``), and
+    008-019 were written against databases whose tables came from
+    ``init_db``'s ``create_all``; replaying the chain on an empty database
+    therefore cannot work. Every existing database (production included) got
+    its tables from ``create_all`` and then the later revisions, so the
+    current models plus a stamp at head is exactly the schema those revisions
+    converge on. This is Alembic's documented recipe for new databases
+    ("Building an Up to Date Database from Scratch"), done inside
+    ``alembic upgrade head`` so that one command serves both fresh installs
+    and upgrades. Databases with any table are never touched by this path.
+    """
+    if _import_failures:
+        raise RuntimeError(
+            "Refusing to build an empty database from the models: these model "
+            "modules failed to import, so their tables would be missing: "
+            + "; ".join(_import_failures)
+        )
+    target_metadata.create_all(connection)
+    context.get_context().stamp(context.script, "heads")
+    _log.info(
+        "alembic env: empty database; created %d tables from the models and stamped %s",
+        len(target_metadata.tables),
+        ", ".join(context.script.get_heads()),
+    )
+
+
 def do_run_migrations(connection: Connection) -> None:
     """Run migrations with the given connection."""
     context.configure(connection=connection, target_metadata=target_metadata)
+
+    bootstrap = _database_is_empty(connection) and _upgrades_to_every_head(context.get_context())
+    if connection.in_transaction():
+        # End the read-only transaction the checks above autobegan, so the
+        # migration context sees the connection exactly as it was configured.
+        connection.commit()
+    if bootstrap:
+        # One transaction for the schema and the version row (atomic on
+        # PostgreSQL; committed explicitly on SQLite, whose DDL alembic
+        # otherwise runs outside a transaction).
+        with connection.begin():
+            _bootstrap_empty_database(connection)
+        return
 
     with context.begin_transaction():
         context.run_migrations()
