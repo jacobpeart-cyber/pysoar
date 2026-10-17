@@ -524,16 +524,22 @@ def claim(claims: dict[str, Any], name: Optional[str]) -> Any:
     return current
 
 
+#: Precedence among a user's mapped groups: built-in admin, then analyst,
+#: then custom roles, then viewer; ties broken by group name. The map's key
+#: order never matters, so reordering it changes nothing.
+_MAPPED_ROLE_RANK = {"admin": 0, "analyst": 1, "viewer": 3}
+
+
 def first_mapped_group(group_role_map: Optional[dict[str, Any]], groups: list[str]) -> Optional[tuple[str, str]]:
-    """``(group, role value)`` for the first entry of ``group_role_map`` (in map
-    order) whose group the user is in, or ``None`` when none of the user's
-    groups is mapped. Used for just-in-time provisioning and the re-sync on
-    every login, so both pick the same role."""
+    """``(group, role value)`` chosen deterministically among the entries of
+    ``group_role_map`` whose group the user is in (``_MAPPED_ROLE_RANK``), or
+    ``None`` when none of the user's groups is mapped. Used for just-in-time
+    provisioning and the re-sync on every login, so both pick the same role."""
     member_of = set(groups)
-    for group, value in (group_role_map or {}).items():
-        if group in member_of:
-            return str(group), str(value)
-    return None
+    candidates = [(str(group), str(value)) for group, value in (group_role_map or {}).items() if group in member_of]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: (_MAPPED_ROLE_RANK.get(item[1].strip().lower(), 2), item[0]))
 
 
 def email_domain(email: str) -> str:

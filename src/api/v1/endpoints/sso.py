@@ -46,7 +46,7 @@ from urllib.parse import quote, urlencode, urlsplit
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from src.api.deps import DatabaseSession, OrganizationId, RedisClient, require_role
 from src.core.config import settings
@@ -569,6 +569,26 @@ async def put_sso_configuration(
         config.last_tested_at = None
         config.last_test_status = None
         config.last_test_detail = None
+        if config.protocol != protocol or config.issuer != issuer:
+            # Subjects are provider-specific: a subject asserted by the new
+            # provider must never bind to an account the old one bound.
+            cleared = await db.execute(
+                update(User)
+                .where(User.organization_id == org_id, User.sso_subject.isnot(None))
+                .values(sso_subject=None)
+            )
+            db.add(AuditLog(
+                user_id=str(current_user.id),
+                organization_id=org_id,
+                action="sso_bindings_cleared",
+                resource_type="sso_configuration",
+                resource_id=str(config.id),
+                description=(
+                    f"identity provider changed ({config.protocol} {config.issuer} -> {protocol} {issuer}); "
+                    f"{cleared.rowcount} subject bindings cleared; users re-bind by email at their next sign-in"
+                ),
+                success=True,
+            ))
 
     if payload.enabled:
         if not domains:
@@ -837,8 +857,8 @@ def _groups(claims: dict[str, Any], groups_claim: Optional[str]) -> list[str]:
 
 
 async def _mapped_role(db: Any, config: SSOConfiguration, claims: dict[str, Any]) -> Optional[tuple[str, Optional[str]]]:
-    """``(User.role, custom_role_id)`` from ``group_role_map`` (first mapped
-    group, in map order), ``None`` when no group of the user is mapped; a
+    """``(User.role, custom_role_id)`` from ``group_role_map`` (the highest-
+    precedence mapped group), ``None`` when no group of the user is mapped; a
     mapping to a role that no longer exists refuses the login."""
     mapped = oidc.first_mapped_group(config.group_role_map, _groups(claims, config.groups_claim))
     if mapped is None:
@@ -851,7 +871,7 @@ async def _mapped_role(db: Any, config: SSOConfiguration, claims: dict[str, Any]
 
 
 async def _role_for_new_user(db: Any, config: SSOConfiguration, claims: dict[str, Any]) -> tuple[str, Optional[str]]:
-    """Role from ``group_role_map`` (first mapped group, in map order) else ``default_role``."""
+    """Role from ``group_role_map`` (highest-precedence mapped group) else ``default_role``."""
     resolved = await _mapped_role(db, config, claims)
     if resolved is not None:
         return resolved
