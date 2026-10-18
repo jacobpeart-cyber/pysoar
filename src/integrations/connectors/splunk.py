@@ -74,12 +74,22 @@ def saved_search_segment(name: Any) -> str:
     return quote(text, safe="")
 
 
-#: SPL commands that change Splunk state, execute code or expose Splunk's own
-#: configuration; the read-only ``search`` action refuses a pipeline using one.
-_STATE_CHANGING_SPL = frozenset({
-    "delete", "collect", "mcollect", "meventcollect", "outputlookup", "outputcsv", "outputtext",
-    "sendemail", "sendalert", "script", "run", "runshellscript", "tscollect", "summaryindex",
-    "map", "rest", "savedsearch", "dbxoutput", "dbxquery", "sendmail",
+#: SPL commands the read-only ``search`` action accepts: searching, filtering,
+#: shaping and aggregating commands only. Anything else (delete, collect,
+#: outputlookup, sendemail, script, rest, savedsearch, map, custom commands,
+#: and macros, which expand server-side to anything) is refused before any
+#: request. A deny list would be bypassable; an allow list fails closed.
+_READ_ONLY_SPL = frozenset({
+    "search", "where", "stats", "eventstats", "streamstats", "tstats", "eval", "table", "fields",
+    "sort", "head", "tail", "rex", "regex", "timechart", "chart", "top", "rare", "dedup", "lookup",
+    "inputlookup", "transaction", "rename", "fillnull", "mvexpand", "mvcombine", "spath", "bin",
+    "bucket", "join", "append", "appendcols", "makemv", "convert", "iplocation", "geostats",
+    "addtotals", "reverse", "xyseries", "untable", "makeresults", "from", "datamodel", "metadata",
+    "multisearch", "nomv", "replace", "rangemap", "strcat", "transpose", "uniq", "filldown",
+    "addinfo", "localop", "noop", "fieldformat", "sitimechart", "timewrap", "predict", "trendline",
+    "cluster", "kmeans", "anomalies", "outlier", "contingency", "correlate", "diff", "highlight",
+    "iconify", "accum", "autoregress", "delta", "xmlkv", "kv", "extract", "erex", "multikv",
+    "tags", "typer", "eventcount", "metasearch", "set", "history", "loadjob",
 })
 
 
@@ -106,7 +116,7 @@ class SplunkConnector(BaseConnector):
             "Run a one-shot search and return its results "
             "(POST /services/search/v2/jobs, exec_mode=oneshot, output_mode=json; REST API Reference, search/v2/jobs).",
             object_schema({
-                "search": {"type": "string", "minLength": 1, "description": "SPL; 'search ' is prefixed unless it starts with 'search' or '|'. Read-only: a pipeline with a state-changing or executing command (delete, collect, outputlookup, sendemail, script, rest, ...) is refused before any request"},
+                "search": {"type": "string", "minLength": 1, "description": "SPL; 'search ' is prefixed unless it starts with 'search' or '|'. Read-only: every pipeline segment must start with an allow-listed read-only command (search, where, stats, eval, table, timechart, tstats, lookup, ...); macros and any other command are refused before any request"},
                 "earliest_time": _TIME,
                 "latest_time": _TIME,
                 "max_count": {"type": "integer", "minimum": 1, "maximum": _MAX_RESULTS, "description": "maximum results (default 100)"},
@@ -261,16 +271,25 @@ class SplunkConnector(BaseConnector):
         text = str(search).strip()
         if not text:
             raise ValueError("search must not be empty")
-        # The action is declared read-only (analysts may run it), so a pipeline
-        # that would change Splunk state, run code or read Splunk's own
-        # configuration is refused here, before any request.
-        for segment in text.split("|"):
-            words = segment.strip().lstrip("[").split()
-            if words and words[0].lower() in _STATE_CHANGING_SPL:
-                raise ValueError(f"search is read-only: SPL command '{words[0]}' is not allowed")
-        if text.startswith("|") or text.lower().startswith("search"):
-            return text
-        return f"search {text}"
+        # The action is declared read-only (analysts may run it): every
+        # pipeline segment, including those inside [subsearches], must start
+        # with an allow-listed read-only command, and macros (`name`) are
+        # refused because they expand server-side to anything.
+        if "`" in text:
+            raise ValueError("search is read-only: SPL macros (`...`) are not allowed")
+        spl = text if text.startswith("|") or text.lower().startswith("search") else f"search {text}"
+        for index, segment in enumerate(spl.split("|")):
+            body = segment.strip()
+            while body.startswith("["):
+                body = body[1:].strip()
+            if not body:
+                if index == 0:
+                    continue  # a leading "|" (generating command follows)
+                raise ValueError("search is read-only: empty pipeline segment")
+            command = body.split()[0].lower().rstrip("]")
+            if command not in _READ_ONLY_SPL:
+                raise ValueError(f"search is read-only: SPL command '{command}' is not allowed")
+        return spl
 
     async def search(
         self,

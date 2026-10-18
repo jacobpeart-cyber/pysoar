@@ -342,8 +342,10 @@ async def test_splunk_ids_refused_before_any_request(monkeypatch, action: str, p
 
 @pytest.mark.asyncio
 async def test_splunk_vendor_error_is_failed_with_status(monkeypatch) -> None:
-    fake_vendor(monkeypatch, lambda request: httpx.Response(400, json={"messages": [{"type": "FATAL", "text": "Unknown search command"}]}))
-    out = await _connector("splunk").execute_action("search", {"search": "index=x | nosuch"})
+    # An allow-listed pipeline the vendor still rejects (a non-allow-listed
+    # command never reaches the vendor: see the read-only tests above).
+    fake_vendor(monkeypatch, lambda request: httpx.Response(400, json={"messages": [{"type": "FATAL", "text": "Error in 'stats' command: invalid argument"}]}))
+    out = await _connector("splunk").execute_action("search", {"search": "index=x | stats count by"})
     assert out["status"] == "failed" and out["http_status"] == 400
 
 
@@ -648,6 +650,9 @@ async def test_qradar_poller_401(db_session, org_a, monkeypatch) -> None:
     "index=main [ search index=x | delete ]",
     "index=main |OUTPUTCSV dump",
     "| savedsearch \"Nightly alert\"",
+    "index=main | `exfil_macro`",
+    "index=main | mycustomcommand arg=1",
+    "index=main | stats count | ",
 ])
 async def test_splunk_search_refuses_state_changing_spl(monkeypatch, spl: str) -> None:
     """The ``search`` action is declared read-only (analysts can run it), so a
@@ -665,5 +670,21 @@ async def test_splunk_search_allows_read_only_pipelines(monkeypatch) -> None:
     out = await _connector("splunk").execute_action(
         "search", {"search": "index=main sourcetype=auth action=failure | stats count by user | sort -count"},
     )
-    assert out["status"] == "success", out
+    # A success result is the connector's output itself (no status / error keys).
+    assert out.get("status") != "failed" and "error" not in out, out
+    assert out["count"] == 1 and out["results"] == [{"count": "3"}]
     assert len(seen) == 1 and seen[0].url.path == "/services/search/v2/jobs"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spl", [
+    "| tstats count where index=main by sourcetype",
+    "index=main [ search index=assets | fields host ] | table host",
+    "| inputlookup threat_list.csv | where severity=\"high\"",
+    "sourcetype=auth | timechart span=1h count by action",
+])
+async def test_splunk_search_accepts_common_read_only_shapes(monkeypatch, spl: str) -> None:
+    seen = fake_vendor(monkeypatch, lambda request: httpx.Response(200, json={"results": []}))
+    out = await _connector("splunk").execute_action("search", {"search": spl})
+    assert out.get("status") != "failed" and "error" not in out, out
+    assert len(seen) == 1
