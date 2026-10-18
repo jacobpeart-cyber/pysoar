@@ -74,6 +74,15 @@ def saved_search_segment(name: Any) -> str:
     return quote(text, safe="")
 
 
+#: SPL commands that change Splunk state, execute code or expose Splunk's own
+#: configuration; the read-only ``search`` action refuses a pipeline using one.
+_STATE_CHANGING_SPL = frozenset({
+    "delete", "collect", "mcollect", "meventcollect", "outputlookup", "outputcsv", "outputtext",
+    "sendemail", "sendalert", "script", "run", "runshellscript", "tscollect", "summaryindex",
+    "map", "rest", "savedsearch", "dbxoutput", "dbxquery", "sendmail",
+})
+
+
 class SplunkConnector(BaseConnector):
     """Splunk REST API and HTTP Event Collector."""
 
@@ -97,7 +106,7 @@ class SplunkConnector(BaseConnector):
             "Run a one-shot search and return its results "
             "(POST /services/search/v2/jobs, exec_mode=oneshot, output_mode=json; REST API Reference, search/v2/jobs).",
             object_schema({
-                "search": {"type": "string", "minLength": 1, "description": "SPL; 'search ' is prefixed unless it starts with 'search' or '|'"},
+                "search": {"type": "string", "minLength": 1, "description": "SPL; 'search ' is prefixed unless it starts with 'search' or '|'. Read-only: a pipeline with a state-changing or executing command (delete, collect, outputlookup, sendemail, script, rest, ...) is refused before any request"},
                 "earliest_time": _TIME,
                 "latest_time": _TIME,
                 "max_count": {"type": "integer", "minimum": 1, "maximum": _MAX_RESULTS, "description": "maximum results (default 100)"},
@@ -252,6 +261,13 @@ class SplunkConnector(BaseConnector):
         text = str(search).strip()
         if not text:
             raise ValueError("search must not be empty")
+        # The action is declared read-only (analysts may run it), so a pipeline
+        # that would change Splunk state, run code or read Splunk's own
+        # configuration is refused here, before any request.
+        for segment in text.split("|"):
+            words = segment.strip().lstrip("[").split()
+            if words and words[0].lower() in _STATE_CHANGING_SPL:
+                raise ValueError(f"search is read-only: SPL command '{words[0]}' is not allowed")
         if text.startswith("|") or text.lower().startswith("search"):
             return text
         return f"search {text}"
