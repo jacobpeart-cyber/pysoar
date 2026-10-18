@@ -42,6 +42,8 @@ SUCCESS: dict[str, tuple[str, str, Any, int]] = {
     "servicenow": ("acme.service-now.com", "/api/now/table/sys_user", {"result": [{"sys_id": "6816f79cc0a8016401c5a33be04be441"}]}, 200),
     "pagerduty": ("api.pagerduty.com", "/abilities", {"abilities": ["teams", "urgencies"]}, 200),
     "jira": ("acme.atlassian.net", "/rest/api/3/myself", {"accountId": "5b10ac8d82e05b22cc7d4ef5", "active": True}, 200),
+    "splunk": ("splunk.acme.example", "/services/server/info", {"entry": [{"content": {"version": "9.2.1", "serverName": "idx-1"}}]}, 200),
+    "elastic": ("es.acme.example", "/", {"name": "es-1", "cluster_name": "soc", "version": {"number": "8.13.0"}}, 200),
 }
 SENTINEL_WORKSPACE = (
     "/subscriptions/00000000-0000-0000-0000-000000000002/resourceGroups/rg-sec"
@@ -61,7 +63,9 @@ def _assert_no_secret(name: str, result: ConnectionTestResult) -> None:
 
 
 def test_every_implemented_connector_has_a_case() -> None:
-    assert set(SUCCESS) | {"microsoft_sentinel", "aws_security_hub"} == set(CONNECTOR_CLASS_MAP)
+    # okta, azure_ad, microsoft_defender, microsoft_teams: tests/unit/test_connectors_identity_edr_chat.py
+    assert set(SUCCESS) | {"microsoft_sentinel", "aws_security_hub", "okta", "azure_ad", "microsoft_defender",
+                           "microsoft_teams"} == set(CONNECTOR_CLASS_MAP)
 
 
 @pytest.mark.asyncio
@@ -268,14 +272,14 @@ async def test_health_task_uses_the_connector_test(db_session, org_a, monkeypatc
     from src.integrations.tasks import _health_check_all_integrations_async
 
     org_id = org_a.id
-    await ensure_connector_rows(db_session, "shodan", "okta")
+    await ensure_connector_rows(db_session, "shodan", "cyberark")
     row = InstalledIntegration(
         organization_id=org_id, connector_id="shodan", display_name="shodan",
         config_encrypted="{}", auth_credentials_encrypted=_encrypt_secret_json(VALID_FIELDS["shodan"][1]),
         status="active",
     )
     planned = InstalledIntegration(
-        organization_id=org_id, connector_id="okta", display_name="okta (legacy row)",
+        organization_id=org_id, connector_id="cyberark", display_name="cyberark (legacy row)",
         config_encrypted="{}", auth_credentials_encrypted=_encrypt_secret_json({}), status="active",
     )
     db_session.add_all([row, planned])

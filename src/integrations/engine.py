@@ -21,12 +21,18 @@ from src.integrations.connectors import (
     SlackConnector,
     VirusTotalConnector,
 )
+from src.integrations.connectors.entra_id import EntraIDConnector
+from src.integrations.connectors.microsoft_defender import MicrosoftDefenderConnector
+from src.integrations.connectors.microsoft_teams import MicrosoftTeamsConnector
+from src.integrations.connectors.okta import OktaConnector
 from src.integrations.connectors.base import (
     BaseConnector,
     ConnectionTestResult,
     ConnectorActionFailed,
     sanitize_message,
 )
+from src.integrations.connectors.elastic import ElasticConnector
+from src.integrations.connectors.splunk import SplunkConnector, https_origin
 from src.integrations.netguard import (
     OutboundTargetRefused,
     VettedTarget,
@@ -57,6 +63,12 @@ CONNECTOR_CLASS_MAP = {
     "aws_security_hub": AWSSecurityHubConnector,
     "jira": JiraConnector,
     "microsoft_sentinel": MicrosoftSentinelConnector,
+    "splunk": SplunkConnector,
+    "elastic": ElasticConnector,
+    "okta": OktaConnector,
+    "azure_ad": EntraIDConnector,
+    "microsoft_defender": MicrosoftDefenderConnector,
+    "microsoft_teams": MicrosoftTeamsConnector,
 }
 
 
@@ -65,15 +77,26 @@ LOG_INGEST = "log_ingest"
 PLANNED = "planned"
 PLANNED_VERIFICATION = "not implemented in this release"
 LOG_INGEST_VERIFICATION = (
-    "log poller implemented with the vendor SDK from public documentation (src/siem/cloud_poller.py); "
+    "log poller implemented from the vendor's public SDK / REST documentation (src/siem/cloud_poller.py); "
     "not verified against a live tenant"
 )
 
 # Connectors with no executable connector class whose events the SIEM cloud
-# poller (src/siem/cloud_poller.py) ingests through the vendor SDK on a
-# schedule. They can be installed (the poller needs the stored credentials)
-# but expose no actions and no connection test.
-LOG_INGEST_CONNECTORS = frozenset({"aws_cloudtrail", "azure_activity_log", "gcp_cloud_logging"})
+# poller (src/siem/cloud_poller.py) ingests on a schedule (the vendor SDK for
+# the three clouds, the pinned REST client for QRadar). They can be installed
+# (the poller needs the stored credentials) but expose no actions and no
+# connection test.
+LOG_INGEST_CONNECTORS = frozenset({"aws_cloudtrail", "azure_activity_log", "gcp_cloud_logging", "qradar"})
+
+# Catalogue entries whose events the SIEM cloud poller ingests: the
+# log_ingest sources plus the implemented connectors that also have a poller
+# (Splunk, Elastic). Surfaced as ``ingest: true`` in the catalogue.
+INGEST_CONNECTORS = LOG_INGEST_CONNECTORS | frozenset({"splunk", "elastic"})
+
+
+def has_ingest(connector_name: Optional[str]) -> bool:
+    """True when the SIEM cloud poller pulls this connector's events."""
+    return (connector_name or "").lower() in INGEST_CONNECTORS
 
 
 def implementation_status(connector_name: Optional[str]) -> str:
@@ -103,12 +126,25 @@ def missing_install_fields(connector_name: str, config: dict[str, Any], credenti
     if cls is not None:
         return cls.missing_fields(config, credentials)
     meta = BUILTIN_CONNECTORS.get((connector_name or "").lower()) or {}
-    return [k for k in meta.get("required_credentials") or [] if credentials.get(k) in (None, "")]
+    missing = [k for k in meta.get("required_config") or [] if str((config or {}).get(k) or "").strip() == ""]
+    return missing + [k for k in meta.get("required_credentials") or [] if credentials.get(k) in (None, "")]
 
 
 def invalid_install_fields(connector_name: str, config: dict[str, Any], credentials: dict[str, Any]) -> list[str]:
     cls = connector_class(connector_name)
-    return cls.invalid_fields(config, credentials) if cls is not None else []
+    if cls is not None:
+        return cls.invalid_fields(config, credentials)
+    # A log_ingest entry may name config fields that must be an https origin.
+    meta = BUILTIN_CONNECTORS.get((connector_name or "").lower()) or {}
+    bad = []
+    for key in meta.get("https_config") or []:
+        value = (config or {}).get(key)
+        if value:
+            try:
+                https_origin(value, key)
+            except ValueError:
+                bad.append(key)
+    return bad
 
 
 def build_connector(connector_name: str, config: dict[str, Any], credentials: dict[str, Any]) -> BaseConnector:
@@ -208,7 +244,7 @@ BUILTIN_CONNECTORS = {
     "splunk": {
         "name": "splunk",
         "display_name": "Splunk Enterprise",
-        "description": "OPTIONAL INTEROP (planned, not in this release): pull events from an existing Splunk deployment. Not required; PySOAR has its own native SIEM.",
+        "description": "OPTIONAL INTEROP: search, saved searches and HEC on an existing Splunk deployment; the SIEM poller pulls its events. Not required; PySOAR has its own native SIEM.",
         "vendor": "Splunk",
         "category": IntegrationCategory.SIEM,
         "integration_role": "external_siem",
@@ -218,17 +254,20 @@ BUILTIN_CONNECTORS = {
     "qradar": {
         "name": "qradar",
         "display_name": "IBM QRadar",
-        "description": "OPTIONAL INTEROP (planned, not in this release): pull offenses from an existing QRadar deployment. Not required; PySOAR has its own native SIEM.",
+        "description": "OPTIONAL INTEROP: the SIEM poller pulls new offenses from an existing QRadar console (GET /api/siem/offenses). Not required; PySOAR has its own native SIEM.",
         "vendor": "IBM",
         "category": IntegrationCategory.SIEM,
         "integration_role": "external_siem",
         "auth_type": AuthType.API_KEY,
-        "supported_triggers": ["manual", "scheduled", "webhook"],
+        "supported_triggers": ["scheduled", "manual"],
+        "required_config": ["base_url"],
+        "https_config": ["base_url"],
+        "required_credentials": ["sec_token"],
     },
     "elastic": {
         "name": "elastic",
         "display_name": "Elastic Security",
-        "description": "OPTIONAL INTEROP (planned, not in this release): pull events from an existing Elastic / OpenSearch cluster. Not required; PySOAR has its own native SIEM.",
+        "description": "OPTIONAL INTEROP: search, count, read and index documents on an existing Elasticsearch cluster; the SIEM poller pulls its events. Not required; PySOAR has its own native SIEM.",
         "vendor": "Elastic",
         "category": IntegrationCategory.SIEM,
         "integration_role": "external_siem",
@@ -306,7 +345,7 @@ BUILTIN_CONNECTORS = {
     "microsoft_defender": {
         "name": "microsoft_defender",
         "display_name": "Microsoft Defender for Endpoint",
-        "description": "Endpoint detection and response from Microsoft",
+        "description": "Microsoft EDR: devices, alerts, isolation, antivirus scans, app restriction, investigation packages, alert updates",
         "vendor": "Microsoft",
         "category": IntegrationCategory.EDR,
         "auth_type": AuthType.OAUTH2,
@@ -417,7 +456,7 @@ BUILTIN_CONNECTORS = {
     "okta": {
         "name": "okta",
         "display_name": "Okta",
-        "description": "Identity and access management platform",
+        "description": "Identity provider: users, groups, MFA factors, System Log; suspend, deactivate, revoke sessions, expire password, reset factor",
         "vendor": "Okta",
         "category": IntegrationCategory.IDENTITY_PROVIDER,
         "auth_type": AuthType.API_KEY,
@@ -425,8 +464,8 @@ BUILTIN_CONNECTORS = {
     },
     "azure_ad": {
         "name": "azure_ad",
-        "display_name": "Azure Active Directory",
-        "description": "Identity and access management from Microsoft",
+        "display_name": "Microsoft Entra ID (Azure AD)",
+        "description": "Microsoft identity provider (Graph): users, sign-in logs, risky users; disable, revoke sessions, reset password, confirm or dismiss risk",
         "vendor": "Microsoft",
         "category": IntegrationCategory.IDENTITY_PROVIDER,
         "auth_type": AuthType.OAUTH2,
@@ -482,10 +521,10 @@ BUILTIN_CONNECTORS = {
     "microsoft_teams": {
         "name": "microsoft_teams",
         "display_name": "Microsoft Teams",
-        "description": "Unified communication and collaboration platform",
+        "description": "Post messages and alert cards to a channel through a Workflows or incoming webhook URL",
         "vendor": "Microsoft",
         "category": IntegrationCategory.COMMUNICATION,
-        "auth_type": AuthType.OAUTH2,
+        "auth_type": AuthType.CUSTOM,
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
     "smtp_email": {
@@ -680,6 +719,7 @@ class ConnectorRegistry:
             "supported_triggers": config["supported_triggers"],
             "implementation_status": status,
             "installable": status in (IMPLEMENTED, LOG_INGEST),
+            "ingest": has_ingest(name),
         }
         if cls is not None:
             config_fields = [_field_dict(f) for f in cls.CONFIG_FIELDS]
@@ -697,6 +737,7 @@ class ConnectorRegistry:
             })
         elif status == LOG_INGEST:
             required = list(config.get("required_credentials") or [])
+            required_config = list(config.get("required_config") or [])
             optional = list(config.get("optional_config") or [])
             credential_fields = [
                 {"name": k, "type": "password", "display_name": k, "description": None,
@@ -704,6 +745,10 @@ class ConnectorRegistry:
                 for k in required
             ]
             config_fields = [
+                {"name": k, "type": "string", "display_name": k, "description": None,
+                 "required": True, "default": None, "secret": False}
+                for k in required_config
+            ] + [
                 {"name": k, "type": "string", "display_name": k, "description": None,
                  "required": False, "default": None, "secret": False}
                 for k in optional

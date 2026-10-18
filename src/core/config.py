@@ -131,6 +131,42 @@ class Settings(BaseSettings):
                 return [cidr.strip() for cidr in raw.split(",") if cidr.strip()]
         return v
 
+    # Operator allow-list for outbound integration targets on private
+    # networks (on-premises Splunk / Elastic / QRadar and the like).
+    # ``src.integrations.netguard.resolve_and_vet`` refuses private
+    # addresses unless they fall inside one of these CIDRs; loopback,
+    # link-local, cloud metadata, multicast, unspecified and reserved
+    # addresses stay refused whatever the list says. Tenants cannot change
+    # it. Env: OUTBOUND_PRIVATE_ALLOWLIST as a JSON list or a
+    # comma-separated string; a malformed CIDR fails settings load.
+    outbound_private_allowlist: Annotated[List[str], NoDecode] = []
+
+    @field_validator("outbound_private_allowlist", mode="before")
+    @classmethod
+    def parse_outbound_private_allowlist(cls, v):
+        import ipaddress
+        import json
+
+        if v is None:
+            return []
+        if isinstance(v, str):
+            raw = v.strip()
+            if not raw:
+                return []
+            try:
+                v = json.loads(raw)
+            except json.JSONDecodeError:
+                v = [cidr.strip() for cidr in raw.split(",") if cidr.strip()]
+        if not isinstance(v, (list, tuple)):
+            raise ValueError("OUTBOUND_PRIVATE_ALLOWLIST must be a list of CIDRs")
+        networks: list[str] = []
+        for entry in v:
+            try:
+                networks.append(str(ipaddress.ip_network(str(entry).strip(), strict=False)))
+            except ValueError:
+                raise ValueError(f"OUTBOUND_PRIVATE_ALLOWLIST entry {str(entry)[:64]!r} is not a CIDR") from None
+        return networks
+
     @field_validator("database_ssl_mode")
     @classmethod
     def validate_database_ssl_mode(cls, v, info):

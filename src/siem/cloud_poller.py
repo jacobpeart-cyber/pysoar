@@ -7,6 +7,16 @@ nothing) with actual SDK calls into:
 * AWS CloudTrail (``boto3.client("cloudtrail").lookup_events``)
 * Azure Activity Log (``azure-mgmt-monitor`` ``activity_logs.list``)
 * GCP Cloud Logging (``google.cloud.logging.Client.list_entries``)
+* Splunk (one-shot search through ``SplunkConnector``), Elasticsearch
+  (``_search`` through ``ElasticConnector``) and QRadar (``/api/siem/offenses``)
+
+The Splunk, Elastic and QRadar requests go through ``PinnedTransport``
+(src/integrations/netguard.py) like every connector: the host is resolved
+once, internal addresses are refused (a private one only opens when the
+operator lists its network in ``OUTBOUND_PRIVATE_ALLOWLIST``), TLS
+verification is always on and redirects are not followed. A stored
+``verify_tls`` / ``ca_bundle`` from an earlier release is ignored and the
+poll says so in ``error_message``.
 
 Each poller dispatches every event through the existing SIEM pipeline
 ``process_log`` so detection rules, correlations, and alert generation
@@ -33,9 +43,15 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.integrations.connectors.base import (
+    ConnectorHTTPError,
+    REFUSED_INTERNAL,
+    sanitize_message,
+)
 from src.integrations.models import InstalledIntegration
 
 logger = logging.getLogger(__name__)
@@ -67,17 +83,14 @@ def _decrypt_config(integration: InstalledIntegration) -> dict[str, Any]:
         return {}
 
 
-def _tls_verify(config: dict[str, Any]) -> bool | str:
-    """httpx ``verify`` value for an integration: on by default (SC-8).
+TLS_OPT_OUT_IGNORED = "verify_tls/ca_bundle are no longer honoured"
 
-    ``ca_bundle`` (a path) wins when set; ``verify_tls: false`` is the explicit
-    opt-out for appliances with self-signed certificates. Nothing here
-    disables verification silently.
-    """
-    ca_bundle = config.get("ca_bundle")
-    if ca_bundle:
-        return str(ca_bundle)
-    return bool(config.get("verify_tls", True))
+
+def _tls_note(config: dict[str, Any]) -> Optional[str]:
+    """The note recorded when a stored config still carries the removed TLS opt-out."""
+    if "verify_tls" in config or "ca_bundle" in config:
+        return TLS_OPT_OUT_IGNORED
+    return None
 
 
 def _last_poll_cutoff(config: dict[str, Any], default_minutes: int = 60) -> datetime:
@@ -102,7 +115,7 @@ def _last_poll_cutoff(config: dict[str, Any], default_minutes: int = 60) -> date
 
 
 async def _persist_poll_marker(
-    db: AsyncSession, integration: InstalledIntegration, when: datetime
+    db: AsyncSession, integration: InstalledIntegration, when: datetime, note: Optional[str] = None,
 ) -> None:
     """Update last_poll_at + last_successful_action on the integration row."""
     config = _decrypt_config(integration)
@@ -110,8 +123,19 @@ async def _persist_poll_marker(
     integration.config_encrypted = json.dumps(config)
     integration.last_successful_action = when
     integration.health_status = "healthy"
-    integration.error_message = None
+    integration.error_message = note
     await db.flush()
+
+
+async def _record_poll_failure(
+    db: AsyncSession, integration: InstalledIntegration, reason: str, note: Optional[str] = None,
+) -> dict[str, Any]:
+    """Mark the integration unhealthy with a sanitised reason; nothing is ingested."""
+    text = f"{reason}; {note}" if note else reason
+    integration.health_status = "unhealthy"
+    integration.error_message = text[:500]
+    await db.flush()
+    return {"status": "error", "reason": text}
 
 
 # --------------------------------------------------------------------------- #
@@ -417,131 +441,185 @@ async def _ingest_cloud_events(
 # --------------------------------------------------------------------------- #
 
 
-async def poll_splunk(db: AsyncSession, integration: InstalledIntegration) -> dict[str, Any]:
-    """Pull recent Splunk events via a real-time search job.
+def _connector_failure(connector: Any, exc: Exception) -> str:
+    """A sanitised poll failure reason from a connector call (never a credential)."""
+    if isinstance(exc, ConnectorHTTPError):
+        if exc.status_code in (401, 403):
+            return f"authentication rejected (HTTP {exc.status_code})"
+        return connector.sanitize(exc.message)
+    message = getattr(exc, "message", None) or str(exc)
+    return connector.sanitize(message)
 
-    Required credentials:
-      * ``base_url`` (e.g. ``https://splunk.example.com:8089``)
-      * ``token`` (Splunk HEC or authentication token)
-    Optional config:
-      * ``search`` (SPL string — defaults to 'search index=* earliest=-5m')
+
+def _site_fields(creds: dict[str, Any], config: dict[str, Any], keys: tuple[str, ...]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Config and credentials for a connector class from a stored row.
+
+    Rows installed before the connector classes kept ``base_url`` among the
+    credentials; it is read from either place.
     """
-    import httpx
+    conn_config = {k: config[k] for k in keys if config.get(k) not in (None, "")}
+    if not conn_config.get("base_url") and creds.get("base_url"):
+        conn_config["base_url"] = creds["base_url"]
+    return conn_config, dict(creds)
+
+
+async def _poll_with_connector(
+    db: AsyncSession,
+    integration: InstalledIntegration,
+    connector_cls: Any,
+    config_keys: tuple[str, ...],
+    *,
+    default_minutes: int,
+    source_type: str,
+    source_name: Any,
+    ip_field: Optional[str],
+) -> dict[str, Any]:
+    """Shared Splunk / Elastic poll: the connector class makes the (pinned) calls."""
     creds = _decrypt_creds(integration)
     config = _decrypt_config(integration)
-    base_url = (creds.get("base_url") or config.get("base_url") or "").rstrip("/")
-    token = creds.get("token") or creds.get("api_key")
-    if not base_url or not token:
-        return {"status": "error", "reason": "Missing base_url / token"}
-    cutoff = _last_poll_cutoff(config, default_minutes=10)
+    note = _tls_note(config)
+    conn_config, conn_creds = _site_fields(creds, config, config_keys)
+    missing = connector_cls.missing_fields(conn_config, conn_creds)
+    invalid = connector_cls.invalid_fields(conn_config, conn_creds)
+    if missing or invalid:
+        problems = ([f"missing {', '.join(missing)}"] if missing else []) + ([f"invalid {', '.join(invalid)}"] if invalid else [])
+        return await _record_poll_failure(db, integration, "; ".join(problems), note)
+    connector = connector_cls(config=conn_config, credentials=conn_creds)
+    cutoff = _last_poll_cutoff(config, default_minutes=default_minutes)
     now = datetime.now(timezone.utc)
-    search = config.get("search") or f'search index=* earliest={int(cutoff.timestamp())} latest={int(now.timestamp())}'
     try:
-        async with httpx.AsyncClient(timeout=30.0, verify=_tls_verify(config), headers={"Authorization": f"Bearer {token}"}) as client:
-            r = await client.post(f"{base_url}/services/search/jobs", data={"search": search, "output_mode": "json", "exec_mode": "oneshot"})
-            r.raise_for_status()
-            data = r.json()
-            events = data.get("results", []) if isinstance(data, dict) else []
-    except Exception as exc:  # noqa: BLE001
-        integration.health_status = "unhealthy"
-        integration.error_message = str(exc)[:500]
-        await db.flush()
-        return {"status": "error", "reason": str(exc)}
+        events = await connector.fetch_events(cutoff, now)
+    except Exception as exc:  # noqa: BLE001 (a poll records the failure, never raises)
+        return await _record_poll_failure(db, integration, _connector_failure(connector, exc), note)
     ingested = await _ingest_cloud_events(
-        db, events, source_type="splunk", source_name="splunk",
-        organization_id=integration.organization_id, event_serializer=lambda e: e, ip_field="src_ip",
+        db, events, source_type=source_type,
+        source_name=source_name(connector) if callable(source_name) else source_name,
+        organization_id=integration.organization_id, event_serializer=lambda e: e, ip_field=ip_field,
     )
-    await _persist_poll_marker(db, integration, now)
-    return {"status": "ok", "events_fetched": len(events), "events_ingested": ingested}
+    await _persist_poll_marker(db, integration, now, note)
+    out: dict[str, Any] = {
+        "status": "ok", "events_fetched": len(events), "events_ingested": ingested,
+        "since": cutoff.isoformat(), "until": now.isoformat(),
+    }
+    if note:
+        out["note"] = note
+    return out
+
+
+async def poll_splunk(db: AsyncSession, integration: InstalledIntegration) -> dict[str, Any]:
+    """Pull Splunk events with a one-shot search (``SplunkConnector.fetch_events``).
+
+    Config: ``base_url`` (management port, https), optional ``search`` (SPL,
+    default ``search index=*``; the window is passed as earliest_time /
+    latest_time). Credentials: ``token`` (Bearer) or ``username`` +
+    ``password``. Every request is pinned; a private Splunk address must be
+    in ``OUTBOUND_PRIVATE_ALLOWLIST``.
+    """
+    from src.integrations.connectors.splunk import SplunkConnector
+
+    return await _poll_with_connector(
+        db, integration, SplunkConnector, ("base_url", "search"),
+        default_minutes=10, source_type="splunk", source_name="splunk", ip_field="src_ip",
+    )
 
 
 async def poll_elastic(db: AsyncSession, integration: InstalledIntegration) -> dict[str, Any]:
-    """Pull Elasticsearch docs added since last poll.
+    """Pull Elasticsearch documents in the poll window (``ElasticConnector.fetch_events``).
 
-    Required credentials:
-      * ``base_url`` (Elasticsearch / OpenSearch URL)
-      * ``api_key`` or (``username`` + ``password``)
-    Optional config:
-      * ``index`` (default ``logs-*``)
-      * ``timestamp_field`` (default ``@timestamp``)
+    Config: ``base_url`` (https), optional ``index`` (default ``logs-*``) and
+    ``timestamp_field`` (default ``@timestamp``). Credentials: ``api_key``
+    (ApiKey) or ``username`` + ``password``. Every request is pinned; a
+    private cluster address must be in ``OUTBOUND_PRIVATE_ALLOWLIST``.
     """
-    import httpx
-    creds = _decrypt_creds(integration)
-    config = _decrypt_config(integration)
-    base_url = (creds.get("base_url") or config.get("base_url") or "").rstrip("/")
-    api_key = creds.get("api_key")
-    user = creds.get("username"); pw = creds.get("password")
-    if not base_url or not (api_key or (user and pw)):
-        return {"status": "error", "reason": "Missing base_url and auth"}
-    index = config.get("index") or "logs-*"
-    ts_field = config.get("timestamp_field") or "@timestamp"
-    cutoff = _last_poll_cutoff(config, default_minutes=10)
-    now = datetime.now(timezone.utc)
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"ApiKey {api_key}"
-        auth = None
-    else:
-        auth = (user, pw)
-    query = {
-        "size": 500,
-        "sort": [{ts_field: "asc"}],
-        "query": {"range": {ts_field: {"gte": cutoff.isoformat(), "lte": now.isoformat()}}},
-    }
-    try:
-        async with httpx.AsyncClient(timeout=30.0, verify=_tls_verify(config), headers=headers, auth=auth) as client:
-            r = await client.post(f"{base_url}/{index}/_search", json=query)
-            r.raise_for_status()
-            hits = r.json().get("hits", {}).get("hits", [])
-            events = [h.get("_source", {}) for h in hits]
-    except Exception as exc:  # noqa: BLE001
-        integration.health_status = "unhealthy"
-        integration.error_message = str(exc)[:500]
-        await db.flush()
-        return {"status": "error", "reason": str(exc)}
-    ingested = await _ingest_cloud_events(
-        db, events, source_type="elastic", source_name=f"elastic/{index}",
-        organization_id=integration.organization_id, event_serializer=lambda e: e, ip_field="source.ip",
+    from src.integrations.connectors.elastic import ElasticConnector
+
+    return await _poll_with_connector(
+        db, integration, ElasticConnector, ("base_url", "index", "timestamp_field"),
+        default_minutes=10, source_type="elastic",
+        source_name=lambda c: f"elastic/{c.poll_index()}", ip_field="source.ip",
     )
-    await _persist_poll_marker(db, integration, now)
-    return {"status": "ok", "events_fetched": len(events), "events_ingested": ingested}
+
+
+QRADAR_API_VERSION = "12.0"
+QRADAR_MAX_OFFENSES = 500
+
+
+def _refusal_text(exc: httpx.ConnectError) -> Optional[str]:
+    """The tenant-safe refusal reason when PinnedTransport refused the target, else None."""
+    text = str(exc)
+    if "outbound target refused" not in text:
+        return None
+    detail = text.split("outbound target refused:", 1)[-1].strip()
+    if "internal address" in detail or "blocked" in detail:
+        return REFUSED_INTERNAL
+    return "refused: " + sanitize_message(detail)
 
 
 async def poll_qradar(db: AsyncSession, integration: InstalledIntegration) -> dict[str, Any]:
-    """Pull recent QRadar offenses via the Ariel /api/siem/offenses endpoint.
+    """Pull QRadar offenses that started since the last poll (GET /api/siem/offenses).
 
-    Required credentials:
-      * ``base_url`` (e.g. ``https://qradar.example.com``)
-      * ``sec_token`` (QRadar SEC token from Admin → User Mgmt)
+    Config: ``base_url`` (https, the console). Credentials: ``sec_token``
+    (an authorized service token, sent in the ``SEC`` header). QRadar REST
+    API reference, ``/siem/offenses`` (filter on ``start_time`` in epoch
+    milliseconds, ``Range: items=0-499``). The request is pinned, TLS is
+    verified and redirects are not followed; a private console address must
+    be in ``OUTBOUND_PRIVATE_ALLOWLIST``.
     """
-    import httpx
+    from src.integrations.connectors.splunk import https_origin
+    from src.integrations.netguard import PinnedTransport
+
     creds = _decrypt_creds(integration)
     config = _decrypt_config(integration)
-    base_url = (creds.get("base_url") or config.get("base_url") or "").rstrip("/")
+    note = _tls_note(config)
+    raw_base = config.get("base_url") or creds.get("base_url")
     sec_token = creds.get("sec_token") or creds.get("api_key") or creds.get("token")
-    if not base_url or not sec_token:
-        return {"status": "error", "reason": "Missing base_url / sec_token"}
+    if not raw_base or not sec_token:
+        return await _record_poll_failure(db, integration, "missing base_url / sec_token", note)
+    try:
+        base_url = https_origin(raw_base, "base_url")
+    except ValueError as exc:
+        return await _record_poll_failure(db, integration, str(exc), note)
     cutoff = _last_poll_cutoff(config, default_minutes=10)
     now = datetime.now(timezone.utc)
-    headers = {"SEC": sec_token, "Version": "12.0", "Accept": "application/json"}
-    # QRadar epoch ms filter on start_time
-    filter_str = f"start_time>={int(cutoff.timestamp() * 1000)}"
+    headers = {
+        "SEC": str(sec_token),
+        "Version": QRADAR_API_VERSION,
+        "Accept": "application/json",
+        "Range": f"items=0-{QRADAR_MAX_OFFENSES - 1}",
+    }
+    params = {"filter": f"start_time>={int(cutoff.timestamp() * 1000)}"}
+    secrets = [str(sec_token)]
     try:
-        async with httpx.AsyncClient(timeout=30.0, verify=_tls_verify(config), headers=headers) as client:
-            r = await client.get(f"{base_url}/api/siem/offenses", params={"filter": filter_str})
-            r.raise_for_status()
-            events = r.json() if isinstance(r.json(), list) else []
-    except Exception as exc:  # noqa: BLE001
-        integration.health_status = "unhealthy"
-        integration.error_message = str(exc)[:500]
-        await db.flush()
-        return {"status": "error", "reason": str(exc)}
+        async with httpx.AsyncClient(
+            timeout=30.0, transport=PinnedTransport(private_hint=True), follow_redirects=False,
+        ) as client:
+            r = await client.get(f"{base_url}/api/siem/offenses", params=params, headers=headers)
+        if r.status_code in (401, 403):
+            return await _record_poll_failure(db, integration, f"authentication rejected (HTTP {r.status_code})", note)
+        if not 200 <= r.status_code < 300:
+            # Includes 3xx: redirects are not followed.
+            return await _record_poll_failure(db, integration, f"HTTP {r.status_code}", note)
+        body = r.json()
+        events = body if isinstance(body, list) else []
+    except httpx.ConnectError as exc:
+        reason = _refusal_text(exc) or "connection failed"
+        return await _record_poll_failure(db, integration, reason, note)
+    except httpx.TimeoutException:
+        return await _record_poll_failure(db, integration, "timed out after 30s", note)
+    except (httpx.RequestError, ValueError) as exc:
+        return await _record_poll_failure(db, integration, sanitize_message(f"request failed: {type(exc).__name__}", secrets), note)
     ingested = await _ingest_cloud_events(
         db, events, source_type="qradar", source_name="qradar",
         organization_id=integration.organization_id, event_serializer=lambda e: e, ip_field="source_address_ids",
     )
-    await _persist_poll_marker(db, integration, now)
-    return {"status": "ok", "events_fetched": len(events), "events_ingested": ingested}
+    await _persist_poll_marker(db, integration, now, note)
+    out: dict[str, Any] = {
+        "status": "ok", "events_fetched": len(events), "events_ingested": ingested,
+        "since": cutoff.isoformat(), "until": now.isoformat(),
+    }
+    if note:
+        out["note"] = note
+    return out
 
 
 _CLOUD_CONNECTOR_DISPATCH = {

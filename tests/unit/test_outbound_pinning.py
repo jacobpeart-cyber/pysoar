@@ -227,7 +227,7 @@ async def test_resolve_generic_target_returns_pinned_url_and_kwargs(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_probe_of_planned_connector_makes_no_network_call(monkeypatch):
-    """Splunk / generic webhooks have no connector class: the probe answers
+    """Wazuh / generic webhooks have no connector class: the probe answers
     ``unavailable`` and never builds a client or resolves a name."""
     class _NeverConnect:
         def __init__(self, *args, **kwargs):
@@ -240,7 +240,7 @@ async def test_probe_of_planned_connector_makes_no_network_call(monkeypatch):
     monkeypatch.setattr(netguard, "_getaddrinfo", _no_dns)
     manager = IntegrationManager(ConnectorRegistry())
 
-    for name, config in (("splunk", {"base_url": "https://splunk.customer.example:8089"}),
+    for name, config in (("wazuh", {"base_url": "https://wazuh.customer.example:55000"}),
                          ("webhook", {"webhook_url": "https://hooks.attacker.example/x"})):
         health, message = await manager._probe_connector(name, config, {"token": "t"})
         assert health == "unavailable" and "no connector implementation" in message

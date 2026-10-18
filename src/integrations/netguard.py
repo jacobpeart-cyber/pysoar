@@ -21,6 +21,14 @@ httpcore 1.0 has no separate ``server_hostname`` request extension; the
 Redirects are never followed automatically by callers in this package; the
 ``PinnedTransport`` below re-vets every request it sends, so a client built on
 it is safe even if a redirect is followed.
+
+On-premises targets: a private address (RFC 1918, IPv6 ULA, carrier-grade NAT
+and the other not-globally-routable unicast ranges) is refused unless it lies
+inside a CIDR of the operator setting ``OUTBOUND_PRIVATE_ALLOWLIST``
+(``settings.outbound_private_allowlist``, read on every call; tenants cannot
+change it). Loopback, link-local (169.254/16, fe80::/10), the cloud metadata
+addresses (169.254.169.254, fd00:ec2::254), multicast, unspecified (0/8, ::)
+and reserved addresses stay refused whatever the list says.
 """
 
 from __future__ import annotations
@@ -34,6 +42,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from src.core.config import settings
 from src.core.url_validator import BLOCKED_HOSTNAMES
 
 IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
@@ -50,8 +59,29 @@ _EXTRA_BLOCKED_NETWORKS = (
 )
 
 
+# Addresses no OUTBOUND_PRIVATE_ALLOWLIST entry can open, in addition to the
+# loopback / link-local / multicast / unspecified / reserved address flags.
+# 169.254/16 holds the IPv4 metadata service (169.254.169.254) and
+# fd00:ec2::/32 the AWS IPv6 one (fd00:ec2::254), which sits inside the ULA
+# range fc00::/7 and so must be named; 0/8 is "this network".
+_NEVER_ALLOWED_NETWORKS = (
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("fd00:ec2::/32"),
+)
+
+PRIVATE_ALLOWLIST_SETTING = "OUTBOUND_PRIVATE_ALLOWLIST"
+PRIVATE_TARGET_HINT = (
+    f"target resolves to a private address; add its network to {PRIVATE_ALLOWLIST_SETTING} to allow it"
+)
+
+
 class OutboundTargetRefused(ValueError):  # noqa: N818 (public name kept for existing callers)
     """An outbound target is outside the allowed scope or resolves to an internal address."""
+
+
+class PrivateTargetRefused(OutboundTargetRefused):
+    """The target resolves to a private address that OUTBOUND_PRIVATE_ALLOWLIST does not cover."""
 
 
 def refusal_reason(ip: IPAddress) -> Optional[str]:
@@ -80,6 +110,52 @@ def refusal_reason(ip: IPAddress) -> Optional[str]:
         if hit:
             return f"{ip} is a {label} address"
     return None
+
+
+def never_allowed_reason(ip: IPAddress) -> Optional[str]:
+    """Why ``ip`` is refused even when an allow-list entry covers it, or None."""
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        reason = never_allowed_reason(mapped)
+        return f"{reason} (IPv4-mapped)" if reason else None
+    for net in _NEVER_ALLOWED_NETWORKS:
+        if ip.version == net.version and ip in net:
+            return f"{ip} is in blocked range {net}"
+    checks = (
+        ("loopback", ip.is_loopback),
+        ("link-local", ip.is_link_local),
+        ("multicast", ip.is_multicast),
+        ("unspecified", ip.is_unspecified),
+        ("reserved", ip.is_reserved),
+    )
+    for label, hit in checks:
+        if hit:
+            return f"{ip} is a {label} address"
+    return None
+
+
+def _allowlist() -> list[Any]:
+    """The operator allow-list as networks, read from settings on every call."""
+    networks = []
+    for entry in getattr(settings, "outbound_private_allowlist", None) or []:
+        try:
+            networks.append(ipaddress.ip_network(str(entry).strip(), strict=False))
+        except ValueError:
+            continue  # the settings validator refuses these at load; a bad entry never widens access
+    return networks
+
+
+def allowlisted(ip: IPAddress) -> bool:
+    """True when ``ip`` may be contacted although it is private.
+
+    It must lie inside an OUTBOUND_PRIVATE_ALLOWLIST network and not be one
+    of the never-allowed addresses (``never_allowed_reason``).
+    """
+    if never_allowed_reason(ip) is not None:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    candidate = mapped if mapped is not None else ip
+    return any(candidate.version == net.version and candidate in net for net in _allowlist())
 
 
 @dataclass(frozen=True)
@@ -163,8 +239,11 @@ async def resolve_and_vet(url: str) -> VettedTarget:
     """Resolve ``url``'s host once, refuse internal addresses, return the pinned target.
 
     Every address in the DNS answer must be acceptable (an answer that mixes
-    public and internal addresses is refused); the first one is used.
-    Raises OutboundTargetRefused.
+    public and internal addresses is refused); the first one is used. A
+    private address inside an OUTBOUND_PRIVATE_ALLOWLIST network is
+    acceptable; one outside it raises ``PrivateTargetRefused`` (a subclass of
+    OutboundTargetRefused) whose message names the setting. Raises
+    OutboundTargetRefused.
     """
     parts = urlsplit(str(url).strip())
     scheme = parts.scheme.lower()
@@ -203,8 +282,14 @@ async def resolve_and_vet(url: str) -> VettedTarget:
 
     for ip in addresses:
         reason = refusal_reason(ip)
-        if reason:
-            raise OutboundTargetRefused(f"{hostname} resolves to an internal address: {reason}")
+        if not reason:
+            continue
+        if never_allowed_reason(ip) is None:
+            # Private but not never-allowed: the operator allow-list decides.
+            if allowlisted(ip):
+                continue
+            raise PrivateTargetRefused(f"{hostname} resolves to an internal address ({ip}): {PRIVATE_TARGET_HINT}")
+        raise OutboundTargetRefused(f"{hostname} resolves to an internal address: {reason}")
 
     chosen = str(addresses[0])
     return VettedTarget(
@@ -250,14 +335,30 @@ class PinnedTransport(httpx.AsyncBaseTransport):
     is resolved once, checked and sent to the vetted IP. A refused target
     raises ``httpx.ConnectError`` so existing httpx error handling reports it
     as a failed connection.
+
+    ``private_hint=True`` reports a private target outside the allow-list as
+    ``outbound target refused: <PRIVATE_TARGET_HINT>`` (no hostname, no
+    address), so a connector built for on-premises products tells the
+    operator which setting opens it without echoing the resolved address to
+    the tenant.
     """
 
-    def __init__(self, inner: Optional[httpx.AsyncBaseTransport] = None, **transport_kwargs: Any) -> None:
+    def __init__(
+        self,
+        inner: Optional[httpx.AsyncBaseTransport] = None,
+        *,
+        private_hint: bool = False,
+        **transport_kwargs: Any,
+    ) -> None:
         self._inner = inner or httpx.AsyncHTTPTransport(**transport_kwargs)
+        self._private_hint = private_hint
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         try:
             target = await resolve_and_vet(str(request.url))
+        except PrivateTargetRefused as exc:
+            text = PRIVATE_TARGET_HINT if self._private_hint else str(exc)
+            raise httpx.ConnectError(f"outbound target refused: {text}", request=request) from exc
         except OutboundTargetRefused as exc:
             raise httpx.ConnectError(f"outbound target refused: {exc}", request=request) from exc
         pinned = pinned_request_kwargs(target)

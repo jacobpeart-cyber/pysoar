@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from src.schemas.base import DBModel
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 # Connector schemas
@@ -48,6 +48,10 @@ class ConnectorResponse(ConnectorBase, DBModel):
     (0 or 1). ``rating``, ``is_community`` and ``last_updated`` are not
     marketplace statistics: there is no marketplace service, so they are
     always None / False / None.
+
+    ``ingest`` is true when the SIEM cloud poller (src/siem/cloud_poller.py)
+    pulls this connector's events: every ``log_ingest`` source, and the
+    implemented Splunk and Elastic connectors, which also have actions.
     """
 
     id: str = ""
@@ -72,6 +76,15 @@ class ConnectorResponse(ConnectorBase, DBModel):
     actions: list[ConnectorActionSummary] = []
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ingest(self) -> bool:
+        # Derived from the code (engine.INGEST_CONNECTORS), like
+        # implementation_status; imported here to avoid an import cycle.
+        from src.integrations.engine import has_ingest
+
+        return has_ingest(self.name)
 
     class Config:
         from_attributes = True

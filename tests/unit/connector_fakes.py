@@ -42,6 +42,24 @@ VALID_FIELDS: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {
         "resource_group": "rg-sec",
         "workspace_id": "ws-sec",
     }),
+    "okta": ({}, {"domain": "acme.okta.com", "api_token": "okta-fixture-token-0001"}),
+    "azure_ad": ({}, {
+        "tenant_id": "contoso.onmicrosoft.com",
+        "client_id": "00000000-0000-0000-0000-000000000003",
+        "client_secret": "entra-fixture-secret-0001",
+    }),
+    "microsoft_defender": ({}, {
+        "tenant_id": "contoso.onmicrosoft.com",
+        "client_id": "00000000-0000-0000-0000-000000000004",
+        "client_secret": "mde-fixture-secret-0001",
+    }),
+    "microsoft_teams": ({}, {
+        "webhook_url": "https://acme.webhook.office.com/webhookb2/fixture-0001@fixture/IncomingWebhook/fixture/fixture-sig-0001",
+    }),
+    # Splunk and Elastic need a credential pair but declare none required
+    # (token, or username + password; api_key, or username + password).
+    "splunk": ({"base_url": "https://splunk.acme.example"}, {"token": "splunk-fixture-token-0001"}),
+    "elastic": ({"base_url": "https://es.acme.example"}, {"api_key": "es-fixture-apikey-0001"}),
 }
 
 

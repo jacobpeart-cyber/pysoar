@@ -191,9 +191,9 @@ async def test_engine_callers_get_honest_failures(client, db_session, org_a, org
     """What playbooks, containment, remediation and the agent tools see."""
     from src.playbooks.actions import ExecuteIntegrationAction
 
-    await ensure_connector_rows(db_session, "okta")
+    await ensure_connector_rows(db_session, "cyberark")
     planned = InstalledIntegration(
-        organization_id=org_a.id, connector_id="okta", display_name="Okta",
+        organization_id=org_a.id, connector_id="cyberark", display_name="CyberArk",
         config_encrypted="{}", auth_credentials_encrypted="", status="active",
     )
     db_session.add(planned)
@@ -203,7 +203,7 @@ async def test_engine_callers_get_honest_failures(client, db_session, org_a, org
 
     result = await ActionExecutor().execute_action(planned_id, "disable_user", {"username": "jdoe"})
     assert result["status"] == "failed" and result["error_code"] == "not_implemented"
-    assert "Okta has no connector implementation" in result["error_message"]
+    assert "CyberArk has no connector implementation" in result["error_message"]
 
     result = await ActionExecutor().execute_action(cs, "isolate", {"device_id": "d-1"})
     assert result["status"] == "failed" and result["error_code"] == "unknown_action"

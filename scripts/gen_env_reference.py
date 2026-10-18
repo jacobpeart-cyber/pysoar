@@ -102,6 +102,11 @@ VALIDATOR_DESCRIPTIONS = {
     "parse_ot_discovery_allowed_cidrs": (
         "A JSON list, or a comma-separated string; empty means `[]`."
     ),
+    "parse_outbound_private_allowlist": (
+        "A JSON list, or a comma-separated string, of CIDRs; empty means `[]`. "
+        "Each entry is normalised to its network (host bits dropped); an entry "
+        "that is not a CIDR fails settings load."
+    ),
     "validate_database_ssl_mode": (
         "When `APP_ENV=production`, must be `require`, `verify-full` or "
         "`disable`, or the settings fail to load (every process that imports "
@@ -122,6 +127,21 @@ class ProductionRule:
 
 
 PRODUCTION_RULES = (
+    ProductionRule(
+        ("outbound_private_allowlist",),
+        "Outbound integration calls (connectors, the SIEM pollers for Splunk, "
+        "Elastic and QRadar, and every other caller of the netguard) refuse a "
+        "target that resolves to a private address (RFC 1918, IPv6 ULA, "
+        "100.64/10 and other non-global unicast) unless the address is inside "
+        "one of these networks. Loopback, link-local (169.254/16, fe80::/10), "
+        "the cloud metadata addresses (169.254.169.254, fd00:ec2::254), "
+        "multicast, unspecified and reserved addresses stay refused whatever "
+        "the list says. Operator-level: tenants cannot change it. Read on "
+        "every call.",
+        "src/integrations/netguard.py",
+        'getattr(settings, "outbound_private_allowlist", None)',
+        production=False,
+    ),
     ProductionRule(
         ("app_env",),
         "`production` (exact string) arms every rule marked Production in this "

@@ -99,7 +99,10 @@ def test_declared_fields_cover_every_key_the_class_reads(name: str) -> None:
 
     config, credentials = VALID_FIELDS[name]
     required = {f.name for f in cls.CONFIG_FIELDS + cls.CREDENTIAL_FIELDS if f.required}
-    assert required == set(config) | set(credentials), name
+    # An either-or credential (Splunk token or username + password) is
+    # declared optional; VALID_FIELDS supplies one alternative of it.
+    optional_supplied = {f.name for f in cls.CREDENTIAL_FIELDS if not f.required} & set(credentials)
+    assert required == (set(config) | set(credentials)) - optional_supplied, name
     assert cls(config=dict(config), credentials=dict(credentials)).is_configured
     for field in sorted(required):
         partial_config = {k: v for k, v in config.items() if k != field}
@@ -170,9 +173,9 @@ async def test_catalogue_routes_expose_status_fields_and_org_install_count(
     assert vt["actions"] and vt["actions"][0]["params_schema"]["type"] == "object"
     assert [f["name"] for f in vt["credential_fields"]] == ["api_key"] and vt["credential_fields"][0]["secret"] is True
     assert vt["install_count"] == 0 and vt["rating"] is None and vt["is_community"] is False and vt["last_updated"] is None
-    splunk = items["splunk"]
-    assert splunk["implementation_status"] == "planned" and splunk["installable"] is False
-    assert splunk["supported_actions"] == [] and splunk["verification"] == "not implemented in this release"
+    wazuh = items["wazuh"]
+    assert wazuh["implementation_status"] == "planned" and wazuh["installable"] is False
+    assert wazuh["supported_actions"] == [] and wazuh["verification"] == "not implemented in this release"
 
     filtered = await client.get(f"{BASE}/connectors", params={"size": 100, "implementation": "implemented"}, headers=org_a_admin_headers)
     assert {c["name"] for c in filtered.json()["items"]} == set(CONNECTOR_CLASS_MAP)
@@ -196,13 +199,13 @@ async def test_catalogue_routes_expose_status_fields_and_org_install_count(
 async def test_planned_connector_install_is_501(client, org_a_admin_headers) -> None:
     resp = await client.post(
         f"{BASE}/install",
-        json={"connector_id": "splunk", "display_name": "Splunk", "config": {"base_url": "https://splunk.example"}, "credentials": {"token": "t"}},
+        json={"connector_id": "wazuh", "display_name": "Wazuh", "config": {"base_url": "https://wazuh.example"}, "credentials": {"token": "t"}},
         headers=org_a_admin_headers,
     )
     assert resp.status_code == 501, resp.text
     assert _detail(resp) == {
         "error": "not_implemented",
-        "detail": "Splunk Enterprise has no connector implementation in this release",
+        "detail": "Wazuh has no connector implementation in this release",
     }
 
 
@@ -260,15 +263,15 @@ async def test_install_and_update_refuse_missing_fields_naming_them(client, db_s
 
 @pytest.mark.asyncio
 async def test_existing_planned_row_is_unavailable_and_cannot_act(client, db_session, org_a, org_a_admin_headers, org_a_headers) -> None:
-    await ensure_connector_rows(db_session, "okta")
+    await ensure_connector_rows(db_session, "cyberark")
     row = InstalledIntegration(
-        organization_id=org_a.id, connector_id="okta", display_name="Okta (installed before this release)",
+        organization_id=org_a.id, connector_id="cyberark", display_name="CyberArk (installed before this release)",
         config_encrypted="{}", auth_credentials_encrypted="", status="active",
     )
     db_session.add(row)
     await db_session.commit()
     inst = f"{BASE}/installed/{row.id}"
-    assert implementation_status("okta") == PLANNED
+    assert implementation_status("cyberark") == PLANNED
 
     got = await client.get(inst, headers=org_a_headers)
     assert got.status_code == 200 and got.json()["health_status"] == "unavailable"
@@ -280,7 +283,7 @@ async def test_existing_planned_row_is_unavailable_and_cannot_act(client, db_ses
     actions = await client.get(f"{inst}/actions", headers=org_a_headers)
     assert actions.status_code == 200 and actions.json()["items"] == []
     execute = await client.post(f"{inst}/actions/whatever/execute", json={"input_data": {}}, headers=org_a_headers)
-    assert execute.status_code == 501 and "Okta has no connector implementation" in _detail(execute)["detail"]
+    assert execute.status_code == 501 and "CyberArk has no connector implementation" in _detail(execute)["detail"]
 
     assert (await client.delete(inst, headers=org_a_admin_headers)).status_code == 204
     assert (await client.get(inst, headers=org_a_headers)).status_code == 404
