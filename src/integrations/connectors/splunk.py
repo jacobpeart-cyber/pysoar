@@ -84,13 +84,70 @@ _READ_ONLY_SPL = frozenset({
     "sort", "head", "tail", "rex", "regex", "timechart", "chart", "top", "rare", "dedup", "lookup",
     "inputlookup", "transaction", "rename", "fillnull", "mvexpand", "mvcombine", "spath", "bin",
     "bucket", "join", "append", "appendcols", "makemv", "convert", "iplocation", "geostats",
-    "addtotals", "reverse", "xyseries", "untable", "makeresults", "from", "datamodel", "metadata",
+    "addtotals", "reverse", "xyseries", "untable", "makeresults", "datamodel",
     "multisearch", "nomv", "replace", "rangemap", "strcat", "transpose", "uniq", "filldown",
     "addinfo", "localop", "noop", "fieldformat", "sitimechart", "timewrap", "predict", "trendline",
     "cluster", "kmeans", "anomalies", "outlier", "contingency", "correlate", "diff", "highlight",
     "iconify", "accum", "autoregress", "delta", "xmlkv", "kv", "extract", "erex", "multikv",
-    "tags", "typer", "eventcount", "metasearch", "set", "history", "loadjob",
+    "tags", "typer", "eventcount", "set",
 })
+# Deliberately absent: ``from`` (``from savedsearch:<name>`` runs a saved search
+# and its alert actions), ``loadjob`` / ``history`` / ``metadata`` /
+# ``metasearch`` (other users' jobs and index metadata), ``savedsearch``,
+# ``map``, ``rest``, ``delete``, ``collect``, ``outputlookup``, ``sendemail``,
+# ``script``, custom commands, and every macro.
+
+
+def check_read_only_spl(spl: str) -> None:
+    """Raise ``ValueError`` unless every command in ``spl`` is allow-listed.
+
+    A command is the first bare word after the start, after each ``|`` and
+    after each ``[`` (a subsearch can open anywhere in a segment). Double
+    quoted strings are skipped so a ``|`` or ``[`` inside a value is not a
+    separator. Backtick macros, an unterminated quote and an empty pipeline
+    segment are refused: the guard fails closed.
+    """
+    if "`" in spl:
+        raise ValueError("search is read-only: SPL macros (`...`) are not allowed")
+    i, n = 0, len(spl)
+    expect_command = True
+    in_quote = False
+    while i < n:
+        ch = spl[i]
+        if in_quote:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == '"':
+                in_quote = False
+            i += 1
+            continue
+        if ch == '"':
+            in_quote = True
+            i += 1
+            continue
+        if ch in "|[":
+            expect_command = True
+            i += 1
+            continue
+        if ch.isspace() or ch == "]":
+            i += 1
+            continue
+        if expect_command:
+            j = i
+            while j < n and not spl[j].isspace() and spl[j] not in '|[]"':
+                j += 1
+            command = spl[i:j].lower()
+            if command not in _READ_ONLY_SPL:
+                raise ValueError(f"search is read-only: SPL command '{command}' is not allowed")
+            expect_command = False
+            i = j
+            continue
+        i += 1
+    if in_quote:
+        raise ValueError("search is read-only: unterminated quoted string")
+    if expect_command:
+        raise ValueError("search is read-only: empty pipeline segment")
 
 
 class SplunkConnector(BaseConnector):
@@ -272,23 +329,10 @@ class SplunkConnector(BaseConnector):
         if not text:
             raise ValueError("search must not be empty")
         # The action is declared read-only (analysts may run it): every
-        # pipeline segment, including those inside [subsearches], must start
-        # with an allow-listed read-only command, and macros (`name`) are
-        # refused because they expand server-side to anything.
-        if "`" in text:
-            raise ValueError("search is read-only: SPL macros (`...`) are not allowed")
+        # command, including those opening a [subsearch] anywhere, must be on
+        # the allow list; macros are refused (see check_read_only_spl).
         spl = text if text.startswith("|") or text.lower().startswith("search") else f"search {text}"
-        for index, segment in enumerate(spl.split("|")):
-            body = segment.strip()
-            while body.startswith("["):
-                body = body[1:].strip()
-            if not body:
-                if index == 0:
-                    continue  # a leading "|" (generating command follows)
-                raise ValueError("search is read-only: empty pipeline segment")
-            command = body.split()[0].lower().rstrip("]")
-            if command not in _READ_ONLY_SPL:
-                raise ValueError(f"search is read-only: SPL command '{command}' is not allowed")
+        check_read_only_spl(spl)
         return spl
 
     async def search(

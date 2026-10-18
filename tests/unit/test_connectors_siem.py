@@ -653,6 +653,15 @@ async def test_qradar_poller_401(db_session, org_a, monkeypatch) -> None:
     "index=main | `exfil_macro`",
     "index=main | mycustomcommand arg=1",
     "index=main | stats count | ",
+    "index=main [delete]",                                   # subsearch opened mid-segment
+    "index=main | stats count [ | delete ]",
+    "index=main [ search index=y [ | collect index=z ] ]",   # nested
+    "| from savedsearch:\"Nightly purge\"",                  # runs a saved search
+    "| from savedsearch:nightly",
+    "| loadjob 1697000000.123",
+    "| history",
+    "| metadata type=hosts",
+    'index=main | eval note="unterminated | stats count',
 ])
 async def test_splunk_search_refuses_state_changing_spl(monkeypatch, spl: str) -> None:
     """The ``search`` action is declared read-only (analysts can run it), so a
@@ -682,6 +691,9 @@ async def test_splunk_search_allows_read_only_pipelines(monkeypatch) -> None:
     "index=main [ search index=assets | fields host ] | table host",
     "| inputlookup threat_list.csv | where severity=\"high\"",
     "sourcetype=auth | timechart span=1h count by action",
+    'index=main | eval note="a|b [c]" | stats count by note',   # separators inside a quoted value
+    'index=main | where like(user, "%|%") | head 5',
+    "| datamodel Authentication search | stats count",
 ])
 async def test_splunk_search_accepts_common_read_only_shapes(monkeypatch, spl: str) -> None:
     seen = fake_vendor(monkeypatch, lambda request: httpx.Response(200, json={"results": []}))
