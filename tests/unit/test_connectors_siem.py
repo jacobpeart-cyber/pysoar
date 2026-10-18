@@ -662,6 +662,9 @@ async def test_qradar_poller_401(db_session, org_a, monkeypatch) -> None:
     "| history",
     "| metadata type=hosts",
     'index=main | eval note="unterminated | stats count',
+    'search a=\\" | delete | eval x="y\\" z"',                 # backslash outside quotes
+    'index=main foo\\" [ | collect index=z ] x="q\\" r"',
+    'index=main | eval p="C:\\\\temp" | rex "\\d+" | delete',   # escapes inside quotes still scan the rest
 ])
 async def test_splunk_search_refuses_state_changing_spl(monkeypatch, spl: str) -> None:
     """The ``search`` action is declared read-only (analysts can run it), so a
@@ -694,6 +697,7 @@ async def test_splunk_search_allows_read_only_pipelines(monkeypatch) -> None:
     'index=main | eval note="a|b [c]" | stats count by note',   # separators inside a quoted value
     'index=main | where like(user, "%|%") | head 5',
     "| datamodel Authentication search | stats count",
+    'index=main | rex field=_raw "user=(?<user>\\S+)" | stats count by user',   # backslash inside quotes is fine
 ])
 async def test_splunk_search_accepts_common_read_only_shapes(monkeypatch, spl: str) -> None:
     seen = fake_vendor(monkeypatch, lambda request: httpx.Response(200, json={"results": []}))

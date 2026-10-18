@@ -104,8 +104,9 @@ def check_read_only_spl(spl: str) -> None:
     A command is the first bare word after the start, after each ``|`` and
     after each ``[`` (a subsearch can open anywhere in a segment). Double
     quoted strings are skipped so a ``|`` or ``[`` inside a value is not a
-    separator. Backtick macros, an unterminated quote and an empty pipeline
-    segment are refused: the guard fails closed.
+    separator. Backtick macros, an unterminated quote, a backslash outside a
+    quoted string and an empty pipeline segment are refused: the guard fails
+    closed.
     """
     if "`" in spl:
         raise ValueError("search is read-only: SPL macros (`...`) are not allowed")
@@ -126,6 +127,11 @@ def check_read_only_spl(spl: str) -> None:
             in_quote = True
             i += 1
             continue
+        if ch == "\\":
+            # Outside a quoted string Splunk's escape handling differs from a
+            # naive scanner (a \" could open or not open a string); refuse
+            # rather than guess.
+            raise ValueError("search is read-only: a backslash outside a quoted string is not allowed")
         if ch in "|[":
             expect_command = True
             i += 1
