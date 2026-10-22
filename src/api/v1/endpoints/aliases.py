@@ -49,6 +49,7 @@ async def _safe_list(
     order_by=None,
     filters: Optional[List] = None,
     include_platform_rows: bool = False,
+    exclude: Optional[set] = None,
 ) -> Dict[str, Any]:
     """Generic paginated list query, scoped to ``org_id``.
 
@@ -91,7 +92,7 @@ async def _safe_list(
     result = await db.execute(stmt)
     rows = list(result.scalars().all())
 
-    items = [_row_to_dict(r) for r in rows]
+    items = [_row_to_dict(r, exclude) for r in rows]
     return {
         "items": items,
         "total": total,
@@ -101,13 +102,16 @@ async def _safe_list(
     }
 
 
-def _row_to_dict(row: Any) -> Dict[str, Any]:
-    """Best-effort SQLAlchemy row -> plain dict."""
+def _row_to_dict(row: Any, exclude: Optional[set] = None) -> Dict[str, Any]:
+    """Best-effort SQLAlchemy row -> plain dict; ``exclude`` names columns that must never leave the server (secret hashes)."""
+    exclude = exclude or set()
     try:
         mapper = getattr(row, "__mapper__", None)
         if mapper is not None:
             d: Dict[str, Any] = {}
             for col in mapper.columns:
+                if col.key in exclude:
+                    continue
                 val = getattr(row, col.key, None)
                 if isinstance(val, datetime):
                     d[col.key] = val.isoformat()
@@ -117,7 +121,7 @@ def _row_to_dict(row: Any) -> Dict[str, Any]:
     except Exception as exc:
         logger.debug("SQLAlchemy row mapping failed; falling back to public attrs", error=str(exc))
     # Fallback: pull public attrs
-    return {k: v for k, v in vars(row).items() if not k.startswith("_") and not callable(v)}
+    return {k: v for k, v in vars(row).items() if not k.startswith("_") and not callable(v) and k not in exclude}
 
 
 # --------------------------------------------------------------------------
@@ -296,7 +300,7 @@ async def integrations_webhooks_flat(
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
 ):
-    """Flat list of webhooks across all integrations."""
+    """Flat list of webhooks across all integrations (the shared secret's hash never leaves the server)."""
     from src.integrations.models import WebhookEndpoint
 
     return await _safe_list(
@@ -305,6 +309,7 @@ async def integrations_webhooks_flat(
         org_id=_org_id(current_user),
         page=page,
         size=size,
+        exclude={"secret_hash"},
     )
 
 

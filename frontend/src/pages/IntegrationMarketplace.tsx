@@ -19,32 +19,27 @@ import ActionErrorBanner from '../components/ActionErrorBanner';
 import DetailDrawer, { DetailSection } from '../components/DetailDrawer';
 import { integrationsApi } from '../api/endpoints';
 import { useRoleGate, ADMIN_ONLY_REASON, ANALYST_ONLY_REASON } from '../lib/roles';
-import { ExecutionStatusBadge, HealthBadge, ImplementationBadge, SideEffectBadge } from '../components/integrations/Badges';
+import {
+  ExecutionStatusBadge,
+  HealthBadge,
+  ImplementationBadge,
+  IngestBadge,
+  SideEffectBadge,
+} from '../components/integrations/Badges';
 import ConnectorFormModal from '../components/integrations/ConnectorFormModal';
 import ActionRunnerDrawer from '../components/integrations/ActionRunnerDrawer';
+import ServerMessage from '../components/integrations/ServerMessage';
+import WebhookFormModal from '../components/integrations/WebhookFormModal';
+import WebhooksPanel from '../components/integrations/WebhooksPanel';
 import type {
   Connector,
   ConnectorField,
   InstalledIntegration,
   IntegrationExecution,
   IntegrationTestResult,
+  WebhookEndpointRow,
 } from '../components/integrations/types';
 import { errorDetailText, formatJson, formatTime, httpStatusOf } from '../components/integrations/types';
-
-const getStatusColor = (status: string) => {
-  switch (status) {
-    case 'success':
-      return 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-100';
-    case 'failed':
-      return 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-100';
-    case 'active':
-      return 'bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-100';
-    case 'inactive':
-      return 'bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-100';
-    default:
-      return 'bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-100';
-  }
-};
 
 const BTN =
   'px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2';
@@ -54,17 +49,6 @@ type TestOutcome =
   | { kind: 'result'; result: IntegrationTestResult }
   | { kind: 'not_testable'; detail: string }
   | { kind: 'error'; error: unknown };
-
-interface WebhookRow {
-  id: string;
-  installation_id?: string;
-  name?: string;
-  url?: string;
-  status?: string;
-  event?: string;
-  lastTriggered?: string;
-  successCount?: number;
-}
 
 function FieldsTable({ fields, title }: { fields: ConnectorField[]; title: string }) {
   if (!fields.length) return <p className="text-sm text-gray-500 dark:text-gray-400">No {title.toLowerCase()} fields.</p>;
@@ -110,7 +94,9 @@ export default function IntegrationMarketplace() {
   const [connectors, setConnectors] = useState<Connector[]>([]);
   const [installed, setInstalled] = useState<InstalledIntegration[]>([]);
   const [executions, setExecutions] = useState<IntegrationExecution[]>([]);
-  const [webhooks, setWebhooks] = useState<WebhookRow[]>([]);
+  const [webhooks, setWebhooks] = useState<WebhookEndpointRow[]>([]);
+  const [webhooksError, setWebhooksError] = useState<unknown>(null);
+  const [webhooksTotal, setWebhooksTotal] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [connectorsError, setConnectorsError] = useState<unknown>(null);
   const [installedError, setInstalledError] = useState<unknown>(null);
@@ -118,10 +104,8 @@ export default function IntegrationMarketplace() {
   const [executionsTotal, setExecutionsTotal] = useState<number | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('all');
-  const [showNewWebhookModal, setShowNewWebhookModal] = useState(false);
-  const [webhookFormError, setWebhookFormError] = useState<unknown>(null);
-  const [webhookFormMessage, setWebhookFormMessage] = useState<string | null>(null);
-  const [webhookActionError, setWebhookActionError] = useState<{ what: string; error: unknown } | null>(null);
+  // The create form, pre-selecting an install when opened from its group.
+  const [webhookFormFor, setWebhookFormFor] = useState<{ integrationId: string | null } | null>(null);
   const [detailConnector, setDetailConnector] = useState<Connector | null>(null);
   const [formTarget, setFormTarget] = useState<{ connector: Connector; installation: InstalledIntegration | null } | null>(null);
   const [runnerFor, setRunnerFor] = useState<InstalledIntegration | null>(null);
@@ -155,6 +139,19 @@ export default function IntegrationMarketplace() {
     }
   }, []);
 
+  const loadWebhooks = useCallback(async () => {
+    try {
+      const res = await integrationsApi.getWebhooks();
+      setWebhooks(res.items);
+      setWebhooksTotal(res.total);
+      setWebhooksError(null);
+    } catch (e) {
+      setWebhooks([]);
+      setWebhooksTotal(null);
+      setWebhooksError(e ?? new Error('request failed'));
+    }
+  }, []);
+
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
@@ -167,13 +164,11 @@ export default function IntegrationMarketplace() {
           setConnectorsError(e ?? new Error('request failed'));
         }
       };
-      await Promise.all([loadConnectors(), loadInstalled(), loadExecutions()]);
-      // Webhooks are not loaded by this page yet.
-      setWebhooks([]);
+      await Promise.all([loadConnectors(), loadInstalled(), loadExecutions(), loadWebhooks()]);
     } finally {
       setLoading(false);
     }
-  }, [loadInstalled, loadExecutions]);
+  }, [loadInstalled, loadExecutions, loadWebhooks]);
 
   React.useEffect(() => {
     loadData();
@@ -313,8 +308,8 @@ export default function IntegrationMarketplace() {
       >
         <p>
           Test result: <span className="font-semibold">{r.status}</span>
-          {r.message ? ` · ${r.message}` : ''}
         </p>
+        <ServerMessage text={r.message} className="break-words" />
         <p className="text-xs mt-1 opacity-80">
           {checked ? `Checked: ${checked} · ` : ''}
           {http !== undefined && http !== null ? `HTTP ${String(http)} · ` : ''}
@@ -337,9 +332,8 @@ export default function IntegrationMarketplace() {
           </div>
           <button
             onClick={() => {
-              setWebhookFormError(null);
-              setWebhookFormMessage(null);
-              setShowNewWebhookModal(true);
+              setActiveTab('webhooks');
+              setWebhookFormFor({ integrationId: null });
             }}
             disabled={!canAdmin}
             title={canAdmin ? undefined : ADMIN_ONLY_REASON}
@@ -473,7 +467,10 @@ export default function IntegrationMarketplace() {
                       >
                         <div className="flex items-start justify-between mb-3 gap-2">
                           <span className="text-xs text-gray-600 dark:text-gray-400">{connector.vendor || ''}</span>
-                          <ImplementationBadge status={connector.implementation_status} />
+                          <span className="flex gap-1 flex-wrap justify-end">
+                            <ImplementationBadge status={connector.implementation_status} />
+                            {connector.ingest && <IngestBadge />}
+                          </span>
                         </div>
                         <h3 className="font-semibold text-lg mb-1">{connector.display_name || connector.name}</h3>
                         <div className="flex gap-2 mb-2 flex-wrap">
@@ -575,7 +572,11 @@ export default function IntegrationMarketplace() {
                           </div>
                           <div>
                             <p className="text-gray-600 dark:text-gray-400">Last Error</p>
-                            <p className="font-medium break-words">{integration.error_message || 'None'}</p>
+                            {integration.error_message ? (
+                              <ServerMessage text={integration.error_message} className="font-medium break-words" />
+                            ) : (
+                              <p className="font-medium">None</p>
+                            )}
                           </div>
                         </div>
                         {testOutcomeView(integration)}
@@ -664,7 +665,10 @@ export default function IntegrationMarketplace() {
                           <td className="px-6 py-4 text-sm font-medium">{integrationLabel(execInstallId(exec))}</td>
                           <td className="px-6 py-4 text-sm">{formatTime(exec.started_at || exec.created_at) ?? 'not started'}</td>
                           <td className="px-6 py-4">
-                            <ExecutionStatusBadge status={exec.status} />
+                            <ExecutionStatusBadge status={exec.status} httpStatus={exec.http_status} />
+                            {exec.error_code && (
+                              <span className="block mt-1 text-xs font-mono text-gray-500 dark:text-gray-400">{exec.error_code}</span>
+                            )}
                           </td>
                           <td className="px-6 py-4 text-sm">{exec.triggered_by || 'not recorded'}</td>
                           <td className="px-6 py-4 text-sm">{typeof exec.duration_ms === 'number' ? `${exec.duration_ms} ms` : 'not recorded'}</td>
@@ -688,155 +692,35 @@ export default function IntegrationMarketplace() {
 
             {/* Webhooks Tab */}
             {activeTab === 'webhooks' && (
-              <div className="space-y-6">
-                {webhookActionError && <ActionErrorBanner what={webhookActionError.what} error={webhookActionError.error} />}
-                {webhooks.length === 0 && (
-                  <p className="text-sm text-gray-500 dark:text-gray-400">
-                    This page does not list registered webhooks yet. New Webhook registers one on an installed integration.
-                  </p>
-                )}
-                <div className="grid grid-cols-1 gap-4">
-                  {webhooks.map((webhook) => (
-                    <div key={webhook.id} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition">
-                      <div className="flex justify-between items-start mb-3">
-                        <div className="flex-1">
-                          <h3 className="font-semibold">{webhook.name}</h3>
-                          <p className="text-xs font-mono text-gray-600 dark:text-gray-400 mt-1 truncate">{webhook.url}</p>
-                        </div>
-                        <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(webhook.status || '')}`}>
-                          {webhook.status}
-                        </span>
-                      </div>
-                      <div className="grid grid-cols-4 gap-4 text-sm mb-4">
-                        <div>
-                          <p className="text-gray-600 dark:text-gray-400">Event Type</p>
-                          <p className="font-medium">{webhook.event}</p>
-                        </div>
-                        <div>
-                          <p className="text-gray-600 dark:text-gray-400">Last Triggered</p>
-                          <p className="font-medium">{webhook.lastTriggered ? new Date(webhook.lastTriggered).toLocaleDateString() : 'Never'}</p>
-                        </div>
-                        <div>
-                          <p className="text-gray-600 dark:text-gray-400">Success Count</p>
-                          <p className="font-medium">{webhook.successCount}</p>
-                        </div>
-                        <div>
-                          <p className="text-gray-600 dark:text-gray-400">Status</p>
-                          <p className="font-medium capitalize">{webhook.status}</p>
-                        </div>
-                      </div>
-                      <div className="flex gap-2">
-                        <button
-                          onClick={async () => {
-                            setWebhookActionError(null);
-                            const integrationId = webhook.installation_id;
-                            if (!integrationId) {
-                              setWebhookActionError({ what: 'test the webhook', error: new Error('this webhook has no installation id') });
-                              return;
-                            }
-                            try {
-                              await integrationsApi.testWebhook(integrationId, webhook.id);
-                              loadData();
-                            } catch (err) {
-                              // 501 by design: there is no inbound pipeline a test event could pass through.
-                              setWebhookActionError({ what: 'test the webhook', error: err });
-                            }
-                          }}
-                          disabled={!canOperate}
-                          title={canOperate ? 'Webhook test (answers 501: there is no inbound pipeline to test)' : ANALYST_ONLY_REASON}
-                          className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition disabled:opacity-50"
-                        >
-                          Test
-                        </button>
-                        <button
-                          onClick={async () => {
-                            if (!window.confirm(`Delete webhook ${webhook.name}?`)) return;
-                            setWebhookActionError(null);
-                            const integrationId = webhook.installation_id;
-                            if (!integrationId) {
-                              setWebhookActionError({ what: 'delete the webhook', error: new Error('this webhook has no installation id') });
-                              return;
-                            }
-                            try {
-                              await integrationsApi.deleteWebhook(integrationId, webhook.id);
-                              loadData();
-                            } catch (err) {
-                              setWebhookActionError({ what: 'delete the webhook', error: err });
-                            }
-                          }}
-                          disabled={!canAdmin}
-                          title={canAdmin ? undefined : ADMIN_ONLY_REASON}
-                          className="px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition disabled:opacity-50"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
+              <WebhooksPanel
+                webhooks={webhooks}
+                total={webhooksTotal}
+                loadError={webhooksError}
+                installed={installed}
+                integrationLabel={integrationLabel}
+                canAdmin={canAdmin}
+                canOperate={canOperate}
+                onCreate={(integrationId) => setWebhookFormFor({ integrationId })}
+                testWebhook={integrationsApi.testWebhook}
+                deleteWebhook={integrationsApi.deleteWebhook}
+                onChanged={loadWebhooks}
+              />
             )}
           </>
         )}
       </div>
 
-      {/* New Webhook Modal */}
-      {showNewWebhookModal && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto">
-            <h2 className="text-xl font-bold mb-4">Create Webhook</h2>
-            <form className="space-y-4" onSubmit={async (e) => {
-              e.preventDefault();
-              setWebhookFormError(null);
-              setWebhookFormMessage(null);
-              const fd = new FormData(e.currentTarget);
-              const integrationId = String(fd.get('integration_id') || '');
-              if (!integrationId) { setWebhookFormMessage('Select an installed integration first.'); return; }
-              try {
-                await integrationsApi.createWebhook(integrationId, {
-                  endpoint_path: String(fd.get('url') || ''),
-                  http_method: 'POST',
-                  event_types: [String(fd.get('event') || '')],
-                });
-                setShowNewWebhookModal(false);
-                loadData();
-              } catch (err) { setWebhookFormError(err); }
-            }}>
-              <div>
-                <label className="block text-sm font-medium mb-1">Integration</label>
-                <select name="integration_id" required className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
-                  <option value="">Select an integration...</option>
-                  {installed.map((inst) => (
-                    <option key={inst.id} value={inst.id}>{inst.display_name || inst.connector_id}</option>
-                  ))}
-                </select>
-                {installed.length === 0 && (
-                  <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">No integrations installed. Install one from the Marketplace first.</p>
-                )}
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">Endpoint Path</label>
-                <input name="url" required type="text" placeholder="/webhooks/my-hook" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">Event Type</label>
-                <select name="event" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
-                  <option>alert.critical</option>
-                  <option>alert.high</option>
-                  <option>incident.created</option>
-                  <option>ticket.created</option>
-                </select>
-              </div>
-              {webhookFormMessage && <p role="alert" className="text-sm text-red-600 dark:text-red-400">{webhookFormMessage}</p>}
-              <ActionErrorBanner what="create the webhook" error={webhookFormError} />
-              <div className="flex gap-2 mt-6">
-                <button type="button" onClick={() => setShowNewWebhookModal(false)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
-                <button type="submit" className="flex-1 px-4 py-2 bg-cyan-600 hover:bg-cyan-700 text-white rounded-lg transition">Create</button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
+      {/* New webhook endpoint */}
+      <WebhookFormModal
+        open={!!webhookFormFor}
+        installed={installed}
+        initialIntegrationId={webhookFormFor?.integrationId ?? null}
+        onClose={() => setWebhookFormFor(null)}
+        onCreate={async (integrationId, body) => {
+          await integrationsApi.createWebhook(integrationId, body);
+          await loadWebhooks();
+        }}
+      />
 
       {/* Install / configure form */}
       <ConnectorFormModal
@@ -879,7 +763,24 @@ export default function IntegrationMarketplace() {
                     { label: 'Description', value: detailConnector.description, full: true },
                     { label: 'Vendor', value: detailConnector.vendor },
                     { label: 'Identifier', value: detailConnector.id, mono: true },
-                    { label: 'Status', value: <ImplementationBadge status={detailConnector.implementation_status} /> },
+                    {
+                      label: 'Status',
+                      value: (
+                        <span className="flex gap-1 flex-wrap">
+                          <ImplementationBadge status={detailConnector.implementation_status} />
+                          {detailConnector.ingest && <IngestBadge />}
+                        </span>
+                      ),
+                    },
+                    ...(detailConnector.ingest
+                      ? [
+                          {
+                            label: 'Ingest',
+                            value: "Once installed, the SIEM cloud poller pulls this connector's events on a schedule.",
+                            full: true,
+                          },
+                        ]
+                      : []),
                     { label: 'Installed here', value: detailInstallation ? <HealthBadge health={detailInstallation.health_status} /> : 'no' },
                     { label: 'Verification', value: detailConnector.verification, full: true },
                     { label: 'Read-only test call', value: detailConnector.test_call || 'none', mono: true, full: true },
@@ -1018,14 +919,14 @@ export default function IntegrationMarketplace() {
                     { label: 'Execution ID', value: detailExec.id, mono: true, full: true },
                     { label: 'Integration', value: integrationLabel(execInstallId(detailExec)) },
                     { label: 'Action ID', value: detailExec.action_id, mono: true },
-                    { label: 'Status', value: detailExec.status },
+                    { label: 'Status', value: <ExecutionStatusBadge status={detailExec.status} httpStatus={detailExec.http_status} /> },
                     { label: 'Triggered by', value: detailExec.triggered_by },
                     { label: 'Playbook run', value: detailExec.playbook_run_id, mono: true },
                     { label: 'Duration', value: detailExec.duration_ms != null ? `${detailExec.duration_ms} ms` : null },
                     { label: 'Retries', value: detailExec.retry_count },
-                    // Returned by the execute call; the stored row has no column for them.
-                    { label: 'Error code', value: detailExec.error_code ?? 'not stored on the execution row', mono: true },
-                    { label: 'HTTP status', value: detailExec.http_status ?? 'not stored on the execution row' },
+                    // Stored on the execution row since migration 039; older rows have neither.
+                    { label: 'Error code', value: detailExec.error_code || 'none recorded', mono: true },
+                    { label: 'HTTP status', value: detailExec.http_status ?? 'none recorded' },
                     { label: 'Started', value: formatTime(detailExec.started_at) },
                     { label: 'Completed', value: formatTime(detailExec.completed_at) },
                   ],
@@ -1033,7 +934,13 @@ export default function IntegrationMarketplace() {
                 {
                   title: 'Input and result',
                   fields: [
-                    { label: 'Error', value: detailExec.error_message, full: true, mono: true },
+                    {
+                      label: 'Error',
+                      value: detailExec.error_message ? (
+                        <ServerMessage text={detailExec.error_message} className="font-mono text-sm break-words" />
+                      ) : null,
+                      full: true,
+                    },
                     {
                       label: 'Input',
                       value: formatJson(detailExec.input_data) ? <pre className="text-xs whitespace-pre-wrap">{formatJson(detailExec.input_data)}</pre> : null,

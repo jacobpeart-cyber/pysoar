@@ -6,7 +6,7 @@ Roles: `viewer` < `analyst` < `admin` inside an organisation; `platform superuse
 
 Classified in wave 5 (W5-B, 2026-10-15) from the uncalled-route tables in `docs/audit/2026-10-08/` and the code as it stands after waves 1-4. Routes graded FAKE, duplicates and superseded aliases were deleted, not listed. Rows are one per method and path; to add a route, add a row in the right section.
 
-## KEEP-API (516 routes)
+## KEEP-API (515 routes)
 
 Real routes with no UI control, kept for integrations, scripts, endpoint agents, probes and API clients.
 
@@ -253,7 +253,6 @@ Real routes with no UI control, kept for integrations, scripts, endpoint agents,
 | GET | `/api/v1/integrations/installed/{integration_id}` | Get details of installed integration | any authenticated user | org-scoped |
 | GET | `/api/v1/integrations/installed/{integration_id}/executions` | Get execution history for integration | any authenticated user | org-scoped |
 | GET | `/api/v1/integrations/installed/{integration_id}/webhooks` | List webhooks for integration | any authenticated user | org-scoped |
-| GET | `/api/v1/integrations/webhooks` | Flat list of webhooks across all integrations. | any authenticated user | org-scoped (in handler) |
 | POST | `/api/v1/iocs/bulk` | Bulk create IOCs. | analyst, admin | org-scoped |
 | POST | `/api/v1/iocs/search` | Search the organisation's IOCs and platform feed intel by value. | any authenticated user | org-scoped |
 | POST | `/api/v1/iocs/{ioc_id}/enrich` | Enrich one of the organisation's IOCs. | analyst, admin | org-scoped |

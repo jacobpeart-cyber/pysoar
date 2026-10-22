@@ -5,6 +5,7 @@ import DetailDrawer, { DetailSection } from '../DetailDrawer';
 import LoadErrorBanner from '../LoadErrorBanner';
 import ActionErrorBanner from '../ActionErrorBanner';
 import { ExecutionStatusBadge, SideEffectBadge } from './Badges';
+import ServerMessage from './ServerMessage';
 import { buildInputData, inputKind, isRequired, schemaProperties } from './schemaForm';
 import type { InstalledAction, InstalledIntegration, IntegrationExecution } from './types';
 import { errorBody, formatJson, httpStatusOf } from './types';
@@ -111,9 +112,10 @@ export default function ActionRunnerDrawer({
       const body = errorBody(err);
       const code = typeof body?.error === 'string' ? body.error : null;
       const status = httpStatusOf(err);
-      if (status === 422 && code === 'invalid_parameters' && Array.isArray(body?.problems)) {
-        setProblems((body.problems as unknown[]).map(String));
-      } else if (status === 403 && code === 'approval_required') {
+      // A server-side 422 invalid_parameters lists its `problems` through
+      // ActionErrorBanner (describeActionError); `problems` here holds only
+      // the form's own checks before the request.
+      if (status === 403 && code === 'approval_required') {
         const why = typeof body?.detail === 'string' ? body.detail : typeof body?.message === 'string' ? body.message : null;
         setApprovalMessage(
           `This action changes state at the vendor and needs an administrator.${why ? ` ${why}` : ''}`,
@@ -241,7 +243,7 @@ export default function ActionRunnerDrawer({
       })}
       {problems.length > 0 && (
         <div role="alert" className="text-sm text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-3">
-          <p>The parameters were refused (invalid_parameters):</p>
+          <p>The parameters were refused before sending:</p>
           <ul className="list-disc ml-5 mt-1 space-y-0.5">
             {problems.map((p) => (
               <li key={p}>{p}</li>
@@ -282,7 +284,7 @@ export default function ActionRunnerDrawer({
           Error code: <span className="font-mono">{result.error_code}</span>
         </p>
       )}
-      {result.error_message && <p className="text-red-700 dark:text-red-300 break-words">{result.error_message}</p>}
+      <ServerMessage text={result.error_message} className="text-red-700 dark:text-red-300 break-words" />
       <p className="text-xs text-gray-500 dark:text-gray-400 font-mono">execution {result.id}</p>
       {formatJson(result.output_data) ? (
         <pre className="text-xs bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-3 overflow-x-auto max-h-96 text-gray-800 dark:text-gray-200">

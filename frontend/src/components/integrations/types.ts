@@ -57,6 +57,8 @@ export interface Connector {
   category: string;
   integration_role?: string | null;
   implementation_status: ImplementationStatus | string;
+  /** True when the SIEM cloud poller pulls this connector's events (computed by the server). */
+  ingest?: boolean;
   installable: boolean;
   verification: string;
   test_call?: string | null;
@@ -97,11 +99,11 @@ export interface InstalledAction {
 }
 
 /**
- * One execution. The execute route returns `installation_id`, `error_code`
- * and `http_status`; the flat list (`GET /integrations/executions`) returns
- * the stored row, which names the install `installed_id`, keeps
- * `input_data` / `output_data` as JSON text and has no `error_code` /
- * `http_status` columns.
+ * One execution. The execute route and the per-integration list return
+ * `installation_id`; the flat list (`GET /integrations/executions`) returns
+ * the stored row, which names the install `installed_id` and keeps
+ * `input_data` / `output_data` as JSON text. All three carry the stored
+ * `error_code` (the connector's code) and `http_status` (the vendor's).
  */
 export interface IntegrationExecution {
   id: string;
@@ -121,6 +123,32 @@ export interface IntegrationExecution {
   error_code?: string | null;
   http_status?: number | null;
   retry_count?: number | null;
+}
+
+/**
+ * A registered webhook endpoint as the flat list (`GET /integrations/webhooks`)
+ * returns the stored row: the install is `installed_id`, `event_types` is
+ * JSON text, `last_received` / `received_count` are the inbound counters
+ * (nothing increments them until an inbound receiver exists).
+ */
+export interface WebhookEndpointRow {
+  id: string;
+  installed_id: string;
+  endpoint_path: string;
+  http_method?: string | null;
+  event_types?: unknown;
+  transform_template?: string | null;
+  is_active?: boolean | null;
+  last_received?: string | null;
+  received_count?: number | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+/** `event_types` of a stored webhook row: a JSON array as text, or already a list. */
+export function webhookEventTypes(value: unknown): string[] {
+  const v = parseJsonish(value);
+  return Array.isArray(v) ? v.map((x) => String(x)) : [];
 }
 
 export interface Paginated<T> {
@@ -183,4 +211,22 @@ export function formatTime(value: string | null | undefined): string | null {
   if (!value) return null;
   const d = new Date(value);
   return Number.isNaN(d.getTime()) ? value : d.toLocaleString();
+}
+
+/**
+ * The server's private-address refusal (src/integrations/netguard.py
+ * PRIVATE_TARGET_HINT) carries the allow-list instruction after a `; `:
+ * "refused: target resolves to a private address; add its network to
+ * OUTBOUND_PRIVATE_ALLOWLIST to allow it". Split it so the instruction can be
+ * shown as its own line. Both parts are the server's text.
+ */
+export const PRIVATE_REFUSAL_PREFIX = 'refused: target resolves to a private address';
+
+export function splitPrivateRefusal(message: string | null | undefined): { message: string; hint: string | null } {
+  const text = message ?? '';
+  const at = text.indexOf(PRIVATE_REFUSAL_PREFIX);
+  if (at < 0) return { message: text, hint: null };
+  const sep = text.indexOf('; ', at + PRIVATE_REFUSAL_PREFIX.length);
+  if (sep < 0) return { message: text, hint: null };
+  return { message: text.slice(0, sep), hint: text.slice(sep + 2) };
 }

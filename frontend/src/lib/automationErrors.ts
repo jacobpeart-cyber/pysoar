@@ -6,7 +6,9 @@ import { describeLoadError } from './loadError';
  * `HTTP 4xx · code: detail` summary plus every itemised reason the body
  * carries (`steps` for invalid_steps, `nodes` for not_implemented /
  * containment_requires_admin, `containment_steps`, `reason`, `message`,
- * and FastAPI's 422 validation list). Nothing is paraphrased.
+ * `problems` for invalid_parameters, `fields` for missing_fields /
+ * invalid_fields, the entries of an object `detail`, and FastAPI's 422
+ * validation list). Nothing is paraphrased.
  */
 export interface ActionErrorDetail {
   summary: string;
@@ -92,6 +94,16 @@ function itemsFrom(body: Record<string, unknown>): string[] {
       else items.push(str(e.error ?? e.message ?? e.msg));
     }
   }
+  // 422 invalid_parameters (integration actions): ["name: reason", ...]
+  if (Array.isArray(body.problems)) {
+    for (const raw of body.problems) items.push(str(raw));
+  }
+  // 422 missing_fields / invalid_fields (integration install / configure): field names only.
+  if (Array.isArray(body.fields) && body.fields.length) {
+    const label =
+      body.error === 'missing_fields' ? 'Missing fields' : body.error === 'invalid_fields' ? 'Invalid fields' : 'Fields';
+    items.push(`${label}: ${body.fields.map(str).join(', ')}`);
+  }
   // The app-wide validation handler nests the list: {details: {errors}}.
   const details = asRecord(body.details);
   if (details && Array.isArray(details.errors)) items.push(...itemsFrom({ errors: details.errors }));
@@ -124,15 +136,49 @@ function itemsFrom(body: Record<string, unknown>): string[] {
   return items;
 }
 
+/**
+ * The `detail` member that describeLoadError would print, when it is an
+ * object: `{detail: {error, detail: {...}}}`, `{error, detail: {...}}`, or a
+ * `{detail: {...}}` with no error code. Printed as JSON in one line it reads
+ * as noise, so its entries become items instead.
+ */
+function dictDetail(body: Record<string, unknown>): Record<string, unknown> | null {
+  const nested = asRecord(body.detail);
+  if (nested && typeof nested.error === 'string') return asRecord(nested.detail);
+  if (typeof body.error === 'string') return asRecord(body.detail);
+  return nested;
+}
+
+function entriesOf(dict: Record<string, unknown>): string[] {
+  return Object.entries(dict)
+    .filter(([, v]) => v !== null && v !== undefined && v !== '')
+    .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.map(str).join(', ') : str(v)}`);
+}
+
 export function describeActionError(err: unknown): ActionErrorDetail {
-  const summary = describeLoadError(err);
+  let summary = describeLoadError(err);
   const data = (err as { response?: { data?: unknown } })?.response?.data;
   const body = asRecord(data);
   if (!body) return { summary, items: [] };
   const items: string[] = [];
+  const dict = dictDetail(body);
+  const structured = dict ?? (Array.isArray(body.detail) ? body.detail : null);
+  if (structured) {
+    // Keep the `HTTP 4xx · code` head; the object's (or the validation
+    // list's) contents follow as items instead of one line of JSON.
+    const json = str(structured);
+    if (json && summary.endsWith(`: ${json}`)) summary = summary.slice(0, -(json.length + 2));
+  }
   const nested = asRecord(body.detail);
   if (nested) items.push(...itemsFrom(nested));
   items.push(...itemsFrom(body));
+  if (dict && dict !== nested) {
+    const own = itemsFrom(dict);
+    items.push(...(own.length ? own : entriesOf(dict)));
+  } else if (dict && !itemsFrom(dict).length) {
+    // `{detail: {...}}` with no code and nothing itemsFrom recognises.
+    items.push(...entriesOf(dict));
+  }
   if (Array.isArray(body.detail)) {
     // FastAPI request validation: [{loc, msg, type}]
     for (const raw of body.detail) {

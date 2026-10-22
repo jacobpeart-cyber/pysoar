@@ -60,7 +60,26 @@ export function SideEffectBadge() {
   );
 }
 
-export function ExecutionStatusBadge({ status }: { status: string | null | undefined }) {
+/** Marks a catalogue entry whose events the SIEM cloud poller pulls (`ingest: true`). */
+export function IngestBadge() {
+  return (
+    <span
+      className={clsx(PILL, 'bg-indigo-100 dark:bg-indigo-900/40 text-indigo-800 dark:text-indigo-200')}
+      title="The SIEM cloud poller pulls this connector's events on a schedule."
+    >
+      Ingest
+    </span>
+  );
+}
+
+export function ExecutionStatusBadge({
+  status,
+  httpStatus,
+}: {
+  status: string | null | undefined;
+  /** The vendor's HTTP status stored on the execution row, when there is one. */
+  httpStatus?: number | null;
+}) {
   const s = status || 'unknown';
   const className =
     s === 'success'
@@ -70,5 +89,10 @@ export function ExecutionStatusBadge({ status }: { status: string | null | undef
         : s === 'running' || s === 'pending'
           ? 'bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-100'
           : 'bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-100';
-  return <span className={clsx('px-3 py-1 rounded-full text-xs font-medium', className)}>{s}</span>;
+  return (
+    <span className={clsx('px-3 py-1 rounded-full text-xs font-medium whitespace-nowrap', className)}>
+      {s}
+      {typeof httpStatus === 'number' ? ` · HTTP ${httpStatus}` : ''}
+    </span>
+  );
 }

@@ -7,6 +7,7 @@ import type {
   IntegrationExecution,
   IntegrationTestResult,
   Paginated,
+  WebhookEndpointRow,
 } from '../components/integrations/types';
 import {
   PaginatedResponse,
@@ -786,9 +787,23 @@ export const integrationsApi = {
     return response.data;
   },
 
+  /** Every registered webhook endpoint of this organisation (stored rows), newest first. */
+  getWebhooks: async (params?: { page?: number; size?: number }): Promise<Paginated<WebhookEndpointRow>> => {
+    const response = await api.get('/integrations/webhooks', { params: { size: 100, ...params } });
+    const d = response.data;
+    return { items: d?.items ?? [], total: d?.total ?? 0, page: d?.page, size: d?.size, pages: d?.pages };
+  },
+
+  /** 201 (admin). `secret` is stored as a hash; `transform_template` as given. */
   createWebhook: async (
     integrationId: string,
-    body: { endpoint_path: string; http_method: string; event_types: string[] },
+    body: {
+      endpoint_path: string;
+      http_method: string;
+      event_types: string[];
+      secret?: string;
+      transform_template?: string;
+    },
   ): Promise<unknown> => {
     const response = await api.post(`/integrations/installed/${integrationId}/webhooks`, body);
     return response.data;
