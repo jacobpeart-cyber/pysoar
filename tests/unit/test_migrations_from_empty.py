@@ -179,12 +179,12 @@ def test_existing_database_at_head_is_untouched(tmp_path: Path, monkeypatch: pyt
     monkeypatch.setattr(settings, "database_url", _async_url(db_path))
     cfg = _alembic_config(db_path)
     _, command, _ = _real_alembic()
-    _in_thread(lambda: command.stamp(cfg, "038"))
+    _in_thread(lambda: command.stamp(cfg, _head()))
     before = _snapshot(db_path)
 
     _in_thread(lambda: command.upgrade(cfg, "head"))
 
-    assert _version(db_path) == "038"
+    assert _version(db_path) == _head()
     assert _snapshot(db_path) == before
     engine = create_engine(_sync_url(db_path))
     with engine.connect() as conn:
