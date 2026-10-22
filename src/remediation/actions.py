@@ -130,7 +130,8 @@ _REGISTRY_LIST: tuple[ActionSpec, ...] = (
         label="Isolate host",
         description=(
             "Network isolation through the host's enrolled endpoint agent, else an installed "
-            "CrowdStrike Falcon integration (contain_host). Target: a hostname or asset name."
+            "CrowdStrike Falcon (contain_host) or Microsoft Defender for Endpoint (isolate_machine, Full) "
+            "integration. Target: a hostname or asset name (matched exactly)."
         ),
         target_type="host",
         path=PATH_CONTAINMENT,
@@ -142,14 +143,17 @@ _REGISTRY_LIST: tuple[ActionSpec, ...] = (
         key="account_disable",
         label="Disable account",
         description=(
-            "Disable a local account through the endpoint agent on 'hostname'. Directory accounts "
-            "(AD / Entra / Okta) need an identity-provider connector PySOAR does not implement: "
-            "the step reports awaiting_integration or detection_only. PySOAR login accounts are "
-            "never touched. Target: a username. Not reversible (no enable command exists)."
+            "Disable a local account through the endpoint agent on 'hostname', else a directory "
+            "login (user@domain) through an installed Okta (suspend_user + revoke_sessions) or "
+            "Microsoft Entra ID (disable_user + revoke_sign_in_sessions) integration; the directory "
+            "path runs only for an administrator, never unattended (manual_required). Active "
+            "Directory has no connector. PySOAR login accounts are never touched. Target: a username "
+            "or login. Reversible only through Okta / Entra ID (unsuspend / enable; revoked sessions "
+            "are not restored); the local-account agent path has no enable command."
         ),
         target_type="user",
         path=PATH_CONTAINMENT,
-        reversible=False,
+        reversible=True,
         requires_approval=_agent_requires_approval("disable_account"),
         parameters=(
             ActionParameter("hostname", "string", False, "Host whose local account is disabled via its agent"),
@@ -421,7 +425,28 @@ async def _revert_handle(
                     "kind": "crowdstrike_lift_containment", "installation_id": installation_id,
                     "hostname": result.target,
                 }
+    if spec.key in ("host_isolate", "account_disable"):
+        # Defender / Okta / Entra ID: reverse the exact vendor object the
+        # forward action changed, through the same installation.
+        return _integration_revert_handle(spec, result)
     return None
+
+
+#: registry key -> containment action whose adapter reverses it.
+_ADAPTER_ACTION = {"host_isolate": "isolate_host", "account_disable": "disable_user"}
+
+
+def _integration_revert_handle(spec: ActionSpec, result: Any) -> Optional[dict[str, Any]]:
+    connector = (getattr(result, "integration", None) or "").lower()
+    action = _ADAPTER_ACTION.get(spec.key)
+    vendor_id = getattr(result, "vendor_id", None)
+    installation_id = getattr(result, "integration_id", None)
+    if not (action and connector and vendor_id and installation_id) or containment.adapter_for(action, connector) is None:
+        return None
+    return {
+        "kind": "integration_revert", "action": action, "connector": connector,
+        "installation_id": installation_id, "vendor_id": vendor_id, "target": result.target,
+    }
 
 
 async def _run_containment(
@@ -720,7 +745,7 @@ async def _revert_crowdstrike(
     hosts = [device_id]
     lift = await executor.execute_action(
         installation_id=installation_id, action_name="lift_containment", input_data={"device_id": str(hosts[0])},
-        triggered_by="playbook", playbook_run_id=execution_ref,
+        triggered_by="playbook", playbook_run_id=containment.engine_run_ref(execution_ref),
     )
     output = lift.get("output_data") or {}
     if lift.get("status") != "success" or (isinstance(output, dict) and (output.get("error") or output.get("success") is False)):
@@ -728,10 +753,66 @@ async def _revert_crowdstrike(
     return [{"integration": "crowdstrike", "device_id": str(hosts[0]), "integration_execution_id": lift.get("execution_id")}], []
 
 
+async def _revert_integration(
+    db: AsyncSession, org_id: str, revert: dict[str, Any], execution_ref: Optional[str],
+    *, actor: str, unattended: bool,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Reverse a Defender isolation or an Okta / Entra ID disable through the adapter's ``revert``.
+
+    The installation must still be an active integration of ``org_id`` with
+    the recorded connector; the vendor id is the object the forward action
+    changed (not re-resolved by name). Re-enabling a directory account is
+    gated like the forward disable: only an attended caller whose ``actor``
+    is, right now, an ``itdr`` administrator of ``org_id`` (``system:*``
+    actors never are); anyone else gets an error and no vendor call. The EDR
+    reverts (Defender unisolate) follow the rollback route's rule (admin).
+    """
+    from src.identity import roles as identity_roles
+    from src.integrations.engine import ActionExecutor
+    from src.integrations.models import InstalledIntegration, IntegrationStatus
+
+    action = str(revert.get("action") or "")
+    connector = str(revert.get("connector") or "")
+    vendor_id = str(revert.get("vendor_id") or "")
+    adapter = containment.adapter_for(action, connector)
+    if adapter is None or not vendor_id:
+        return [], [f"no {connector or 'integration'} revert for {action or 'this action'}"]
+    if adapter.identity:
+        human = None if (not actor or actor.startswith("system:")) else actor
+        if unattended or not await identity_roles.user_has_tier(db, human, org_id, "itdr", "admin"):
+            return [], [f"{connector} re-enable requires an itdr administrator; {actor or 'unknown actor'} is not one"]
+    integ = (await db.execute(
+        select(InstalledIntegration)
+        .options(selectinload(InstalledIntegration.connector))
+        .where(
+            InstalledIntegration.id == str(revert.get("installation_id") or ""),
+            InstalledIntegration.organization_id == org_id,
+            InstalledIntegration.status == IntegrationStatus.ACTIVE.value,
+        ),
+    )).scalar_one_or_none()
+    name = ((integ.connector.name if integ.connector is not None else integ.connector_id) or "").lower() if integ else ""
+    if integ is None or name != connector:
+        return [], [f"{connector} integration {revert.get('installation_id')} is no longer active in this organization"]
+    ctx = containment.AdapterContext(
+        ActionExecutor(), integ.id, execution_ref, reason="rollback", target=str(revert.get("target") or ""),
+    )
+    done = await adapter.revert(ctx, vendor_id)
+    if done.error:
+        return [], [done.error]
+    return [{
+        "integration": connector, "vendor_id": vendor_id, "detail": done.detail,
+        "integration_execution_ids": done.execution_ids, "vendor_action_id": done.vendor_action_id,
+    }], []
+
+
 async def revert_step(
     db: AsyncSession, org_id: str, step: dict[str, Any], *, actor: str, execution_ref: Optional[str],
+    unattended: bool = False,
 ) -> dict[str, Any]:
-    """Reverse one recorded step through its revert handle (agent queue or integration)."""
+    """Reverse one recorded step through its revert handle (agent queue or integration).
+
+    ``unattended`` (no human clicked rollback) refuses directory re-enables.
+    """
     action_type = step.get("action_type")
     if not step_is_reversible(step):
         reason = (
@@ -747,6 +828,10 @@ async def revert_step(
         )
     elif kind == "crowdstrike_lift_containment":
         issued, problems = await _revert_crowdstrike(revert, execution_ref)
+    elif kind == "integration_revert":
+        issued, problems = await _revert_integration(
+            db, org_id, revert, execution_ref, actor=actor, unattended=unattended,
+        )
     else:
         issued, problems = [], [f"unknown revert handle kind {kind!r}"]
 

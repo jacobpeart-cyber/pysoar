@@ -6,18 +6,40 @@ honestly that none was possible:
 * ``block_ip``: a host-firewall ``block_ip`` command on every enrolled,
   IR-capable endpoint agent of the organisation (``AgentService.issue_command``).
 * ``isolate_host``: an ``isolate_host`` command on the host's enrolled agent,
-  else ``contain_host`` through an installed CrowdStrike Falcon integration
-  (``ActionExecutor`` in ``src/integrations/engine.py``).
+  else an installed EDR integration with an adapter (``ADAPTERS``):
+  CrowdStrike Falcon ``contain_host`` or Microsoft Defender for Endpoint
+  ``isolate_machine`` (Full), called through ``ActionExecutor`` in
+  ``src/integrations/engine.py``.
 * ``disable_user``: a ``disable_account`` command on the named host's agent
-  (local account). No identity-provider connector can disable a directory
-  account today, so without a host the request is not actuated.
+  (local account), else an installed identity-provider integration with an
+  adapter: Okta ``suspend_user`` + ``revoke_sessions`` or Microsoft Entra ID
+  ``disable_user`` + ``revoke_sign_in_sessions``. Identity-provider actions
+  run only for an administrator (see below).
 * ``quarantine_file``: a ``quarantine_file`` command on the host's agent.
+
+Integration adapters
+--------------------
+``ADAPTERS`` maps each action to the connectors that can carry it out, in a
+fixed order (isolate_host: crowdstrike, then microsoft_defender; disable_user:
+okta, then azure_ad). Every adapter resolves the target to exactly one vendor
+object first (exact hostname / login, verified by a second read) and refuses
+``host_not_found`` / ``user_not_found`` / ``ambiguous_host`` before any change.
+When an organisation has several capable integrations they are tried in that
+order (installations of one connector oldest first); a target the first does
+not know (``*_not_found``) moves on to the next, any other refusal or vendor
+error stops there. Every vendor call goes through
+``ActionExecutor.execute_action`` (``triggered_by="playbook"``, the execution
+reference as ``playbook_run_id``), so each one leaves an
+``integration_executions`` row; all their ids are in
+``integration_execution_ids``.
 
 Result status (``ContainmentResult.status``):
 
 ``executed``
     A real command was queued for delivery to an agent, or an integration
-    call returned success. Never set otherwise.
+    call returned success. Never set otherwise. With ``failed`` True the
+    target WAS changed but a follow-up call failed (e.g. an Okta user was
+    suspended and session revocation failed); ``detail`` says which part ran.
 ``queued_for_approval``
     A real agent command was created but the action is high-blast and waits
     in the agent approval queue (``/agents/commands/{id}/approve``).
@@ -34,11 +56,20 @@ Result status (``ContainmentResult.status``):
     runs: no human in the loop). The only actuation path executes immediately
     (an integration such as CrowdStrike ``contain_host``), so it is NOT called;
     ``detail`` names the integration and the action an operator must trigger.
+    Also returned for an identity-provider action whose actor is not an
+    administrator.
 
 Unattended callers (``unattended=True``) never actuate without a human: the
 agent path always yields an ``awaiting_approval`` command (approval override
 is ignored and an action that would not need approval is refused), and the
 integration path returns ``manual_required`` without calling the engine.
+
+Identity-provider adapters (Okta, Entra ID) additionally require the actor to
+be, right now, an active administrator of the organisation over ``itdr``
+(built-in admin, platform superuser, or a custom role granting it): an
+interactive admin, or the admin who approved a remediation run (the run's
+actor is its approver). Anyone else gets ``manual_required`` and no vendor
+call is made.
 
 Every call writes exactly one ``AuditLog`` row (actor, target, result).
 All lookups are scoped to ``org_id``; another tenant's agent or integration is
@@ -51,7 +82,7 @@ import ipaddress
 import json
 import re
 from dataclasses import asdict, dataclass, field
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -142,13 +173,38 @@ def _validate_ip(value: Any) -> str:
     return str(addr)
 
 
+#: Longest login accepted (RFC 3696 erratum: 64 + 1 + 255).
+MAX_LOGIN_LENGTH = 320
+_LOGIN_LOCAL_RE = re.compile(r"[A-Za-z0-9!#$%&'*+=^_`{|}~.\-]{1,64}")
+_LOGIN_DOMAIN_RE = re.compile(r"(?=.{1,255}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*")
+
+
+def _validate_login(value: Any) -> str:
+    """Stripped directory login / user principal name (``user@domain``), else ``InvalidTargetError('invalid_login')``.
+
+    Okta logins and Entra ID UPNs are ``local@domain``: exactly one ``@``, a
+    local part of RFC 5322 atext characters and dots, a hostname-shaped
+    domain, no whitespace, at most ``MAX_LOGIN_LENGTH`` characters. Anything
+    else (a bare ``jdoe``, a path, quotes, wildcards) is refused before any
+    lookup.
+    """
+    login = str(value or "").strip()
+    local, sep, domain = login.partition("@")
+    if (
+        not sep
+        or len(login) > MAX_LOGIN_LENGTH
+        or any(ch.isspace() for ch in login)
+        or not _LOGIN_LOCAL_RE.fullmatch(local)
+        or local.startswith(".") or local.endswith(".") or ".." in local
+        or not _LOGIN_DOMAIN_RE.fullmatch(domain)
+    ):
+        raise InvalidTargetError("invalid_login", f"{str(value)[:80]!r} is not a directory login (user@domain)")
+    return login
+
+
 def fql_quote(value: str) -> str:
     """Escape backslashes and single quotes for a CrowdStrike FQL string literal."""
     return value.replace("\\", "\\\\").replace("'", "\\'")
-
-
-#: Connectors with a real, executable implementation for an action.
-_EXECUTABLE_CONNECTORS = {"isolate_host": ("crowdstrike",)}
 
 
 class UnattendedRefusedError(Exception):
@@ -170,6 +226,14 @@ class ContainmentResult:
     agent_hostname: Optional[str] = None
     integration: Optional[str] = None
     integration_execution_id: Optional[str] = None
+    #: Installed integration that acted, every engine execution row of this
+    #: request (lookups included), the vendor object acted on (Falcon device
+    #: id, Defender machine id, Okta / Entra user id) and, for Defender, the
+    #: machineAction id ``get_machine_action`` reads.
+    integration_id: Optional[str] = None
+    integration_execution_ids: list[str] = field(default_factory=list)
+    vendor_id: Optional[str] = None
+    vendor_action_id: Optional[str] = None
     commands: list[dict[str, Any]] = field(default_factory=list)
     rejected: list[dict[str, Any]] = field(default_factory=list)
     asset_id: Optional[str] = None
@@ -245,6 +309,7 @@ async def _active_integrations(db: AsyncSession, org_id: str) -> list[InstalledI
             InstalledIntegration.organization_id == org_id,
             InstalledIntegration.status == IntegrationStatus.ACTIVE.value,
         )
+        .order_by(InstalledIntegration.created_at, InstalledIntegration.id)
     )
     return list((await db.execute(q)).scalars().all())
 
@@ -259,21 +324,35 @@ def _connector_category(integration: InstalledIntegration) -> str:
     return str(getattr(connector, "category", "") or "").lower()
 
 
+async def _integration_candidates(
+    db: AsyncSession, org_id: str, action: str,
+) -> tuple[list[tuple["IntegrationAdapter", InstalledIntegration]], list[str]]:
+    """(executable integrations for ``action`` in adapter order, names of installed but non-executable ones).
+
+    Order: the adapter order of ``ADAPTERS[action]``, then installation age
+    (oldest first), then id. Only the organisation's active rows are read.
+    """
+    adapters = ADAPTERS.get(action, ())
+    rank = {adapter.connector: i for i, adapter in enumerate(adapters)}
+    categories = _CATEGORY_FOR_ACTION.get(action, ())
+    found: list[tuple[int, int, IntegrationAdapter, InstalledIntegration]] = []
+    unsupported: list[str] = []
+    for position, integ in enumerate(await _active_integrations(db, org_id)):
+        name = _connector_name(integ)
+        if name in rank:
+            found.append((rank[name], position, adapters[rank[name]], integ))
+        elif _connector_category(integ) in categories:
+            unsupported.append(name or integ.display_name)
+    found.sort(key=lambda item: (item[0], item[1]))
+    return [(adapter, integ) for _, _, adapter, integ in found], unsupported
+
+
 async def _integration_paths(
     db: AsyncSession, org_id: str, action: str,
 ) -> tuple[Optional[InstalledIntegration], list[str]]:
-    """(an executable integration for ``action``, names of installed but non-executable ones)."""
-    executable = _EXECUTABLE_CONNECTORS.get(action, ())
-    categories = _CATEGORY_FOR_ACTION.get(action, ())
-    chosen: Optional[InstalledIntegration] = None
-    unsupported: list[str] = []
-    for integ in await _active_integrations(db, org_id):
-        name = _connector_name(integ)
-        if name in executable and chosen is None:
-            chosen = integ
-        elif _connector_category(integ) in categories:
-            unsupported.append(name or integ.display_name)
-    return chosen, unsupported
+    """(the first executable integration for ``action``, names of installed but non-executable ones)."""
+    candidates, unsupported = await _integration_candidates(db, org_id, action)
+    return (candidates[0][1] if candidates else None), unsupported
 
 
 async def _audit_user_id(db: AsyncSession, org_id: str, actor: str) -> Optional[str]:
@@ -437,6 +516,24 @@ def _integration_error(output: Any) -> Optional[str]:
     return None
 
 
+#: Width of ``integration_executions.playbook_run_id``.
+_RUN_REF_MAX = 36
+
+
+def engine_run_ref(execution_ref: Optional[str]) -> Optional[str]:
+    """``execution_ref`` as it fits ``integration_executions.playbook_run_id`` (VARCHAR(36)).
+
+    ``playbook_execution:<uuid>`` (55 characters) does not fit, and on
+    PostgreSQL the engine's history write would fail and leave no execution
+    row. A longer reference is stored as its last ``:`` segment (the run's id);
+    the audit row keeps the full reference.
+    """
+    if execution_ref is None or len(execution_ref) <= _RUN_REF_MAX:
+        return execution_ref
+    tail = execution_ref.rsplit(":", 1)[-1]
+    return tail if 0 < len(tail) <= _RUN_REF_MAX else execution_ref[-_RUN_REF_MAX:]
+
+
 async def crowdstrike_device_for_host(
     executor: Any, installation_id: str, hostname: str, execution_ref: Optional[str],
 ) -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -454,7 +551,7 @@ async def crowdstrike_device_for_host(
     lookup = await executor.execute_action(
         installation_id=installation_id, action_name="search_hosts",
         input_data={"filter_query": f"hostname:'{fql_quote(host)}'", "limit": 2},
-        triggered_by="playbook", playbook_run_id=execution_ref,
+        triggered_by="playbook", playbook_run_id=engine_run_ref(execution_ref),
     )
     exec_id = lookup.get("execution_id")
     if lookup.get("status") != "success":
@@ -471,7 +568,7 @@ async def crowdstrike_device_for_host(
     device_id = str(hosts[0])
     detail = await executor.execute_action(
         installation_id=installation_id, action_name="get_device", input_data={"device_id": device_id},
-        triggered_by="playbook", playbook_run_id=execution_ref,
+        triggered_by="playbook", playbook_run_id=engine_run_ref(execution_ref),
     )
     exec_id = detail.get("execution_id") or exec_id
     if detail.get("status") != "success":
@@ -487,27 +584,394 @@ async def crowdstrike_device_for_host(
     return exec_id, device_id, None
 
 
-async def _crowdstrike_contain(
-    integ: InstalledIntegration, hostname: str, execution_ref: Optional[str],
-) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    """Resolve the verified Falcon device for ``hostname`` and contain it.
+@dataclass
+class AdapterContext:
+    """One adapter run: the engine executor, the installation and the request's references."""
 
-    Returns (integration execution id, device id, error).
+    executor: Any
+    installation_id: str
+    execution_ref: Optional[str]
+    reason: str = ""
+    target: str = ""
+
+
+@dataclass
+class AdapterOutcome:
+    """Result of an adapter's resolve / apply / revert.
+
+    ``changed`` (apply / revert) is True when the vendor object's state was
+    changed even if ``error`` is set (a follow-up call failed). ``state`` is
+    what resolve read (Okta status, Entra ``accountEnabled``) for apply.
     """
+
+    execution_ids: list[str] = field(default_factory=list)
+    vendor_id: Optional[str] = None
+    error: Optional[str] = None
+    detail: str = ""
+    changed: bool = False
+    reversible: bool = False
+    vendor_action_id: Optional[str] = None
+    state: Any = None
+
+
+async def _engine_call(
+    ctx: AdapterContext, action_name: str, input_data: dict[str, Any], ids: list[str],
+) -> tuple[Optional[dict[str, Any]], Optional[str], Optional[int]]:
+    """One connector action through ``ActionExecutor.execute_action``: (output, error, http status)."""
+    out = await ctx.executor.execute_action(
+        installation_id=ctx.installation_id, action_name=action_name, input_data=input_data,
+        triggered_by="playbook", playbook_run_id=engine_run_ref(ctx.execution_ref),
+    )
+    if out.get("execution_id"):
+        ids.append(str(out["execution_id"]))
+    if out.get("status") != "success":
+        return None, f"{action_name}: {out.get('error_message') or 'failed'}", out.get("http_status")
+    output = out.get("output_data") or {}
+    err = _integration_error(output)
+    if err:
+        return None, f"{action_name}: {err}", None
+    return output, None, None
+
+
+def _vendor_comment(ctx: AdapterContext, verb: str) -> str:
+    """Comment recorded in the vendor's action log: names PySOAR and the execution reference."""
+    text = f"PySOAR {verb}, execution {ctx.execution_ref or 'interactive'}"
+    if ctx.reason:
+        text = f"{text}: {ctx.reason}"
+    return text[:500]
+
+
+# -- CrowdStrike Falcon ------------------------------------------------------
+
+
+async def _crowdstrike_resolve(ctx: AdapterContext, target: str) -> AdapterOutcome:
+    exec_id, device_id, err = await crowdstrike_device_for_host(ctx.executor, ctx.installation_id, target, ctx.execution_ref)
+    ids = [exec_id] if exec_id else []
+    if err or device_id is None:
+        return AdapterOutcome(ids, error=err or "host_not_found")
+    return AdapterOutcome(ids, vendor_id=device_id)
+
+
+async def _crowdstrike_apply(ctx: AdapterContext, found: AdapterOutcome) -> AdapterOutcome:
+    ids: list[str] = []
+    contain = await ctx.executor.execute_action(
+        installation_id=ctx.installation_id, action_name="contain_host", input_data={"device_id": found.vendor_id},
+        triggered_by="playbook", playbook_run_id=engine_run_ref(ctx.execution_ref),
+    )
+    if contain.get("execution_id"):
+        ids.append(contain["execution_id"])
+    if contain.get("status") != "success":
+        return AdapterOutcome(ids, error=contain.get("error_message") or "contain_host failed")
+    err = _integration_error(contain.get("output_data"))
+    if err:
+        return AdapterOutcome(ids, error=err)
+    return AdapterOutcome(
+        ids, detail=f"CrowdStrike Falcon contained device {found.vendor_id} ({ctx.target})", changed=True, reversible=True,
+    )
+
+
+async def _crowdstrike_revert(ctx: AdapterContext, vendor_id: str) -> AdapterOutcome:
+    ids: list[str] = []
+    _, err, _ = await _engine_call(ctx, "lift_containment", {"device_id": vendor_id}, ids)
+    if err:
+        return AdapterOutcome(ids, error=err)
+    return AdapterOutcome(ids, detail=f"CrowdStrike Falcon lifted containment of device {vendor_id}", changed=True)
+
+
+# -- Microsoft Defender for Endpoint ----------------------------------------
+
+
+async def _defender_resolve(ctx: AdapterContext, target: str) -> AdapterOutcome:
+    """The single Defender machine whose ``computerDnsName`` equals ``target`` exactly."""
+    ids: list[str] = []
+    try:
+        host = _validate_hostname(target)
+    except InvalidTargetError as exc:
+        return AdapterOutcome(ids, error=str(exc))
+    found, err, _ = await _engine_call(ctx, "search_machines", {"query": host, "top": 10}, ids)
+    if err or found is None:
+        return AdapterOutcome(ids, error=err)
+    # search_machines filters computerDnsName OR lastIpAddress: keep exact
+    # computerDnsName matches only.
+    matches = {
+        str(m["id"]) for m in found.get("machines") or []
+        if isinstance(m, dict) and m.get("id") and str(m.get("computer_dns_name") or "").strip().lower() == host
+    }
+    if not matches:
+        return AdapterOutcome(ids, error=f"host_not_found: Microsoft Defender has no machine whose computerDnsName is {host}")
+    if len(matches) > 1:
+        return AdapterOutcome(ids, error=f"ambiguous_host: Microsoft Defender matched {len(matches)} machines for {host}")
+    machine_id = matches.pop()
+    machine, err, _ = await _engine_call(ctx, "get_machine", {"machine_id": machine_id}, ids)
+    if err or machine is None:
+        return AdapterOutcome(ids, error=err)
+    name = str(machine.get("computer_dns_name") or "").strip().lower()
+    if name != host or str(machine.get("id") or "") != machine_id:
+        return AdapterOutcome(ids, error=(
+            f"host_not_found: machine {machine_id} is named {machine.get('computer_dns_name')!r}, not {host}"
+        ))
+    return AdapterOutcome(ids, vendor_id=machine_id)
+
+
+async def _defender_apply(ctx: AdapterContext, found: AdapterOutcome) -> AdapterOutcome:
+    ids: list[str] = []
+    out, err, _ = await _engine_call(ctx, "isolate_machine", {
+        "machine_id": found.vendor_id, "comment": _vendor_comment(ctx, "isolate_host"), "isolation_type": "Full",
+    }, ids)
+    if err or out is None:
+        return AdapterOutcome(ids, error=err)
+    action_id = out.get("action_id")
+    progress = (
+        f"machine action {action_id} ({out.get('status') or 'status not reported'}); "
+        "get_machine_action reads its progress" if action_id else "Defender returned no machine action id"
+    )
+    return AdapterOutcome(
+        ids, detail=f"Microsoft Defender full isolation requested for machine {found.vendor_id} ({ctx.target}): {progress}",
+        changed=True, reversible=True, vendor_action_id=str(action_id) if action_id else None,
+    )
+
+
+async def _defender_revert(ctx: AdapterContext, vendor_id: str) -> AdapterOutcome:
+    ids: list[str] = []
+    out, err, _ = await _engine_call(ctx, "unisolate_machine", {
+        "machine_id": vendor_id, "comment": _vendor_comment(ctx, "rollback of isolate_host"),
+    }, ids)
+    if err or out is None:
+        return AdapterOutcome(ids, error=err)
+    return AdapterOutcome(
+        ids, detail=f"Microsoft Defender release from isolation requested for machine {vendor_id}: machine action "
+                    f"{out.get('action_id')} ({out.get('status') or 'status not reported'})",
+        changed=True, vendor_action_id=str(out["action_id"]) if out.get("action_id") else None,
+    )
+
+
+# -- Identity providers --------------------------------------------------------
+
+
+def _user_lookup_error(provider: str, login: str, err: Optional[str], http_status: Optional[int]) -> str:
+    if http_status == 404:
+        return f"user_not_found: {provider} has no user {login}"
+    return err or "user lookup failed"
+
+
+async def _okta_resolve(ctx: AdapterContext, target: str) -> AdapterOutcome:
+    """The Okta user whose login equals ``target`` (case-insensitive)."""
+    ids: list[str] = []
+    try:
+        login = _validate_login(target)
+    except InvalidTargetError as exc:
+        return AdapterOutcome(ids, error=str(exc))
+    user, err, http_status = await _engine_call(ctx, "get_user", {"user": login}, ids)
+    if err or user is None:
+        return AdapterOutcome(ids, error=_user_lookup_error("Okta", login, err, http_status))
+    if str(user.get("login") or "").strip().lower() != login.lower() or not user.get("id"):
+        return AdapterOutcome(ids, error=f"user_not_found: Okta user {user.get('id')} has login {user.get('login')!r}, not {login}")
+    return AdapterOutcome(ids, vendor_id=str(user["id"]), state=str(user.get("status") or "").upper())
+
+
+async def _okta_apply(ctx: AdapterContext, found: AdapterOutcome) -> AdapterOutcome:
+    ids: list[str] = []
+    already = found.state == "SUSPENDED"
+    if not already:
+        _, err, _ = await _engine_call(ctx, "suspend_user", {"user_id": found.vendor_id}, ids)
+        if err:
+            return AdapterOutcome(ids, error=err)
+    _, err, _ = await _engine_call(ctx, "revoke_sessions", {"user_id": found.vendor_id}, ids)
+    first = (
+        f"Okta user {found.vendor_id} ({ctx.target}) was already SUSPENDED (left as is)" if already
+        else f"Okta suspended user {found.vendor_id} ({ctx.target})"
+    )
+    if err:
+        return AdapterOutcome(
+            ids, error=err, changed=not already, reversible=not already,
+            detail=f"{first}; session revocation FAILED ({err}): existing sessions may still be valid",
+        )
+    return AdapterOutcome(ids, detail=f"{first}; every Okta session revoked", changed=True, reversible=not already)
+
+
+async def _okta_revert(ctx: AdapterContext, vendor_id: str) -> AdapterOutcome:
+    ids: list[str] = []
+    _, err, _ = await _engine_call(ctx, "unsuspend_user", {"user_id": vendor_id}, ids)
+    if err:
+        return AdapterOutcome(ids, error=err)
+    return AdapterOutcome(
+        ids, changed=True,
+        detail=f"Okta unsuspended user {vendor_id}; the sessions revoked at disable time cannot be restored (the user signs in again)",
+    )
+
+
+async def _entra_resolve(ctx: AdapterContext, target: str) -> AdapterOutcome:
+    """The Entra ID user whose userPrincipalName equals ``target`` (case-insensitive)."""
+    ids: list[str] = []
+    try:
+        login = _validate_login(target)
+    except InvalidTargetError as exc:
+        return AdapterOutcome(ids, error=str(exc))
+    user, err, http_status = await _engine_call(ctx, "get_user", {"user": login}, ids)
+    if err or user is None:
+        return AdapterOutcome(ids, error=_user_lookup_error("Microsoft Entra ID", login, err, http_status))
+    upn = str(user.get("userPrincipalName") or "").strip()
+    if upn.lower() != login.lower() or not user.get("id"):
+        return AdapterOutcome(ids, error=f"user_not_found: Entra ID user {user.get('id')} is {upn!r}, not {login}")
+    return AdapterOutcome(ids, vendor_id=str(user["id"]), state=user.get("accountEnabled"))
+
+
+async def _entra_apply(ctx: AdapterContext, found: AdapterOutcome) -> AdapterOutcome:
+    ids: list[str] = []
+    already = found.state is False
+    if not already:
+        _, err, _ = await _engine_call(ctx, "disable_user", {"user": found.vendor_id}, ids)
+        if err:
+            return AdapterOutcome(ids, error=err)
+    _, err, _ = await _engine_call(ctx, "revoke_sign_in_sessions", {"user": found.vendor_id}, ids)
+    first = (
+        f"Entra ID user {found.vendor_id} ({ctx.target}) was already disabled (left as is)" if already
+        else f"Entra ID disabled sign-in for user {found.vendor_id} ({ctx.target})"
+    )
+    if err:
+        return AdapterOutcome(
+            ids, error=err, changed=not already, reversible=not already,
+            detail=f"{first}; sign-in session revocation FAILED ({err}): refresh tokens may still be valid",
+        )
+    return AdapterOutcome(
+        ids, detail=f"{first}; refresh tokens and session cookies revoked", changed=True, reversible=not already,
+    )
+
+
+async def _entra_revert(ctx: AdapterContext, vendor_id: str) -> AdapterOutcome:
+    ids: list[str] = []
+    _, err, _ = await _engine_call(ctx, "enable_user", {"user": vendor_id}, ids)
+    if err:
+        return AdapterOutcome(ids, error=err)
+    return AdapterOutcome(
+        ids, changed=True,
+        detail=f"Entra ID enabled sign-in for user {vendor_id}; the sessions revoked at disable time cannot be restored",
+    )
+
+
+@dataclass(frozen=True)
+class IntegrationAdapter:
+    """How one connector carries out one containment action.
+
+    ``resolve(ctx, target)`` finds exactly one vendor object (no change),
+    ``apply(ctx, resolved)`` changes it, ``revert(ctx, vendor_id)`` undoes
+    it (remediation rollback). ``operation`` names the vendor actions an
+    operator must trigger when the request is not executed.
+    """
+
+    action: str
+    connector: str
+    label: str
+    operation: str
+    resolve: Callable[[AdapterContext, str], Awaitable[AdapterOutcome]]
+    apply: Callable[[AdapterContext, AdapterOutcome], Awaitable[AdapterOutcome]]
+    revert: Callable[[AdapterContext, str], Awaitable[AdapterOutcome]]
+    identity: bool = False
+
+
+#: (action) -> adapters in the order they are tried.
+ADAPTERS: dict[str, tuple[IntegrationAdapter, ...]] = {
+    "isolate_host": (
+        IntegrationAdapter(
+            "isolate_host", "crowdstrike", "CrowdStrike Falcon", "contain_host",
+            _crowdstrike_resolve, _crowdstrike_apply, _crowdstrike_revert,
+        ),
+        IntegrationAdapter(
+            "isolate_host", "microsoft_defender", "Microsoft Defender for Endpoint", "isolate_machine",
+            _defender_resolve, _defender_apply, _defender_revert,
+        ),
+    ),
+    "disable_user": (
+        IntegrationAdapter(
+            "disable_user", "okta", "Okta", "suspend_user + revoke_sessions",
+            _okta_resolve, _okta_apply, _okta_revert, identity=True,
+        ),
+        IntegrationAdapter(
+            "disable_user", "azure_ad", "Microsoft Entra ID", "disable_user + revoke_sign_in_sessions",
+            _entra_resolve, _entra_apply, _entra_revert, identity=True,
+        ),
+    ),
+}
+
+#: Connectors with a real, executable implementation for an action (derived from ``ADAPTERS``).
+_EXECUTABLE_CONNECTORS: dict[str, tuple[str, ...]] = {
+    action: tuple(adapter.connector for adapter in adapters) for action, adapters in ADAPTERS.items()
+}
+
+
+def adapter_for(action: str, connector: str) -> Optional[IntegrationAdapter]:
+    """The adapter for ``connector`` and ``action``, if one exists (remediation's revert uses it)."""
+    for adapter in ADAPTERS.get(action, ()):
+        if adapter.connector == connector:
+            return adapter
+    return None
+
+
+def _is_not_found(error: Optional[str]) -> bool:
+    return bool(error) and str(error).startswith(("host_not_found", "user_not_found"))
+
+
+async def _actuate_via_integrations(
+    action: str,
+    target: str,
+    candidates: list[tuple[IntegrationAdapter, InstalledIntegration]],
+    *,
+    execution_ref: Optional[str],
+    reason: str,
+    asset: Optional[Asset] = None,
+) -> ContainmentResult:
+    """Run the first adapter that knows ``target`` (see the module docstring for the order)."""
     from src.integrations.engine import ActionExecutor
 
     executor = ActionExecutor()
-    exec_id, device_id, err = await crowdstrike_device_for_host(executor, integ.id, hostname, execution_ref)
-    if err or device_id is None:
-        return exec_id, None, err or "host_not_found"
-    contain = await executor.execute_action(
-        installation_id=integ.id, action_name="contain_host", input_data={"device_id": device_id},
-        triggered_by="playbook", playbook_run_id=execution_ref,
+    misses: list[str] = []
+    all_ids: list[str] = []
+    asset_id = asset.id if asset else None
+    for index, (adapter, integ) in enumerate(candidates):
+        ctx = AdapterContext(executor, integ.id, execution_ref, reason=reason, target=target)
+        found = await adapter.resolve(ctx, target)
+        all_ids.extend(found.execution_ids)
+        common: dict[str, Any] = {
+            "action": action, "target": target, "integration": adapter.connector, "integration_id": integ.id,
+            "integration_execution_ids": all_ids, "asset_id": asset_id,
+        }
+        if found.error or not found.vendor_id:
+            err = found.error or "target not resolved"
+            if _is_not_found(err) and index + 1 < len(candidates):
+                misses.append(err)
+                continue
+            err = "; ".join([*misses, err])
+            return ContainmentResult(
+                status=DETECTION_ONLY, detail=f"{adapter.label} {action} of {target} refused or failed before any change: {err}",
+                integration_execution_id=all_ids[-1] if all_ids else None, error=err, failed=True, **common,
+            )
+        done = await adapter.apply(ctx, found)
+        all_ids.extend(done.execution_ids)
+        common.update(vendor_id=found.vendor_id, vendor_action_id=done.vendor_action_id)
+        last_id = all_ids[-1] if all_ids else None
+        if done.error and not done.changed:
+            return ContainmentResult(
+                status=DETECTION_ONLY, detail=f"{adapter.label} {action} of {target} failed: {done.error}",
+                integration_execution_id=last_id, error=done.error, failed=True, **common,
+            )
+        return ContainmentResult(
+            status=EXECUTED, detail=done.detail, reversible=done.reversible, integration_execution_id=last_id,
+            error=done.error, failed=bool(done.error), **common,
+        )
+    raise ValueError(f"no integration candidates for {action}")  # callers check candidates first
+
+
+def _manual_required_result(
+    action: str, target: str, adapter: IntegrationAdapter, integ: InstalledIntegration, why: str, **extra: Any,
+) -> ContainmentResult:
+    return ContainmentResult(
+        action=action, target=target, status=MANUAL_REQUIRED,
+        detail=(
+            f"{why}: an operator must trigger {adapter.connector} {adapter.operation} for {target} "
+            f"(integration '{integ.display_name}') from the alert."
+        ),
+        integration=adapter.connector, integration_id=integ.id, **extra,
     )
-    if contain.get("status") != "success":
-        return contain.get("execution_id"), device_id, contain.get("error_message") or "contain_host failed"
-    err = _integration_error(contain.get("output_data"))
-    return contain.get("execution_id"), device_id, err
 
 
 def _invalid_target_result(action: str, target: Any, exc: InvalidTargetError) -> ContainmentResult:
@@ -590,7 +1054,7 @@ async def isolate_host(
     approval_override: bool = False,
     unattended: bool = False,
 ) -> ContainmentResult:
-    """Network isolation via the host's agent, else an installed CrowdStrike integration."""
+    """Network isolation via the host's agent, else an installed EDR integration (``ADAPTERS['isolate_host']``)."""
     if not hostname:
         raise ValueError("isolate_host requires a hostname")
     try:
@@ -609,42 +1073,63 @@ async def isolate_host(
     if done is not None:
         return await _audit(db, org_id, actor=actor, reason=reason, execution_ref=execution_ref, result=done)
 
-    integ, unsupported = await _integration_paths(db, org_id, "isolate_host")
-    if integ is not None and unattended:
-        name = _connector_name(integ)
-        result = ContainmentResult(
-            action="isolate_host", target=label, status=MANUAL_REQUIRED,
-            detail=(
-                f"Unattended request not executed: an operator must trigger {name} contain_host for {label} "
-                f"(integration '{integ.display_name}') from the alert."
-            ),
-            integration=name, asset_id=asset.id if asset else None, agent_id=agent.id if agent else None,
+    candidates, unsupported = await _integration_candidates(db, org_id, "isolate_host")
+    if candidates and unattended:
+        adapter, integ = candidates[0]
+        result = _manual_required_result(
+            "isolate_host", label, adapter, integ, "Unattended request not executed",
+            asset_id=asset.id if asset else None, agent_id=agent.id if agent else None,
             agent_hostname=agent.hostname if agent else None, error=rejection,
         )
         return await _audit(db, org_id, actor=actor, reason=reason, execution_ref=execution_ref, result=result)
-    if integ is not None:
-        exec_id, device_id, err = await _crowdstrike_contain(integ, label, execution_ref)
-        if err is None:
-            result = ContainmentResult(
-                action="isolate_host", target=label, status=EXECUTED,
-                detail=f"CrowdStrike Falcon contained device {device_id} ({label})",
-                reversible=True, integration=_connector_name(integ), integration_execution_id=exec_id,
-                asset_id=asset.id if asset else None, agent_id=agent.id if agent else None,
-            )
-        else:
-            result = ContainmentResult(
-                action="isolate_host", target=label, status=DETECTION_ONLY,
-                detail=f"CrowdStrike Falcon containment of {label} failed: {err}",
-                integration=_connector_name(integ), integration_execution_id=exec_id,
-                asset_id=asset.id if asset else None, error=err, failed=True,
-            )
+    if candidates:
+        result = await _actuate_via_integrations(
+            "isolate_host", label, candidates, execution_ref=execution_ref, reason=reason, asset=asset,
+        )
+        if result.status == EXECUTED and agent is not None:
+            result.agent_id = agent.id
         return await _audit(db, org_id, actor=actor, reason=reason, execution_ref=execution_ref, result=result)
 
     result = _no_path_result(
         "isolate_host", label, asset=asset, agent=agent, rejection=rejection, unsupported=unsupported,
-        needs=f"an enrolled endpoint agent with the 'ir' capability on {label}, or a CrowdStrike Falcon integration",
+        needs=(
+            f"an enrolled endpoint agent with the 'ir' capability on {label}, or a CrowdStrike Falcon or "
+            "Microsoft Defender for Endpoint integration"
+        ),
     )
     return await _audit(db, org_id, actor=actor, reason=reason, execution_ref=execution_ref, result=result)
+
+
+async def _identity_disable(
+    db: AsyncSession,
+    org_id: str,
+    login: str,
+    candidates: list[tuple[IntegrationAdapter, InstalledIntegration]],
+    *,
+    actor: str,
+    reason: str,
+    execution_ref: Optional[str],
+    unattended: bool,
+    agent: Optional[EndpointAgent],
+    rejection: Optional[str],
+) -> ContainmentResult:
+    """The identity-provider leg of ``disable_user`` (gated: attended, administrator actor)."""
+    from src.identity import roles as identity_roles
+
+    adapter, integ = candidates[0]
+    extra: dict[str, Any] = {
+        "agent_id": agent.id if agent else None, "agent_hostname": agent.hostname if agent else None, "error": rejection,
+    }
+    if unattended:
+        return _manual_required_result("disable_user", login, adapter, integ, "Unattended request not executed", **extra)
+    if not await identity_roles.user_has_tier(db, None if actor.startswith("system:") else actor, org_id, "itdr", "admin"):
+        return _manual_required_result(
+            "disable_user", login, adapter, integ,
+            f"Identity-provider actions run only for an administrator; {actor} is not one", **extra,
+        )
+    return await _actuate_via_integrations(
+        "disable_user", login, candidates, execution_ref=execution_ref, reason=reason,
+    )
 
 
 async def disable_user(
@@ -660,12 +1145,17 @@ async def disable_user(
     approval_override: bool = False,
     unattended: bool = False,
 ) -> ContainmentResult:
-    """Disable a local account through the named host's agent.
+    """Disable a local account through the named host's agent, else a directory account.
 
-    Directory accounts (AD / Entra / Okta) need an identity-provider connector
-    that PySOAR does not implement yet: ``awaiting_integration`` when one is
-    installed, ``detection_only`` otherwise. PySOAR's own login accounts are
-    never touched here.
+    Without a host (or when the host has no capable agent) a directory login
+    (``user@domain``) is disabled through the first installed identity-provider
+    adapter that knows it (``ADAPTERS['disable_user']``: Okta, then Entra ID),
+    and only when the request is attended and ``actor`` is an ``itdr``
+    administrator; otherwise ``manual_required`` with no vendor call. A
+    username that is not a login is refused (``invalid_login``) before any
+    lookup when no host was named. Active Directory has no connector, so an
+    installed but unimplemented identity integration is
+    ``awaiting_integration``. PySOAR's own login accounts are never touched.
     """
     if not username:
         raise ValueError("disable_user requires a username")
@@ -688,11 +1178,25 @@ async def disable_user(
             done.target = username
             done.reversible = False  # the agent has no enable_account command
             return await _audit(db, org_id, actor=actor, reason=reason, execution_ref=execution_ref, result=done)
-    _, unsupported = await _integration_paths(db, org_id, "disable_user")
+    candidates, unsupported = await _integration_candidates(db, org_id, "disable_user")
+    if candidates:
+        try:
+            login = _validate_login(username)
+        except InvalidTargetError as exc:
+            login = None
+            if not hostname:
+                result = _invalid_target_result("disable_user", username, exc)
+                return await _audit(db, org_id, actor=actor, reason=reason, execution_ref=execution_ref, result=result)
+        if login is not None:
+            result = await _identity_disable(
+                db, org_id, login, candidates, actor=actor, reason=reason, execution_ref=execution_ref,
+                unattended=unattended, agent=agent, rejection=rejection,
+            )
+            return await _audit(db, org_id, actor=actor, reason=reason, execution_ref=execution_ref, result=result)
     needs = (
         f"an enrolled endpoint agent with the 'ir' capability on {hostname}"
         if hostname
-        else "a host (for a local account via its endpoint agent) or an identity-provider connector with a disable_user action"
+        else "a host (for a local account via its endpoint agent) or an Okta / Microsoft Entra ID integration"
     )
     result = _no_path_result(
         "disable_user", username, asset=asset, agent=agent, rejection=rejection, unsupported=unsupported, needs=needs,

@@ -119,14 +119,19 @@ async def test_no_agent_no_integration_is_detection_only(db_session):
 
 @pytest.mark.asyncio
 async def test_installed_but_unimplemented_integration_is_awaiting_integration(db_session):
-    await _install(db_session, ORG_A, "okta", "identity_provider")
+    # Okta and Entra ID now have adapters (tests/unit/test_containment_connectors.py);
+    # an identity-provider row without one still reports awaiting_integration.
+    await _install(db_session, ORG_A, "onelogin", "identity_provider")
     await _install(db_session, ORG_A, "palo_alto_ngfw", "firewall")
+    await _install(db_session, ORG_A, "sentinelone", "edr")
     await db_session.commit()
 
     res = await containment.disable_user(db_session, ORG_A, username="jdoe", actor="system:t", reason="r", execution_ref=None)
-    assert res.status == containment.AWAITING_INTEGRATION and "okta" in res.missing_dependency
+    assert res.status == containment.AWAITING_INTEGRATION and "onelogin" in res.missing_dependency
     res = await containment.block_ip(db_session, ORG_A, ip="198.51.100.2", actor="system:t", reason="r", execution_ref=None)
     assert res.status == containment.AWAITING_INTEGRATION and "palo_alto_ngfw" in res.missing_dependency
+    res = await containment.isolate_host(db_session, ORG_A, hostname="ws-1", actor="system:t", reason="r", execution_ref=None)
+    assert res.status == containment.AWAITING_INTEGRATION and res.missing_dependency == "isolate_host connector implementation for sentinelone"
 
 
 @pytest.mark.asyncio

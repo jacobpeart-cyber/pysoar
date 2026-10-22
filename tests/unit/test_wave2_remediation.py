@@ -85,7 +85,8 @@ async def test_actions_registry_lists_executable_keys(client, viewer_headers):
     fq = by_key["file_quarantine"]
     assert fq["label"] and fq["reversible"] is True and isinstance(fq["requires_approval"], bool)
     assert {"name": "file_path", "type": "string", "required": True}.items() <= fq["parameters"][0].items()
-    assert by_key["account_disable"]["reversible"] is False
+    # Reversible through Okta / Entra ID (unsuspend / enable); the agent path step itself records no revert.
+    assert by_key["account_disable"]["reversible"] is True
 
     one = await client.get(f"{API}/actions", params={"action_type": "auto_block"}, headers=viewer_headers)
     assert [a["key"] for a in one.json()] == ["firewall_block"]

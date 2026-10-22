@@ -6,9 +6,11 @@ table. This module is the ingestion side.
 
 Sources
 -------
-* **Okta** (installed integration, connector ``okta``): ``config.base_url``
-  (``https://<org>.okta.com``) and an API token in the credentials
-  (``api_key`` / ``token`` / ``api_token``, sent as ``SSWS``). Users come from
+* **Okta** (installed integration, connector ``okta``): the catalogue install
+  shape ``credentials.domain`` (org hostname, e.g. ``acme.okta.com``; the base
+  URL is ``https://<domain>``) + ``credentials.api_token``, or the earlier
+  shape ``config.base_url`` (``https://<org>.okta.com``) + a token in
+  ``credentials.api_key`` / ``token``. The token is sent as ``SSWS``. Users come from
   ``GET /api/v1/users`` (200 per page, ``Link: rel="next"``); admin-role
   holders from ``GET /api/v1/iam/assignees/users``; MFA from
   ``GET /api/v1/users/{id}/factors`` (one call per user, at most
@@ -31,7 +33,8 @@ so memory stays at one page plus small per-user lookup sets.
 
 Outbound calls
 --------------
-Okta calls are pinned to the integration's configured ``base_url`` through
+Okta calls are pinned to the integration's base URL (configured, or derived
+from the validated domain) through
 the integration engine's guard (``ActionExecutor._resolve_generic_target``:
 same origin as the stored base URL, DNS resolved once, internal addresses
 refused, connection to the vetted IP). Microsoft endpoints are fixed vendor
@@ -354,14 +357,44 @@ def _next_link(link_header: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+_OKTA_SHAPES = (
+    "credentials.domain + credentials.api_token (catalogue install), or config.base_url + an API token "
+    "in credentials.api_key / token"
+)
+
+
 def _okta_auth(config: dict[str, Any], credentials: dict[str, Any]) -> tuple[str, dict[str, str]]:
+    """(base URL, request headers) for an installed Okta integration.
+
+    ``config.base_url`` wins when present; otherwise the base URL is
+    ``https://<credentials.domain>``, the domain validated as a bare hostname
+    (``okta_domain``: no scheme, path, port, ``@``, ``?``, ``#``,
+    whitespace or IP literal). The token is ``api_token``, then ``api_key``,
+    then ``token``. The message names both accepted shapes and never echoes a
+    value.
+    """
+    from src.integrations.connectors.okta import okta_domain
+
+    token = credentials.get("api_token") or credentials.get("api_key") or credentials.get("token")
     base = str(config.get("base_url") or config.get("url") or "").strip().rstrip("/")
-    token = credentials.get("api_key") or credentials.get("token") or credentials.get("api_token")
+    if not base and credentials.get("domain"):
+        try:
+            base = f"https://{okta_domain(credentials['domain'])}"
+        except ValueError:
+            raise DirectoryError(
+                "Okta credentials.domain must be the org hostname, e.g. acme.okta.com "
+                "(no scheme, path, port, '@', '?', '#' or whitespace)",
+            ) from None
     if not base or not token:
-        raise DirectoryError("Okta integration needs config.base_url and an API token (credentials.api_key)")
+        raise DirectoryError(f"Okta integration needs {_OKTA_SHAPES}")
     if urlsplit(base).scheme != "https":
         raise DirectoryError("Okta base_url must be https")
     return base, {"Authorization": f"SSWS {token}", "Accept": "application/json", "Content-Type": "application/json"}
+
+
+def _pinned_config(config: dict[str, Any], base: str) -> dict[str, Any]:
+    """``config`` with ``base_url`` set to ``base``: the engine guard pins every Okta call to it."""
+    return {**config, "base_url": base}
 
 
 _OKTA_INACTIVE = {"SUSPENDED", "DEPROVISIONED", "LOCKED_OUT"}
@@ -450,7 +483,7 @@ async def _sync_okta(db: AsyncSession, org_id: str, integration: InstalledIntegr
     config, credentials = _secrets(integration)
     base, headers = _okta_auth(config, credentials)
     mfa_budget = MAX_MFA_LOOKUPS
-    async with _Client(config, pin_to_base=True) as client:
+    async with _Client(_pinned_config(config, base), pin_to_base=True) as client:
         admin_ids = await _okta_admin_ids(client, base, headers, summary)
         async for page in _okta_users(client, base, headers, summary):
             records: list[DirectoryUser] = []
@@ -488,7 +521,7 @@ async def _okta_action(integration: InstalledIntegration, identity: IdentityProf
         "revoke_sessions": [("DELETE", f"{user_path}/sessions")],
     }[action]
     steps = []
-    async with _Client(config, pin_to_base=True) as client:
+    async with _Client(_pinned_config(config, base), pin_to_base=True) as client:
         for method, url in calls:
             resp = await client.request(method, url, headers)
             steps.append({"call": f"{method} {urlsplit(url).path}", "http_status": resp.status_code})
