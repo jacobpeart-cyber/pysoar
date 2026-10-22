@@ -312,7 +312,8 @@ class IntegrationExecution(BaseModel):
         default=ExecutionTrigger.MANUAL.value,
         nullable=False,
     )
-    playbook_run_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    # Callers pass "playbook_execution:<uuid>" (55 characters): 100 since migration 039.
+    playbook_run_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
 
     # Input and output
     input_data: Mapped[str] = mapped_column(Text, nullable=False)  # JSON
@@ -333,6 +334,10 @@ class IntegrationExecution(BaseModel):
 
     # Error tracking
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # The connector's error code (invalid_parameters, http_error, ...) and the
+    # vendor's HTTP status, stored since migration 039 so history carries them.
+    error_code: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    http_status: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     # Relationships

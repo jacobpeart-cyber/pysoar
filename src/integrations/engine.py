@@ -1142,6 +1142,8 @@ class ActionExecutor:
             duration_ms=duration_ms,
             triggered_by=triggered_by,
             playbook_run_id=playbook_run_id,
+            error_code=error_code,
+            http_status=http_status,
         )
         result: dict[str, Any] = {
             "execution_id": execution_id,
@@ -1251,6 +1253,8 @@ class ActionExecutor:
         duration_ms: int,
         triggered_by: str,
         playbook_run_id: Optional[str],
+        error_code: Optional[str] = None,
+        http_status: Optional[int] = None,
     ) -> Optional[str]:
         """Persist one execution row; returns its id.
 
@@ -1318,6 +1322,8 @@ class ActionExecutor:
                     completed_at=now.isoformat(),
                     duration_ms=duration_ms,
                     error_message=error_message,
+                    error_code=error_code,
+                    http_status=http_status,
                     retry_count=0,
                 )
                 db.add(execution)

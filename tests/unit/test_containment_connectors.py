@@ -497,7 +497,8 @@ async def test_identity_disable_reverted_by_rollback(db_session, monkeypatch, na
 
 @pytest.mark.asyncio
 async def test_long_execution_reference_still_leaves_execution_rows(db_session, monkeypatch):
-    # integration_executions.playbook_run_id is VARCHAR(36): the run id is stored.
+    # integration_executions.playbook_run_id is VARCHAR(100) since migration 039:
+    # the full playbook reference is stored; only a longer one is cut to its tail.
     integ_id = await _install(db_session, ORG, "microsoft_defender")
     await db_session.commit()
     fake_vendor(monkeypatch, _defender([_machine(MACHINE_ID, "ws1.contoso.com")]))
@@ -506,8 +507,8 @@ async def test_long_execution_reference_still_leaves_execution_rows(db_session, 
         db_session, ORG, hostname="ws1.contoso.com", actor="system:t", reason="r", execution_ref=f"playbook_execution:{run_id}",
     )
     assert res.status == containment.EXECUTED
-    assert {r.playbook_run_id for r in await _executions(db_session, integ_id)} == {run_id}
-    assert containment.engine_run_ref("x" * 50) == "x" * 36 and containment.engine_run_ref(None) is None
+    assert {r.playbook_run_id for r in await _executions(db_session, integ_id)} == {f"playbook_execution:{run_id}"}
+    assert containment.engine_run_ref("x" * 150) == "x" * 100 and containment.engine_run_ref(None) is None
 
 
 def test_adapter_table_and_executable_connectors():

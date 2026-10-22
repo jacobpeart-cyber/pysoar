@@ -517,16 +517,16 @@ def _integration_error(output: Any) -> Optional[str]:
 
 
 #: Width of ``integration_executions.playbook_run_id``.
-_RUN_REF_MAX = 36
+_RUN_REF_MAX = 100
 
 
 def engine_run_ref(execution_ref: Optional[str]) -> Optional[str]:
-    """``execution_ref`` as it fits ``integration_executions.playbook_run_id`` (VARCHAR(36)).
+    """``execution_ref`` as it fits ``integration_executions.playbook_run_id``
+    (VARCHAR(100) since migration 039; ``playbook_execution:<uuid>`` fits).
 
-    ``playbook_execution:<uuid>`` (55 characters) does not fit, and on
-    PostgreSQL the engine's history write would fail and leave no execution
-    row. A longer reference is stored as its last ``:`` segment (the run's id);
-    the audit row keeps the full reference.
+    A longer reference would make PostgreSQL refuse the history write and
+    leave no execution row, so it is stored as its last ``:`` segment (the
+    run's id); the audit row keeps the full reference.
     """
     if execution_ref is None or len(execution_ref) <= _RUN_REF_MAX:
         return execution_ref

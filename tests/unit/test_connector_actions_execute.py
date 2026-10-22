@@ -121,6 +121,11 @@ async def test_vendor_4xx_is_a_failed_row_with_its_status(client, db_session, or
     assert "HTTP 404" in out["error_message"] and "Issue does not exist" in out["error_message"]
     assert "jira-fixture-token-0001" not in resp.text
     rows = await _executions(db_session, jira)
+    # Since migration 039 the history row carries the code and the vendor status too.
+    assert rows[0].http_status == 404 and rows[0].error_code == out["error_code"]
+    listed = await client.get(f"{BASE}/installed/{jira}/executions", params={"size": 10}, headers=org_a_headers)
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["items"][0]["http_status"] == 404
     assert [r.status for r in rows] == ["failed"]
 
 
