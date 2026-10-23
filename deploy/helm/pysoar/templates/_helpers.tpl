@@ -94,6 +94,12 @@ app.kubernetes.io/component: {{ .component }}
 {{- if not (has .Values.networkPolicy.egress.flavor (list "kubernetes" "cilium")) -}}
 {{- fail "networkPolicy.egress.flavor must be kubernetes or cilium" -}}
 {{- end -}}
+{{- if hasKey (.Values.config.extra | default dict) "OUTBOUND_PRIVATE_ALLOWLIST" -}}
+{{- fail "set the private-target allow-list with config.outboundPrivateAllowlist, not config.extra.OUTBOUND_PRIVATE_ALLOWLIST" -}}
+{{- end -}}
+{{- if not (kindIs "slice" (.Values.config.outboundPrivateAllowlist | default list)) -}}
+{{- fail "config.outboundPrivateAllowlist must be a list of CIDRs" -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -121,6 +127,7 @@ OLLAMA_BASE_URL: {{ . | quote }}
 OPENAI_BASE_URL: {{ . | quote }}
 {{- end }}
 OT_DISCOVERY_ALLOWED_CIDRS: {{ .Values.config.otDiscoveryAllowedCidrs | toJson | quote }}
+OUTBOUND_PRIVATE_ALLOWLIST: {{ .Values.config.outboundPrivateAllowlist | default list | toJson | quote }}
 SIEM_SYSLOG_ENABLED: {{ .Values.config.siemSyslogEnabled | toString | quote }}
 SIEM_SYSLOG_PORT: {{ .Values.config.siemSyslogPort | toString | quote }}
 {{- range $k, $v := .Values.config.extra }}

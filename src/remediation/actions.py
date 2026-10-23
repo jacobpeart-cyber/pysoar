@@ -799,8 +799,17 @@ async def _revert_integration(
     done = await adapter.revert(ctx, vendor_id)
     if done.error:
         return [], [done.error]
+    detail = done.detail
+    if adapter.identity:
+        # The account is enabled again at the provider: so is its ITDR profile.
+        note = await containment.sync_identity_profile(
+            db, org_id, connector, str(revert.get("target") or ""),
+            vendor_id=vendor_id, installation_id=integ.id, disabled=False,
+        )
+        if note:
+            detail = f"{detail}; {note}"
     return [{
-        "integration": connector, "vendor_id": vendor_id, "detail": done.detail,
+        "integration": connector, "vendor_id": vendor_id, "detail": detail,
         "integration_execution_ids": done.execution_ids, "vendor_action_id": done.vendor_action_id,
     }], []
 

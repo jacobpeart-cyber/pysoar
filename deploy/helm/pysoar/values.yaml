@@ -74,6 +74,20 @@ config:
   openaiBaseUrl: ""
   # OT_DISCOVERY_ALLOWED_CIDRS; empty disables active OT discovery.
   otDiscoveryAllowedCidrs: []
+  # OUTBOUND_PRIVATE_ALLOWLIST (src/integrations/netguard.py), rendered into
+  # the ConfigMap as a JSON list. Outbound integration calls (connectors, the
+  # SIEM pollers and log forwarder, the generic HTTP action, OIDC / SAML
+  # metadata, directory sync) refuse a target that resolves to a private
+  # address (RFC 1918, IPv6 ULA, 100.64.0.0/10, ...) unless it lies inside one
+  # of these CIDRs, e.g. an on-premises Splunk, Elasticsearch or QRadar:
+  #   outboundPrivateAllowlist: ["10.20.0.0/24", "fd12:3456::/48"]
+  # Default empty: deny every private target. Operator-level only; tenants
+  # cannot change it. Loopback, link-local, the cloud metadata addresses,
+  # multicast and reserved addresses stay refused whatever it lists. With
+  # networkPolicy.egress.enabled the pods reach only public TCP/443, so the
+  # same networks also need a networkPolicy.egress.extraEgress rule.
+  # Set it here, not through config.extra (the chart refuses that).
+  outboundPrivateAllowlist: []
   # SIEM syslog receiver started by the api process (UDP and TCP).
   siemSyslogEnabled: true
   siemSyslogPort: 5514

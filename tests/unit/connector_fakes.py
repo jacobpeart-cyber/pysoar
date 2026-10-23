@@ -60,6 +60,7 @@ VALID_FIELDS: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {
     # (token, or username + password; api_key, or username + password).
     "splunk": ({"base_url": "https://splunk.acme.example"}, {"token": "splunk-fixture-token-0001"}),
     "elastic": ({"base_url": "https://es.acme.example"}, {"api_key": "es-fixture-apikey-0001"}),
+    "qradar": ({"base_url": "https://qradar.acme.example"}, {"sec_token": "qradar-fixture-sec-0001"}),
 }
 
 

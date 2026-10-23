@@ -553,3 +553,110 @@ async def test_identity_rollback_refused_unless_attended_admin(db_session, monke
     seen.clear()
     allowed = await remediation_actions.revert_step(db_session, ORG, step, actor=admin, execution_ref="remediation:z")
     assert allowed["rolled_back"] is True and [r for r in seen if host_header(r) != "login.microsoftonline.com"]
+
+
+# --------------------------------------------------------------------------
+# The ITDR identity profile follows a containment disable and its revert
+# --------------------------------------------------------------------------
+
+
+async def _profile(db, org: str, provider: str, username: str, status: str):
+    from src.itdr.models import IdentityProfile
+
+    row = IdentityProfile(
+        organization_id=org, user_id=f"csv-{username}", username=username, email=username,
+        identity_provider=provider, account_status=status, source="csv_import",
+    )
+    db.add(row)
+    await db.flush()
+    return row.id
+
+
+async def _reload(db, row_id: str):
+    from src.itdr.models import IdentityProfile
+
+    db.expire_all()
+    return (await db.execute(select(IdentityProfile).where(IdentityProfile.id == row_id))).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_okta_disable_updates_only_this_tenants_matching_profile(db_session, monkeypatch):
+    integ_id = await _install(db_session, ORG, "okta")
+    admin = await _user(db_session, ORG, "admin")
+    mine = await _profile(db_session, ORG, "okta", "ADA@corp.io", "ACTIVE")
+    other_tenant = await _profile(db_session, OTHER_ORG, "okta", "ada@corp.io", "ACTIVE")
+    other_provider = await _profile(db_session, ORG, "azure_ad", "ada@corp.io", "enabled")
+    await db_session.commit()
+    fake_vendor(monkeypatch, _okta())
+
+    res = await containment.disable_user(db_session, ORG, username="ada@corp.io", actor=admin, reason="r", execution_ref=None)
+    assert res.status == containment.EXECUTED and not res.failed, res
+    assert "ITDR identity profile updated to SUSPENDED" in res.detail
+
+    mine = await _reload(db_session, mine)
+    assert mine.account_status == "SUSPENDED" and mine.source == "okta"
+    assert mine.source_integration_id == integ_id and mine.user_id == OKTA_USER and mine.last_synced_at
+    other_tenant = await _reload(db_session, other_tenant)
+    assert other_tenant.account_status == "ACTIVE" and other_tenant.source == "csv_import" and other_tenant.last_synced_at is None
+    other_provider = await _reload(db_session, other_provider)
+    assert other_provider.account_status == "enabled" and other_provider.source == "csv_import"
+
+
+@pytest.mark.asyncio
+async def test_failed_vendor_disable_leaves_the_profile_untouched(db_session, monkeypatch):
+    await _install(db_session, ORG, "okta")
+    admin = await _user(db_session, ORG, "admin")
+    mine = await _profile(db_session, ORG, "okta", "ada@corp.io", "ACTIVE")
+    await db_session.commit()
+    okta = _okta()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/lifecycle/suspend"):
+            return httpx.Response(403, json={"errorCode": "E0000006", "errorSummary": "forbidden"})
+        return okta(request)
+
+    fake_vendor(monkeypatch, handler)
+    res = await containment.disable_user(db_session, ORG, username="ada@corp.io", actor=admin, reason="r", execution_ref=None)
+    assert res.status == containment.DETECTION_ONLY and res.failed, res
+    mine = await _reload(db_session, mine)
+    assert mine.account_status == "ACTIVE" and mine.source == "csv_import" and mine.last_synced_at is None
+
+
+@pytest.mark.asyncio
+async def test_disable_without_a_matching_profile_says_so(db_session, monkeypatch):
+    await _install(db_session, ORG, "okta")
+    admin = await _user(db_session, ORG, "admin")
+    await _profile(db_session, ORG, "okta", "someone.else@corp.io", "ACTIVE")
+    await db_session.commit()
+    fake_vendor(monkeypatch, _okta())
+    res = await containment.disable_user(db_session, ORG, username="ada@corp.io", actor=admin, reason="r", execution_ref=None)
+    assert res.status == containment.EXECUTED and not res.failed, res
+    assert "no ITDR identity profile of okta matches ada@corp.io; none updated" in res.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name,handler,disabled,enabled", [
+    ("okta", _okta(), "SUSPENDED", "ACTIVE"),
+    ("azure_ad", _entra(upn="ada@corp.io"), "disabled", "enabled"),
+])
+async def test_profile_restored_when_the_disable_is_reverted(db_session, monkeypatch, name, handler, disabled, enabled):
+    integ_id = await _install(db_session, ORG, name)
+    admin = await _user(db_session, ORG, "admin")
+    mine = await _profile(db_session, ORG, name, "ada@corp.io", enabled)
+    other_tenant = await _profile(db_session, OTHER_ORG, name, "ada@corp.io", disabled)
+    await db_session.commit()
+    fake_vendor(monkeypatch, handler)
+
+    step = await remediation_actions.run_action(
+        db_session, ORG, "account_disable", "ada@corp.io", actor=admin, reason="r", execution_ref="remediation:p",
+    )
+    assert step["success"] and step["revert"]["kind"] == "integration_revert", step
+    assert (await _reload(db_session, mine)).account_status == disabled
+
+    outcome = await remediation_actions.revert_step(db_session, ORG, step, actor=admin, execution_ref="remediation:p")
+    assert outcome["rolled_back"] is True, outcome
+    assert f"ITDR identity profile updated to {enabled}" in outcome["reverse_commands"][0]["detail"]
+    mine = await _reload(db_session, mine)
+    assert mine.account_status == enabled and mine.source == name and mine.source_integration_id == integ_id
+    other_tenant = await _reload(db_session, other_tenant)
+    assert other_tenant.account_status == disabled and other_tenant.source == "csv_import"

@@ -1,0 +1,45 @@
+# gitleaks configuration (secrets scanning, .github/workflows/security.yml).
+#
+# The default gitleaks rule set applies unchanged. The allow-lists below are
+# pattern-only and narrow: each matches the exact reviewed false positive (a
+# hash, a template prefix, a value that names itself a fixture, or a fixed
+# test vector), so a real credential is still reported wherever it lands.
+# There is no path allow-list: in gitleaks 8.28 a `paths` entry skips the whole
+# file before any rule runs (even with condition = "AND"), which would be a
+# blanket allow of that file.
+#
+# Reviewed 2026-10-22 against the tracked tree (gitleaks v8.28.0,
+# `detect --no-git`): every finding allowed below is a test fixture, a hash or
+# a template prefix; none matched a value in the operator's local env files.
+
+title = "PySOAR gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "detect-secrets baseline (.secrets.baseline): hashed_secret fields are SHA-1 hashes of reviewed findings, not secrets"
+regexTarget = "line"
+regexes = ['''^\s*"hashed_secret": "[0-9a-f]{40}",?\s*$''']
+
+[[allowlists]]
+description = "deception engine honeytoken templates (src/deception/engine.py): the PEM header is a prefix and the key body is generated at runtime; the match must run from the template prefix to the generator's own header line, so a key placed between them is still reported"
+regexTarget = "match"
+regexes = ['''(?s)\A-----BEGIN RSA PRIVATE KEY-----",\s+"length": 1700,.*key_data = "-----BEGIN RSA PRIVATE KEY-----\z''']
+
+[[allowlists]]
+description = "test fixtures whose value names itself one (tests/unit/connector_fakes.py convention: <vendor>-fixture-<kind>-NNNN)"
+regexes = ['''\A[a-z0-9]+(-[a-z0-9]+)*-fixture-[a-z]+(-[a-z0-9]+)*\z''']
+
+[[allowlists]]
+description = "fixed test vectors of the DLP, redaction and production-secret-rule tests (tests/unit/test_wave4_dlp.py, test_redact.py, tests/test_dlp.py, test_production_secret_rules.py, test_env_reference_doc.py); exact values, no live credential"
+regexes = [
+  '''\AAKIAABCDEFGHIJKLMNOP\z''',
+  '''\AeyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiIxMjM0In0\.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c\z''',
+  '''\AQx9v2LmT8pZr4Wc1Hs7Yb3Nd6Kf0Ja5Ug\z''',
+  '''\Ask_live_1234567890abcdefghij\z''',
+  '''\AVq3xN8kLp2Rz7WmTb5YcHd9JfGs4Ua6E\z''',
+  '''\AKr7Bn2Xq9LmZ4Wc8Tv6Yp3Hd5Jf1Gs0A\z''',
+  '''\AMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=\z''',
+  '''\AXb7-Rq2-Lm9-Wz4-Tc8\z''',
+]

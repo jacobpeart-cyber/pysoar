@@ -1,4 +1,4 @@
-"""Splunk and Elastic connectors and the Splunk / Elastic / QRadar SIEM pollers.
+"""Splunk, Elastic and QRadar connectors and the Splunk / Elastic / QRadar SIEM pollers.
 
 Documented requests (method, path, headers, body) through the pinned
 transport, the either-or credential rule, refusals before any request, and
@@ -27,7 +27,7 @@ from src.integrations.engine import (
     CONNECTOR_CLASS_MAP,
     IMPLEMENTED,
     INGEST_CONNECTORS,
-    LOG_INGEST,
+    LOG_INGEST_CONNECTORS,
     ConnectorRegistry,
     implementation_status,
     invalid_install_fields,
@@ -43,6 +43,7 @@ SPLUNK_TOKEN = "splunk-fixture-token-0001"
 ES_KEY = "es-fixture-apikey-0001"
 QRADAR_TOKEN = "qradar-fixture-sec-0001"
 PRIVATE_IP = "10.20.0.5"
+QRADAR_ABOUT = {"release_name": "7.5.0 UpdatePackage 7", "build_version": "2023.07.0.20231004", "external_version": "7.5.0"}
 
 
 def _connector(name: str, config: dict[str, Any] | None = None, credentials: dict[str, Any] | None = None):
@@ -75,8 +76,9 @@ def _basic(user: str, password: str) -> str:
 
 
 def test_status_and_ingest_flags() -> None:
-    assert implementation_status("splunk") == IMPLEMENTED and implementation_status("elastic") == IMPLEMENTED
-    assert implementation_status("qradar") == LOG_INGEST
+    for name in ("splunk", "elastic", "qradar"):
+        assert implementation_status(name) == IMPLEMENTED, name
+    assert "qradar" not in LOG_INGEST_CONNECTORS
     registry = ConnectorRegistry()
     for name in ("aws_cloudtrail", "azure_activity_log", "gcp_cloud_logging", "qradar", "splunk", "elastic"):
         assert registry.connectors[name]["ingest"] is True, name
@@ -85,9 +87,12 @@ def test_status_and_ingest_flags() -> None:
     # The ingest flag is the poller dispatch table, not a hand-kept list.
     assert INGEST_CONNECTORS == set(cloud_poller._CLOUD_CONNECTOR_DISPATCH) & set(registry.connectors)
     qradar = registry.connectors["qradar"]
-    assert qradar["actions"] == [] and qradar["test_call"] is None
+    assert qradar["supported_actions"] == list(CONNECTOR_CLASS_MAP["qradar"].ACTIONS)
+    assert qradar["test_call"] == "GET /api/system/about"
     assert [(f["name"], f["required"], f["secret"]) for f in qradar["config_fields"]] == [("base_url", True, False)]
     assert [(f["name"], f["secret"]) for f in qradar["credential_fields"]] == [("sec_token", True)]
+    side_effects = {a["name"] for a in qradar["actions"] if a["side_effect"]}
+    assert side_effects == {"close_offense", "add_offense_note", "assign_offense", "add_to_reference_set"}
     assert not hasattr(cloud_poller, "_tls_verify")
 
 
@@ -97,7 +102,7 @@ async def test_catalogue_route_reports_ingest(client, org_a_admin_headers) -> No
     items = {c["name"]: c for c in resp.json()["items"]}
     assert items["splunk"]["implementation_status"] == "implemented" and items["splunk"]["ingest"] is True
     assert items["elastic"]["implementation_status"] == "implemented" and items["elastic"]["ingest"] is True
-    assert items["qradar"]["implementation_status"] == "log_ingest" and items["qradar"]["ingest"] is True
+    assert items["qradar"]["implementation_status"] == "implemented" and items["qradar"]["ingest"] is True
     assert items["virustotal"]["ingest"] is False
 
 
@@ -162,7 +167,7 @@ async def test_install_refuses_neither_credential(client, org_a_admin_headers, o
 
 
 @pytest.mark.asyncio
-async def test_qradar_installs_with_its_poller_fields(client, org_a_admin_headers, org_a_headers) -> None:
+async def test_qradar_installs_with_its_fields_and_tests_read_only(client, org_a_admin_headers, org_a_headers, monkeypatch) -> None:
     missing = await client.post(
         f"{BASE}/install", json={"connector_id": "qradar", "display_name": "QRadar", "credentials": {}},
         headers=org_a_admin_headers,
@@ -183,9 +188,14 @@ async def test_qradar_installs_with_its_poller_fields(client, org_a_admin_header
               "credentials": {"sec_token": QRADAR_TOKEN}},
         headers=org_a_admin_headers,
     )
-    assert ok.status_code == 201, ok.text and QRADAR_TOKEN not in ok.text
+    assert ok.status_code == 201, ok.text
+    assert QRADAR_TOKEN not in ok.text
+    actions = await client.get(f"{BASE}/installed/{ok.json()['id']}/actions", headers=org_a_headers)
+    assert {a["action_name"] for a in actions.json()["items"]} == set(CONNECTOR_CLASS_MAP["qradar"].ACTIONS)
+    seen = fake_vendor(monkeypatch, lambda request: httpx.Response(200, json=QRADAR_ABOUT))
     test = await client.post(f"{BASE}/installed/{ok.json()['id']}/test", headers=org_a_headers)
-    assert test.status_code == 501 and "SIEM cloud poller" in test.json()["detail"]["detail"]
+    assert test.status_code == 200 and test.json()["status"] == "healthy", test.text
+    assert [(r.method, r.url.path) for r in seen] == [("GET", "/api/system/about")]
 
 
 # --------------------------------------------------------------------------
@@ -432,11 +442,12 @@ async def test_elastic_names_refused_before_any_request(monkeypatch, action: str
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("name", ["splunk", "elastic"])
+@pytest.mark.parametrize("name", ["splunk", "elastic", "qradar"])
 async def test_private_siem_refused_with_the_setting_named_until_allowlisted(monkeypatch, name: str) -> None:
     monkeypatch.setattr(settings, "outbound_private_allowlist", [])
     seen = fake_vendor(monkeypatch, lambda request: httpx.Response(200, json={
-        "entry": [{"content": {"version": "9.2.1"}}], "cluster_name": "soc", "version": {"number": "8.13.0"}}), ip=PRIVATE_IP)
+        "entry": [{"content": {"version": "9.2.1"}}], "cluster_name": "soc", "version": {"number": "8.13.0"},
+        **QRADAR_ABOUT}), ip=PRIVATE_IP)
     refused = await _connector(name).test_connection()
     assert refused.status == "unhealthy" and seen == []
     assert refused.detail == f"refused: {PRIVATE_TARGET_HINT}"
@@ -704,3 +715,236 @@ async def test_splunk_search_accepts_common_read_only_shapes(monkeypatch, spl: s
     out = await _connector("splunk").execute_action("search", {"search": spl})
     assert out.get("status") != "failed" and "error" not in out, out
     assert len(seen) == 1
+
+
+# --------------------------------------------------------------------------
+# QRadar connector
+# --------------------------------------------------------------------------
+
+
+QRADAR_HEADERS = {"sec": QRADAR_TOKEN, "version": "12.0", "accept": "application/json"}
+
+
+def _qradar_headers_ok(request: httpx.Request) -> None:
+    for key, value in QRADAR_HEADERS.items():
+        assert request.headers[key] == value, key
+    assert "authorization" not in request.headers
+
+
+@pytest.mark.asyncio
+async def test_qradar_connection_healthy(monkeypatch) -> None:
+    seen = fake_vendor(monkeypatch, lambda request: httpx.Response(200, json=QRADAR_ABOUT))
+    result = await _connector("qradar").test_connection()
+    assert result.status == "healthy" and "QRadar 7.5.0" in result.detail, result
+    (request,) = seen
+    assert request.method == "GET" and request.url.path == "/api/system/about"
+    assert request.url.host == PUBLIC_IP and host_header(request) == "qradar.acme.example"
+    assert request.extensions["sni_hostname"] == "qradar.acme.example"
+    _qradar_headers_ok(request)
+
+
+@pytest.mark.asyncio
+async def test_qradar_connection_401_is_unhealthy_without_secret(monkeypatch) -> None:
+    fake_vendor(monkeypatch, lambda request: httpx.Response(401, json={
+        "http_response": {"code": 401, "message": "Unauthorized"}, "code": 26,
+        "message": f"No SEC header present in request {QRADAR_TOKEN}", "description": "", "details": {}}))
+    result = await _connector("qradar").test_connection()
+    assert result.status == "unhealthy" and result.http_status == 401 and "401" in result.detail
+    assert QRADAR_TOKEN not in json.dumps(result.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_qradar_redirect_is_a_failure_not_followed(monkeypatch) -> None:
+    seen = fake_vendor(monkeypatch, lambda request: httpx.Response(302, headers={"location": "http://169.254.169.254/"}))
+    result = await _connector("qradar").test_connection()
+    assert result.status == "unhealthy" and result.http_status == 302 and len(seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_qradar_offense_actions_documented_requests(monkeypatch) -> None:
+    offense = {"id": 42, "description": "Multiple login failures", "status": "OPEN", "magnitude": 6, "assigned_to": None}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/api/siem/offenses":
+            return httpx.Response(200, json=[offense])
+        if request.method == "GET" and path == "/api/siem/offenses/42":
+            return httpx.Response(200, json=offense)
+        if request.method == "POST" and path == "/api/siem/offenses/42":
+            params = request.url.params
+            if params.get("status") == "CLOSED":
+                return httpx.Response(200, json={**offense, "status": "CLOSED", "closing_reason_id": int(params["closing_reason_id"])})
+            return httpx.Response(200, json={**offense, "assigned_to": params["assigned_to"]})
+        if request.method == "POST" and path == "/api/siem/offenses/42/notes":
+            return httpx.Response(201, json={"id": 9001, "note_text": request.url.params["note_text"],
+                                             "create_time": 1700000000000, "username": "pysoar-svc"})
+        return httpx.Response(404, json={"message": "unexpected"})
+
+    seen = fake_vendor(monkeypatch, handler)
+    qradar = _connector("qradar")
+
+    listed = await qradar.execute_action("list_offenses", {"filter": "status=OPEN and magnitude>=5", "fields": "id,description,status", "limit": 25})
+    assert listed == {"count": 1, "offenses": [offense]}
+    req = seen[-1]
+    assert req.method == "GET" and dict(req.url.params) == {"filter": "status=OPEN and magnitude>=5", "fields": "id,description,status"}
+    assert req.headers["range"] == "items=0-24"
+    _qradar_headers_ok(req)
+
+    got = await qradar.execute_action("get_offense", {"offense_id": 42})
+    assert got == {"offense": offense} and seen[-1].method == "GET" and seen[-1].url.path == "/api/siem/offenses/42"
+
+    closed = await qradar.execute_action("close_offense", {"offense_id": 42, "closing_reason_id": 2})
+    assert closed == {"id": 42, "status": "CLOSED", "closing_reason_id": 2}
+    req = seen[-1]
+    assert req.method == "POST" and req.url.path == "/api/siem/offenses/42"
+    assert dict(req.url.params) == {"status": "CLOSED", "closing_reason_id": "2"} and not req.content
+    _qradar_headers_ok(req)
+
+    note = await qradar.execute_action("add_offense_note", {"offense_id": 42, "note_text": "Contained by PySOAR playbook p-7"})
+    assert note["id"] == 9001 and note["note_text"] == "Contained by PySOAR playbook p-7"
+    req = seen[-1]
+    assert req.method == "POST" and req.url.path == "/api/siem/offenses/42/notes"
+    assert dict(req.url.params) == {"note_text": "Contained by PySOAR playbook p-7"}
+
+    assigned = await qradar.execute_action("assign_offense", {"offense_id": 42, "assigned_to": "analyst1"})
+    assert assigned == {"id": 42, "assigned_to": "analyst1"}
+    assert seen[-1].method == "POST" and dict(seen[-1].url.params) == {"assigned_to": "analyst1"}
+
+
+@pytest.mark.asyncio
+async def test_qradar_aql_search_bounded_poll(monkeypatch) -> None:
+    from src.integrations.connectors import qradar as qradar_module
+
+    sleeps: list[float] = []
+
+    async def _no_wait(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(qradar_module, "_sleep", _no_wait)
+    states = iter(["EXECUTE", "SORTING", "COMPLETED"])
+    sid = "s-2b5e0f4e-0a52-4b0c-9d3e-6c1f7c0b9a11"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "POST" and path == "/api/ariel/searches":
+            return httpx.Response(201, json={"search_id": sid, "status": "WAIT"})
+        if request.method == "GET" and path == f"/api/ariel/searches/{sid}":
+            return httpx.Response(200, json={"search_id": sid, "status": next(states)})
+        if request.method == "GET" and path == f"/api/ariel/searches/{sid}/results":
+            return httpx.Response(200, json={"events": [{"sourceip": "198.51.100.7", "count": 12}]})
+        return httpx.Response(404, json={"message": "unexpected"})
+
+    seen = fake_vendor(monkeypatch, handler)
+    aql = "SELECT sourceip, COUNT(*) AS count FROM events GROUP BY sourceip LAST 1 HOURS"
+    out = await _connector("qradar").execute_action("aql_search", {"query_expression": aql, "limit": 10})
+    assert out == {"search_id": sid, "status": "COMPLETED", "count": 1, "rows": [{"sourceip": "198.51.100.7", "count": 12}]}
+    assert [(r.method, r.url.path) for r in seen] == [
+        ("POST", "/api/ariel/searches"),
+        ("GET", f"/api/ariel/searches/{sid}"),
+        ("GET", f"/api/ariel/searches/{sid}"),
+        ("GET", f"/api/ariel/searches/{sid}"),
+        ("GET", f"/api/ariel/searches/{sid}/results"),
+    ]
+    assert dict(seen[0].url.params) == {"query_expression": aql}
+    assert seen[-1].headers["range"] == "items=0-9"
+    assert len(sleeps) == 3
+    for request in seen:
+        _qradar_headers_ok(request)
+
+
+@pytest.mark.asyncio
+async def test_qradar_aql_search_gives_up_within_its_bound(monkeypatch) -> None:
+    from src.integrations.connectors import qradar as qradar_module
+
+    clock = [0.0]
+
+    async def _advance(seconds: float) -> None:
+        clock[0] += seconds
+
+    monkeypatch.setattr(qradar_module, "_sleep", _advance)
+    monkeypatch.setattr(qradar_module, "_now", lambda: clock[0])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(201, json={"search_id": "s-1", "status": "WAIT"})
+        return httpx.Response(200, json={"search_id": "s-1", "status": "EXECUTE"})
+
+    seen = fake_vendor(monkeypatch, handler)
+    out = await _connector("qradar").execute_action(
+        "aql_search", {"query_expression": "select * from events last 5 minutes", "max_wait_seconds": 10},
+    )
+    assert out["status"] == "failed" and "did not complete within 10s" in out["error"]
+    assert not [r for r in seen if r.url.path.endswith("/results")]
+    assert len(seen) <= 7  # POST plus at most max_wait / poll interval status reads
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("aql", [
+    "DELETE FROM events",
+    "  drop table events",
+    "WITH x AS (SELECT 1) SELECT * FROM x",
+    "SELECTED * FROM events",
+    "SELECT * FROM events; DELETE FROM events",
+    "select * from events;",
+    "/* comment */ SELECT * FROM events",
+])
+async def test_qradar_aql_must_be_a_single_select_refused_before_any_request(monkeypatch, aql: str) -> None:
+    fake_vendor(monkeypatch, _refuse_everything)
+    out = await _connector("qradar").execute_action("aql_search", {"query_expression": aql})
+    assert out["status"] == "failed" and out["code"] == "invalid_parameters", out
+    assert "read-only" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_qradar_reference_sets(monkeypatch) -> None:
+    body = {"name": "Blocked IPs", "element_type": "IP", "number_of_elements": 1, "creation_time": 1700000000000,
+            "data": [{"value": "198.51.100.7", "first_seen": 1700000000000, "last_seen": 1700000000000, "source": "reference data api"}]}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.raw_path.decode().startswith("/api/reference_data/sets/Blocked%20IPs"):
+            if request.method == "POST":
+                return httpx.Response(200, json={**body, "number_of_elements": 2})
+            return httpx.Response(200, json=body)
+        return httpx.Response(404, json={"message": "unexpected"})
+
+    seen = fake_vendor(monkeypatch, handler)
+    qradar = _connector("qradar")
+    listed = await qradar.execute_action("list_reference_set", {"name": "Blocked IPs"})
+    assert listed == {k: body[k] for k in ("name", "element_type", "number_of_elements", "data")}
+    assert seen[-1].method == "GET" and seen[-1].url.raw_path.decode() == "/api/reference_data/sets/Blocked%20IPs"
+
+    added = await qradar.execute_action("add_to_reference_set", {"name": "Blocked IPs", "value": "198.51.100.8"})
+    assert added == {"name": "Blocked IPs", "element_type": "IP", "number_of_elements": 2}
+    req = seen[-1]
+    assert req.method == "POST" and req.url.raw_path.decode().split("?", 1)[0] == "/api/reference_data/sets/Blocked%20IPs"
+    assert dict(req.url.params) == {"value": "198.51.100.8"}
+    _qradar_headers_ok(req)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("action", "params"), [
+    ("get_offense", {"offense_id": "../../system/about"}),
+    ("get_offense", {"offense_id": "42/notes"}),
+    ("get_offense", {"offense_id": -1}),
+    ("get_offense", {"offense_id": True}),
+    ("close_offense", {"offense_id": "42?status=OPEN", "closing_reason_id": 1}),
+    ("add_offense_note", {"offense_id": 4.5, "note_text": "x"}),
+    ("list_reference_set", {"name": "../../config/access/users"}),
+    ("list_reference_set", {"name": ".."}),
+    ("list_reference_set", {"name": "a%2fb"}),
+    ("list_reference_set", {"name": "set?x=1"}),
+    ("add_to_reference_set", {"name": "a/b", "value": "198.51.100.8"}),
+    ("add_to_reference_set", {"name": "x" * 256, "value": "1"}),
+])
+async def test_qradar_ids_refused_before_any_request(monkeypatch, action: str, params: dict[str, Any]) -> None:
+    fake_vendor(monkeypatch, _refuse_everything)
+    out = await _connector("qradar").execute_action(action, params)
+    assert out["status"] == "failed" and out["code"] == "invalid_parameters", out
+
+
+@pytest.mark.asyncio
+async def test_qradar_vendor_error_is_failed_with_status(monkeypatch) -> None:
+    fake_vendor(monkeypatch, lambda request: httpx.Response(404, json={
+        "http_response": {"code": 404, "message": "Not Found"}, "code": 1002, "message": "Offense not found"}))
+    out = await _connector("qradar").execute_action("get_offense", {"offense_id": 999})
+    assert out["status"] == "failed" and out["http_status"] == 404 and "Offense not found" in out["error"]

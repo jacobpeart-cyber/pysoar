@@ -849,6 +849,65 @@ async def _entra_revert(ctx: AdapterContext, vendor_id: str) -> AdapterOutcome:
     )
 
 
+#: The ``IdentityProfile.account_status`` the ITDR directory sync records
+#: (src/itdr/directory.py: ``_okta_record`` / ``_sync_entra``) for an account
+#: after a containment disable (True) or its revert (False).
+_PROFILE_STATUS = {
+    "okta": {True: "SUSPENDED", False: "ACTIVE"},
+    "azure_ad": {True: "disabled", False: "enabled"},
+}
+
+
+async def sync_identity_profile(
+    db: AsyncSession,
+    org_id: str,
+    connector: str,
+    login: str,
+    *,
+    vendor_id: Optional[str],
+    installation_id: Optional[str],
+    disabled: bool,
+) -> str:
+    """Make ``org_id``'s ITDR profile of ``login`` show what the provider now holds.
+
+    Called after a successful Okta / Entra ID disable (``disabled=True``) or
+    its revert. Matches the organisation's ``IdentityProfile`` rows of the same
+    provider whose username or email equals ``login`` (case-insensitive), sets
+    ``account_status`` to the string the directory sync writes and stamps the
+    provenance the sync stamps (``user_id`` = the vendor id, ``source``,
+    ``source_integration_id``, ``last_synced_at``). Returns a sentence for the
+    result detail; no matching profile is not an error. Flushes, does not commit.
+    """
+    from datetime import datetime, timezone
+
+    from src.itdr.models import IdentityProfile
+
+    status = _PROFILE_STATUS.get(connector, {}).get(disabled)
+    if status is None:
+        return ""
+    key = str(login or "").strip().lower()
+    rows = list((await db.execute(
+        select(IdentityProfile).where(
+            IdentityProfile.organization_id == org_id,
+            IdentityProfile.identity_provider == connector,
+            or_(func.lower(IdentityProfile.username) == key, func.lower(IdentityProfile.email) == key),
+        ),
+    )).scalars().all())
+    if not rows:
+        return f"no ITDR identity profile of {connector} matches {login}; none updated"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for row in rows:
+        row.account_status = status
+        if vendor_id:
+            row.user_id = str(vendor_id)[:255]
+        row.source = connector
+        if installation_id:
+            row.source_integration_id = installation_id
+        row.last_synced_at = now_iso
+    await db.flush()
+    return f"ITDR identity profile updated to {status}"
+
+
 @dataclass(frozen=True)
 class IntegrationAdapter:
     """How one connector carries out one containment action.
@@ -1127,9 +1186,19 @@ async def _identity_disable(
             "disable_user", login, adapter, integ,
             f"Identity-provider actions run only for an administrator; {actor} is not one", **extra,
         )
-    return await _actuate_via_integrations(
+    result = await _actuate_via_integrations(
         "disable_user", login, candidates, execution_ref=execution_ref, reason=reason,
     )
+    if result.status == EXECUTED and result.integration:
+        # The account is disabled at the provider (possibly with a failed
+        # session revocation): the ITDR profile records that state.
+        note = await sync_identity_profile(
+            db, org_id, result.integration, login,
+            vendor_id=result.vendor_id, installation_id=result.integration_id, disabled=True,
+        )
+        if note:
+            result.detail = f"{result.detail}; {note}"
+    return result
 
 
 async def disable_user(

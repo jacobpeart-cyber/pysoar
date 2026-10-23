@@ -44,6 +44,7 @@ SUCCESS: dict[str, tuple[str, str, Any, int]] = {
     "jira": ("acme.atlassian.net", "/rest/api/3/myself", {"accountId": "5b10ac8d82e05b22cc7d4ef5", "active": True}, 200),
     "splunk": ("splunk.acme.example", "/services/server/info", {"entry": [{"content": {"version": "9.2.1", "serverName": "idx-1"}}]}, 200),
     "elastic": ("es.acme.example", "/", {"name": "es-1", "cluster_name": "soc", "version": {"number": "8.13.0"}}, 200),
+    "qradar": ("qradar.acme.example", "/api/system/about", {"release_name": "7.5.0 UpdatePackage 7", "external_version": "7.5.0"}, 200),
 }
 SENTINEL_WORKSPACE = (
     "/subscriptions/00000000-0000-0000-0000-000000000002/resourceGroups/rg-sec"
@@ -90,7 +91,7 @@ async def test_healthy_on_documented_success_body(monkeypatch, name: str) -> Non
         assert b"client_secret=cs-fixture-secret-0001" in request.content
     else:
         auth_header = {
-            "virustotal": "x-apikey", "abuseipdb": "key",
+            "virustotal": "x-apikey", "abuseipdb": "key", "qradar": "sec",
         }.get(name, "authorization")
         assert request.headers.get(auth_header), f"{name}: no credential header"
     if name == "pagerduty":

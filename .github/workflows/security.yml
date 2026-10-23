@@ -77,3 +77,58 @@ jobs:
         with:
           name: pip-audit-results
           path: pip-audit-results.json
+
+  secrets-scan:
+    # Enforcing: a finding fails the job. This repository once committed a
+    # live .env (the history was purged), so committed credentials are
+    # scanned for on every push and pull request. Rules: the gitleaks default
+    # set; .gitleaks.toml allow-lists reviewed false positives by exact
+    # pattern only (no path allow-list). Two scans: the checked-out tree, and
+    # the commits this event brings (push: before..after; pull request:
+    # base..head; schedule: the last 50 commits). The full history is not
+    # rescanned on every run.
+    name: Secrets Scan (gitleaks)
+    runs-on: ubuntu-latest
+    env:
+      # gitleaks v8.28.0, pinned to the multi-arch index digest.
+      GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks:v8.28.0@sha256:cdbb7c955abce02001a9f6c9f602fb195b7fadc1e812065883f695d1eeaba854
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan the checked-out tree
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" -w /repo "$GITLEAKS_IMAGE" \
+            detect --source . --no-git --config .gitleaks.toml --redact --no-banner --exit-code 1
+
+      - name: Scan the commits of this push or pull request
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          zero=0000000000000000000000000000000000000000
+          case "$EVENT_NAME" in
+            pull_request)
+              range="$PR_BASE..$PR_HEAD" ;;
+            push)
+              if [ "$PUSH_BEFORE" = "$zero" ] || ! git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+                # New branch or a force push whose old tip is gone: scan the pushed tip.
+                range="$PUSH_AFTER~1..$PUSH_AFTER"
+              else
+                range="$PUSH_BEFORE..$PUSH_AFTER"
+              fi ;;
+            *)
+              range="HEAD~50..HEAD" ;;
+          esac
+          echo "gitleaks commit range: $range"
+          docker run --rm -v "$PWD:/repo:ro" -w /repo \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
+            "$GITLEAKS_IMAGE" \
+            detect --source . --config .gitleaks.toml --log-opts="$range" --redact --no-banner --exit-code 1

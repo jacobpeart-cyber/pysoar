@@ -32,6 +32,7 @@ from src.integrations.connectors.base import (
     sanitize_message,
 )
 from src.integrations.connectors.elastic import ElasticConnector
+from src.integrations.connectors.qradar import QRadarConnector
 from src.integrations.connectors.splunk import SplunkConnector, https_origin
 from src.integrations.netguard import (
     OutboundTargetRefused,
@@ -65,6 +66,7 @@ CONNECTOR_CLASS_MAP = {
     "microsoft_sentinel": MicrosoftSentinelConnector,
     "splunk": SplunkConnector,
     "elastic": ElasticConnector,
+    "qradar": QRadarConnector,
     "okta": OktaConnector,
     "azure_ad": EntraIDConnector,
     "microsoft_defender": MicrosoftDefenderConnector,
@@ -83,15 +85,14 @@ LOG_INGEST_VERIFICATION = (
 
 # Connectors with no executable connector class whose events the SIEM cloud
 # poller (src/siem/cloud_poller.py) ingests on a schedule (the vendor SDK for
-# the three clouds, the pinned REST client for QRadar). They can be installed
-# (the poller needs the stored credentials) but expose no actions and no
-# connection test.
-LOG_INGEST_CONNECTORS = frozenset({"aws_cloudtrail", "azure_activity_log", "gcp_cloud_logging", "qradar"})
+# the three clouds). They can be installed (the poller needs the stored
+# credentials) but expose no actions and no connection test.
+LOG_INGEST_CONNECTORS = frozenset({"aws_cloudtrail", "azure_activity_log", "gcp_cloud_logging"})
 
 # Catalogue entries whose events the SIEM cloud poller ingests: the
 # log_ingest sources plus the implemented connectors that also have a poller
-# (Splunk, Elastic). Surfaced as ``ingest: true`` in the catalogue.
-INGEST_CONNECTORS = LOG_INGEST_CONNECTORS | frozenset({"splunk", "elastic"})
+# (Splunk, Elastic, QRadar). Surfaced as ``ingest: true`` in the catalogue.
+INGEST_CONNECTORS = LOG_INGEST_CONNECTORS | frozenset({"splunk", "elastic", "qradar"})
 
 
 def has_ingest(connector_name: Optional[str]) -> bool:
@@ -254,15 +255,12 @@ BUILTIN_CONNECTORS = {
     "qradar": {
         "name": "qradar",
         "display_name": "IBM QRadar",
-        "description": "OPTIONAL INTEROP: the SIEM poller pulls new offenses from an existing QRadar console (GET /api/siem/offenses). Not required; PySOAR has its own native SIEM.",
+        "description": "OPTIONAL INTEROP: offenses, read-only AQL searches and reference sets on an existing QRadar console; the SIEM poller pulls new offenses. Not required; PySOAR has its own native SIEM.",
         "vendor": "IBM",
         "category": IntegrationCategory.SIEM,
         "integration_role": "external_siem",
         "auth_type": AuthType.API_KEY,
         "supported_triggers": ["scheduled", "manual"],
-        "required_config": ["base_url"],
-        "https_config": ["base_url"],
-        "required_credentials": ["sec_token"],
     },
     "elastic": {
         "name": "elastic",

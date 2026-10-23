@@ -141,7 +141,37 @@ Usually also set: `ingress.className`, `ingress.annotations`,
 pod CIDR, so uvicorn trusts its `X-Forwarded-For` and rate limits and audit
 rows see client addresses; uvicorn reads it as `FORWARDED_ALLOW_IPS`), and
 `config.*` (log level, CORS origins, LLM defaults, OT discovery CIDRs,
-syslog). Anything else non-secret goes in `config.extra` as `NAME: "value"`.
+syslog, the private-target allow-list below). Anything else non-secret goes
+in `config.extra` as `NAME: "value"`.
+
+### Private integration targets (`config.outboundPrivateAllowlist`)
+
+Outbound integration calls (connectors, the SIEM pollers and log forwarder,
+the generic HTTP action, OIDC / SAML metadata, directory sync; everything
+that goes through `src/integrations/netguard.py`) refuse a target that
+resolves to a private address (RFC 1918, IPv6 ULA, `100.64.0.0/10` and the
+other non-global ranges). An on-premises Splunk, Elasticsearch or QRadar is
+opened by listing its network:
+
+```yaml
+config:
+  outboundPrivateAllowlist: ["10.20.0.0/24", "fd12:3456::/48"]
+```
+
+The list is rendered into the ConfigMap (and the migration Job's inline
+environment) as `OUTBOUND_PRIVATE_ALLOWLIST`, a JSON list; the default `[]`
+denies every private target. Set it here, not through `config.extra` (the
+chart refuses `config.extra.OUTBOUND_PRIVATE_ALLOWLIST`, and a value that is
+not a list). A malformed CIDR is not caught at render time: the backend
+refuses it when it loads its settings, so the pods do not start. Loopback,
+link-local, the cloud metadata addresses, multicast and reserved addresses
+stay refused whatever the list says. The application allow-list does not
+open the network: with `networkPolicy.egress.enabled` the pods reach only
+public TCP/443, so the same networks and ports also need a
+`networkPolicy.egress.extraEgress` rule. Validated by rendering only
+(`helm template` with the example values plus the list, and
+`tests/unit/test_helm_values_allowlist.py`, which runs when `helm` is on PATH
+or `HELM_BIN` names it); not applied to a cluster.
 
 `values-example-production.yaml` shows a complete production override; its
 hostnames, CIDRs and storage class are placeholders.

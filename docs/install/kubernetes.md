@@ -58,6 +58,19 @@ with the ingress enabled, `ingress.host`. Non-secret settings go under
 [environment.md](environment.md)); they are rendered into the
 `<release>-config` ConfigMap.
 
+An on-premises SIEM or other integration on a private network (Splunk,
+Elasticsearch, QRadar, an internal IdP) is refused until its network is in
+`config.outboundPrivateAllowlist` (a list of CIDRs, default empty, rendered
+as the JSON list `OUTBOUND_PRIVATE_ALLOWLIST`; not through `config.extra`,
+which the chart refuses for this key). With `networkPolicy.egress.enabled`
+the same network also needs an `extraEgress` rule. Details:
+["Private integration targets"](../../deploy/kubernetes/README.md#private-integration-targets-configoutboundprivateallowlist).
+This value was checked by rendering only (2026-10-22: `helm lint --strict`,
+`helm template` with the example values and with
+`--set-json 'config.outboundPrivateAllowlist=["10.20.0.0/24","fd12:3456::/48"]'`,
+`kubeconform -strict` on that render: 19 valid); it has not been applied to a
+cluster.
+
 Check the render before installing:
 
 ```sh
